@@ -1,18 +1,50 @@
-# Phos
+# Phos - AI Photo & Video Manager
 
-AI-powered photo and video manager designed for local-first usage.
+Phos is a self-hosted AI-powered media manager that automatically indexes your photos and videos, detects faces, and groups them by person using ONNX Runtime.
 
-## Status: Incubation 🧪
-Phos is currently in the architectural design phase.
+## Features
 
-## Tech Stack
-- **Backend:** Rust (Axum, ONNX Runtime, SQLite)
-- **Frontend:** Vue 3 (Vite, Tailwind CSS)
+- **Recursive Media Scanning**: Automatically finds and hashes media files to prevent duplicates.
+- **AI Face Detection**: Uses SCRFD for fast and accurate face detection.
+- **AI Face Recognition**: Uses ArcFace to generate embeddings for clustering faces.
+- **Video Support**: Keyframe extraction and analysis (Coming Soon).
+- **Web UI**: Modern Vue 3 interface for browsing your gallery and people.
 
-## Key Features
-- **Visual Similarity Grouping:** Automatically links crops, edits, and upscales to the original file.
-- **Face Clustering:** Organizes your library by people detected in photos and videos.
-- **Nextcloud Friendly:** Designed to live within a synced folder without requiring a centralized server database.
+## Getting Started
 
-## Documentation
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design specifications.
+### Prerequisites
+
+- Rust (latest stable)
+- Node.js (v18+)
+- ONNX Models (det_10g.onnx and w600k_r50.onnx)
+
+### Installation
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/DiverOfDark/phos.git
+   cd phos
+   ```
+
+2. Setup Backend:
+   ```bash
+   cd backend
+   # Download models into backend/models/
+   cargo run
+   ```
+
+3. Setup Frontend:
+   ```bash
+   cd frontend
+   npm install
+   npm run dev
+   ```
+
+## Architecture
+
+- **Backend**: Axum (Web Framework), Rusqlite (Database), ORT (ONNX Runtime), FFmpeg (Video processing).
+- **Frontend**: Vue 3, Vite, Tailwind CSS, shadcn-vue.
+
+## License
+
+MIT
