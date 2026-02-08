@@ -1,0 +1,18 @@
+[package]
+name = "phos-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rusqlite = { version = "0.31", features = ["bundled"] }
+ort = "1.16" # ONNX Runtime bindings
+image = "0.25"
+notify = "6.1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tower-http = { version = "0.5", features = ["cors"] }
+uuid = { version = "1.8", features = ["v4"] }
