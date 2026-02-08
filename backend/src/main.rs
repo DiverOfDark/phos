@@ -33,8 +33,17 @@ async fn main() {
     // Run a scan in the background
     let scan_path = root_path.to_path_buf();
     let scanner_db_path = db_path.to_path_buf();
+    
+    let model_dir = Path::new("models");
+    let ai = if model_dir.exists() {
+        Some(ai::AiPipeline::new(model_dir).expect("Failed to load AI models"))
+    } else {
+        tracing::warn!("AI models not found in 'models/', face detection will be disabled");
+        None
+    };
+
     tokio::task::spawn_blocking(move || {
-        let scanner = scanner::Scanner::new(scanner_db_path);
+        let scanner = scanner::Scanner::new(scanner_db_path, ai);
         if let Err(e) = scanner.scan(&scan_path) {
             tracing::error!("Scan failed: {}", e);
         }

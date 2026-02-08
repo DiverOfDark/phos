@@ -119,10 +119,45 @@ struct PersonBrief {
 }
 
 async fn get_person_photos(Path(id): Path<String>, State(state): State<AppState>) -> Json<Vec<PhotoBrief>> {
-     // Implementation for getting photos where a specific person appears
-     Json(vec![])
+    let db = state.db.lock().await;
+    let mut stmt = db.prepare("
+        SELECT DISTINCT p.id, f.path, p.timestamp 
+        FROM photos p 
+        JOIN files f ON p.main_file_id = f.id 
+        JOIN faces fa ON f.id = fa.file_id 
+        WHERE fa.person_id = ? 
+        ORDER BY p.timestamp DESC
+    ").unwrap();
+    
+    let rows = stmt.query_map(params![id], |row| {
+        Ok(PhotoBrief {
+            id: row.get(0)?,
+            thumbnail_url: format!("/{}", row.get::<_, String>(1)?),
+            timestamp: row.get(2)?,
+        })
+    }).unwrap();
+
+    let photos: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+    Json(photos)
 }
 
-async fn trigger_scan() -> Json<serde_json::Value> {
+#[derive(Deserialize)]
+pub struct ScanParams {
+    pub path: String,
+}
+
+async fn trigger_scan(State(state): State<AppState>, Json(payload): Json<ScanParams>) -> Json<serde_json::Value> {
+    let db_path_result: Result<String, rusqlite::Error> = {
+         let db = state.db.lock().await;
+         db.query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
+    };
+
+    if let Ok(db_path) = db_path_result {
+        tokio::task::spawn_blocking(move || {
+            let scanner = crate::scanner::Scanner::new(std::path::PathBuf::from(db_path), None);
+            let _ = scanner.scan(std::path::Path::new(&payload.path));
+        });
+    }
+
     Json(serde_json::json!({"status": "started"}))
 }
