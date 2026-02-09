@@ -58,7 +58,11 @@ async fn main() {
         .fallback_service(serve_static)
         .layer(CorsLayer::permissive());
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let port = std::env::var("PHOS_PORT")
+        .unwrap_or_else(|_| "33000".to_string())
+        .parse::<u16>()
+        .unwrap_or(33000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("listening on {}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();

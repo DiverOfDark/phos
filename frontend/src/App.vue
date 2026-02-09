@@ -1,8 +1,28 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetDescription,
+  SheetTrigger,
+} from '@/components/ui/sheet'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+
 import { 
   Activity, 
   Image as ImageIcon, 
@@ -11,7 +31,12 @@ import {
   Search, 
   Upload, 
   LayoutGrid,
-  RefreshCw
+  RefreshCw,
+  Clock,
+  HardDrive,
+  Shield,
+  Zap,
+  FolderOpen
 } from 'lucide-vue-next'
 
 const stats = ref([
@@ -21,27 +46,59 @@ const stats = ref([
 ])
 
 const isScanning = ref(false)
+const scanProgress = ref(0)
+const libraryPath = ref('/mnt/photos')
 
 const startScan = async () => {
+  if (isScanning.value) return
   isScanning.value = true
-  // Mocking scan start
-  setTimeout(() => {
-    isScanning.value = false
-  }, 3000)
+  
+  try {
+    // Communication with backend
+    const response = await fetch('/api/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: libraryPath.value })
+    })
+    
+    // Fallback for demo if API not yet ready
+    if (!response.ok) {
+       console.warn('Backend API not responding, using mock scan')
+    }
+  } catch (e) {
+    console.error('Scan failed', e)
+  }
+
+  // Visual feedback
+  let interval = setInterval(() => {
+    scanProgress.value += 5
+    if (scanProgress.value >= 100) {
+      clearInterval(interval)
+      isScanning.value = false
+      scanProgress.value = 0
+    }
+  }, 200)
+}
+
+const isDragging = ref(false)
+const handleDrop = (e) => {
+  isDragging.value = false
+  const files = e.dataTransfer.files
+  console.log('Importing files:', files.length)
 }
 </script>
 
 <template>
   <div class="min-h-screen bg-zinc-950 text-zinc-50 font-sans selection:bg-indigo-500/30">
-    <!-- Glass Sidebar/Nav -->
-    <header class="border-b border-white/5 bg-zinc-950/50 backdrop-blur-xl sticky top-0 z-50">
-      <div class="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-        <div class="flex items-center gap-8">
-          <div class="flex items-center gap-2.5">
-            <div class="w-9 h-9 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
+    <!-- Navigation -->
+    <header class="border-b border-white/5 bg-zinc-950/80 backdrop-blur-xl sticky top-0 z-50">
+      <div class="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
+        <div class="flex items-center gap-4 md:gap-8">
+          <div class="flex items-center gap-2.5 group cursor-pointer">
+            <div class="w-9 h-9 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20 group-hover:scale-105 transition-transform">
               <span class="text-white font-black text-lg">P</span>
             </div>
-            <span class="text-xl font-bold tracking-tight text-white">Phos</span>
+            <span class="text-xl font-bold tracking-tight text-white hidden xs:block">Phos</span>
           </div>
           
           <nav class="hidden md:flex items-center gap-1">
@@ -54,50 +111,138 @@ const startScan = async () => {
               People
             </Button>
             <Button variant="ghost" class="text-zinc-400 hover:text-white hover:bg-white/5 gap-2 px-3">
-              <Activity class="w-4 h-4" />
+              <Clock class="w-4 h-4" />
               Timeline
             </Button>
           </nav>
         </div>
 
         <div class="flex items-center gap-2">
-          <div class="relative hidden sm:block mr-2">
+          <div class="relative hidden lg:block mr-2">
             <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
-            <input 
-              type="text" 
+            <Input 
               placeholder="Search memories..." 
-              class="bg-zinc-900 border-none rounded-full pl-9 pr-4 py-1.5 text-sm w-64 focus:ring-2 focus:ring-indigo-500/50 outline-none transition-all placeholder:text-zinc-600"
+              class="rounded-full pl-9 pr-4 py-1.5 h-9 w-64 bg-zinc-900/50 border-white/5 focus-visible:ring-indigo-500/40"
             />
           </div>
-          <Button variant="ghost" size="icon" class="text-zinc-400 hover:text-white rounded-full">
-            <Settings class="w-5 h-5" />
-          </Button>
-          <div class="h-8 w-[1px] bg-white/10 mx-1"></div>
-          <Button class="bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/20 rounded-xl gap-2 px-4">
-            <Upload class="w-4 h-4" />
-            Import
-          </Button>
+
+          <!-- Settings Sheet -->
+          <Sheet>
+            <SheetTrigger as-child>
+              <Button variant="ghost" size="icon" class="text-zinc-400 hover:text-white rounded-xl hover:bg-white/5">
+                <Settings class="w-5 h-5" />
+              </Button>
+            </SheetTrigger>
+            <SheetContent>
+              <SheetHeader class="mb-8 text-left">
+                <SheetTitle>Settings</SheetTitle>
+                <SheetDescription>Configure your personal photo laboratory.</SheetDescription>
+              </SheetHeader>
+              
+              <Tabs default-value="general" class="w-full">
+                <TabsList class="grid w-full grid-cols-2 mb-6">
+                  <TabsTrigger value="general">General</TabsTrigger>
+                  <TabsTrigger value="ai">AI Models</TabsTrigger>
+                </TabsList>
+                
+                <TabsContent value="general" class="space-y-6">
+                  <div class="space-y-2">
+                    <Label>Library Path</Label>
+                    <div class="flex gap-2">
+                      <Input v-model="libraryPath" class="flex-1" />
+                      <Button variant="outline" size="icon" class="shrink-0 border-white/10">
+                        <FolderOpen class="w-4 h-4" />
+                      </Button>
+                    </div>
+                  </div>
+                  
+                  <div class="space-y-4 pt-4">
+                    <div class="flex items-center justify-between p-4 rounded-2xl bg-zinc-900/50 border border-white/5">
+                      <div class="space-y-0.5">
+                        <p class="text-sm font-medium text-white">Auto-Scan</p>
+                        <p class="text-xs text-zinc-500">Watch for new files automatically</p>
+                      </div>
+                      <div class="w-10 h-5 bg-indigo-600 rounded-full relative">
+                         <div class="absolute right-1 top-1 w-3 h-3 bg-white rounded-full"></div>
+                      </div>
+                    </div>
+                  </div>
+                </TabsContent>
+                
+                <TabsContent value="ai" class="space-y-4 text-center py-12">
+                   <Zap class="w-12 h-12 text-indigo-500 mx-auto mb-4 opacity-20" />
+                   <p class="text-white font-medium">Neural Engine v1.2</p>
+                   <p class="text-sm text-zinc-500">Face detection and object recognition models are currently managed by the system.</p>
+                </TabsContent>
+              </Tabs>
+
+              <div class="absolute bottom-8 left-6 right-6">
+                 <div class="p-4 rounded-2xl bg-zinc-900 border border-white/5 flex items-center gap-3">
+                    <Shield class="w-5 h-5 text-emerald-500" />
+                    <div>
+                       <p class="text-xs font-bold text-white uppercase tracking-wider">Privacy Mode</p>
+                       <p class="text-[10px] text-zinc-500">All processing is strictly local.</p>
+                    </div>
+                 </div>
+              </div>
+            </SheetContent>
+          </Sheet>
+
+          <div class="h-6 w-[1px] bg-white/10 mx-1 hidden xs:block"></div>
+
+          <!-- Import Dialog -->
+          <Dialog>
+            <DialogTrigger as-child>
+              <Button class="bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/20 rounded-xl gap-2 px-4 transition-all active:scale-95">
+                <Upload class="w-4 h-4" />
+                <span class="hidden sm:inline">Import</span>
+              </Button>
+            </DialogTrigger>
+            <DialogContent class="sm:max-w-[425px]">
+              <DialogHeader>
+                <DialogTitle>Import Media</DialogTitle>
+                <DialogDescription>
+                  Drag and drop files or folders to add them to your collection.
+                </DialogDescription>
+              </DialogHeader>
+              <div 
+                @dragover.prevent="isDragging = true"
+                @dragleave.prevent="isDragging = false"
+                @drop.prevent="handleDrop"
+                :class="cn(
+                  'mt-4 flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-12 transition-all duration-300',
+                  isDragging ? 'border-indigo-500 bg-indigo-500/10 scale-[0.98]' : 'border-white/10 bg-zinc-900/50 hover:border-white/20'
+                )"
+              >
+                <div class="w-12 h-12 rounded-full bg-zinc-800 flex items-center justify-center mb-4">
+                  <Upload :class="cn('w-6 h-6 transition-colors', isDragging ? 'text-indigo-400' : 'text-zinc-500')" />
+                </div>
+                <p class="text-sm font-medium text-white">Click to upload or drag and drop</p>
+                <p class="text-xs text-zinc-500 mt-1">PNG, JPG, MP4 up to 500MB each</p>
+              </div>
+            </DialogContent>
+          </Dialog>
         </div>
       </div>
     </header>
 
-    <main class="max-w-7xl mx-auto p-6 md:p-8">
+    <main class="max-w-7xl mx-auto p-4 sm:p-6 md:p-8 lg:p-10">
       <!-- Welcome Header -->
-      <div class="mb-10">
-        <h2 class="text-3xl font-bold tracking-tight text-white mb-2 text-glow">Welcome back, Kirill</h2>
-        <p class="text-zinc-400">Your personal AI-curated photo laboratory is ready.</p>
+      <div class="mb-8 md:mb-12">
+        <h2 class="text-3xl md:text-4xl font-bold tracking-tight text-white mb-3 text-glow">Library</h2>
+        <p class="text-zinc-400 text-lg">Your personal AI-curated photo laboratory.</p>
       </div>
 
       <!-- Stats Grid -->
-      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6 mb-12">
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6 mb-12">
         <Card v-for="stat in stats" :key="stat.name" class="bg-zinc-900/40 border-white/5 backdrop-blur-sm group hover:border-indigo-500/30 transition-all duration-300">
           <CardHeader class="flex flex-row items-center justify-between pb-2 space-y-0">
-            <CardTitle class="text-sm font-medium text-zinc-400 group-hover:text-zinc-300">{{ stat.name }}</CardTitle>
+            <CardTitle class="text-sm font-semibold text-zinc-400 group-hover:text-zinc-300">{{ stat.name }}</CardTitle>
             <component :is="stat.icon" class="w-4 h-4 text-zinc-500 group-hover:text-indigo-400 transition-colors" />
           </CardHeader>
           <CardContent>
             <div class="text-3xl font-bold text-white tracking-tight">{{ stat.value }}</div>
-            <p class="text-xs text-zinc-500 mt-1.5">{{ stat.description }}</p>
+            <p class="text-xs text-zinc-500 mt-2 font-medium leading-relaxed">{{ stat.description }}</p>
           </CardContent>
         </Card>
       </div>
@@ -111,44 +256,69 @@ const startScan = async () => {
           </Button>
         </div>
 
-        <ScrollArea class="h-[500px] w-full rounded-3xl border border-white/5 bg-zinc-900/20 backdrop-blur-sm relative overflow-hidden group">
+        <ScrollArea class="h-[400px] md:h-[500px] w-full rounded-[2rem] border border-white/5 bg-zinc-900/20 backdrop-blur-sm relative overflow-hidden group shadow-2xl">
           <!-- Background Decoration -->
           <div class="absolute inset-0 bg-gradient-to-br from-indigo-500/5 via-transparent to-purple-500/5 opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none"></div>
           
-          <div class="flex flex-col items-center justify-center h-full text-center p-12 space-y-6 relative z-10">
+          <div class="flex flex-col items-center justify-center h-full text-center p-8 sm:p-12 space-y-6 relative z-10">
             <div class="relative">
               <div class="absolute inset-0 bg-indigo-500 blur-3xl opacity-10 animate-pulse"></div>
-              <div class="w-20 h-20 bg-zinc-900 rounded-2xl flex items-center justify-center border border-white/5 shadow-2xl relative">
+              <div class="w-20 h-20 bg-zinc-900 rounded-2xl flex items-center justify-center border border-white/5 shadow-2xl relative transition-transform group-hover:scale-110 duration-500">
                 <ImageIcon class="w-10 h-10 text-zinc-700 group-hover:text-indigo-500 transition-colors duration-500" />
               </div>
             </div>
             
-            <div class="max-w-xs">
+            <div class="max-w-xs mx-auto">
               <p class="text-xl font-bold text-white mb-2">No memories found</p>
               <p class="text-zinc-500 text-sm leading-relaxed">
                 Connect your library folder to start the AI-powered indexing and face clustering process.
               </p>
             </div>
 
-            <Button 
-              @click="startScan"
-              :disabled="isScanning"
-              class="bg-white text-black hover:bg-zinc-200 font-bold px-8 py-6 rounded-2xl transition-all active:scale-95 disabled:opacity-50 h-auto"
-            >
-              <RefreshCw v-if="isScanning" class="w-5 h-5 mr-2 animate-spin" />
-              {{ isScanning ? 'Initializing Intelligence...' : 'Scan test_library' }}
-            </Button>
+            <div class="w-full max-w-xs space-y-4">
+               <Button 
+                @click="startScan"
+                :disabled="isScanning"
+                class="w-full bg-white text-black hover:bg-zinc-200 font-bold px-8 py-6 rounded-2xl transition-all active:scale-95 disabled:opacity-50 h-auto shadow-xl"
+              >
+                <RefreshCw v-if="isScanning" class="w-5 h-5 mr-2 animate-spin" />
+                {{ isScanning ? 'Initializing Engine...' : 'Scan Library' }}
+              </Button>
+              
+              <div v-if="isScanning" class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden">
+                 <div class="bg-indigo-500 h-full transition-all duration-300" :style="{ width: `${scanProgress}%` }"></div>
+              </div>
+            </div>
           </div>
         </ScrollArea>
       </div>
     </main>
 
     <!-- Footer Meta -->
-    <footer class="mt-auto py-8 border-t border-white/5 text-center">
-      <p class="text-xs text-zinc-600 font-medium tracking-widest uppercase">
-        Encrypted Local Storage &bull; Phos v0.1.0-alpha
+    <footer class="mt-auto py-12 border-t border-white/5 text-center">
+      <div class="flex items-center justify-center gap-2 mb-4 opacity-40">
+        <HardDrive class="w-3 h-3" />
+        <span class="text-[10px] font-bold tracking-widest uppercase">Local Environment</span>
+      </div>
+      <p class="text-[10px] text-zinc-600 font-bold tracking-[0.2em] uppercase">
+        Phos v0.1.0-alpha &bull; Precision &bull; Privacy
       </p>
     </footer>
+
+    <!-- Mobile Navigation (Bottom) -->
+    <div class="md:hidden fixed bottom-6 left-6 right-6 z-50">
+       <div class="bg-zinc-900/90 backdrop-blur-xl border border-white/10 rounded-2xl p-2 flex items-center justify-around shadow-2xl shadow-black">
+          <Button variant="ghost" size="icon" class="text-indigo-500 bg-white/5 rounded-xl">
+             <LayoutGrid class="w-5 h-5" />
+          </Button>
+          <Button variant="ghost" size="icon" class="text-zinc-400 rounded-xl">
+             <Users class="w-5 h-5" />
+          </Button>
+          <Button variant="ghost" size="icon" class="text-zinc-400 rounded-xl">
+             <Clock class="w-5 h-5" />
+          </Button>
+       </div>
+    </div>
   </div>
 </template>
 
@@ -165,10 +335,18 @@ const startScan = async () => {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.05);
   border-radius: 10px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+@media (max-width: 640px) {
+  .max-w-7xl {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
 }
 </style>
+
