@@ -50,13 +50,12 @@ async fn main() {
     });
 
     let api_router = api::create_router(state);
-    
-    // Serve files from the library for the gallery
-    let serve_dir = ServeDir::new(root_path);
+    let static_dir = std::env::var("PHOS_STATIC_DIR").unwrap_or_else(|_| "static".to_string());
+    let serve_static = ServeDir::new(static_dir);
 
     let app = Router::new()
         .merge(api_router)
-        .fallback_service(serve_dir)
+        .fallback_service(serve_static)
         .layer(CorsLayer::permissive());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));

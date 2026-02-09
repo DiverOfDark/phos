@@ -92,7 +92,7 @@ impl Scanner {
         if let Some(ai) = &self.ai {
             if mime_type.starts_with("image/") {
                 if let Ok(img) = image::open(path) {
-                    let detections = ai.detect_faces(&img)?;
+                    let detections = ai.detect_faces(&img).unwrap_or_default();
                     for det in detections {
                         // Extract face chip
                         let sub_img = img.view(
@@ -102,7 +102,9 @@ impl Scanner {
                             (det.box_y2 - det.box_y1) as u32,
                         ).to_image();
                         
-                        let embedding = ai.extract_embedding(&image::DynamicImage::ImageRgb8(sub_img))?;
+                        let embedding = ai.extract_embedding(&image::DynamicImage::ImageRgba8(sub_img)).unwrap_or_default();
+                        if embedding.is_empty() { continue; }
+                        
                         let embedding_blob = bincode::serialize(&embedding)?;
 
                         conn.execute(
