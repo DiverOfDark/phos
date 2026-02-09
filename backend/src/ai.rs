@@ -49,8 +49,7 @@ impl AiPipeline {
             input[[0, 2, y as usize, x as usize]] = (rgb[2] as f32 - 127.5) / 128.0;
         }
 
-        let input_shape = vec![1, 3, target_size as usize, target_size as usize];
-        let input_tensor = Value::from_array((input_shape, input.into_raw_vec()))?;
+        let input_tensor = Value::from_array((vec![1, 3, target_size as usize, target_size as usize], input.into_raw_vec()))?;
         let mut session = self.face_detector.lock().map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
         let _outputs = session.run(inputs!["input.1" => input_tensor])?;
         
@@ -76,8 +75,7 @@ impl AiPipeline {
             input[[0, 2, y as usize, x as usize]] = (rgb[2] as f32 - 127.5) / 128.0;
         }
 
-        let input_shape = vec![1, 3, 112, 112];
-        let input_tensor = Value::from_array((input_shape, input.into_raw_vec()))?;
+        let input_tensor = Value::from_array((vec![1, 3, 112, 112], input.into_raw_vec()))?;
         let mut session = self.face_recognizer.lock().map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
         let outputs = session.run(inputs!["data" => input_tensor])?;
         let output_tensor = outputs[0].try_extract_tensor::<f32>()?;

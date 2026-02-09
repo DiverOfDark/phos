@@ -102,7 +102,7 @@ impl Scanner {
                             (det.box_y2 - det.box_y1) as u32,
                         ).to_image();
                         
-                        let embedding = ai.extract_embedding(&image::DynamicImage::ImageRgba8(sub_img)).unwrap_or_default();
+                        let embedding = ai.extract_embedding(&image::DynamicImage::from(sub_img)).unwrap_or_default();
                         if embedding.is_empty() { continue; }
                         
                         let embedding_blob = bincode::serialize(&embedding)?;

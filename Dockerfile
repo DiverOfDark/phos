@@ -9,7 +9,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: Build Backend
-FROM rust:1.83-slim AS backend-builder
+FROM rust:latest AS backend-builder
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
