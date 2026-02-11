@@ -1,16 +1,16 @@
-mod db;
-mod scanner;
 mod ai;
 mod api;
+mod db;
+mod scanner;
 
 use axum::Router;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
+use tracing::info;
 
 #[tokio::main]
 async fn main() {
@@ -33,17 +33,11 @@ async fn main() {
     // Run a scan in the background
     let scan_path = root_path.to_path_buf();
     let scanner_db_path = db_path.to_path_buf();
-    
-    let model_dir = Path::new("models");
-    let ai = if model_dir.exists() {
-        Some(ai::AiPipeline::new(model_dir).expect("Failed to load AI models"))
-    } else {
-        tracing::warn!("AI models not found in 'models/', face detection will be disabled");
-        None
-    };
+
+    let ai = ai::AiPipeline::new().expect("Failed to load AI models");
 
     tokio::task::spawn_blocking(move || {
-        let scanner = scanner::Scanner::new(scanner_db_path, ai);
+        let scanner = scanner::Scanner::new(scanner_db_path, Some(ai));
         if let Err(e) = scanner.scan(&scan_path) {
             tracing::error!("Scan failed: {}", e);
         }
@@ -64,7 +58,7 @@ async fn main() {
         .unwrap_or(33000);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("listening on {}", addr);
-    
+
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

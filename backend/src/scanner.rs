@@ -1,13 +1,13 @@
-use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
-use sha2::{Sha256, Digest};
+use crate::ai::AiPipeline;
+use image::GenericImageView;
+use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read};
-use rusqlite::{params, Connection};
+use std::path::{Path, PathBuf};
+use tracing::{error, info};
 use uuid::Uuid;
-use tracing::{info, error};
-use image::GenericImageView;
-use crate::ai::AiPipeline;
+use walkdir::WalkDir;
 
 pub struct Scanner {
     db_path: PathBuf,
@@ -21,7 +21,7 @@ impl Scanner {
 
     pub fn scan(&self, root: &Path) -> anyhow::Result<()> {
         let conn = Connection::open(&self.db_path)?;
-        
+
         for entry in WalkDir::new(root)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -39,20 +39,23 @@ impl Scanner {
 
     fn process_file(&self, conn: &Connection, path: &Path) -> anyhow::Result<()> {
         let hash = calculate_hash(path)?;
-        
+
         let mut stmt = conn.prepare("SELECT id, photo_id FROM files WHERE hash = ?")?;
         let mut rows = stmt.query(params![hash])?;
-        
+
         if let Some(row) = rows.next()? {
             // File already exists, check if path matches or if it's a move
             let existing_id: String = row.get(0)?;
-            info!("File already exists with hash {}, ID: {}", hash, existing_id);
+            info!(
+                "File already exists with hash {}, ID: {}",
+                hash, existing_id
+            );
             return Ok(());
         }
 
         let id = Uuid::new_v4().to_string();
         let photo_id = Uuid::new_v4().to_string();
-        
+
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
         let mime_type = match ext.to_lowercase().as_str() {
             "jpg" | "jpeg" => "image/jpeg",
@@ -95,16 +98,22 @@ impl Scanner {
                     let detections = ai.detect_faces(&img).unwrap_or_default();
                     for det in detections {
                         // Extract face chip
-                        let sub_img = img.view(
-                            det.box_x1 as u32,
-                            det.box_y1 as u32,
-                            (det.box_x2 - det.box_x1) as u32,
-                            (det.box_y2 - det.box_y1) as u32,
-                        ).to_image();
-                        
-                        let embedding = ai.extract_embedding(&image::DynamicImage::from(sub_img)).unwrap_or_default();
-                        if embedding.is_empty() { continue; }
-                        
+                        let sub_img = img
+                            .view(
+                                det.box_x1 as u32,
+                                det.box_y1 as u32,
+                                (det.box_x2 - det.box_x1) as u32,
+                                (det.box_y2 - det.box_y1) as u32,
+                            )
+                            .to_image();
+
+                        let embedding = ai
+                            .extract_embedding(&image::DynamicImage::from(sub_img))
+                            .unwrap_or_default();
+                        if embedding.is_empty() {
+                            continue;
+                        }
+
                         let embedding_blob = bincode::serialize(&embedding)?;
 
                         conn.execute(
@@ -121,13 +130,16 @@ impl Scanner {
     }
 }
 
-
 fn is_media_file(path: &Path) -> bool {
-    let ext = path.extension()
+    let ext = path
+        .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
-    matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "mp4" | "mkv" | "mov")
+    matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "webp" | "mp4" | "mkv" | "mov"
+    )
 }
 
 fn calculate_hash(path: &Path) -> io::Result<String> {
@@ -137,7 +149,9 @@ fn calculate_hash(path: &Path) -> io::Result<String> {
 
     loop {
         let count = file.read(&mut buffer)?;
-        if count == 0 { break; }
+        if count == 0 {
+            break;
+        }
         hasher.update(&buffer[..count]);
     }
 
@@ -147,8 +161,8 @@ fn calculate_hash(path: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_is_media_file() {
@@ -163,18 +177,19 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let photos_dir = dir.path().join("photos");
         fs::create_dir(&photos_dir).unwrap();
-        
+
         let photo_path = photos_dir.join("test.jpg");
         fs::write(&photo_path, b"fake image data").unwrap();
 
         let _conn = crate::db::init_db(&db_path).unwrap();
         let scanner = Scanner::new(db_path.clone(), None);
-        
+
         scanner.scan(&photos_dir).unwrap();
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
     }
 }
-
