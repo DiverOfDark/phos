@@ -2,6 +2,7 @@ mod ai;
 mod api;
 mod db;
 mod scanner;
+mod watcher;
 
 use axum::Router;
 use std::net::SocketAddr;
@@ -16,7 +17,12 @@ use tracing::info;
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let root_path = Path::new("./test_library");
+    ffmpeg_next::init().expect("Failed to initialize ffmpeg");
+
+    let library_path =
+        std::env::var("PHOS_LIBRARY_PATH").unwrap_or_else(|_| "./library".to_string());
+    let root_path = Path::new(&library_path);
+    info!("Using library path: {:?}", root_path);
     if !root_path.exists() {
         std::fs::create_dir_all(root_path).unwrap();
     }
@@ -30,9 +36,11 @@ async fn main() {
         db: shared_conn.clone(),
     };
 
-    // Run a scan in the background
+    // Run a scan in the background, then start the file watcher once done.
     let scan_path = root_path.to_path_buf();
     let scanner_db_path = db_path.to_path_buf();
+    let watcher_library_path = root_path.to_path_buf();
+    let watcher_db_path = db_path.to_path_buf();
 
     let ai = ai::AiPipeline::new().expect("Failed to load AI models");
 
@@ -40,6 +48,23 @@ async fn main() {
         let scanner = scanner::Scanner::new(scanner_db_path, Some(ai));
         if let Err(e) = scanner.scan(&scan_path) {
             tracing::error!("Scan failed: {}", e);
+        }
+
+        // Initial scan complete -- start watching for incremental changes.
+        match watcher::start_watcher(watcher_library_path, watcher_db_path, None) {
+            Ok(watcher_handle) => {
+                info!("File watcher active after initial scan");
+                // Keep the watcher alive for the lifetime of this thread.
+                // The watcher handle must not be dropped, so we park the thread.
+                // (The watcher's internal thread handles events independently.)
+                // We use a channel that never sends to block forever.
+                let (_tx, rx) = std::sync::mpsc::channel::<()>();
+                let _ = rx.recv(); // blocks until program exit
+                drop(watcher_handle);
+            }
+            Err(e) => {
+                tracing::error!("Failed to start file watcher: {}", e);
+            }
         }
     });
 

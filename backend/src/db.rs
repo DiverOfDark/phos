@@ -10,6 +10,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             id TEXT PRIMARY KEY,
             name TEXT,
             thumbnail_face_id TEXT,
+            representative_embedding BLOB,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )",
         [],
@@ -76,6 +77,21 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         )",
         [],
     )?;
+
+    // Add representative_embedding column to people if it doesn't exist (migration)
+    // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we check via pragma
+    let has_repr_embedding: bool = conn
+        .prepare("PRAGMA table_info(people)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "representative_embedding");
+
+    if !has_repr_embedding {
+        conn.execute(
+            "ALTER TABLE people ADD COLUMN representative_embedding BLOB",
+            [],
+        )?;
+    }
 
     Ok(conn)
 }

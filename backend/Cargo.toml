@@ -25,3 +25,4 @@ anyhow = "1.0"
 ffmpeg-next = {  version = "7.1.0", features = ["build"] }
 ndarray = "0.15"
 hf-hub = "0.4"
+kamadak-exif = "0.5"
