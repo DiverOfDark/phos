@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 /// Resizes the image to 9x8 grayscale, then compares each pixel to its right
 /// neighbour, producing 64 bits (8 bytes). This is a simple perceptual hash
 /// that is resilient to minor scaling and compression changes.
-fn compute_dhash(img: &DynamicImage) -> [u8; 8] {
+pub fn compute_dhash(img: &DynamicImage) -> [u8; 8] {
     let gray = img.resize_exact(9, 8, FilterType::Triangle).to_luma8();
     let mut hash = [0u8; 8];
     let mut bit_index: usize = 0;
@@ -48,6 +48,11 @@ struct PersonRecord {
 impl Scanner {
     pub fn new(db_path: PathBuf, ai: Option<AiPipeline>) -> Self {
         Self { db_path, ai }
+    }
+
+    /// Access the AI pipeline, if loaded.
+    pub fn ai(&self) -> Option<&AiPipeline> {
+        self.ai.as_ref()
     }
 
     /// Open a connection to the scanner's database.
@@ -222,6 +227,19 @@ impl Scanner {
 
         debug!("Created new person {} for face {}", person_id, face_id);
         Ok(person_id)
+    }
+
+    /// Match an embedding to an existing person, or create a new one.
+    /// Returns the person_id. New persons are created with name = NULL,
+    /// which serves as the "needs naming" flag for the UI.
+    pub fn find_or_create_person(conn: &Connection, embedding: &[f32]) -> anyhow::Result<String> {
+        let persons = Self::load_person_embeddings(conn);
+        if let Some((person_id, _sim)) = Self::find_matching_person(embedding, &persons) {
+            Ok(person_id)
+        } else {
+            let face_id = Uuid::new_v4().to_string();
+            Self::create_new_person(conn, embedding, &face_id)
+        }
     }
 
     /// Detect faces in an image and store them in the database, linking to the given file_id.
@@ -707,7 +725,7 @@ pub fn is_media_file(path: &Path) -> bool {
     )
 }
 
-fn calculate_hash(path: &Path) -> io::Result<String> {
+pub fn calculate_hash(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0; 1024 * 1024];

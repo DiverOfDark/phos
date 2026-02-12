@@ -1,24 +1,68 @@
 mod ai;
 mod api;
 mod db;
+mod import;
 mod scanner;
 mod watcher;
 
 use axum::Router;
+use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing::info;
 
+#[derive(Parser)]
+#[command(name = "phos", about = "AI-powered photo/video manager")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the web server (default)
+    Serve,
+    /// Import media files from source into organized target directory
+    Import {
+        /// Source directory to import from
+        source: PathBuf,
+        /// Target directory for organized files and database
+        target: PathBuf,
+        /// Move files instead of copying
+        #[arg(long)]
+        r#move: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-
     ffmpeg_next::init().expect("Failed to initialize ffmpeg");
 
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Import {
+            source,
+            target,
+            r#move,
+        }) => {
+            if let Err(e) = import::run_import(&source, &target, r#move) {
+                eprintln!("Import failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Serve) | None => {
+            run_server().await;
+        }
+    }
+}
+
+async fn run_server() {
     let library_path =
         std::env::var("PHOS_LIBRARY_PATH").unwrap_or_else(|_| "./library".to_string());
     let root_path = Path::new(&library_path);
