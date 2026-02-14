@@ -1,8 +1,19 @@
 use rusqlite::{Connection, Result};
 use std::path::Path;
 
+/// Open a connection with WAL mode and busy timeout enabled.
+/// Use this when worker threads need their own connection.
+pub fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "busy_timeout", "5000")?;
+    Ok(conn)
+}
+
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "busy_timeout", "5000")?;
 
     // We store people (clusters)
     conn.execute(
@@ -78,19 +89,41 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         [],
     )?;
 
+    // Cached pairwise face distances for clustering
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS face_neighbors (
+            face_id_a TEXT NOT NULL,
+            face_id_b TEXT NOT NULL,
+            distance REAL NOT NULL,
+            PRIMARY KEY (face_id_a, face_id_b)
+        )",
+        [],
+    )?;
+
     // Add representative_embedding column to people if it doesn't exist (migration)
     // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we check via pragma
-    let has_repr_embedding: bool = conn
+    let people_columns: Vec<String> = conn
         .prepare("PRAGMA table_info(people)")?
         .query_map([], |row| row.get::<_, String>(1))?
         .filter_map(|r| r.ok())
-        .any(|name| name == "representative_embedding");
+        .collect();
 
-    if !has_repr_embedding {
+    if !people_columns.contains(&"representative_embedding".to_string()) {
         conn.execute(
             "ALTER TABLE people ADD COLUMN representative_embedding BLOB",
             [],
         )?;
+    }
+
+    // Add score column to faces if it doesn't exist (migration)
+    let faces_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(faces)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if !faces_columns.contains(&"score".to_string()) {
+        conn.execute("ALTER TABLE faces ADD COLUMN score REAL", [])?;
     }
 
     Ok(conn)

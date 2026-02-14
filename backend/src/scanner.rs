@@ -1,8 +1,12 @@
-use crate::ai::{cosine_similarity, AiPipeline, FACE_SIMILARITY_THRESHOLD};
+use crate::ai::{cosine_similarity, AiPipeline, MAX_FACE_DISTANCE, MIN_FACES_FOR_CORE};
+use crate::db;
 use exif::{In, Tag};
 use ffmpeg_next as ffmpeg;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, RgbImage};
+use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -39,12 +43,6 @@ pub struct Scanner {
     ai: Option<AiPipeline>,
 }
 
-/// A person record with their representative embedding loaded from the DB.
-struct PersonRecord {
-    id: String,
-    embedding: Vec<f32>,
-}
-
 impl Scanner {
     pub fn new(db_path: PathBuf, ai: Option<AiPipeline>) -> Self {
         Self { db_path, ai }
@@ -55,26 +53,42 @@ impl Scanner {
         self.ai.as_ref()
     }
 
-    /// Open a connection to the scanner's database.
+    /// Open a connection to the scanner's database with WAL mode and busy timeout.
     pub fn open_db(&self) -> anyhow::Result<Connection> {
-        Ok(Connection::open(&self.db_path)?)
+        Ok(db::open_connection(&self.db_path)?)
     }
 
     pub fn scan(&self, root: &Path) -> anyhow::Result<()> {
-        let conn = self.open_db()?;
-
-        for entry in WalkDir::new(root)
+        let files: Vec<PathBuf> = WalkDir::new(root)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let path = entry.path();
-            if is_media_file(path) {
+            .filter(|e| e.file_type().is_file() && is_media_file(e.path()))
+            .map(|e| e.path().to_path_buf())
+            .collect();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(half_available_threads())
+            .build()?;
+
+        pool.install(|| {
+            files.par_iter().for_each(|path| {
+                let conn = match self.open_db() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Failed to open DB: {}", e);
+                        return;
+                    }
+                };
                 if let Err(e) = self.process_file(&conn, path) {
                     error!("Error processing {:?}: {}", path, e);
                 }
-            }
-        }
+            });
+        });
+
+        // After all files are processed, run face clustering
+        let conn = self.open_db()?;
+        self.cluster_faces(&conn)?;
+
         Ok(())
     }
 
@@ -147,102 +161,275 @@ impl Scanner {
         Ok(())
     }
 
-    /// Load all person records with their representative embeddings from the DB.
-    fn load_person_embeddings(conn: &Connection) -> Vec<PersonRecord> {
-        let mut stmt = match conn
-            .prepare("SELECT id, representative_embedding FROM people WHERE representative_embedding IS NOT NULL")
+    /// Cluster all unassigned faces using a core-point nearest-neighbor approach.
+    ///
+    /// Pass 1: For each unassigned face, find neighbors within `MAX_FACE_DISTANCE`.
+    ///   - "Core" faces (≥ `MIN_FACES_FOR_CORE` neighbors) are assigned to the
+    ///     closest neighbor's person, or a new person is created.
+    ///   - Non-core faces are deferred.
+    /// Pass 2: Deferred faces are re-checked — some may now have assigned neighbors.
+    pub fn cluster_faces(&self, conn: &Connection) -> anyhow::Result<()> {
+        // Load all face embeddings
+        let mut stmt =
+            conn.prepare("SELECT id, embedding, person_id FROM faces WHERE embedding IS NOT NULL")?;
+        let rows: Vec<(String, Vec<f32>, Option<String>)> = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                let person_id: Option<String> = row.get(2)?;
+                Ok((id, blob, person_id))
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|(id, blob, person_id)| {
+                bincode::deserialize::<Vec<f32>>(&blob)
+                    .ok()
+                    .filter(|e| !e.is_empty())
+                    .map(|embedding| (id, embedding, person_id))
+            })
+            .collect();
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        info!("Clustering {} faces", rows.len());
+
+        // Build index: face_id -> (embedding, person_id)
+        let face_ids: Vec<String> = rows.iter().map(|(id, _, _)| id.clone()).collect();
+        let embeddings: Vec<Vec<f32>> = rows.iter().map(|(_, e, _)| e.clone()).collect();
+        let mut assignments: Vec<Option<String>> =
+            rows.iter().map(|(_, _, p)| p.clone()).collect();
+
+        // Clean up: delete all existing person records and reset assignments.
+        // We re-cluster from scratch each scan.
+        // Clear FK references first so DELETE FROM people doesn't violate constraints.
+        conn.execute("UPDATE faces SET person_id = NULL", [])?;
+        conn.execute("DELETE FROM people", [])?;
+        for a in assignments.iter_mut() {
+            *a = None;
+        }
+
+        let n = face_ids.len();
+
+        // Build face_id -> index lookup
+        let id_to_idx: HashMap<&str, usize> = face_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
+
+        // Load cached neighbors from DB
+        let mut neighbors: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+        let mut cached_faces: HashSet<String> = HashSet::new();
+
         {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to prepare person embeddings query: {}", e);
-                return Vec::new();
-            }
-        };
+            let mut load_stmt = conn.prepare(
+                "SELECT face_id_a, face_id_b, distance FROM face_neighbors"
+            )?;
+            let cached_rows: Vec<(String, String, f32)> = load_stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
 
-        let rows = match stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            Ok((id, blob))
-        }) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Failed to query person embeddings: {}", e);
-                return Vec::new();
-            }
-        };
-
-        let mut persons = Vec::new();
-        for (id, blob) in rows.flatten() {
-            match bincode::deserialize::<Vec<f32>>(&blob) {
-                Ok(embedding) => {
-                    if !embedding.is_empty() {
-                        persons.push(PersonRecord { id, embedding });
-                    }
+            for (a, b, dist) in &cached_rows {
+                if let (Some(&i), Some(&j)) = (id_to_idx.get(a.as_str()), id_to_idx.get(b.as_str())) {
+                    neighbors[i].push((j, *dist));
+                    cached_faces.insert(a.clone());
                 }
-                Err(e) => {
-                    warn!("Failed to deserialize embedding for person {}: {}", id, e);
-                }
-            }
-        }
-        persons
-    }
-
-    /// Find the best matching person for a given face embedding.
-    /// Returns (person_id, similarity) if a match above threshold is found.
-    fn find_matching_person(embedding: &[f32], persons: &[PersonRecord]) -> Option<(String, f32)> {
-        let mut best_match: Option<(String, f32)> = None;
-
-        for person in persons {
-            if person.embedding.len() != embedding.len() {
-                continue;
-            }
-            let sim = cosine_similarity(embedding, &person.embedding);
-            if sim > FACE_SIMILARITY_THRESHOLD {
-                if let Some((_, best_sim)) = &best_match {
-                    if sim > *best_sim {
-                        best_match = Some((person.id.clone(), sim));
-                    }
-                } else {
-                    best_match = Some((person.id.clone(), sim));
-                }
+                // Note: the reverse (b->a) is stored as its own row
             }
         }
 
-        best_match
-    }
+        // Find faces that need distance computation (not yet in cache)
+        let new_face_indices: Vec<usize> = (0..n)
+            .filter(|i| !cached_faces.contains(&face_ids[*i]))
+            .collect();
 
-    /// Create a new person in the DB with the given embedding as the representative.
-    fn create_new_person(
-        conn: &Connection,
-        embedding: &[f32],
-        face_id: &str,
-    ) -> anyhow::Result<String> {
-        let person_id = Uuid::new_v4().to_string();
-        let embedding_blob = bincode::serialize(embedding)?;
+        let new_count = new_face_indices.len();
+        let cached_count = n - new_count;
 
+        if new_count == 0 {
+            info!("All {} face distances loaded from cache", n);
+        } else {
+            info!(
+                "Computing distances for {} new faces ({} cached)",
+                new_count, cached_count
+            );
+        }
+
+        let pb = ProgressBar::new(new_count as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        pb.set_message("Computing distances");
+
+        // Compute distances for new faces against ALL faces, and store in cache
+        // Also compute distances between cached faces and new faces (reverse direction)
+        {
+            let mut insert_stmt = conn.prepare(
+                "INSERT OR IGNORE INTO face_neighbors (face_id_a, face_id_b, distance) VALUES (?, ?, ?)"
+            )?;
+
+            for &i in &new_face_indices {
+                let mut nbrs = Vec::new();
+                for j in 0..n {
+                    if i == j {
+                        continue;
+                    }
+                    if embeddings[i].len() != embeddings[j].len() {
+                        continue;
+                    }
+                    let sim = cosine_similarity(&embeddings[i], &embeddings[j]);
+                    let dist = 1.0 - sim;
+                    if dist <= MAX_FACE_DISTANCE {
+                        nbrs.push((j, dist));
+                        // Cache both directions
+                        insert_stmt.execute(params![face_ids[i], face_ids[j], dist])?;
+                        insert_stmt.execute(params![face_ids[j], face_ids[i], dist])?;
+                        // Also add reverse direction to in-memory neighbor list
+                        neighbors[j].push((i, dist));
+                    }
+                }
+                neighbors[i] = nbrs;
+                pb.inc(1);
+            }
+
+        }
+
+        // Sort all neighbor lists by distance
+        for nbrs in &mut neighbors {
+            nbrs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // Prune cached entries for faces that no longer exist in the DB
         conn.execute(
-            "INSERT INTO people (id, thumbnail_face_id, representative_embedding) VALUES (?, ?, ?)",
-            params![person_id, face_id, embedding_blob],
+            "DELETE FROM face_neighbors WHERE face_id_a NOT IN (SELECT id FROM faces) \
+             OR face_id_b NOT IN (SELECT id FROM faces)",
+            [],
         )?;
 
-        debug!("Created new person {} for face {}", person_id, face_id);
-        Ok(person_id)
-    }
+        pb.set_message("Assigning clusters");
+        pb.set_length(n as u64);
+        pb.set_position(0);
 
-    /// Match an embedding to an existing person, or create a new one.
-    /// Returns the person_id. New persons are created with name = NULL,
-    /// which serves as the "needs naming" flag for the UI.
-    pub fn find_or_create_person(conn: &Connection, embedding: &[f32]) -> anyhow::Result<String> {
-        let persons = Self::load_person_embeddings(conn);
-        if let Some((person_id, _sim)) = Self::find_matching_person(embedding, &persons) {
-            Ok(person_id)
-        } else {
-            let face_id = Uuid::new_v4().to_string();
-            Self::create_new_person(conn, embedding, &face_id)
+        let mut deferred: Vec<usize> = Vec::new();
+
+        // Pass 1: Process core faces
+        for i in 0..n {
+            if assignments[i].is_some() {
+                pb.inc(1);
+                continue;
+            }
+
+            let nbrs = &neighbors[i];
+            if nbrs.len() >= MIN_FACES_FOR_CORE {
+                // Core face: look for an assigned neighbor
+                let assigned_neighbor = nbrs
+                    .iter()
+                    .find(|(j, _)| assignments[*j].is_some());
+
+                let person_id = if let Some((j, _)) = assigned_neighbor {
+                    assignments[*j].clone().unwrap()
+                } else {
+                    // Create a new person
+                    let pid = Uuid::new_v4().to_string();
+                    conn.execute(
+                        "INSERT INTO people (id, thumbnail_face_id) VALUES (?, ?)",
+                        params![pid, face_ids[i]],
+                    )?;
+                    pid
+                };
+
+                assignments[i] = Some(person_id.clone());
+
+                // Also assign unassigned neighbors that are core or close
+                for &(j, _) in nbrs {
+                    if assignments[j].is_none() {
+                        assignments[j] = Some(person_id.clone());
+                    }
+                }
+            } else {
+                deferred.push(i);
+            }
+            pb.inc(1);
         }
+
+        // Pass 2: Process deferred (non-core) faces
+        for &i in &deferred {
+            if assignments[i].is_some() {
+                continue; // May have been assigned in pass 1 as a neighbor
+            }
+
+            // Find closest assigned neighbor
+            let closest = neighbors[i]
+                .iter()
+                .find(|(j, _)| assignments[*j].is_some());
+
+            if let Some((j, _)) = closest {
+                assignments[i] = assignments[*j].clone();
+            }
+            // Otherwise leave unassigned (isolated face)
+        }
+
+        pb.finish_and_clear();
+
+        // Write assignments back to DB
+        let mut update_stmt =
+            conn.prepare("UPDATE faces SET person_id = ? WHERE id = ?")?;
+        let mut assigned_count = 0;
+        for i in 0..n {
+            if let Some(ref person_id) = assignments[i] {
+                update_stmt.execute(params![person_id, face_ids[i]])?;
+                assigned_count += 1;
+            }
+        }
+
+        // Update thumbnail_face_id for each person to the first face
+        let person_ids: Vec<String> = conn
+            .prepare("SELECT id FROM people")?
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for pid in &person_ids {
+            let first_face: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM faces WHERE person_id = ? LIMIT 1",
+                    params![pid],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(fid) = first_face {
+                conn.execute(
+                    "UPDATE people SET thumbnail_face_id = ? WHERE id = ?",
+                    params![fid, pid],
+                )?;
+            }
+        }
+
+        // Clean up persons with no faces
+        conn.execute(
+            "DELETE FROM people WHERE id NOT IN (SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL)",
+            [],
+        )?;
+
+        let person_count: i64 = conn.query_row("SELECT COUNT(*) FROM people", [], |row| row.get(0))?;
+        info!(
+            "Clustering complete: {} faces assigned to {} persons ({} unassigned)",
+            assigned_count,
+            person_count,
+            n - assigned_count
+        );
+
+        Ok(())
     }
 
     /// Detect faces in an image and store them in the database, linking to the given file_id.
+    /// Faces are stored without person assignment — clustering happens after the scan.
     fn detect_and_store_faces(
         &self,
         conn: &Connection,
@@ -279,10 +466,11 @@ impl Scanner {
                 continue;
             }
 
-            // Extract face chip
-            let sub_img = img.crop_imm(x1, y1, face_w, face_h);
-
-            let embedding = ai.extract_embedding(&sub_img).unwrap_or_default();
+            // Extract aligned face embedding using landmarks when available
+            let bbox = (det.box_x1, det.box_y1, det.box_x2, det.box_y2);
+            let embedding = ai
+                .extract_embedding(img, det.landmarks.as_deref(), bbox)
+                .unwrap_or_default();
             if embedding.is_empty() {
                 continue;
             }
@@ -290,25 +478,10 @@ impl Scanner {
             let face_id = Uuid::new_v4().to_string();
             let embedding_blob = bincode::serialize(&embedding)?;
 
-            // Face clustering: find or create a person for this face
-            let persons = Self::load_person_embeddings(conn);
-            let person_id = if let Some((matched_person_id, sim)) =
-                Self::find_matching_person(&embedding, &persons)
-            {
-                debug!(
-                    "Matched face {} to person {} with similarity {:.3}",
-                    face_id, matched_person_id, sim
-                );
-                matched_person_id
-            } else {
-                // Create a new person
-                Self::create_new_person(conn, &embedding, &face_id)?
-            };
-
-            // Insert face with person_id and embedding
+            // Insert face WITHOUT person_id — clustering happens after scan
             conn.execute(
-                "INSERT INTO faces (id, file_id, person_id, box_x1, box_y1, box_x2, box_y2, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                params![face_id, file_id, person_id, det.box_x1, det.box_y1, det.box_x2, det.box_y2, embedding_blob],
+                "INSERT INTO faces (id, file_id, person_id, box_x1, box_y1, box_x2, box_y2, embedding, score) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+                params![face_id, file_id, det.box_x1, det.box_y1, det.box_x2, det.box_y2, embedding_blob, det.score],
             )?;
         }
 
@@ -711,6 +884,13 @@ fn extract_gps_coord(exif: &exif::Exif, coord_tag: Tag, ref_tag: Tag) -> Option<
         }
     }
     None
+}
+
+/// Return half of the available CPU threads (minimum 1).
+pub fn half_available_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).max(1))
+        .unwrap_or(1)
 }
 
 pub fn is_media_file(path: &Path) -> bool {

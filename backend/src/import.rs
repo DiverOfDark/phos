@@ -1,12 +1,16 @@
-use crate::ai::AiPipeline;
+use crate::ai::{cosine_similarity, AiPipeline, MAX_FACE_DISTANCE};
 use crate::db;
 use crate::scanner::{self, Scanner};
 use image::DynamicImage;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 use walkdir::WalkDir;
 
 /// Hamming distance between two 8-byte dHash values (out of 64 bits).
@@ -85,14 +89,13 @@ fn parse_target_folder(file_path: &str) -> Option<(PathBuf, PathBuf)> {
     Some((person_dir.to_path_buf(), counter_dir.to_path_buf()))
 }
 
-/// Import summary statistics.
+/// Import summary statistics (thread-safe with atomic counters).
 struct ImportStats {
     total: u64,
-    imported: u64,
-    variations: u64,
-    skipped_duplicate: u64,
-    skipped_error: u64,
-    people_detected: usize,
+    imported: AtomicU64,
+    variations: AtomicU64,
+    skipped_duplicate: AtomicU64,
+    skipped_error: AtomicU64,
 }
 
 pub fn run_import(source: &Path, target: &Path, move_files: bool) -> anyhow::Result<()> {
@@ -145,63 +148,66 @@ pub fn run_import(source: &Path, target: &Path, move_files: bool) -> anyhow::Res
             .progress_chars("=>-"),
     );
 
-    let mut stats = ImportStats {
+    let stats = ImportStats {
         total,
-        imported: 0,
-        variations: 0,
-        skipped_duplicate: 0,
-        skipped_error: 0,
-        people_detected: 0,
+        imported: AtomicU64::new(0),
+        variations: AtomicU64::new(0),
+        skipped_duplicate: AtomicU64::new(0),
+        skipped_error: AtomicU64::new(0),
     };
 
     // Load dHash cache (starts empty, grows as we import)
-    let mut dhash_cache = load_dhash_cache(&conn);
+    let dhash_cache = Mutex::new(load_dhash_cache(&conn));
 
-    for source_path in &source_files {
-        pb.set_message(
-            source_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
-        );
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(scanner::half_available_threads())
+        .build()?;
 
-        match import_single_file(
-            source_path,
-            target,
-            move_files,
-            &conn,
-            &scanner,
-            &mut dhash_cache,
-            &mut stats,
-        ) {
-            Ok(()) => {}
-            Err(e) => {
-                error!("Error importing {:?}: {}", source_path, e);
-                stats.skipped_error += 1;
+    pool.install(|| {
+        source_files.par_iter().for_each(|source_path| {
+            pb.set_message(
+                source_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            );
+
+            match import_single_file(
+                source_path,
+                target,
+                move_files,
+                &db_path,
+                &scanner,
+                &dhash_cache,
+                &stats,
+            ) {
+                Ok(()) => {}
+                Err(e) => {
+                    error!("Error importing {:?}: {}", source_path, e);
+                    stats.skipped_error.fetch_add(1, Ordering::Relaxed);
+                }
             }
-        }
 
-        pb.inc(1);
-    }
-
-    // Count unique people
-    let people_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM people", [], |row| row.get(0))
-        .unwrap_or(0);
-    stats.people_detected = people_count as usize;
+            pb.inc(1);
+        });
+    });
 
     pb.finish_with_message("Import complete!");
 
-    // Print summary
+    // Print import summary
     println!();
     println!("=== Import Summary ===");
     println!("  Total files found:     {}", stats.total);
-    println!("  Successfully imported: {}", stats.imported);
-    println!("  Grouped as variations: {}", stats.variations);
-    println!("  Skipped (duplicate):   {}", stats.skipped_duplicate);
-    println!("  Skipped (error):       {}", stats.skipped_error);
-    println!("  People detected:       {}", stats.people_detected);
+    println!("  Successfully imported: {}", stats.imported.load(Ordering::Relaxed));
+    println!("  Grouped as variations: {}", stats.variations.load(Ordering::Relaxed));
+    println!("  Skipped (duplicate):   {}", stats.skipped_duplicate.load(Ordering::Relaxed));
+    println!("  Skipped (error):       {}", stats.skipped_error.load(Ordering::Relaxed));
     println!("======================");
+    println!();
+
+    // Reorganize files to match clustering
+    info!("Running post-import reorganize...");
+    run_reorganize(target, false)?;
 
     Ok(())
 }
@@ -210,26 +216,29 @@ fn import_single_file(
     source_path: &Path,
     target: &Path,
     move_files: bool,
-    conn: &Connection,
+    db_path: &Path,
     scanner: &Scanner,
-    dhash_cache: &mut Vec<StoredFileRecord>,
-    stats: &mut ImportStats,
+    dhash_cache: &Mutex<Vec<StoredFileRecord>>,
+    stats: &ImportStats,
 ) -> anyhow::Result<()> {
     // 1. SHA256 hash — check for exact duplicate
     let hash = scanner::calculate_hash(source_path)?;
 
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT id FROM files WHERE hash = ?",
-            params![hash],
-            |row| row.get(0),
-        )
-        .ok();
+    {
+        let conn = db::open_connection(db_path)?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM files WHERE hash = ?",
+                params![hash],
+                |row| row.get(0),
+            )
+            .ok();
 
-    if existing.is_some() {
-        warn!("Skipping exact duplicate: {:?} (hash {})", source_path, hash);
-        stats.skipped_duplicate += 1;
-        return Ok(());
+        if existing.is_some() {
+            warn!("Skipping exact duplicate: {:?} (hash {})", source_path, hash);
+            stats.skipped_duplicate.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
     }
 
     // 2. Load image (or first video frame) for dHash and face detection
@@ -258,23 +267,28 @@ fn import_single_file(
     if let Some(ref img) = img {
         let dhash = scanner::compute_dhash(img);
 
-        // Check against all stored dHashes
-        let variation_match = dhash_cache.iter().find(|stored| {
-            hamming_distance(&dhash, &stored.dhash) <= 10
-        });
+        // Check against all stored dHashes (brief lock)
+        let variation_match = {
+            let cache = dhash_cache.lock().unwrap();
+            cache.iter().find(|stored| {
+                hamming_distance(&dhash, &stored.dhash) <= 10
+            }).map(|stored| stored.path.clone())
+        };
 
-        if let Some(matched) = variation_match {
+        if let Some(matched_path) = variation_match {
             // This is a variation — place in the same folder as the match
-            if let Some((_person_dir, counter_dir)) = parse_target_folder(&matched.path) {
+            if let Some((_person_dir, counter_dir)) = parse_target_folder(&matched_path) {
                 target_dir = counter_dir;
-                stats.variations += 1;
+                stats.variations.fetch_add(1, Ordering::Relaxed);
             } else {
                 // Fallback: couldn't parse path, treat as new
-                target_dir = determine_person_folder(img, target, conn, scanner)?;
+                let conn = db::open_connection(db_path)?;
+                target_dir = determine_person_folder(img, target, &conn, scanner)?;
             }
         } else {
             // 4. Not a variation — run face detection for person assignment
-            target_dir = determine_person_folder(img, target, conn, scanner)?;
+            let conn = db::open_connection(db_path)?;
+            target_dir = determine_person_folder(img, target, &conn, scanner)?;
         }
     } else {
         // Couldn't load image — put in unsorted
@@ -327,16 +341,16 @@ fn import_single_file(
     let scan_conn = scanner.open_db()?;
     scanner.process_file(&scan_conn, &target_path)?;
 
-    // Update dHash cache with the newly imported file
+    // Update dHash cache with the newly imported file (brief lock)
     if let Some(ref img) = img {
         let dhash = scanner::compute_dhash(img);
-        dhash_cache.push(StoredFileRecord {
+        dhash_cache.lock().unwrap().push(StoredFileRecord {
             path: target_path.to_string_lossy().to_string(),
             dhash,
         });
     }
 
-    stats.imported += 1;
+    stats.imported.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -378,11 +392,14 @@ fn determine_person_folder(
             let face_h = y2.saturating_sub(y1);
 
             if face_w >= 10 && face_h >= 10 {
-                let face_chip = img.crop_imm(x1, y1, face_w, face_h);
-                let embedding = ai.extract_embedding(&face_chip).unwrap_or_default();
+                let bbox = (largest.box_x1, largest.box_y1, largest.box_x2, largest.box_y2);
+                let embedding = ai
+                    .extract_embedding(img, largest.landmarks.as_deref(), bbox)
+                    .unwrap_or_default();
 
                 if !embedding.is_empty() {
-                    let person_id = Scanner::find_or_create_person(conn, &embedding)?;
+                    // Simple nearest-neighbor match for folder sorting
+                    let person_id = find_or_create_person_for_import(conn, &embedding)?;
                     let person_dir = target.join(&person_id);
                     let counter = next_counter(&person_dir);
                     return Ok(person_dir.join(counter.to_string()));
@@ -397,8 +414,293 @@ fn determine_person_folder(
     Ok(unsorted.join(counter.to_string()))
 }
 
+/// Simple greedy person matching for import folder sorting.
+/// Matches against person representative embeddings, or creates a new person.
+/// This is only used for deciding which folder to place a file in during import.
+fn find_or_create_person_for_import(
+    conn: &Connection,
+    embedding: &[f32],
+) -> anyhow::Result<String> {
+    // Match against person representative embeddings (populated during import)
+    let mut stmt = conn.prepare(
+        "SELECT id, representative_embedding FROM people WHERE representative_embedding IS NOT NULL",
+    )?;
+    let rows: Vec<(String, Vec<f32>)> = stmt
+        .query_map([], |row| {
+            let pid: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((pid, blob))
+        })?
+        .filter_map(|r| r.ok())
+        .filter_map(|(pid, blob)| {
+            bincode::deserialize::<Vec<f32>>(&blob)
+                .ok()
+                .filter(|e| e.len() == embedding.len())
+                .map(|e| (pid, e))
+        })
+        .collect();
+
+    let mut best: Option<(String, f32)> = None;
+    for (pid, emb) in &rows {
+        let dist = 1.0 - cosine_similarity(embedding, emb);
+        if dist <= MAX_FACE_DISTANCE {
+            if let Some((_, best_dist)) = &best {
+                if dist < *best_dist {
+                    best = Some((pid.clone(), dist));
+                }
+            } else {
+                best = Some((pid.clone(), dist));
+            }
+        }
+    }
+
+    if let Some((person_id, _)) = best {
+        Ok(person_id)
+    } else {
+        let person_id = Uuid::new_v4().to_string();
+        let embedding_blob = bincode::serialize(embedding)?;
+        conn.execute(
+            "INSERT INTO people (id, representative_embedding) VALUES (?, ?)",
+            params![person_id, embedding_blob],
+        )?;
+        Ok(person_id)
+    }
+}
+
 /// Access the AI pipeline from a Scanner instance.
 /// This uses a helper that exposes the AI reference.
 fn get_ai_from_scanner(scanner: &Scanner) -> Option<&AiPipeline> {
     scanner.ai()
+}
+
+/// Reorganize files on disk to match current face clustering.
+///
+/// Opens the `.phos.db` in the library, re-clusters faces, then moves each file
+/// into `library/<person_id>/filename` (or `library/unsorted/filename` if no
+/// person is associated). Updates `files.path` in the DB after each move and
+/// cleans up empty directories afterwards.
+pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
+    let db_path = library.join(".phos.db");
+    if !db_path.exists() {
+        anyhow::bail!("No .phos.db found in {:?}", library);
+    }
+
+    let conn = db::init_db(&db_path)?;
+    info!("Database opened at {:?}", db_path);
+
+    // Re-cluster faces (no AI models needed — uses existing embeddings)
+    let scanner = Scanner::new(db_path.clone(), None);
+    info!("Running face clustering...");
+    scanner.cluster_faces(&conn)?;
+
+    // Load all photos with their files from the DB
+    // Group files by photo_id so we maintain <person>/<photo>/<files> structure
+    let mut stmt = conn.prepare(
+        "SELECT p.id, f.id, f.path FROM photos p JOIN files f ON f.photo_id = p.id"
+    )?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |row| {
+            let photo_id: String = row.get(0)?;
+            let file_id: String = row.get(1)?;
+            let path: String = row.get(2)?;
+            Ok((photo_id, file_id, path))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Group by photo_id
+    let mut photos: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    for (photo_id, file_id, path) in &rows {
+        photos
+            .entry(photo_id.clone())
+            .or_default()
+            .push((file_id.clone(), path.clone()));
+    }
+
+    let total = rows.len() as u64;
+    let action = if dry_run { "Planning" } else { "Reorganizing" };
+    println!("{} {} files across {} photos...", action, total, photos.len());
+
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+
+    let mut moved = 0u64;
+    let mut skipped = 0u64;
+    let mut errors = 0u64;
+
+    for (photo_id, files) in &photos {
+        // Find the primary person for this photo:
+        // Look across ALL files of this photo, pick face with highest score / largest bbox
+        let file_ids: Vec<&str> = files.iter().map(|(fid, _)| fid.as_str()).collect();
+        let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT person_id FROM faces WHERE file_id IN ({}) AND person_id IS NOT NULL \
+             ORDER BY score DESC, (box_x2 - box_x1) * (box_y2 - box_y1) DESC LIMIT 1",
+            placeholders
+        );
+        let mut person_stmt = conn.prepare(&query)?;
+        let primary_person: Option<String> = person_stmt
+            .query_row(
+                rusqlite::params_from_iter(file_ids.iter()),
+                |row| row.get(0),
+            )
+            .ok();
+
+        // Target: library/<person_id>/<photo_id>/ or library/unsorted/<photo_id>/
+        let person_dir = match &primary_person {
+            Some(person_id) => library.join(person_id),
+            None => library.join("unsorted"),
+        };
+        let target_dir = person_dir.join(photo_id);
+
+        for (file_id, current_path_str) in files {
+            let current_path = PathBuf::from(current_path_str);
+            pb.set_message(
+                current_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            );
+
+            // Compute target path preserving the original filename
+            let filename = current_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("{}.unknown", file_id));
+
+            let mut target_path = target_dir.join(&filename);
+
+            // Handle filename collisions (skip if it would collide with itself)
+            if target_path != current_path && target_path.exists() {
+                let stem = current_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file");
+                let ext = current_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let mut i = 1u32;
+                loop {
+                    let candidate = if ext.is_empty() {
+                        target_dir.join(format!("{}_{}", stem, i))
+                    } else {
+                        target_dir.join(format!("{}_{}.{}", stem, i, ext))
+                    };
+                    if !candidate.exists() || candidate == current_path {
+                        target_path = candidate;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+
+            // Compare paths
+            if target_path == current_path {
+                if dry_run {
+                    pb.println(format!("SKIP: {} (already correct)", current_path_str));
+                }
+                skipped += 1;
+                pb.inc(1);
+                continue;
+            }
+
+            if dry_run {
+                pb.println(format!(
+                    "MOVE: {} → {}",
+                    current_path_str,
+                    target_path.to_string_lossy()
+                ));
+                moved += 1;
+                pb.inc(1);
+                continue;
+            }
+
+            // Actually move the file
+            if let Err(e) = (|| -> anyhow::Result<()> {
+                fs::create_dir_all(&target_dir)?;
+
+                // Try rename first (same filesystem), fall back to copy+delete
+                if fs::rename(&current_path, &target_path).is_err() {
+                    fs::copy(&current_path, &target_path)?;
+                    fs::remove_file(&current_path)?;
+                }
+
+                // Update DB path
+                conn.execute(
+                    "UPDATE files SET path = ? WHERE id = ?",
+                    params![target_path.to_string_lossy().as_ref(), file_id],
+                )?;
+
+                Ok(())
+            })() {
+                pb.println(format!("ERROR: {} — {}", current_path_str, e));
+                errors += 1;
+                pb.inc(1);
+                continue;
+            }
+
+            moved += 1;
+            pb.inc(1);
+        }
+    }
+
+    pb.finish_and_clear();
+
+    // Clean up empty directories (but never the library root or .phos.db)
+    if !dry_run {
+        println!("Cleaning up empty directories...");
+        cleanup_empty_dirs(library)?;
+    }
+
+    // Count unique people
+    let people_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM people", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    println!();
+    println!("=== Reorganize Summary ===");
+    println!("  Files moved:     {}", moved);
+    println!("  Files unchanged: {}", skipped);
+    if errors > 0 {
+        println!("  Errors:          {}", errors);
+    }
+    println!("  People count:    {}", people_count);
+    if dry_run {
+        println!("  (dry run — no files were actually moved)");
+    }
+    println!("==========================");
+
+    Ok(())
+}
+
+/// Remove empty directories under `root`, walking bottom-up.
+/// Never removes the root directory itself.
+fn cleanup_empty_dirs(root: &Path) -> anyhow::Result<()> {
+    let mut dirs: Vec<PathBuf> = WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_dir())
+        .map(|e| e.path().to_path_buf())
+        .filter(|p| p != root)
+        .collect();
+
+    // Sort by path length descending so we process deepest dirs first
+    dirs.sort_by(|a, b| b.as_os_str().len().cmp(&a.as_os_str().len()));
+
+    for dir in dirs {
+        if let Ok(mut entries) = fs::read_dir(&dir) {
+            if entries.next().is_none() {
+                fs::remove_dir(&dir).ok();
+            }
+        }
+    }
+
+    Ok(())
 }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use hf_hub::api::sync::Api;
-use image::{DynamicImage, GenericImageView};
+use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
 use ndarray::Array4;
 use ort::inputs;
 use ort::session::Session;
@@ -9,8 +9,21 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-/// Cosine similarity threshold for matching face embeddings to existing persons.
-pub const FACE_SIMILARITY_THRESHOLD: f32 = 0.4;
+/// Max cosine distance for a face match (= 1.0 - cosine_similarity).
+pub const MAX_FACE_DISTANCE: f32 = 0.6;
+
+/// Minimum neighbors within distance for a face to be considered a "core" point.
+pub const MIN_FACES_FOR_CORE: usize = 3;
+
+/// ArcFace canonical reference landmarks for a 112x112 aligned face.
+/// Order: left eye, right eye, nose tip, left mouth corner, right mouth corner.
+const ARCFACE_REF_LANDMARKS: [(f32, f32); 5] = [
+    (38.2946, 51.6963),
+    (73.5318, 51.5014),
+    (56.0252, 71.7366),
+    (41.5493, 92.3655),
+    (70.7299, 92.2041),
+];
 
 /// Computes the cosine similarity between two embedding vectors.
 ///
@@ -151,6 +164,186 @@ fn find_output_tensor<'a>(
     None
 }
 
+/// Estimate a 2D similarity transform (rotation + uniform scale + translation)
+/// mapping `src` points to `dst` points via least-squares.
+///
+/// Returns the 2x3 affine matrix `[[a, -b, tx], [b, a, ty]]`.
+fn estimate_similarity_transform(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -> [f32; 6] {
+    // Build the 10x4 linear system:
+    //   For each point i:
+    //     dst_x_i = a * src_x_i - b * src_y_i + tx
+    //     dst_y_i = b * src_x_i + a * src_y_i + ty
+    //
+    // Parameters: [a, b, tx, ty]
+    // We solve via normal equations: (A^T A) params = A^T rhs
+
+    let mut ata = [0.0f64; 16]; // 4x4
+    let mut atb = [0.0f64; 4];  // 4x1
+
+    for i in 0..5 {
+        let (sx, sy) = (src[i].0 as f64, src[i].1 as f64);
+        let (dx, dy) = (dst[i].0 as f64, dst[i].1 as f64);
+
+        // Row 1: [sx, -sy, 1, 0] -> dx
+        let row1 = [sx, -sy, 1.0, 0.0];
+        // Row 2: [sy,  sx, 0, 1] -> dy
+        let row2 = [sy, sx, 0.0, 1.0];
+
+        for r in 0..4 {
+            for c in 0..4 {
+                ata[r * 4 + c] += row1[r] * row1[c] + row2[r] * row2[c];
+            }
+            atb[r] += row1[r] * dx + row2[r] * dy;
+        }
+    }
+
+    // Solve 4x4 system via Gaussian elimination with partial pivoting
+    let mut aug = [[0.0f64; 5]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            aug[r][c] = ata[r * 4 + c];
+        }
+        aug[r][4] = atb[r];
+    }
+
+    for col in 0..4 {
+        // Partial pivoting
+        let mut max_row = col;
+        let mut max_val = aug[col][col].abs();
+        for row in (col + 1)..4 {
+            if aug[row][col].abs() > max_val {
+                max_val = aug[row][col].abs();
+                max_row = row;
+            }
+        }
+        aug.swap(col, max_row);
+
+        let pivot = aug[col][col];
+        if pivot.abs() < 1e-12 {
+            // Degenerate — return identity
+            return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        }
+
+        for c in col..5 {
+            aug[col][c] /= pivot;
+        }
+        for row in 0..4 {
+            if row == col {
+                continue;
+            }
+            let factor = aug[row][col];
+            for c in col..5 {
+                aug[row][c] -= factor * aug[col][c];
+            }
+        }
+    }
+
+    let a = aug[0][4] as f32;
+    let b = aug[1][4] as f32;
+    let tx = aug[2][4] as f32;
+    let ty = aug[3][4] as f32;
+
+    // Return the 2x3 matrix: [[a, -b, tx], [b, a, ty]]
+    [a, -b, tx, b, a, ty]
+}
+
+/// Apply an affine warp to produce a 112x112 aligned face image.
+///
+/// For each pixel (ox, oy) in the output, we compute the corresponding source
+/// position using the *inverse* of the forward transform, then bilinear-interpolate.
+fn affine_warp_face(img: &DynamicImage, forward: &[f32; 6]) -> RgbImage {
+    let size = 112u32;
+    let rgb = img.to_rgb8();
+    let (src_w, src_h) = (rgb.width(), rgb.height());
+
+    // Invert the 2x3 similarity matrix [[a, -b, tx], [b, a, ty]]
+    let (a, mb, tx, b, a2, ty) = (forward[0], forward[1], forward[2], forward[3], forward[4], forward[5]);
+    let det = a * a2 - mb * b;
+    if det.abs() < 1e-10 {
+        // Degenerate — just resize the image
+        return img.resize_exact(size, size, image::imageops::FilterType::Triangle).to_rgb8();
+    }
+    let inv_det = 1.0 / det;
+    // Inverse: [[a2, -mb, mb*ty - a2*tx], [-b, a, b*tx - a*ty]] / det
+    let ia = a2 * inv_det;
+    let imb = -mb * inv_det;
+    let itx = (mb * ty - a2 * tx) * inv_det;
+    let ib = -b * inv_det;
+    let ia2 = a * inv_det;
+    let ity = (b * tx - a * ty) * inv_det;
+
+    let mut out = RgbImage::new(size, size);
+
+    for oy in 0..size {
+        for ox in 0..size {
+            let sx = ia * ox as f32 + imb * oy as f32 + itx;
+            let sy = ib * ox as f32 + ia2 * oy as f32 + ity;
+
+            // Bilinear interpolation
+            let x0 = sx.floor() as i32;
+            let y0 = sy.floor() as i32;
+            let x1 = x0 + 1;
+            let y1 = y0 + 1;
+            let fx = sx - x0 as f32;
+            let fy = sy - y0 as f32;
+
+            let sample = |x: i32, y: i32| -> [f32; 3] {
+                if x < 0 || y < 0 || x >= src_w as i32 || y >= src_h as i32 {
+                    [0.0, 0.0, 0.0]
+                } else {
+                    let p = rgb.get_pixel(x as u32, y as u32);
+                    [p[0] as f32, p[1] as f32, p[2] as f32]
+                }
+            };
+
+            let p00 = sample(x0, y0);
+            let p10 = sample(x1, y0);
+            let p01 = sample(x0, y1);
+            let p11 = sample(x1, y1);
+
+            let mut pixel = [0u8; 3];
+            for c in 0..3 {
+                let v = p00[c] * (1.0 - fx) * (1.0 - fy)
+                    + p10[c] * fx * (1.0 - fy)
+                    + p01[c] * (1.0 - fx) * fy
+                    + p11[c] * fx * fy;
+                pixel[c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+            out.put_pixel(ox, oy, Rgb(pixel));
+        }
+    }
+
+    out
+}
+
+/// Produce an aligned 112x112 face crop using the detected landmarks.
+/// Falls back to a simple bbox crop + resize when landmarks are unavailable.
+pub fn align_face(
+    img: &DynamicImage,
+    landmarks: Option<&[(f32, f32)]>,
+    bbox: (f32, f32, f32, f32),
+) -> RgbImage {
+    if let Some(lms) = landmarks {
+        if lms.len() == 5 {
+            let src: [(f32, f32); 5] = [lms[0], lms[1], lms[2], lms[3], lms[4]];
+            let transform = estimate_similarity_transform(&src, &ARCFACE_REF_LANDMARKS);
+            return affine_warp_face(img, &transform);
+        }
+    }
+
+    // Fallback: crop by bbox and resize
+    let (img_w, img_h) = img.dimensions();
+    let x1 = (bbox.0 as u32).min(img_w.saturating_sub(1));
+    let y1 = (bbox.1 as u32).min(img_h.saturating_sub(1));
+    let x2 = (bbox.2 as u32).min(img_w);
+    let y2 = (bbox.3 as u32).min(img_h);
+    let w = x2.saturating_sub(x1).max(1);
+    let h = y2.saturating_sub(y1).max(1);
+    let sub = img.crop_imm(x1, y1, w, h);
+    sub.resize_exact(112, 112, image::imageops::FilterType::Triangle)
+        .to_rgb8()
+}
+
 impl AiPipeline {
     pub fn new() -> Result<Self> {
         if std::env::var("PHOS_DUMMY_AI").is_ok() {
@@ -227,7 +420,8 @@ impl AiPipeline {
                 }
             }
 
-            let outputs = session.run(inputs!["input.1" => input_tensor])?;
+            let det_input_name = session.inputs()[0].name().to_string();
+            let outputs = session.run(inputs![det_input_name.as_str() => input_tensor])?;
 
             // Collect actual output names for flexible matching
             let output_keys: Vec<String> = outputs.keys().map(|k| k.to_string()).collect();
@@ -300,14 +494,21 @@ impl AiPipeline {
                 );
 
                 // Determine layout from shapes
-                // SCRFD outputs can be in two formats:
-                // Format A (insightface): [1, num_anchors*H*W, 1] for scores, [1, num_anchors*H*W, 4] for bbox
-                // Format B (standard):    [1, num_anchors, H, W] for scores, [1, num_anchors*4, H, W] for bbox
-                let is_flat = score_shape.len() == 3;
+                // SCRFD outputs can be in three formats:
+                // Format A (insightface 3D): [1, num_anchors*H*W, 1] for scores — n = shape[1]
+                // Format A (insightface 2D): [num_anchors*H*W, 1] for scores — n = shape[0]
+                // Format B (standard 4D):    [1, num_anchors, H, W] for scores
+                let is_flat = score_shape.len() <= 3;
 
                 if is_flat {
-                    // Format A: [1, N, 1] scores, [1, N, 4] bbox, [1, N, 10] kps
-                    let n = score_shape[1] as usize;
+                    // Format A: [N, 1] or [1, N, 1] scores, same pattern for bbox/kps
+                    let n = if score_shape.len() == 3 {
+                        score_shape[1] as usize
+                    } else if score_shape.len() == 2 {
+                        score_shape[0] as usize
+                    } else {
+                        score_data.len()
+                    };
                     for (idx, &score) in score_data.iter().enumerate().take(n) {
                         if score < score_threshold {
                             continue;
@@ -433,23 +634,19 @@ impl AiPipeline {
                 }
 
                 // Try to identify score/bbox/kps by shape patterns
-                // Scores have last dim 1 or channel count = num_anchors
-                // Bboxes have last dim 4 or channel count = num_anchors*4
-                // Kps have last dim 10 or channel count = num_anchors*10
+                // Scores have last dim 1, bboxes have last dim 4, kps have last dim 10
                 if tensor_data.len() == 9 {
-                    // Determine if grouped by stride or by type
-                    // Check if outputs are grouped by stride (score,bbox,kps per stride)
-                    // or grouped by type (all scores, all bboxes, all kps)
+                    // Determine if grouped by type or by stride using last dimension:
+                    // Type-grouped: [score_s8, score_s16, score_s32, bbox_s8, ..., kps_s8, ...]
+                    //   → first 3 outputs all have last dim = 1
+                    // Stride-grouped: [score_s8, bbox_s8, kps_s8, score_s16, ...]
+                    //   → output[1] has last dim = 4 (bbox)
+                    let first_three_are_scores = tensor_data[0..3]
+                        .iter()
+                        .all(|(dims, _)| dims.last() == Some(&1));
 
-                    // Heuristic: if output[0] has fewer elements than output[1], likely type-grouped
-                    // (scores are smaller than bboxes). If similar, likely stride-grouped.
-
-                    let elem_0 = tensor_data[0].1.len();
-                    let elem_1 = tensor_data[1].1.len();
-
-                    let (score_indices, bbox_indices, kps_indices) = if elem_1 > elem_0 * 2 {
+                    let (score_indices, bbox_indices, kps_indices) = if first_three_are_scores {
                         // Type-grouped: [scores..., bboxes..., kps...]
-                        // scores for stride 8,16,32 then bboxes then kps
                         ([0, 1, 2], [3, 4, 5], [6, 7, 8])
                     } else {
                         // Stride-grouped: [score8, bbox8, kps8, score16, bbox16, kps16, ...]
@@ -465,11 +662,13 @@ impl AiPipeline {
                         let kps_data = &tensor_data[kps_indices[si]].1;
                         let score_shape = &tensor_data[score_indices[si]].0;
 
-                        let is_flat = score_shape.len() == 3;
+                        let is_flat = score_shape.len() <= 3;
 
                         if is_flat {
-                            let n = if score_shape.len() >= 2 {
+                            let n = if score_shape.len() == 3 {
                                 score_shape[1] as usize
+                            } else if score_shape.len() == 2 {
+                                score_shape[0] as usize
                             } else {
                                 score_data.len()
                             };
@@ -623,34 +822,47 @@ impl AiPipeline {
         }
     }
 
-    pub fn extract_embedding(&self, face_img: &DynamicImage) -> Result<Vec<f32>> {
+    /// Extract a face embedding from a full image using landmark-based alignment.
+    ///
+    /// When landmarks are available, the face is aligned to the ArcFace canonical
+    /// position via a similarity transform before embedding extraction.
+    /// Falls back to bbox crop + resize when landmarks are unavailable.
+    pub fn extract_embedding(
+        &self,
+        img: &DynamicImage,
+        landmarks: Option<&[(f32, f32)]>,
+        bbox: (f32, f32, f32, f32),
+    ) -> Result<Vec<f32>> {
         if let (Some(recognizer_mutex), false) = (
             &self.face_recognizer,
             std::env::var("PHOS_DUMMY_AI").is_ok(),
         ) {
-            let resized = face_img.resize_exact(112, 112, image::imageops::FilterType::Triangle);
-            let rgb_img = resized.to_rgb8();
+            let rgb_img = align_face(img, landmarks, bbox);
 
             let mut input = Array4::<f32>::zeros((1, 3, 112, 112));
             for (x, y, rgb) in rgb_img.enumerate_pixels() {
-                input[[0, 0, y as usize, x as usize]] = (rgb[0] as f32 - 127.5) / 128.0;
-                input[[0, 1, y as usize, x as usize]] = (rgb[1] as f32 - 127.5) / 128.0;
-                input[[0, 2, y as usize, x as usize]] = (rgb[2] as f32 - 127.5) / 128.0;
+                input[[0, 0, y as usize, x as usize]] = (rgb[0] as f32 - 127.5) / 127.5;
+                input[[0, 1, y as usize, x as usize]] = (rgb[1] as f32 - 127.5) / 127.5;
+                input[[0, 2, y as usize, x as usize]] = (rgb[2] as f32 - 127.5) / 127.5;
             }
 
             let input_tensor = Value::from_array((vec![1, 3, 112, 112], input.into_raw_vec()))?;
             let mut session = recognizer_mutex
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
-            let outputs = session.run(inputs!["data" => input_tensor])?;
+            let input_name = session.inputs()[0].name().to_string();
+            let outputs = session.run(inputs![input_name.as_str() => input_tensor])?;
             let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
 
             let embedding: Vec<f32> = output_tensor.1.to_vec();
             let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
             Ok(embedding.into_iter().map(|x| x / (norm + 1e-10)).collect())
         } else {
-            // Dummy mode: random embedding
-            Ok(vec![0.1; 512])
+            // Dummy mode: deterministic embedding based on bbox position
+            let mut emb = vec![0.1; 512];
+            emb[0] = bbox.0 / 1000.0;
+            emb[1] = bbox.1 / 1000.0;
+            Ok(emb)
         }
     }
 }
@@ -755,6 +967,46 @@ mod tests {
             landmarks: vec![],
         };
         assert!(iou(&a, &b) < 1e-6);
+    }
+
+    #[test]
+    fn test_similarity_transform_identity() {
+        // When src == dst, the transform should be close to identity
+        let pts: [(f32, f32); 5] = ARCFACE_REF_LANDMARKS;
+        let m = estimate_similarity_transform(&pts, &pts);
+        // m should be [1, 0, 0, 0, 1, 0] (identity)
+        assert!((m[0] - 1.0).abs() < 1e-4, "a should be ~1, got {}", m[0]);
+        assert!(m[1].abs() < 1e-4, "-b should be ~0, got {}", m[1]);
+        assert!(m[2].abs() < 1e-4, "tx should be ~0, got {}", m[2]);
+        assert!(m[3].abs() < 1e-4, "b should be ~0, got {}", m[3]);
+        assert!((m[4] - 1.0).abs() < 1e-4, "a should be ~1, got {}", m[4]);
+        assert!(m[5].abs() < 1e-4, "ty should be ~0, got {}", m[5]);
+    }
+
+    #[test]
+    fn test_similarity_transform_translation() {
+        // Translate all points by (10, 20)
+        let dst = ARCFACE_REF_LANDMARKS;
+        let src: [(f32, f32); 5] = dst.map(|(x, y)| (x - 10.0, y - 20.0));
+        let m = estimate_similarity_transform(&src, &dst);
+        // Should be [1, 0, 10, 0, 1, 20]
+        assert!((m[0] - 1.0).abs() < 1e-3);
+        assert!(m[1].abs() < 1e-3);
+        assert!((m[2] - 10.0).abs() < 1e-3);
+        assert!(m[3].abs() < 1e-3);
+        assert!((m[4] - 1.0).abs() < 1e-3);
+        assert!((m[5] - 20.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_align_face_no_landmarks_fallback() {
+        // Without landmarks, should produce a 112x112 image from bbox crop
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(200, 200, |_, _| {
+            image::Rgb([128, 128, 128])
+        }));
+        let result = align_face(&img, None, (10.0, 10.0, 100.0, 100.0));
+        assert_eq!(result.width(), 112);
+        assert_eq!(result.height(), 112);
     }
 
     #[test]

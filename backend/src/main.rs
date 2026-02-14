@@ -36,6 +36,14 @@ enum Commands {
         #[arg(long)]
         r#move: bool,
     },
+    /// Reorganize files on disk to match current face clustering
+    Reorganize {
+        /// Library directory containing .phos.db
+        library: PathBuf,
+        /// Show what would be moved without actually moving anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -53,6 +61,12 @@ async fn main() {
         }) => {
             if let Err(e) = import::run_import(&source, &target, r#move) {
                 eprintln!("Import failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Reorganize { library, dry_run }) => {
+            if let Err(e) = import::run_reorganize(&library, dry_run) {
+                eprintln!("Reorganize failed: {}", e);
                 std::process::exit(1);
             }
         }

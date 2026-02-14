@@ -28,3 +28,4 @@ hf-hub = "0.4"
 kamadak-exif = "0.5"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
+rayon = "1.10"
