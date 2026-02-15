@@ -1,9 +1,15 @@
 <script setup>
-import { ref, onMounted, defineExpose } from 'vue'
+import { ref, computed, onMounted, defineExpose } from 'vue'
+import { Button } from '@/components/ui/button'
+import { UserPlus } from 'lucide-vue-next'
+import PersonNamer from '@/components/PersonNamer.vue'
 
 const people = ref([])
 const loading = ref(false)
 const error = ref(null)
+const showNamer = ref(false)
+
+const hasUnnamed = computed(() => people.value.some((p) => !p.name))
 
 async function fetchPeople() {
   loading.value = true
@@ -18,6 +24,10 @@ async function fetchPeople() {
   } finally {
     loading.value = false
   }
+}
+
+function onNamerChanged() {
+  fetchPeople()
 }
 
 onMounted(fetchPeople)
@@ -35,13 +45,37 @@ defineExpose({ fetchPeople })
   <div v-else-if="people.length === 0" class="text-center py-20">
     <p class="text-zinc-500 text-sm">No people detected yet. Scan a library to detect faces.</p>
   </div>
-  <div v-else class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-6">
-    <div v-for="person in people" :key="person.id" class="flex flex-col items-center space-y-2 group cursor-pointer">
-      <div class="w-24 h-24 rounded-full bg-zinc-800 border-2 border-zinc-700 group-hover:border-indigo-500 overflow-hidden flex items-center justify-center transition-colors">
-        <span v-if="!person.thumbnail" class="text-2xl font-bold text-zinc-600">{{ (person.name || '?')[0] }}</span>
-        <img v-else :src="person.thumbnail" class="w-full h-full object-cover" />
-      </div>
-      <span class="text-sm font-medium text-zinc-300 group-hover:text-white transition-colors">{{ person.name || 'Unnamed' }}</span>
+  <div v-else>
+    <!-- Header with Name People button -->
+    <div v-if="hasUnnamed" class="flex justify-end mb-4">
+      <Button
+        @click="showNamer = true"
+        class="bg-indigo-600 hover:bg-indigo-500 text-white gap-2"
+      >
+        <UserPlus class="w-4 h-4" />
+        Name People
+      </Button>
     </div>
+
+    <div class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-6">
+      <div v-for="person in people" :key="person.id" class="flex flex-col items-center space-y-2 group cursor-pointer">
+        <div class="w-24 h-24 rounded-full bg-zinc-800 border-2 border-zinc-700 group-hover:border-indigo-500 overflow-hidden flex items-center justify-center transition-colors">
+          <img
+            v-if="person.thumbnail_url"
+            :src="person.thumbnail_url"
+            class="w-full h-full object-cover"
+          />
+          <span v-else class="text-2xl font-bold text-zinc-600">{{ (person.name || '?')[0] }}</span>
+        </div>
+        <span class="text-sm font-medium text-zinc-300 group-hover:text-white transition-colors">{{ person.name || 'Unnamed' }}</span>
+        <span class="text-xs text-zinc-500">{{ person.face_count }} {{ person.face_count === 1 ? 'face' : 'faces' }}</span>
+      </div>
+    </div>
+
+    <!-- PersonNamer dialog -->
+    <PersonNamer
+      v-model:open="showNamer"
+      @changed="onNamerChanged"
+    />
   </div>
 </template>

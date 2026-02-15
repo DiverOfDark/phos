@@ -22,7 +22,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/photos", get(get_photos))
         .route("/api/photos/:id", get(get_photo_detail))
         .route("/api/people", get(get_people))
-        .route("/api/people/:id", get(get_person_photos))
+        .route("/api/people/merge", post(merge_people))
+        .route("/api/people/:id", get(get_person_photos).put(rename_person))
+        .route("/api/people/:id/faces", get(get_person_faces))
+        .route("/api/faces/:id/thumbnail", get(get_face_thumbnail))
         .route("/api/files/:id", get(get_file))
         .route("/api/files/:id/thumbnail", get(get_file_thumbnail))
         .route("/api/stats", get(get_stats))
@@ -184,12 +187,24 @@ async fn get_photo_detail(
 
 async fn get_people(State(state): State<AppState>) -> Json<Vec<PersonBrief>> {
     let db = state.db.lock().await;
-    let mut stmt = db.prepare("SELECT id, name FROM people").unwrap();
+    let mut stmt = db
+        .prepare(
+            "SELECT p.id, p.name, COUNT(f.id) as face_count, p.thumbnail_face_id
+             FROM people p
+             LEFT JOIN faces f ON f.person_id = p.id
+             GROUP BY p.id
+             ORDER BY face_count DESC",
+        )
+        .unwrap();
     let rows = stmt
         .query_map([], |row| {
+            let thumbnail_face_id: Option<String> = row.get(3)?;
             Ok(PersonBrief {
                 id: row.get(0)?,
                 name: row.get(1)?,
+                face_count: row.get(2)?,
+                thumbnail_url: thumbnail_face_id
+                    .map(|fid| format!("/api/faces/{}/thumbnail", fid)),
             })
         })
         .unwrap();
@@ -202,6 +217,8 @@ async fn get_people(State(state): State<AppState>) -> Json<Vec<PersonBrief>> {
 struct PersonBrief {
     id: String,
     name: Option<String>,
+    face_count: i64,
+    thumbnail_url: Option<String>,
 }
 
 async fn get_person_photos(
@@ -234,6 +251,220 @@ async fn get_person_photos(
 
     let photos: Vec<_> = rows.filter_map(|r| r.ok()).collect();
     Json(photos)
+}
+
+/// Get up to 12 face IDs with thumbnail URLs for a person
+#[derive(Serialize)]
+struct PersonFaceBrief {
+    id: String,
+    thumbnail_url: String,
+}
+
+async fn get_person_faces(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Json<Vec<PersonFaceBrief>> {
+    let db = state.db.lock().await;
+    let mut stmt = db
+        .prepare("SELECT id FROM faces WHERE person_id = ? LIMIT 12")
+        .unwrap();
+    let rows = stmt
+        .query_map(params![id], |row| {
+            let face_id: String = row.get(0)?;
+            Ok(PersonFaceBrief {
+                thumbnail_url: format!("/api/faces/{}/thumbnail", face_id),
+                id: face_id,
+            })
+        })
+        .unwrap();
+
+    let faces: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+    Json(faces)
+}
+
+/// Rename a person
+#[derive(Deserialize)]
+struct RenamePersonPayload {
+    name: String,
+}
+
+async fn rename_person(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<RenamePersonPayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let db = state.db.lock().await;
+    let updated = db
+        .execute("UPDATE people SET name = ? WHERE id = ?", params![payload.name, id])
+        .map_err(|e| {
+            tracing::error!("Failed to rename person: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if updated == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+/// Merge two people: move all faces from source to target, then delete source
+#[derive(Deserialize)]
+struct MergePeoplePayload {
+    source_id: String,
+    target_id: String,
+}
+
+async fn merge_people(
+    State(state): State<AppState>,
+    Json(payload): Json<MergePeoplePayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if payload.source_id == payload.target_id {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let db = state.db.lock().await;
+
+    db.execute(
+        "UPDATE faces SET person_id = ? WHERE person_id = ?",
+        params![payload.target_id, payload.source_id],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to reassign faces during merge: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    db.execute("DELETE FROM people WHERE id = ?", params![payload.source_id])
+        .map_err(|e| {
+            tracing::error!("Failed to delete merged person: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+/// Serve a face thumbnail: crop face from source image, resize, cache as JPEG
+async fn get_face_thumbnail(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let (file_path, box_x1, box_y1, box_x2, box_y2, db_path) = {
+        let db = state.db.lock().await;
+        let mut stmt = db
+            .prepare(
+                "SELECT fi.path, fa.box_x1, fa.box_y1, fa.box_x2, fa.box_y2
+                 FROM faces fa
+                 JOIN files fi ON fa.file_id = fi.id
+                 WHERE fa.id = ?",
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let result = stmt
+            .query_row(params![id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f32>(1)?,
+                    row.get::<_, f32>(2)?,
+                    row.get::<_, f32>(3)?,
+                    row.get::<_, f32>(4)?,
+                ))
+            })
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+
+        let db_path: String = db
+            .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        (result.0, result.1, result.2, result.3, result.4, db_path)
+    };
+
+    let source_path = std::path::Path::new(&file_path);
+    if !source_path.exists() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Cache directory
+    let db_dir = std::path::Path::new(&db_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let thumb_dir = db_dir.join(".phos_thumbnails").join("faces");
+
+    tokio::fs::create_dir_all(&thumb_dir)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let thumb_path = thumb_dir.join(format!("{}.jpg", id));
+
+    // Return cached thumbnail if it exists
+    if thumb_path.exists() {
+        let bytes = tokio::fs::read(&thumb_path)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(([(header::CONTENT_TYPE, "image/jpeg".to_string())], bytes));
+    }
+
+    // Generate face thumbnail
+    let file_path_owned = file_path.clone();
+    let thumb_path_clone = thumb_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let img =
+            image::open(&file_path_owned).map_err(|e| format!("Failed to open image: {}", e))?;
+
+        let (img_w, img_h) = img.dimensions();
+
+        // Box coords are in pixels; add some padding around the face
+        let pad = 0.15;
+        let face_w = box_x2 - box_x1;
+        let face_h = box_y2 - box_y1;
+        let cx1 = (box_x1 - face_w * pad).max(0.0) as u32;
+        let cy1 = (box_y1 - face_h * pad).max(0.0) as u32;
+        let cx2 = ((box_x2 + face_w * pad) as u32).min(img_w);
+        let cy2 = ((box_y2 + face_h * pad) as u32).min(img_h);
+
+        let crop_w = cx2.saturating_sub(cx1).max(1);
+        let crop_h = cy2.saturating_sub(cy1).max(1);
+
+        let cropped = img.crop_imm(cx1, cy1, crop_w, crop_h);
+
+        // Resize to 150px wide
+        let target_width = 150u32;
+        let thumbnail = if crop_w > target_width {
+            let target_height = (crop_h as f64 * target_width as f64 / crop_w as f64) as u32;
+            cropped.resize(
+                target_width,
+                target_height,
+                image::imageops::FilterType::Triangle,
+            )
+        } else {
+            cropped
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        thumbnail
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .map_err(|e| format!("Failed to encode face thumbnail: {}", e))?;
+
+        let jpeg_bytes = buf.into_inner();
+
+        if let Err(e) = std::fs::write(&thumb_path_clone, &jpeg_bytes) {
+            tracing::warn!(
+                "Failed to cache face thumbnail to {:?}: {}",
+                thumb_path_clone,
+                e
+            );
+        }
+
+        Ok(jpeg_bytes)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|e| {
+        tracing::error!("Face thumbnail generation failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(([(header::CONTENT_TYPE, "image/jpeg".to_string())], result))
 }
 
 /// Serve a file by its database ID
