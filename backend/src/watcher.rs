@@ -131,8 +131,16 @@ fn collect_event(pending: &mut HashMap<PathBuf, (FileAction, Instant)>, event: &
 
     if let Some(action) = action {
         for path in &event.paths {
-            // Only care about media files.
+            // Only care about media files, skip .phos* directories (thumbnails, db)
             if path.is_dir() || !is_media_file(path) {
+                continue;
+            }
+            if path.components().any(|c| {
+                c.as_os_str()
+                    .to_str()
+                    .map(|s| s.starts_with(".phos"))
+                    .unwrap_or(false)
+            }) {
                 continue;
             }
             debug!("Watcher event: {:?} on {:?}", action, path);
@@ -164,6 +172,11 @@ fn flush_pending(
         }
     };
 
+    // Build a dHash cache so new files can be grouped into existing shots.
+    // Created once before the loop so that files in the same watcher batch
+    // can still match against each other.
+    let dhash_cache = std::sync::Mutex::new(Vec::<crate::scanner::DHashCacheEntry>::new());
+
     // Drain the map so we process each path exactly once.
     let actions: Vec<(PathBuf, FileAction)> = pending
         .drain()
@@ -184,7 +197,7 @@ fn flush_pending(
                 // real-time).  The file will still be indexed, hashed, and get
                 // a dHash.
                 let _ = ai; // acknowledge but don't use in the watcher loop
-                if let Err(e) = scanner.process_file(&conn, &path) {
+                if let Err(e) = scanner.process_file(&conn, &path, &dhash_cache) {
                     error!("Watcher: failed to process {:?}: {}", path, e);
                 }
             }

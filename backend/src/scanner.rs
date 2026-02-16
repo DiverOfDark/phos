@@ -12,9 +12,60 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+/// Open an image file using FFmpeg, falling back to the `image` crate.
+///
+/// FFmpeg handles a wider range of formats (extended WebP, HEIC, AVIF, etc.)
+/// but its pipe-based demuxers sometimes fail for formats like PNG where codec
+/// parameters can't be determined without extra probing.  In those cases we
+/// fall back to the `image` crate which handles PNG/JPEG/GIF/BMP well.
+///
+/// After loading, applies EXIF orientation so the image is correctly rotated.
+pub fn open_image(path: &Path) -> anyhow::Result<DynamicImage> {
+    let img = match extract_first_video_frame(path) {
+        Ok(img) => img,
+        Err(ffmpeg_err) => {
+            debug!(
+                "FFmpeg failed to open {:?} ({}), trying image crate fallback",
+                path, ffmpeg_err
+            );
+            image::open(path).map_err(|image_err| {
+                anyhow::anyhow!(
+                    "Failed to open image {:?}: FFmpeg: {}, image crate: {}",
+                    path,
+                    ffmpeg_err,
+                    image_err
+                )
+            })?
+        }
+    };
+    Ok(apply_exif_orientation(img, path))
+}
+
+/// Read the EXIF orientation tag and transform the image accordingly.
+fn apply_exif_orientation(img: DynamicImage, path: &Path) -> DynamicImage {
+    let orientation = (|| -> Option<u32> {
+        let file = File::open(path).ok()?;
+        let mut bufreader = BufReader::new(file);
+        let exif = exif::Reader::new().read_from_container(&mut bufreader).ok()?;
+        let field = exif.get_field(Tag::Orientation, In::PRIMARY)?;
+        field.value.get_uint(0)
+    })();
+
+    match orientation {
+        Some(2) => img.fliph(),
+        Some(3) => img.rotate180(),
+        Some(4) => img.flipv(),
+        Some(5) => img.rotate90().fliph(),
+        Some(6) => img.rotate90(),
+        Some(7) => img.rotate270().fliph(),
+        Some(8) => img.rotate270(),
+        _ => img, // 1 or unknown — no rotation needed
+    }
+}
 
 /// Compute a difference hash (dHash) for a given image.
 ///
@@ -36,6 +87,21 @@ pub fn compute_dhash(img: &DynamicImage) -> [u8; 8] {
         }
     }
     hash
+}
+
+/// Hamming distance between two 8-byte dHash values (out of 64 bits).
+pub fn hamming_distance(a: &[u8; 8], b: &[u8; 8]) -> u32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x ^ y).count_ones())
+        .sum()
+}
+
+/// Entry in the in-memory dHash cache used for shot grouping during scanning.
+pub struct DHashCacheEntry {
+    pub file_id: String,
+    pub shot_id: String,
+    pub dhash: [u8; 8],
 }
 
 pub struct Scanner {
@@ -61,10 +127,46 @@ impl Scanner {
     pub fn scan(&self, root: &Path) -> anyhow::Result<()> {
         let files: Vec<PathBuf> = WalkDir::new(root)
             .into_iter()
+            .filter_entry(|e| {
+                // Skip .phos* directories (thumbnails cache, db files)
+                if e.file_type().is_dir() {
+                    if let Some(name) = e.file_name().to_str() {
+                        return !name.starts_with(".phos");
+                    }
+                }
+                true
+            })
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file() && is_media_file(e.path()))
             .map(|e| e.path().to_path_buf())
             .collect();
+
+        // Build an in-memory dHash cache from existing files in the DB
+        let dhash_cache = {
+            let conn = self.open_db()?;
+            let mut stmt = conn.prepare(
+                "SELECT f.id, f.shot_id, f.visual_embedding FROM files f WHERE f.visual_embedding IS NOT NULL"
+            )?;
+            let entries: Vec<DHashCacheEntry> = stmt
+                .query_map([], |row| {
+                    let file_id: String = row.get(0)?;
+                    let shot_id: String = row.get(1)?;
+                    let blob: Vec<u8> = row.get(2)?;
+                    Ok((file_id, shot_id, blob))
+                })?
+                .filter_map(|r| r.ok())
+                .filter_map(|(file_id, shot_id, blob)| {
+                    if blob.len() == 8 {
+                        let mut dhash = [0u8; 8];
+                        dhash.copy_from_slice(&blob);
+                        Some(DHashCacheEntry { file_id, shot_id, dhash })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            std::sync::Mutex::new(entries)
+        };
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(half_available_threads())
@@ -79,7 +181,7 @@ impl Scanner {
                         return;
                     }
                 };
-                if let Err(e) = self.process_file(&conn, path) {
+                if let Err(e) = self.process_file(&conn, path, &dhash_cache) {
                     error!("Error processing {:?}: {}", path, e);
                 }
             });
@@ -89,21 +191,27 @@ impl Scanner {
         let conn = self.open_db()?;
         self.cluster_faces(&conn)?;
 
+        // Assign primary person to each shot based on largest face
+        assign_primary_persons(&conn)?;
+
+        // Assign folder numbers to shots that don't have one yet
+        assign_folder_numbers(&conn)?;
+
         Ok(())
     }
 
     /// Remove a file from the database by its filesystem path.
     ///
     /// Deletes associated faces, video keyframes, and the file record itself.
-    /// If the parent photo has no remaining files, the photo record is also removed.
+    /// If the parent shot has no remaining files, the shot record is also removed.
     /// Orphaned person records (those with no remaining faces) are cleaned up too.
     pub fn remove_file(&self, conn: &Connection, path: &Path) -> anyhow::Result<()> {
         let path_str = path.to_string_lossy();
 
         // Look up the file by path
-        let (file_id, photo_id): (String, String) = conn
+        let (file_id, shot_id): (String, String) = conn
             .query_row(
-                "SELECT id, photo_id FROM files WHERE path = ?",
+                "SELECT id, shot_id FROM files WHERE path = ?",
                 params![path_str.as_ref()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -133,16 +241,16 @@ impl Scanner {
         conn.execute("DELETE FROM files WHERE id = ?", params![file_id])?;
         info!("Removed file record {} for {:?}", file_id, path);
 
-        // Check if the photo has any remaining files
+        // Check if the shot has any remaining files
         let remaining_files: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM files WHERE photo_id = ?",
-            params![photo_id],
+            "SELECT COUNT(*) FROM files WHERE shot_id = ?",
+            params![shot_id],
             |row| row.get(0),
         )?;
 
         if remaining_files == 0 {
-            conn.execute("DELETE FROM photos WHERE id = ?", params![photo_id])?;
-            info!("Removed orphaned photo record {}", photo_id);
+            conn.execute("DELETE FROM shots WHERE id = ?", params![shot_id])?;
+            info!("Removed orphaned shot record {}", shot_id);
         }
 
         // Clean up orphaned person records (persons with no remaining faces)
@@ -428,84 +536,27 @@ impl Scanner {
         Ok(())
     }
 
-    /// Detect faces in an image and store them in the database, linking to the given file_id.
-    /// Faces are stored without person assignment — clustering happens after the scan.
-    fn detect_and_store_faces(
-        &self,
-        conn: &Connection,
-        ai: &AiPipeline,
-        img: &DynamicImage,
-        file_id: &str,
-    ) -> anyhow::Result<()> {
-        let (img_w, img_h) = img.dimensions();
-        let detections = ai.detect_faces(img).unwrap_or_default();
+    pub fn process_file(&self, conn: &Connection, path: &Path, dhash_cache: &std::sync::Mutex<Vec<DHashCacheEntry>>) -> anyhow::Result<()> {
+        // --- Phase 1: CPU-heavy work (no DB writes) ---
 
-        debug!(
-            "Detected {} faces in file {} ({}x{})",
-            detections.len(),
-            file_id,
-            img_w,
-            img_h
-        );
-
-        for det in detections {
-            // Clamp bounding box to image dimensions
-            let x1 = (det.box_x1 as u32).min(img_w.saturating_sub(1));
-            let y1 = (det.box_y1 as u32).min(img_h.saturating_sub(1));
-            let x2 = (det.box_x2 as u32).min(img_w);
-            let y2 = (det.box_y2 as u32).min(img_h);
-
-            let face_w = x2.saturating_sub(x1);
-            let face_h = y2.saturating_sub(y1);
-
-            if face_w < 10 || face_h < 10 {
-                debug!(
-                    "Skipping too-small face region: {}x{} at ({},{}) in file {}",
-                    face_w, face_h, x1, y1, file_id
-                );
-                continue;
-            }
-
-            // Extract aligned face embedding using landmarks when available
-            let bbox = (det.box_x1, det.box_y1, det.box_x2, det.box_y2);
-            let embedding = ai
-                .extract_embedding(img, det.landmarks.as_deref(), bbox)
-                .unwrap_or_default();
-            if embedding.is_empty() {
-                continue;
-            }
-
-            let face_id = Uuid::new_v4().to_string();
-            let embedding_blob = bincode::serialize(&embedding)?;
-
-            // Insert face WITHOUT person_id — clustering happens after scan
-            conn.execute(
-                "INSERT INTO faces (id, file_id, person_id, box_x1, box_y1, box_x2, box_y2, embedding, score) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
-                params![face_id, file_id, det.box_x1, det.box_y1, det.box_x2, det.box_y2, embedding_blob, det.score],
-            )?;
-        }
-
-        Ok(())
-    }
-
-    pub fn process_file(&self, conn: &Connection, path: &Path) -> anyhow::Result<()> {
         let hash = calculate_hash(path)?;
 
-        let mut stmt = conn.prepare("SELECT id, photo_id FROM files WHERE hash = ?")?;
-        let mut rows = stmt.query(params![hash])?;
-
-        if let Some(row) = rows.next()? {
-            // File already exists, check if path matches or if it's a move
-            let existing_id: String = row.get(0)?;
-            info!(
-                "File already exists with hash {}, ID: {}",
-                hash, existing_id
-            );
-            return Ok(());
+        // Quick duplicate check (read-only)
+        {
+            let mut stmt = conn.prepare("SELECT id FROM files WHERE hash = ?")?;
+            let mut rows = stmt.query(params![hash])?;
+            if let Some(row) = rows.next()? {
+                let existing_id: String = row.get(0)?;
+                info!(
+                    "File already exists with hash {}, ID: {}",
+                    hash, existing_id
+                );
+                return Ok(());
+            }
         }
 
         let id = Uuid::new_v4().to_string();
-        let photo_id = Uuid::new_v4().to_string();
+        let shot_id = Uuid::new_v4().to_string();
 
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
         let mime_type = match ext.to_lowercase().as_str() {
@@ -523,113 +574,336 @@ impl Scanner {
         let metadata = std::fs::metadata(path)?;
         let file_size = metadata.len() as i64;
 
-        // Try to get dimensions (image or video)
-        let (width, height) = if mime_type.starts_with("image/") {
-            match image::image_dimensions(path) {
-                Ok((w, h)) => (Some(w as i32), Some(h as i32)),
-                Err(_) => (None, None),
-            }
-        } else if mime_type.starts_with("video/") {
+        let (width, height) = if mime_type.starts_with("image/") || mime_type.starts_with("video/") {
             get_video_dimensions(path)
         } else {
             (None, None)
         };
 
-        // Insert into photos
-        conn.execute(
-            "INSERT INTO photos (id, main_file_id, width, height) VALUES (?, ?, ?, ?)",
-            params![photo_id, id, width, height],
-        )?;
+        // EXIF metadata (images only)
+        let exif_data = if mime_type.starts_with("image/") {
+            let (ts, lat, lon) = extract_exif_metadata(path);
+            if ts.is_some() || lat.is_some() || lon.is_some() {
+                Some((ts, lat, lon))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-        // Insert into files
-        conn.execute(
-            "INSERT INTO files (id, photo_id, path, hash, mime_type, file_size, is_original) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![id, photo_id, path.to_string_lossy(), hash, mime_type, file_size, 1],
-        )?;
+        // dHash computation
+        let dhash: Option<[u8; 8]> = if mime_type.starts_with("image/") {
+            open_image(path).ok().map(|img| compute_dhash(&img))
+        } else if mime_type.starts_with("video/") {
+            extract_first_video_frame(path).ok().map(|frame| compute_dhash(&frame))
+        } else {
+            None
+        };
 
-        // Extract EXIF metadata for images and update the photo record
-        if mime_type.starts_with("image/") {
-            let (timestamp, latitude, longitude) = extract_exif_metadata(path);
-            if timestamp.is_some() || latitude.is_some() || longitude.is_some() {
-                if let Err(e) = conn.execute(
-                    "UPDATE photos SET timestamp = ?, latitude = ?, longitude = ? WHERE id = ?",
-                    params![timestamp, latitude, longitude, photo_id],
-                ) {
-                    warn!(
-                        "Failed to update EXIF metadata for photo {}: {}",
-                        photo_id, e
-                    );
+        // Face detection (collect results without writing)
+        let mut image_faces: Vec<FaceResult> = Vec::new();
+        let mut keyframe_results: Vec<KeyframeResult> = Vec::new();
+
+        if let Some(ai) = &self.ai {
+            if mime_type.starts_with("image/") {
+                if let Ok(img) = open_image(path) {
+                    image_faces = detect_faces_collect(ai, &img);
+                }
+            } else if mime_type.starts_with("video/") {
+                if let Ok(keyframes) = extract_video_keyframes(path, 5.0) {
+                    for kf in &keyframes {
+                        keyframe_results.push(KeyframeResult {
+                            kf_id: Uuid::new_v4().to_string(),
+                            timestamp_ms: kf.timestamp_ms,
+                            kf_path: format!("memory://keyframe_{}", kf.timestamp_ms),
+                            faces: detect_faces_collect(ai, &kf.image),
+                        });
+                    }
+                    debug!("Processed {} keyframes for video {:?}", keyframes.len(), path);
                 }
             }
         }
 
-        // Compute perceptual hash (dHash) for images and videos
-        if mime_type.starts_with("image/") {
-            if let Ok(img) = image::open(path) {
-                let dhash = compute_dhash(&img);
+        // --- Phase 2: dHash shot grouping ---
+        // Check the dhash_cache for a match (Hamming distance <= 10).
+        // If match found: add file to existing shot (is_original = false).
+        // No match: create new shot (is_original = true).
+        let (actual_shot_id, is_new_shot, is_original) = if let Some(ref file_dhash) = dhash {
+            let cache = dhash_cache.lock().unwrap();
+            let matched = cache.iter().find(|entry| {
+                hamming_distance(&entry.dhash, file_dhash) <= 10
+            });
+            if let Some(entry) = matched {
+                (entry.shot_id.clone(), false, false)
+            } else {
+                (shot_id.clone(), true, true)
+            }
+        } else {
+            (shot_id.clone(), true, true)
+        };
+
+        // --- Phase 3: Write everything to DB in a single transaction ---
+
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+
+        let result = (|| -> anyhow::Result<()> {
+            if is_new_shot {
+                conn.execute(
+                    "INSERT INTO shots (id, main_file_id, width, height) VALUES (?, ?, ?, ?)",
+                    params![actual_shot_id, id, width, height],
+                )?;
+            }
+
+            conn.execute(
+                "INSERT INTO files (id, shot_id, path, hash, mime_type, file_size, is_original) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![id, actual_shot_id, path.to_string_lossy(), hash, mime_type, file_size, is_original],
+            )?;
+
+            if is_new_shot {
+                if let Some((ts, lat, lon)) = &exif_data {
+                    conn.execute(
+                        "UPDATE shots SET timestamp = ?, latitude = ?, longitude = ? WHERE id = ?",
+                        params![ts, lat, lon, actual_shot_id],
+                    )?;
+                }
+            }
+
+            if let Some(dhash) = &dhash {
                 conn.execute(
                     "UPDATE files SET visual_embedding = ? WHERE id = ?",
                     params![dhash.as_slice(), id],
                 )?;
-                debug!("Stored dHash for image file {}", id);
             }
-        } else if mime_type.starts_with("video/") {
-            match extract_first_video_frame(path) {
-                Ok(frame) => {
-                    let dhash = compute_dhash(&frame);
+
+            for face in &image_faces {
+                conn.execute(
+                    "INSERT INTO faces (id, file_id, person_id, box_x1, box_y1, box_x2, box_y2, embedding, score) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+                    params![face.face_id, id, face.box_x1, face.box_y1, face.box_x2, face.box_y2, face.embedding_blob, face.score],
+                )?;
+            }
+
+            for kfr in &keyframe_results {
+                conn.execute(
+                    "INSERT INTO video_keyframes (id, video_file_id, timestamp_ms, path) VALUES (?, ?, ?, ?)",
+                    params![kfr.kf_id, id, kfr.timestamp_ms, kfr.kf_path],
+                )?;
+                for face in &kfr.faces {
                     conn.execute(
-                        "UPDATE files SET visual_embedding = ? WHERE id = ?",
-                        params![dhash.as_slice(), id],
+                        "INSERT INTO faces (id, file_id, person_id, box_x1, box_y1, box_x2, box_y2, embedding, score) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+                        params![face.face_id, id, face.box_x1, face.box_y1, face.box_x2, face.box_y2, face.embedding_blob, face.score],
                     )?;
-                    debug!("Stored dHash for video file {}", id);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to extract first frame for dHash from {:?}: {}",
-                        path, e
-                    );
                 }
             }
-        }
 
-        // AI Processing
-        if let Some(ai) = &self.ai {
-            if mime_type.starts_with("image/") {
-                if let Ok(img) = image::open(path) {
-                    self.detect_and_store_faces(conn, ai, &img, &id)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+
+                // Add to the dHash cache so subsequent files can match against this one
+                if let Some(ref file_dhash) = dhash {
+                    let mut cache = dhash_cache.lock().unwrap();
+                    cache.push(DHashCacheEntry {
+                        file_id: id.clone(),
+                        shot_id: actual_shot_id.clone(),
+                        dhash: *file_dhash,
+                    });
                 }
-            } else if mime_type.starts_with("video/") {
-                // Extract keyframes from video and run face detection on each
-                match extract_video_keyframes(path, 5.0) {
-                    Ok(keyframes) => {
-                        for kf in &keyframes {
-                            let kf_id = Uuid::new_v4().to_string();
-                            let kf_path = format!("memory://keyframe_{}", kf.timestamp_ms);
 
-                            conn.execute(
-                                "INSERT INTO video_keyframes (id, video_file_id, timestamp_ms, path) VALUES (?, ?, ?, ?)",
-                                params![kf_id, id, kf.timestamp_ms, kf_path],
-                            )?;
-
-                            // Run face detection on this keyframe
-                            self.detect_and_store_faces(conn, ai, &kf.image, &id)?;
-                        }
-                        debug!(
-                            "Processed {} keyframes for video {:?}",
-                            keyframes.len(),
-                            path
-                        );
-                    }
-                    Err(e) => {
-                        warn!("Failed to extract keyframes from {:?}: {}", path, e);
-                    }
-                }
+                info!("Indexed: {:?}", path);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
             }
         }
-
-        info!("Indexed: {:?}", path);
-        Ok(())
     }
+}
+
+/// Assign `primary_person_id` for each shot based on the largest face with a person_id.
+///
+/// For each shot where `review_status != 'confirmed'`, finds the face with the
+/// largest bounding box area `(box_x2 - box_x1) * (box_y2 - box_y1)` that has a
+/// `person_id` assigned. Sets `shots.primary_person_id` to that person. If no
+/// faces have a `person_id`, sets it to NULL (unsorted).
+pub fn assign_primary_persons(conn: &Connection) -> anyhow::Result<()> {
+    // Find shots that need primary person assignment (not confirmed by user)
+    let mut shot_stmt = conn.prepare(
+        "SELECT id FROM shots WHERE review_status != 'confirmed' OR review_status IS NULL"
+    )?;
+    let shot_ids: Vec<String> = shot_stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if shot_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut update_stmt = conn.prepare(
+        "UPDATE shots SET primary_person_id = ? WHERE id = ?"
+    )?;
+
+    // For each shot, find the face with the largest bbox area that has a person_id
+    let mut face_stmt = conn.prepare(
+        "SELECT f.person_id, (f.box_x2 - f.box_x1) * (f.box_y2 - f.box_y1) AS area
+         FROM faces f
+         JOIN files fl ON f.file_id = fl.id
+         WHERE fl.shot_id = ? AND f.person_id IS NOT NULL
+         ORDER BY area DESC
+         LIMIT 1"
+    )?;
+
+    let mut assigned = 0;
+    let mut cleared = 0;
+    for shot_id in &shot_ids {
+        let best_person: Option<String> = face_stmt
+            .query_row(params![shot_id], |row| row.get(0))
+            .ok();
+
+        match &best_person {
+            Some(_) => assigned += 1,
+            None => cleared += 1,
+        }
+
+        update_stmt.execute(params![best_person, shot_id])?;
+    }
+
+    info!(
+        "Primary person assignment: {} shots assigned, {} set to unsorted (NULL)",
+        assigned, cleared
+    );
+
+    Ok(())
+}
+
+/// Assign sequential `folder_number` values to shots that don't have one yet.
+///
+/// For each shot with a `primary_person_id` but NULL `folder_number`, assigns
+/// `MAX(folder_number) + 1` for that person. Unsorted shots (NULL primary_person_id)
+/// are treated as their own separate namespace.
+pub fn assign_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
+    // Get all shots needing folder number assignment, grouped by primary_person_id
+    // We handle NULL primary_person_id (unsorted) as a separate group
+    let mut shots_stmt = conn.prepare(
+        "SELECT id, primary_person_id FROM shots WHERE folder_number IS NULL ORDER BY created_at"
+    )?;
+    let shots: Vec<(String, Option<String>)> = shots_stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if shots.is_empty() {
+        return Ok(());
+    }
+
+    let mut update_stmt = conn.prepare(
+        "UPDATE shots SET folder_number = ? WHERE id = ?"
+    )?;
+
+    // Cache the current max folder_number per person (including NULL for unsorted)
+    let mut max_numbers: HashMap<Option<String>, i64> = HashMap::new();
+
+    // Load existing max folder numbers for each person
+    let mut max_stmt = conn.prepare(
+        "SELECT primary_person_id, MAX(folder_number) FROM shots WHERE folder_number IS NOT NULL GROUP BY primary_person_id"
+    )?;
+    let existing_maxes: Vec<(Option<String>, i64)> = max_stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (person_id, max_num) in existing_maxes {
+        max_numbers.insert(person_id, max_num);
+    }
+
+    let mut total_assigned = 0;
+    for (shot_id, person_id) in &shots {
+        let next_number = max_numbers
+            .get(person_id)
+            .map(|n| n + 1)
+            .unwrap_or(1);
+
+        update_stmt.execute(params![next_number, shot_id])?;
+        max_numbers.insert(person_id.clone(), next_number);
+        total_assigned += 1;
+    }
+
+    info!("Folder number assignment: {} shots assigned numbers", total_assigned);
+
+    Ok(())
+}
+
+/// Run face detection on an image and collect results without writing to DB.
+fn detect_faces_collect(
+    ai: &crate::ai::AiPipeline,
+    img: &DynamicImage,
+) -> Vec<FaceResult> {
+    let (img_w, img_h) = img.dimensions();
+    let detections = ai.detect_faces(img).unwrap_or_default();
+    let mut results = Vec::new();
+
+    for det in detections {
+        let x1 = (det.box_x1 as u32).min(img_w.saturating_sub(1));
+        let y1 = (det.box_y1 as u32).min(img_h.saturating_sub(1));
+        let x2 = (det.box_x2 as u32).min(img_w);
+        let y2 = (det.box_y2 as u32).min(img_h);
+
+        let face_w = x2.saturating_sub(x1);
+        let face_h = y2.saturating_sub(y1);
+
+        if face_w < 10 || face_h < 10 {
+            continue;
+        }
+
+        let bbox = (det.box_x1, det.box_y1, det.box_x2, det.box_y2);
+        let embedding = ai
+            .extract_embedding(img, det.landmarks.as_deref(), bbox)
+            .unwrap_or_default();
+        if embedding.is_empty() {
+            continue;
+        }
+
+        let embedding_blob = match bincode::serialize(&embedding) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        results.push(FaceResult {
+            face_id: Uuid::new_v4().to_string(),
+            box_x1: det.box_x1,
+            box_y1: det.box_y1,
+            box_x2: det.box_x2,
+            box_y2: det.box_y2,
+            embedding_blob,
+            score: det.score,
+        });
+    }
+
+    results
+}
+
+/// Intermediate face detection result for batch DB writes.
+struct FaceResult {
+    face_id: String,
+    box_x1: f32,
+    box_y1: f32,
+    box_x2: f32,
+    box_y2: f32,
+    embedding_blob: Vec<u8>,
+    score: f32,
+}
+
+/// Intermediate keyframe result for batch DB writes.
+struct KeyframeResult {
+    kf_id: String,
+    timestamp_ms: i64,
+    kf_path: String,
+    faces: Vec<FaceResult>,
 }
 
 /// Get video dimensions using ffmpeg.
@@ -938,16 +1212,16 @@ mod tests {
     fn test_scanner_integration() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let photos_dir = dir.path().join("photos");
-        fs::create_dir(&photos_dir).unwrap();
+        let media_dir = dir.path().join("media");
+        fs::create_dir(&media_dir).unwrap();
 
-        let photo_path = photos_dir.join("test.jpg");
-        fs::write(&photo_path, b"fake image data").unwrap();
+        let file_path = media_dir.join("test.jpg");
+        fs::write(&file_path, b"fake image data").unwrap();
 
         let _conn = crate::db::init_db(&db_path).unwrap();
         let scanner = Scanner::new(db_path.clone(), None);
 
-        scanner.scan(&photos_dir).unwrap();
+        scanner.scan(&media_dir).unwrap();
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let count: i64 = conn
@@ -960,11 +1234,11 @@ mod tests {
     fn test_remove_file() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let photos_dir = dir.path().join("photos");
-        fs::create_dir(&photos_dir).unwrap();
+        let shots_dir = dir.path().join("shots");
+        fs::create_dir(&shots_dir).unwrap();
 
-        let photo_path = photos_dir.join("remove_me.jpg");
-        fs::write(&photo_path, b"fake image data for removal").unwrap();
+        let shot_path = shots_dir.join("remove_me.jpg");
+        fs::write(&shot_path, b"fake image data for removal").unwrap();
 
         let _conn = crate::db::init_db(&db_path).unwrap();
         let scanner = Scanner::new(db_path.clone(), None);
@@ -972,34 +1246,35 @@ mod tests {
         // Process the file first
         {
             let conn = scanner.open_db().unwrap();
-            scanner.process_file(&conn, &photo_path).unwrap();
+            let dhash_cache = std::sync::Mutex::new(Vec::<DHashCacheEntry>::new());
+            scanner.process_file(&conn, &shot_path, &dhash_cache).unwrap();
 
             let count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(count, 1);
 
-            let photo_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
+            let shot_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM shots", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(photo_count, 1);
+            assert_eq!(shot_count, 1);
         }
 
         // Now remove it
         {
             let conn = scanner.open_db().unwrap();
-            scanner.remove_file(&conn, &photo_path).unwrap();
+            scanner.remove_file(&conn, &shot_path).unwrap();
 
             let count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(count, 0);
 
-            // Photo should also be removed since it has no remaining files
-            let photo_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
+            // Shot should also be removed since it has no remaining files
+            let shot_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM shots", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(photo_count, 0);
+            assert_eq!(shot_count, 0);
         }
     }
 

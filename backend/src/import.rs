@@ -98,9 +98,9 @@ struct ImportStats {
     skipped_error: AtomicU64,
 }
 
-pub fn run_import(source: &Path, target: &Path, move_files: bool) -> anyhow::Result<()> {
+pub fn run_import(source: &Path, target: &Path, move_files: bool, threads: usize) -> anyhow::Result<()> {
     // AI is mandatory for import — reject dummy mode
-    if std::env::var("PHOS_DUMMY_AI").is_ok() {
+    if std::env::var("PHOS_DUMMY_AI").ok().is_some_and(|v| v == "1") {
         anyhow::bail!(
             "PHOS_DUMMY_AI is set but AI models are required for import. \
              Unset PHOS_DUMMY_AI and ensure models can be downloaded."
@@ -159,8 +159,9 @@ pub fn run_import(source: &Path, target: &Path, move_files: bool) -> anyhow::Res
     // Load dHash cache (starts empty, grows as we import)
     let dhash_cache = Mutex::new(load_dhash_cache(&conn));
 
+    info!("Using {} import threads", threads);
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(scanner::half_available_threads())
+        .num_threads(threads)
         .build()?;
 
     pool.install(|| {
@@ -212,6 +213,96 @@ pub fn run_import(source: &Path, target: &Path, move_files: bool) -> anyhow::Res
     Ok(())
 }
 
+pub fn run_remote_import(source_str: &str, target_url: &str, threads: usize) -> anyhow::Result<()> {
+    let source = Path::new(source_str);
+    if !source.exists() {
+        anyhow::bail!("Source directory does not exist: {:?}", source);
+    }
+
+    // Collect files
+    let source_files: Vec<PathBuf> = WalkDir::new(source)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| scanner::is_media_file(e.path()))
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    let total = source_files.len() as u64;
+    info!("Found {} media files for remote import", total);
+
+    if total == 0 {
+        return Ok(());
+    }
+
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .unwrap(),
+    );
+
+    let base_url = format!("{}/api/import/upload", target_url.trim_end_matches('/'));
+
+    info!("Using {} upload threads", threads);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()?;
+
+    pool.install(|| {
+        source_files.par_iter().for_each(|path| {
+            let filename = path.file_name().unwrap().to_string_lossy().to_string();
+            pb.set_message(filename.clone());
+
+            let file_bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Failed to read {:?}: {}", path, e);
+                    pb.inc(1);
+                    return;
+                }
+            };
+
+            let client = ureq::Agent::new_with_defaults();
+            let encoded_filename = urlencoding::encode(&filename);
+            let url = format!("{}?filename={}", base_url, encoded_filename);
+
+            match client.put(&url)
+                .header("Content-Type", "application/octet-stream")
+                .send(file_bytes)
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Failed to upload {}: {}", filename, e);
+                }
+            }
+
+            pb.inc(1);
+        });
+    });
+
+    pb.finish_with_message("Upload complete!");
+
+    // Trigger server-side face clustering and reorganization
+    info!("Triggering post-import finalization on server...");
+    let finalize_url = format!(
+        "{}/api/import/finalize",
+        target_url.trim_end_matches('/')
+    );
+    let client = ureq::Agent::new_with_defaults();
+    match client.post(&finalize_url).send_empty() {
+        Ok(_) => {
+            println!("Post-import finalization complete (face clustering + reorganization).");
+        }
+        Err(e) => {
+            error!("Finalize request failed: {}", e);
+            println!("Warning: post-import finalization failed: {}. You can trigger it manually via the UI.", e);
+        }
+    }
+
+    Ok(())
+}
+
 fn import_single_file(
     source_path: &Path,
     target: &Path,
@@ -258,7 +349,7 @@ fn import_single_file(
     let img: Option<DynamicImage> = if is_video {
         scanner::extract_first_video_frame(source_path).ok()
     } else {
-        image::open(source_path).ok()
+        scanner::open_image(source_path).ok()
     };
 
     // 3. Compute dHash and check for variations
@@ -338,8 +429,12 @@ fn import_single_file(
     }
 
     // 6. Full DB indexing via scanner
+    // Create a scanner-specific dHash cache for process_file.
+    // Import already handles variation detection separately via its own cache,
+    // so this cache starts empty — its purpose is just to satisfy the API.
+    let scan_dhash_cache = std::sync::Mutex::new(Vec::<scanner::DHashCacheEntry>::new());
     let scan_conn = scanner.open_db()?;
-    scanner.process_file(&scan_conn, &target_path)?;
+    scanner.process_file(&scan_conn, &target_path, &scan_dhash_cache)?;
 
     // Update dHash cache with the newly imported file (brief lock)
     if let Some(ref img) = img {
@@ -473,19 +568,205 @@ fn get_ai_from_scanner(scanner: &Scanner) -> Option<&AiPipeline> {
     scanner.ai()
 }
 
+/// Sanitize a name for use as a filesystem folder name.
+/// Strips characters that are illegal on common filesystems: `/\:*?"<>|`
+/// and trims leading/trailing whitespace. Returns the sanitized string.
+pub fn sanitize_folder_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Ensure every person in the DB has a non-NULL `folder_name`.
+/// For people with a `name`, sanitize it. For unnamed people, use the UUID.
+/// Handles collisions by appending " (2)", " (3)", etc.
+fn ensure_folder_names(conn: &Connection) -> anyhow::Result<()> {
+    // Find people whose folder_name is NULL
+    let mut stmt = conn.prepare("SELECT id, name FROM people WHERE folder_name IS NULL")?;
+    let people: Vec<(String, Option<String>)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (person_id, name) in people {
+        let base = match name {
+            Some(ref n) if !n.trim().is_empty() => sanitize_folder_name(n),
+            _ => person_id.clone(),
+        };
+
+        let folder_name = find_unique_folder_name(conn, &base, Some(&person_id))?;
+
+        conn.execute(
+            "UPDATE people SET folder_name = ? WHERE id = ?",
+            params![folder_name, person_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Find a folder_name that doesn't collide with existing ones in the people table.
+/// `exclude_person_id` allows excluding the person being renamed from collision checks.
+fn find_unique_folder_name(
+    conn: &Connection,
+    base_name: &str,
+    exclude_person_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let candidate = base_name.to_string();
+    if !folder_name_exists(conn, &candidate, exclude_person_id)? {
+        return Ok(candidate);
+    }
+
+    let mut suffix = 2u32;
+    loop {
+        let candidate = format!("{} ({})", base_name, suffix);
+        if !folder_name_exists(conn, &candidate, exclude_person_id)? {
+            return Ok(candidate);
+        }
+        suffix += 1;
+        if suffix > 1000 {
+            anyhow::bail!("Could not find a unique folder name for '{}'", base_name);
+        }
+    }
+}
+
+/// Check if a folder_name already exists in the people table,
+/// optionally excluding a specific person_id from the check.
+fn folder_name_exists(
+    conn: &Connection,
+    folder_name: &str,
+    exclude_person_id: Option<&str>,
+) -> anyhow::Result<bool> {
+    let count: i64 = match exclude_person_id {
+        Some(pid) => conn.query_row(
+            "SELECT COUNT(*) FROM people WHERE folder_name = ? AND id != ?",
+            params![folder_name, pid],
+            |row| row.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM people WHERE folder_name = ?",
+            params![folder_name],
+            |row| row.get(0),
+        )?,
+    };
+    Ok(count > 0)
+}
+
+/// Rename a person's folder on disk and update all related DB records.
+///
+/// 1. Computes a new `folder_name` by sanitizing `new_name` and handling collisions.
+/// 2. Renames the directory on disk from old folder_name to new folder_name.
+/// 3. Batch-updates `files.path` in the DB for all files under that person's shots.
+/// 4. Updates `people.folder_name` and `people.name`.
+pub fn rename_person_folder(
+    conn: &Connection,
+    library: &Path,
+    person_id: &str,
+    new_name: &str,
+) -> anyhow::Result<()> {
+    // Get the current folder_name for this person
+    let old_folder_name: Option<String> = conn
+        .query_row(
+            "SELECT folder_name FROM people WHERE id = ?",
+            params![person_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("Person '{}' not found", person_id))?;
+
+    let old_folder_name = old_folder_name
+        .unwrap_or_else(|| person_id.to_string());
+
+    // Compute new folder_name with collision handling
+    let sanitized = sanitize_folder_name(new_name);
+    if sanitized.is_empty() {
+        anyhow::bail!("Sanitized folder name is empty for '{}'", new_name);
+    }
+    let new_folder_name = find_unique_folder_name(conn, &sanitized, Some(person_id))?;
+
+    if old_folder_name == new_folder_name {
+        // Just update the display name, folder_name stays the same
+        conn.execute(
+            "UPDATE people SET name = ? WHERE id = ?",
+            params![new_name, person_id],
+        )?;
+        return Ok(());
+    }
+
+    let old_dir = library.join(&old_folder_name);
+    let new_dir = library.join(&new_folder_name);
+
+    // Rename directory on disk if it exists
+    if old_dir.exists() {
+        if new_dir.exists() {
+            anyhow::bail!(
+                "Target directory {:?} already exists on disk",
+                new_dir
+            );
+        }
+        fs::rename(&old_dir, &new_dir)?;
+        info!(
+            "Renamed directory {:?} -> {:?}",
+            old_dir, new_dir
+        );
+    }
+
+    // Batch-update files.path: replace old folder_name prefix with new one
+    // Find all files that belong to shots assigned to this person
+    let old_prefix = format!("{}/", old_dir.to_string_lossy());
+    let new_prefix = format!("{}/", new_dir.to_string_lossy());
+
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.path FROM files f
+         JOIN shots s ON f.shot_id = s.id
+         WHERE s.primary_person_id = ?",
+    )?;
+    let files: Vec<(String, String)> = stmt
+        .query_map(params![person_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (file_id, file_path) in &files {
+        if file_path.starts_with(&old_prefix) {
+            let new_path = format!("{}{}", new_prefix, &file_path[old_prefix.len()..]);
+            conn.execute(
+                "UPDATE files SET path = ? WHERE id = ?",
+                params![new_path, file_id],
+            )?;
+        }
+    }
+
+    // Update people table
+    conn.execute(
+        "UPDATE people SET name = ?, folder_name = ? WHERE id = ?",
+        params![new_name, new_folder_name, person_id],
+    )?;
+
+    info!(
+        "Person '{}' renamed to '{}' (folder: '{}' -> '{}')",
+        person_id, new_name, old_folder_name, new_folder_name
+    );
+
+    Ok(())
+}
+
 /// Reorganize files on disk to match current face clustering.
 ///
 /// Opens the `.phos.db` in the library, re-clusters faces, then moves each file
-/// into `library/<person_id>/filename` (or `library/unsorted/filename` if no
-/// person is associated). Updates `files.path` in the DB after each move and
-/// cleans up empty directories afterwards.
+/// into `library/<person.folder_name>/<folder_number>/filename` (or
+/// `library/unsorted/<folder_number>/filename` if no person is associated).
+/// Updates `files.path` in the DB after each move and cleans up empty directories afterwards.
 pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     let db_path = library.join(".phos.db");
     if !db_path.exists() {
         anyhow::bail!("No .phos.db found in {:?}", library);
     }
 
-    let conn = db::init_db(&db_path)?;
+    let conn = db::open_connection(&db_path)?;
     info!("Database opened at {:?}", db_path);
 
     // Re-cluster faces (no AI models needed — uses existing embeddings)
@@ -493,34 +774,52 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     info!("Running face clustering...");
     scanner.cluster_faces(&conn)?;
 
-    // Load all photos with their files from the DB
-    // Group files by photo_id so we maintain <person>/<photo>/<files> structure
+    // Ensure all people have folder_name set (use UUID for unnamed people)
+    ensure_folder_names(&conn)?;
+
+    // Load all shots with their files, joining people for folder_name and
+    // using shots.primary_person_id and shots.folder_number
     let mut stmt = conn.prepare(
-        "SELECT p.id, f.id, f.path FROM photos p JOIN files f ON f.photo_id = p.id"
+        "SELECT s.id, f.id, f.path, s.primary_person_id, s.folder_number,
+                p.folder_name
+         FROM shots s
+         JOIN files f ON f.shot_id = s.id
+         LEFT JOIN people p ON s.primary_person_id = p.id"
     )?;
-    let rows: Vec<(String, String, String)> = stmt
+
+    struct FileRow {
+        shot_id: String,
+        file_id: String,
+        path: String,
+        primary_person_id: Option<String>,
+        folder_number: Option<i64>,
+        person_folder_name: Option<String>,
+    }
+
+    let rows: Vec<FileRow> = stmt
         .query_map([], |row| {
-            let photo_id: String = row.get(0)?;
-            let file_id: String = row.get(1)?;
-            let path: String = row.get(2)?;
-            Ok((photo_id, file_id, path))
+            Ok(FileRow {
+                shot_id: row.get(0)?,
+                file_id: row.get(1)?,
+                path: row.get(2)?,
+                primary_person_id: row.get(3)?,
+                folder_number: row.get(4)?,
+                person_folder_name: row.get(5)?,
+            })
         })?
         .filter_map(|r| r.ok())
         .collect();
 
-    // Group by photo_id
-    let mut photos: std::collections::BTreeMap<String, Vec<(String, String)>> =
+    // Group by shot_id
+    let mut shots: std::collections::BTreeMap<String, Vec<&FileRow>> =
         std::collections::BTreeMap::new();
-    for (photo_id, file_id, path) in &rows {
-        photos
-            .entry(photo_id.clone())
-            .or_default()
-            .push((file_id.clone(), path.clone()));
+    for row in &rows {
+        shots.entry(row.shot_id.clone()).or_default().push(row);
     }
 
     let total = rows.len() as u64;
     let action = if dry_run { "Planning" } else { "Reorganizing" };
-    println!("{} {} files across {} photos...", action, total, photos.len());
+    println!("{} {} files across {} shots...", action, total, shots.len());
 
     let pb = ProgressBar::new(total);
     pb.set_style(
@@ -534,33 +833,34 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     let mut skipped = 0u64;
     let mut errors = 0u64;
 
-    for (photo_id, files) in &photos {
-        // Find the primary person for this photo:
-        // Look across ALL files of this photo, pick face with highest score / largest bbox
-        let file_ids: Vec<&str> = files.iter().map(|(fid, _)| fid.as_str()).collect();
-        let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let query = format!(
-            "SELECT person_id FROM faces WHERE file_id IN ({}) AND person_id IS NOT NULL \
-             ORDER BY score DESC, (box_x2 - box_x1) * (box_y2 - box_y1) DESC LIMIT 1",
-            placeholders
-        );
-        let mut person_stmt = conn.prepare(&query)?;
-        let primary_person: Option<String> = person_stmt
-            .query_row(
-                rusqlite::params_from_iter(file_ids.iter()),
-                |row| row.get(0),
-            )
-            .ok();
+    for (_shot_id, files) in &shots {
+        // All files in a shot share the same primary_person_id and folder_number,
+        // so use the first file's metadata.
+        let first = files[0];
 
-        // Target: library/<person_id>/<photo_id>/ or library/unsorted/<photo_id>/
-        let person_dir = match &primary_person {
-            Some(person_id) => library.join(person_id),
-            None => library.join("unsorted"),
+        // Determine the person folder name:
+        // - If primary_person_id is set, use person.folder_name (or person_id as fallback)
+        // - Otherwise, use "unsorted"
+        let person_folder = match &first.primary_person_id {
+            Some(pid) => first
+                .person_folder_name
+                .clone()
+                .unwrap_or_else(|| pid.clone()),
+            None => "unsorted".to_string(),
         };
-        let target_dir = person_dir.join(photo_id);
 
-        for (file_id, current_path_str) in files {
-            let current_path = PathBuf::from(current_path_str);
+        // Determine the folder_number subfolder. If NULL, use "000" as a fallback
+        // (shots without an assigned folder_number haven't been through assign_folder_numbers yet)
+        let folder_num_str = match first.folder_number {
+            Some(n) => format!("{:03}", n),
+            None => "000".to_string(),
+        };
+
+        // Target: library/<person_folder_name>/<folder_number>/
+        let target_dir = library.join(&person_folder).join(&folder_num_str);
+
+        for file_row in files {
+            let current_path = PathBuf::from(&file_row.path);
             pb.set_message(
                 current_path
                     .file_name()
@@ -572,7 +872,7 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
             let filename = current_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| format!("{}.unknown", file_id));
+                .unwrap_or_else(|| format!("{}.unknown", file_row.file_id));
 
             let mut target_path = target_dir.join(&filename);
 
@@ -604,7 +904,7 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
             // Compare paths
             if target_path == current_path {
                 if dry_run {
-                    pb.println(format!("SKIP: {} (already correct)", current_path_str));
+                    pb.println(format!("SKIP: {} (already correct)", file_row.path));
                 }
                 skipped += 1;
                 pb.inc(1);
@@ -613,8 +913,8 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
 
             if dry_run {
                 pb.println(format!(
-                    "MOVE: {} → {}",
-                    current_path_str,
+                    "MOVE: {} -> {}",
+                    file_row.path,
                     target_path.to_string_lossy()
                 ));
                 moved += 1;
@@ -635,12 +935,12 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                 // Update DB path
                 conn.execute(
                     "UPDATE files SET path = ? WHERE id = ?",
-                    params![target_path.to_string_lossy().as_ref(), file_id],
+                    params![target_path.to_string_lossy().as_ref(), file_row.file_id],
                 )?;
 
                 Ok(())
             })() {
-                pb.println(format!("ERROR: {} — {}", current_path_str, e));
+                pb.println(format!("ERROR: {} -- {}", file_row.path, e));
                 errors += 1;
                 pb.inc(1);
                 continue;
@@ -673,7 +973,7 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     }
     println!("  People count:    {}", people_count);
     if dry_run {
-        println!("  (dry run — no files were actually moved)");
+        println!("  (dry run -- no files were actually moved)");
     }
     println!("==========================");
 

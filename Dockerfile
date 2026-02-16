@@ -27,24 +27,30 @@ RUN apt-get update && apt-get install -y \
     libavfilter-dev \
     wget \
     unzip \
+    nasm \
+    yasm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
 # Create dummy src/main.rs to build dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
+RUN mkdir src && echo "fn main() {}" > src/main.rs && \
+    cargo build --release --features "" || true && \
+    rm -rf src
 
 COPY backend/src ./src
 RUN touch src/main.rs && cargo build --release
 
 # Stage 3: Final Image
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y \
     libssl3 \
     libsqlite3-0 \
     ffmpeg \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -g 1000 phos && useradd -u 1000 -g phos -m phos
 
 WORKDIR /app
 
@@ -54,10 +60,10 @@ COPY --from=backend-builder /app/backend/target/release/phos-backend ./phos-back
 # Copy frontend build
 COPY --from=frontend-builder /app/frontend/dist ./static
 
-# Models should be provided via volume or downloaded
-# For now, create the directory
-RUN mkdir models library
+# Create directories writable by the app user
+RUN mkdir models library && chown -R phos:phos /app
 
 EXPOSE 3000
 ENV PHOS_STATIC_DIR=/app/static
+USER 1000
 CMD ["./phos-backend"]

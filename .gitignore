@@ -1,3 +1,7 @@
 backend/target/
 frontend/node_modules/
 .phos.db
+data
+backend/Parsed
+.idea
+.claude/worktrees

@@ -2,11 +2,12 @@ services:
   phos:
     build: .
     ports:
-      - "3000:3000"
+      - "33000:33000"
     volumes:
-      - ./models:/app/models
-      - ./library:/app/test_library
+      - ./data/models:/app/models
+      - ./data/library:/app/library
     environment:
       - RUST_LOG=info
-      - PHOS_DUMMY_AI=1
+      #- PHOS_DUMMY_AI=1  # Uncomment to skip AI model loading
+      - PHOS_LIBRARY_PATH=/app/library
     restart: unless-stopped

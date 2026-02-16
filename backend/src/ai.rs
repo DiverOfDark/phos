@@ -346,7 +346,7 @@ pub fn align_face(
 
 impl AiPipeline {
     pub fn new() -> Result<Self> {
-        if std::env::var("PHOS_DUMMY_AI").is_ok() {
+        if std::env::var("PHOS_DUMMY_AI").ok().is_some_and(|v| v == "1") {
             return Ok(Self {
                 face_detector: None,
                 face_recognizer: None,
@@ -370,7 +370,7 @@ impl AiPipeline {
 
     pub fn detect_faces(&self, img: &DynamicImage) -> Result<Vec<FaceDetection>> {
         if let (Some(detector_mutex), false) =
-            (&self.face_detector, std::env::var("PHOS_DUMMY_AI").is_ok())
+            (&self.face_detector, std::env::var("PHOS_DUMMY_AI").ok().is_some_and(|v| v == "1"))
         {
             let (orig_w, orig_h) = img.dimensions();
             let target_size: u32 = 640;
@@ -835,7 +835,7 @@ impl AiPipeline {
     ) -> Result<Vec<f32>> {
         if let (Some(recognizer_mutex), false) = (
             &self.face_recognizer,
-            std::env::var("PHOS_DUMMY_AI").is_ok(),
+            std::env::var("PHOS_DUMMY_AI").ok().is_some_and(|v| v == "1"),
         ) {
             let rgb_img = align_face(img, landmarks, bbox);
 

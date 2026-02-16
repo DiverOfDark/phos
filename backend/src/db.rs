@@ -6,14 +6,39 @@ use std::path::Path;
 pub fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "busy_timeout", "5000")?;
+    conn.pragma_update(None, "busy_timeout", "60000")?;
     Ok(conn)
 }
 
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
-    let conn = Connection::open(path)?;
+    tracing::info!("Initializing database at {:?}", path.as_ref());
+    let conn = Connection::open(&path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", "5000")?;
+
+    // Check if we need to migrate from old schema (photos -> shots)
+    let has_photos_table: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='photos'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+
+    let has_shots_table: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='shots'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+
+    if has_photos_table && !has_shots_table {
+        tracing::info!("Detected old schema with 'photos' table. Running migration to 'shots'...");
+        migrate_photos_to_shots(&conn, &path)?;
+    }
 
     // We store people (clusters)
     conn.execute(
@@ -22,14 +47,15 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             name TEXT,
             thumbnail_face_id TEXT,
             representative_embedding BLOB,
+            folder_name TEXT UNIQUE,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )",
         [],
     )?;
 
-    // A photo is a conceptual media item that can have multiple files (original + edits)
+    // A shot is a conceptual media item that can have multiple files (original + edits)
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS photos (
+        "CREATE TABLE IF NOT EXISTS shots (
             id TEXT PRIMARY KEY,
             main_file_id TEXT,
             timestamp DATETIME,
@@ -37,7 +63,11 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             height INTEGER,
             latitude REAL,
             longitude REAL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            primary_person_id TEXT,
+            folder_number INTEGER,
+            review_status TEXT DEFAULT 'pending',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(primary_person_id) REFERENCES people(id)
         )",
         [],
     )?;
@@ -46,7 +76,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS files (
             id TEXT PRIMARY KEY,
-            photo_id TEXT NOT NULL,
+            shot_id TEXT NOT NULL,
             path TEXT NOT NULL UNIQUE,
             hash TEXT NOT NULL,
             mime_type TEXT,
@@ -54,7 +84,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             is_original BOOLEAN DEFAULT 0,
             visual_embedding BLOB,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(photo_id) REFERENCES photos(id)
+            FOREIGN KEY(shot_id) REFERENCES shots(id)
         )",
         [],
     )?;
@@ -115,6 +145,13 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         )?;
     }
 
+    if !people_columns.contains(&"folder_name".to_string()) {
+        conn.execute(
+            "ALTER TABLE people ADD COLUMN folder_name TEXT UNIQUE",
+            [],
+        )?;
+    }
+
     // Add score column to faces if it doesn't exist (migration)
     let faces_columns: Vec<String> = conn
         .prepare("PRAGMA table_info(faces)")?
@@ -126,5 +163,122 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         conn.execute("ALTER TABLE faces ADD COLUMN score REAL", [])?;
     }
 
+    // Add new shot columns if they don't exist (for existing shots tables without them)
+    let shots_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(shots)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if !shots_columns.is_empty() {
+        if !shots_columns.contains(&"primary_person_id".to_string()) {
+            conn.execute(
+                "ALTER TABLE shots ADD COLUMN primary_person_id TEXT",
+                [],
+            )?;
+        }
+        if !shots_columns.contains(&"folder_number".to_string()) {
+            conn.execute(
+                "ALTER TABLE shots ADD COLUMN folder_number INTEGER",
+                [],
+            )?;
+        }
+        if !shots_columns.contains(&"review_status".to_string()) {
+            conn.execute(
+                "ALTER TABLE shots ADD COLUMN review_status TEXT DEFAULT 'pending'",
+                [],
+            )?;
+        }
+    }
+
     Ok(conn)
+}
+
+/// Migrate from the old `photos` table schema to the new `shots` table schema.
+/// This creates a backup, renames tables/columns within a transaction, and drops the old table.
+fn migrate_photos_to_shots<P: AsRef<Path>>(conn: &Connection, db_path: P) -> Result<()> {
+    // Back up the database file
+    let db_path = db_path.as_ref();
+    let backup_path = db_path.with_extension("db.bak");
+    if let Err(e) = std::fs::copy(db_path, &backup_path) {
+        tracing::warn!(
+            "Failed to create DB backup at {:?}: {}. Proceeding with migration anyway.",
+            backup_path,
+            e
+        );
+    } else {
+        tracing::info!("Database backed up to {:?}", backup_path);
+    }
+
+    conn.execute_batch("BEGIN TRANSACTION")?;
+
+    // Create the new shots table with all new columns
+    conn.execute_batch(
+        "CREATE TABLE shots (
+            id TEXT PRIMARY KEY,
+            main_file_id TEXT,
+            timestamp DATETIME,
+            width INTEGER,
+            height INTEGER,
+            latitude REAL,
+            longitude REAL,
+            primary_person_id TEXT,
+            folder_number INTEGER,
+            review_status TEXT DEFAULT 'pending',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(primary_person_id) REFERENCES people(id)
+        );
+
+        INSERT INTO shots (id, main_file_id, timestamp, width, height, latitude, longitude, created_at)
+            SELECT id, main_file_id, timestamp, width, height, latitude, longitude, created_at
+            FROM photos;"
+    )?;
+
+    // Rename photo_id -> shot_id in files table
+    // SQLite ALTER TABLE RENAME COLUMN is supported since 3.25.0
+    let files_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(files)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if files_columns.contains(&"photo_id".to_string()) {
+        conn.execute_batch("ALTER TABLE files RENAME COLUMN photo_id TO shot_id")?;
+    }
+
+    // Add folder_name column to people if it doesn't exist
+    let people_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(people)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if !people_columns.contains(&"folder_name".to_string()) {
+        conn.execute_batch("ALTER TABLE people ADD COLUMN folder_name TEXT UNIQUE")?;
+    }
+
+    // Populate folder_name from name or id
+    conn.execute_batch(
+        "UPDATE people SET folder_name = COALESCE(name, id) WHERE folder_name IS NULL"
+    )?;
+
+    // Ensure exactly one is_original = 1 per shot.
+    // For shots where no file has is_original = 1, set the first file as original.
+    conn.execute_batch(
+        "UPDATE files SET is_original = 1
+         WHERE id IN (
+             SELECT MIN(f.id) FROM files f
+             LEFT JOIN (SELECT shot_id FROM files WHERE is_original = 1) o ON f.shot_id = o.shot_id
+             WHERE o.shot_id IS NULL
+             GROUP BY f.shot_id
+         )"
+    )?;
+
+    // Drop the old photos table
+    conn.execute_batch("DROP TABLE photos")?;
+
+    conn.execute_batch("COMMIT")?;
+
+    tracing::info!("Migration from 'photos' to 'shots' completed successfully.");
+    Ok(())
 }

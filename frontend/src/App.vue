@@ -1,9 +1,8 @@
 <script setup>
 import { ref, onMounted, computed, nextTick } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import {
   Dialog,
   DialogContent,
@@ -24,14 +23,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
-import Gallery from '@/components/Gallery.vue'
-import PeopleList from '@/components/PeopleList.vue'
-import Timeline from '@/components/Timeline.vue'
-
 import {
-  Activity,
-  Image as ImageIcon,
-  Users,
   Settings,
   Search,
   Upload,
@@ -43,55 +35,38 @@ import {
   Zap,
   FolderOpen,
   Check,
-  AlertCircle
+  AlertCircle,
+  ClipboardCheck,
+  Users,
+  Image as ImageIcon,
 } from 'lucide-vue-next'
 
-// --- Navigation ---
-const currentView = ref('library')
+// --- Router ---
+const route = useRoute()
+const router = useRouter()
 
-function setView(view) {
-  currentView.value = view
-}
+const currentView = computed(() => route.meta.view || 'organize')
 
-// --- View titles ---
-const viewTitle = computed(() => {
-  switch (currentView.value) {
-    case 'library': return 'Library'
-    case 'people': return 'People'
-    case 'timeline': return 'Timeline'
-    default: return 'Library'
-  }
-})
+// --- Pending count for Review badge ---
+const pendingCount = ref(0)
 
-const viewDescription = computed(() => {
-  switch (currentView.value) {
-    case 'library': return 'Your personal AI-curated photo laboratory.'
-    case 'people': return 'Face clusters detected by the AI engine.'
-    case 'timeline': return 'Browse your memories chronologically.'
-    default: return 'Your personal AI-curated photo laboratory.'
-  }
-})
-
-// --- Stats ---
-const stats = ref([
-  { name: 'Total Media', value: '0', icon: ImageIcon, description: 'Images and videos indexed' },
-  { name: 'Detected People', value: '0', icon: Users, description: 'Face clusters identified' },
-  { name: 'System Status', value: 'Idle', icon: Activity, description: 'Backend processing state' },
-])
-
-async function fetchStats() {
+async function fetchPendingCount() {
   try {
-    const res = await fetch('/api/stats')
+    const res = await fetch('/api/organize/stats')
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
-    stats.value = [
-      { name: 'Total Media', value: String(data.total_photos || 0), icon: ImageIcon, description: `${data.total_files || 0} files indexed` },
-      { name: 'Detected People', value: String(data.total_people || 0), icon: Users, description: 'Face clusters identified' },
-      { name: 'System Status', value: 'Online', icon: Activity, description: 'Backend connected' },
-    ]
-  } catch (e) {
-    console.warn('Could not fetch stats:', e.message)
-    stats.value[2] = { name: 'System Status', value: 'Offline', icon: Activity, description: 'Backend not reachable' }
+    pendingCount.value = data.pending_review || 0
+  } catch {
+    // Fallback: try the old stats endpoint
+    try {
+      const res = await fetch('/api/stats')
+      if (res.ok) {
+        // Old API doesn't have pending count
+        pendingCount.value = 0
+      }
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -102,10 +77,8 @@ const libraryPath = ref(localStorage.getItem('phos_library_path') || '/mnt/photo
 const scanMessage = ref('')
 const scanError = ref('')
 
-// Reference to Gallery/Timeline/People components for refreshing
-const galleryRef = ref(null)
-const peopleRef = ref(null)
-const timelineRef = ref(null)
+// Reference to the current route component for refreshing
+const routeComponentRef = ref(null)
 
 const startScan = async () => {
   if (isScanning.value) return
@@ -138,27 +111,24 @@ const startScan = async () => {
       }
     }, 300)
 
-    // Poll stats to detect when scan finishes (stats change)
+    // Poll to detect when scan finishes
     const pollInterval = setInterval(async () => {
       try {
-        await fetchStats()
-        // After some time, assume scan is done and refresh
+        await fetchPendingCount()
         if (progress >= 95) {
           clearInterval(pollInterval)
           clearInterval(interval)
           scanProgress.value = 100
           scanMessage.value = 'Scan complete!'
 
-          // Refresh gallery, timeline, and people data
+          // Refresh the current route component's data
           await nextTick()
-          if (galleryRef.value?.fetchPhotos) {
-            galleryRef.value.fetchPhotos()
-          }
-          if (timelineRef.value?.fetchPhotos) {
-            timelineRef.value.fetchPhotos()
-          }
-          if (peopleRef.value?.fetchPeople) {
-            peopleRef.value.fetchPeople()
+          const comp = routeComponentRef.value
+          if (comp) {
+            comp.loadData?.()
+            comp.fetchPhotos?.()
+            comp.fetchPeople?.()
+            comp.fetchShots?.()
           }
 
           setTimeout(() => {
@@ -167,7 +137,7 @@ const startScan = async () => {
             scanMessage.value = ''
           }, 2000)
         }
-      } catch (e) {
+      } catch {
         // ignore polling errors
       }
     }, 3000)
@@ -176,7 +146,6 @@ const startScan = async () => {
     console.error('Scan failed:', e)
     scanError.value = e.message || 'Scan failed. Is the backend running?'
 
-    // Still show progress animation for visual feedback
     let progress = 0
     const interval = setInterval(() => {
       progress += 5
@@ -219,17 +188,14 @@ const handleImportScan = async () => {
 
     importMessage.value = `Scanning "${pathToScan}" started. This may take a while...`
 
-    // Wait a bit then refresh stats, gallery, timeline, and people
     setTimeout(async () => {
-      await fetchStats()
-      if (galleryRef.value?.fetchPhotos) {
-        galleryRef.value.fetchPhotos()
-      }
-      if (timelineRef.value?.fetchPhotos) {
-        timelineRef.value.fetchPhotos()
-      }
-      if (peopleRef.value?.fetchPeople) {
-        peopleRef.value.fetchPeople()
+      await fetchPendingCount()
+      const comp = routeComponentRef.value
+      if (comp) {
+        comp.loadData?.()
+        comp.fetchPhotos?.()
+        comp.fetchPeople?.()
+        comp.fetchShots?.()
       }
       isImporting.value = false
     }, 5000)
@@ -243,8 +209,6 @@ const handleImportScan = async () => {
 
 const handleDrop = (e) => {
   isDragging.value = false
-  // Since this is a server-side app, drag and drop of local files doesn't apply.
-  // Show a helpful message instead.
   importMessage.value = 'Phos scans server-side directories. Enter a path above and click "Scan Directory".'
 }
 
@@ -257,15 +221,9 @@ function saveLibraryPath() {
   setTimeout(() => { settingsSaved.value = false }, 2000)
 }
 
-// --- Has content (to decide whether to show empty state or gallery) ---
-const hasPhotos = computed(() => {
-  const mediaVal = parseInt(stats.value[0]?.value)
-  return !isNaN(mediaVal) && mediaVal > 0
-})
-
 // --- Init ---
 onMounted(() => {
-  fetchStats()
+  fetchPendingCount()
 })
 </script>
 
@@ -275,53 +233,102 @@ onMounted(() => {
     <header class="border-b border-white/5 bg-zinc-950/80 backdrop-blur-xl sticky top-0 z-50">
       <div class="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
         <div class="flex items-center gap-4 md:gap-8">
-          <div class="flex items-center gap-2.5 group cursor-pointer" @click="setView('library')">
+          <router-link to="/" class="flex items-center gap-2.5 group">
             <div class="w-9 h-9 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20 group-hover:scale-105 transition-transform">
               <span class="text-white font-black text-lg">P</span>
             </div>
             <span class="text-xl font-bold tracking-tight text-white hidden xs:block">Phos</span>
-          </div>
+          </router-link>
 
+          <!-- Desktop Navigation -->
           <nav class="hidden md:flex items-center gap-1">
-            <Button
-              variant="ghost"
-              :class="cn(
-                'gap-2 px-3 transition-colors',
-                currentView === 'library'
-                  ? 'text-white bg-white/10'
-                  : 'text-zinc-400 hover:text-white hover:bg-white/5'
-              )"
-              @click="setView('library')"
-            >
-              <LayoutGrid class="w-4 h-4" />
-              Library
-            </Button>
-            <Button
-              variant="ghost"
-              :class="cn(
-                'gap-2 px-3 transition-colors',
-                currentView === 'people'
-                  ? 'text-white bg-white/10'
-                  : 'text-zinc-400 hover:text-white hover:bg-white/5'
-              )"
-              @click="setView('people')"
-            >
-              <Users class="w-4 h-4" />
-              People
-            </Button>
-            <Button
-              variant="ghost"
-              :class="cn(
-                'gap-2 px-3 transition-colors',
-                currentView === 'timeline'
-                  ? 'text-white bg-white/10'
-                  : 'text-zinc-400 hover:text-white hover:bg-white/5'
-              )"
-              @click="setView('timeline')"
-            >
-              <Clock class="w-4 h-4" />
-              Timeline
-            </Button>
+            <!-- Primary Nav -->
+            <router-link to="/" custom v-slot="{ navigate }">
+              <Button
+                variant="ghost"
+                :class="cn(
+                  'gap-2 px-3 transition-colors',
+                  currentView === 'organize'
+                    ? 'text-white bg-white/10'
+                    : 'text-zinc-400 hover:text-white hover:bg-white/5'
+                )"
+                @click="navigate"
+              >
+                <LayoutGrid class="w-4 h-4" />
+                Organize
+              </Button>
+            </router-link>
+            <router-link to="/review" custom v-slot="{ navigate }">
+              <Button
+                variant="ghost"
+                :class="cn(
+                  'gap-2 px-3 transition-colors',
+                  currentView === 'review'
+                    ? 'text-white bg-white/10'
+                    : 'text-zinc-400 hover:text-white hover:bg-white/5'
+                )"
+                @click="navigate"
+              >
+                <ClipboardCheck class="w-4 h-4" />
+                Review
+                <span
+                  v-if="pendingCount > 0"
+                  class="ml-1 px-1.5 py-0.5 bg-yellow-500/20 text-yellow-400 rounded text-[10px] font-bold leading-none"
+                >
+                  {{ pendingCount }}
+                </span>
+              </Button>
+            </router-link>
+            <router-link to="/people" custom v-slot="{ navigate }">
+              <Button
+                variant="ghost"
+                :class="cn(
+                  'gap-2 px-3 transition-colors',
+                  currentView === 'people'
+                    ? 'text-white bg-white/10'
+                    : 'text-zinc-400 hover:text-white hover:bg-white/5'
+                )"
+                @click="navigate"
+              >
+                <Users class="w-4 h-4" />
+                People
+              </Button>
+            </router-link>
+
+            <!-- Separator -->
+            <div class="h-5 w-[1px] bg-white/10 mx-2"></div>
+
+            <!-- Secondary Nav -->
+            <router-link to="/browse" custom v-slot="{ navigate }">
+              <Button
+                variant="ghost"
+                :class="cn(
+                  'gap-2 px-3 transition-colors text-sm',
+                  currentView === 'browse'
+                    ? 'text-white bg-white/10'
+                    : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/5'
+                )"
+                @click="navigate"
+              >
+                <ImageIcon class="w-3.5 h-3.5" />
+                Browse
+              </Button>
+            </router-link>
+            <router-link to="/timeline" custom v-slot="{ navigate }">
+              <Button
+                variant="ghost"
+                :class="cn(
+                  'gap-2 px-3 transition-colors text-sm',
+                  currentView === 'timeline'
+                    ? 'text-white bg-white/10'
+                    : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/5'
+                )"
+                @click="navigate"
+              >
+                <Clock class="w-3.5 h-3.5" />
+                Timeline
+              </Button>
+            </router-link>
           </nav>
         </div>
 
@@ -478,104 +485,12 @@ onMounted(() => {
       </div>
     </header>
 
+    <!-- Main Content Area -->
     <main class="max-w-7xl mx-auto p-4 sm:p-6 md:p-8 lg:p-10">
-      <!-- Welcome Header -->
-      <div class="mb-8 md:mb-12">
-        <h2 class="text-3xl md:text-4xl font-bold tracking-tight text-white mb-3 text-glow">{{ viewTitle }}</h2>
-        <p class="text-zinc-400 text-lg">{{ viewDescription }}</p>
-      </div>
-
-      <!-- Stats Grid -->
-      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6 mb-12">
-        <Card v-for="stat in stats" :key="stat.name" class="bg-zinc-900/40 border-white/5 backdrop-blur-sm group hover:border-indigo-500/30 transition-all duration-300">
-          <CardHeader class="flex flex-row items-center justify-between pb-2 space-y-0">
-            <CardTitle class="text-sm font-semibold text-zinc-400 group-hover:text-zinc-300">{{ stat.name }}</CardTitle>
-            <component :is="stat.icon" class="w-4 h-4 text-zinc-500 group-hover:text-indigo-400 transition-colors" />
-          </CardHeader>
-          <CardContent>
-            <div class="text-3xl font-bold text-white tracking-tight">{{ stat.value }}</div>
-            <p class="text-xs text-zinc-500 mt-2 font-medium leading-relaxed">{{ stat.description }}</p>
-          </CardContent>
-        </Card>
-      </div>
-
-      <!-- Main Content Area -->
-      <div class="relative">
-        <div class="flex items-center justify-between mb-6">
-          <h3 class="text-lg font-semibold text-white/90">
-            {{ currentView === 'people' ? 'Detected Faces' : currentView === 'timeline' ? 'Your Timeline' : 'Recent Discovery' }}
-          </h3>
-          <Button
-            v-if="currentView !== 'people' && currentView !== 'timeline'"
-            variant="link"
-            class="text-indigo-400 hover:text-indigo-300 p-0 h-auto font-medium"
-            @click="setView('library')"
-          >
-            Browse all
-          </Button>
-        </div>
-
-        <!-- Library View -->
-        <div v-if="currentView === 'library'">
-          <div v-if="hasPhotos" class="rounded-[2rem] border border-white/5 bg-zinc-900/20 backdrop-blur-sm p-6 shadow-2xl">
-            <Gallery ref="galleryRef" />
-          </div>
-          <ScrollArea v-else class="h-[400px] md:h-[500px] w-full rounded-[2rem] border border-white/5 bg-zinc-900/20 backdrop-blur-sm relative overflow-hidden group shadow-2xl">
-            <!-- Background Decoration -->
-            <div class="absolute inset-0 bg-gradient-to-br from-indigo-500/5 via-transparent to-purple-500/5 opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none"></div>
-
-            <div class="flex flex-col items-center justify-center h-full text-center p-8 sm:p-12 space-y-6 relative z-10">
-              <div class="relative">
-                <div class="absolute inset-0 bg-indigo-500 blur-3xl opacity-10 animate-pulse"></div>
-                <div class="w-20 h-20 bg-zinc-900 rounded-2xl flex items-center justify-center border border-white/5 shadow-2xl relative transition-transform group-hover:scale-110 duration-500">
-                  <ImageIcon class="w-10 h-10 text-zinc-700 group-hover:text-indigo-500 transition-colors duration-500" />
-                </div>
-              </div>
-
-              <div class="max-w-xs mx-auto">
-                <p class="text-xl font-bold text-white mb-2">No memories found</p>
-                <p class="text-zinc-500 text-sm leading-relaxed">
-                  Connect your library folder to start the AI-powered indexing and face clustering process.
-                </p>
-              </div>
-
-              <div class="w-full max-w-xs space-y-4">
-                 <Button
-                  @click="startScan"
-                  :disabled="isScanning"
-                  class="w-full bg-white text-black hover:bg-zinc-200 font-bold px-8 py-6 rounded-2xl transition-all active:scale-95 disabled:opacity-50 h-auto shadow-xl"
-                >
-                  <RefreshCw v-if="isScanning" class="w-5 h-5 mr-2 animate-spin" />
-                  {{ isScanning ? 'Initializing Engine...' : 'Scan Library' }}
-                </Button>
-
-                <!-- Scan feedback messages -->
-                <div v-if="scanMessage" class="flex items-start gap-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
-                  <Check class="w-4 h-4 text-emerald-500 mt-0.5 shrink-0" />
-                  <p class="text-xs text-emerald-400">{{ scanMessage }}</p>
-                </div>
-                <div v-if="scanError" class="flex items-start gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/20">
-                  <AlertCircle class="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
-                  <p class="text-xs text-red-400">{{ scanError }}</p>
-                </div>
-
-                <div v-if="isScanning" class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden">
-                   <div class="bg-indigo-500 h-full transition-all duration-300" :style="{ width: `${scanProgress}%` }"></div>
-                </div>
-              </div>
-            </div>
-          </ScrollArea>
-        </div>
-
-        <!-- Timeline View -->
-        <div v-if="currentView === 'timeline'" class="rounded-[2rem] border border-white/5 bg-zinc-900/20 backdrop-blur-sm p-6 shadow-2xl">
-          <Timeline ref="timelineRef" />
-        </div>
-
-        <!-- People View -->
-        <div v-if="currentView === 'people'" class="rounded-[2rem] border border-white/5 bg-zinc-900/20 backdrop-blur-sm p-6 shadow-2xl">
-          <PeopleList ref="peopleRef" />
-        </div>
+      <div class="rounded-[2rem] border border-white/5 bg-zinc-900/20 backdrop-blur-sm p-6 shadow-2xl">
+        <router-view v-slot="{ Component }">
+          <component :is="Component" ref="routeComponentRef" />
+        </router-view>
       </div>
     </main>
 
@@ -593,39 +508,82 @@ onMounted(() => {
     <!-- Mobile Navigation (Bottom) -->
     <div class="md:hidden fixed bottom-6 left-6 right-6 z-50">
        <div class="bg-zinc-900/90 backdrop-blur-xl border border-white/10 rounded-2xl p-2 flex items-center justify-around shadow-2xl shadow-black">
-          <Button
-            variant="ghost"
-            size="icon"
-            :class="cn(
-              'rounded-xl',
-              currentView === 'library' ? 'text-indigo-500 bg-white/5' : 'text-zinc-400'
-            )"
-            @click="setView('library')"
-          >
-             <LayoutGrid class="w-5 h-5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            :class="cn(
-              'rounded-xl',
-              currentView === 'people' ? 'text-indigo-500 bg-white/5' : 'text-zinc-400'
-            )"
-            @click="setView('people')"
-          >
-             <Users class="w-5 h-5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            :class="cn(
-              'rounded-xl',
-              currentView === 'timeline' ? 'text-indigo-500 bg-white/5' : 'text-zinc-400'
-            )"
-            @click="setView('timeline')"
-          >
-             <Clock class="w-5 h-5" />
-          </Button>
+          <!-- Primary: Organize -->
+          <router-link to="/" custom v-slot="{ navigate }">
+            <Button
+              variant="ghost"
+              size="icon"
+              :class="cn(
+                'rounded-xl',
+                currentView === 'organize' ? 'text-indigo-500 bg-white/5' : 'text-zinc-400'
+              )"
+              @click="navigate"
+            >
+               <LayoutGrid class="w-5 h-5" />
+            </Button>
+          </router-link>
+          <!-- Primary: Review -->
+          <router-link to="/review" custom v-slot="{ navigate }">
+            <Button
+              variant="ghost"
+              size="icon"
+              :class="cn(
+                'rounded-xl relative',
+                currentView === 'review' ? 'text-indigo-500 bg-white/5' : 'text-zinc-400'
+              )"
+              @click="navigate"
+            >
+               <ClipboardCheck class="w-5 h-5" />
+               <span
+                 v-if="pendingCount > 0"
+                 class="absolute -top-1 -right-1 w-4 h-4 bg-yellow-500 rounded-full text-[9px] font-bold text-black flex items-center justify-center"
+               >
+                 {{ pendingCount > 9 ? '9+' : pendingCount }}
+               </span>
+            </Button>
+          </router-link>
+          <!-- Primary: People -->
+          <router-link to="/people" custom v-slot="{ navigate }">
+            <Button
+              variant="ghost"
+              size="icon"
+              :class="cn(
+                'rounded-xl',
+                currentView === 'people' ? 'text-indigo-500 bg-white/5' : 'text-zinc-400'
+              )"
+              @click="navigate"
+            >
+               <Users class="w-5 h-5" />
+            </Button>
+          </router-link>
+          <!-- Secondary: Browse -->
+          <router-link to="/browse" custom v-slot="{ navigate }">
+            <Button
+              variant="ghost"
+              size="icon"
+              :class="cn(
+                'rounded-xl',
+                currentView === 'browse' ? 'text-indigo-500 bg-white/5' : 'text-zinc-400'
+              )"
+              @click="navigate"
+            >
+               <ImageIcon class="w-5 h-5" />
+            </Button>
+          </router-link>
+          <!-- Secondary: Timeline -->
+          <router-link to="/timeline" custom v-slot="{ navigate }">
+            <Button
+              variant="ghost"
+              size="icon"
+              :class="cn(
+                'rounded-xl',
+                currentView === 'timeline' ? 'text-indigo-500 bg-white/5' : 'text-zinc-400'
+              )"
+              @click="navigate"
+            >
+               <Clock class="w-5 h-5" />
+            </Button>
+          </router-link>
        </div>
     </div>
   </div>
