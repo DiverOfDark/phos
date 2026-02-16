@@ -250,7 +250,7 @@ pub fn run_remote_import(source_str: &str, target_url: &str) -> anyhow::Result<(
 
         let file_bytes = std::fs::read(&path)?;
         
-        // Multi-part form manually for ureq (simplified)
+        // Multi-part form manually for ureq
         let boundary = "phos-boundary";
         let mut body = Vec::new();
         
@@ -270,13 +270,12 @@ pub fn run_remote_import(source_str: &str, target_url: &str) -> anyhow::Result<(
 
         let resp = client.post(&upload_url)
             .header("Content-Type", &format!("multipart/form-data; boundary={}", boundary))
-            .send(body);
+            .send(&body);
 
         match resp {
             Ok(_) => pb.inc(1),
             Err(e) => {
                 error!("Failed to upload {}: {}", filename, e);
-                // Continue with next file
             }
         }
     }
@@ -286,9 +285,11 @@ pub fn run_remote_import(source_str: &str, target_url: &str) -> anyhow::Result<(
     // Trigger scan on remote
     info!("Triggering scan on remote...");
     let scan_url = format!("{}/api/scan", target_url.trim_end_matches('/'));
+    let scan_payload = serde_json::json!({"path": "."});
+    let scan_body = serde_json::to_vec(&scan_payload)?;
     let _ = client.post(&scan_url)
         .header("Content-Type", "application/json")
-        .send(serde_json::to_vec(&serde_json::json!({"path": "."}))?);
+        .send(&scan_body);
 
     Ok(())
 }
