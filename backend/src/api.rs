@@ -30,7 +30,48 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/files/:id/thumbnail", get(get_file_thumbnail))
         .route("/api/stats", get(get_stats))
         .route("/api/scan", post(trigger_scan))
+        .route("/api/import/upload", post(upload_file))
         .with_state(state)
+}
+
+async fn upload_file(
+    State(_state): State<AppState>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<StatusCode, StatusCode> {
+    let mut file_path: Option<String> = None;
+    let mut file_content: Option<axum::body::Bytes> = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        tracing::error!("Failed to get next field: {}", e);
+        StatusCode::BAD_REQUEST
+    })? {
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "path" {
+            file_path = Some(field.text().await.map_err(|e| {
+                tracing::error!("Failed to get field text: {}", e);
+                StatusCode::BAD_REQUEST
+            })?);
+        } else if name == "file" {
+            file_content = Some(field.bytes().await.map_err(|e| {
+                tracing::error!("Failed to get field bytes: {}", e);
+                StatusCode::BAD_REQUEST
+            })?);
+        }
+    }
+
+    if let (Some(rel_path), Some(content)) = (file_path, file_content) {
+        let library_path = std::env::var("PHOS_LIBRARY_PATH").unwrap_or_else(|_| "./library".to_string());
+        let target_path = std::path::Path::new(&library_path).join(&rel_path);
+
+        if let Some(parent) = target_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+
+        tokio::fs::write(target_path, content).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(StatusCode::OK)
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
 }
 
 #[derive(Serialize)]

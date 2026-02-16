@@ -212,6 +212,87 @@ pub fn run_import(source: &Path, target: &Path, move_files: bool) -> anyhow::Res
     Ok(())
 }
 
+pub fn run_remote_import(source_str: &str, target_url: &str) -> anyhow::Result<()> {
+    let source = Path::new(source_str);
+    if !source.exists() {
+        anyhow::bail!("Source directory does not exist: {:?}", source);
+    }
+
+    // Collect files
+    let source_files: Vec<PathBuf> = WalkDir::new(source)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| scanner::is_media_file(e.path()))
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    let total = source_files.len() as u64;
+    info!("Found {} media files for remote import", total);
+
+    if total == 0 {
+        return Ok(());
+    }
+
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .unwrap(),
+    );
+
+    let client = ureq::Agent::new_with_defaults();
+    let upload_url = format!("{}/api/import/upload", target_url.trim_end_matches('/'));
+
+    for path in source_files {
+        let filename = path.file_name().unwrap().to_string_lossy().to_string();
+        pb.set_message(filename.clone());
+
+        let file_bytes = std::fs::read(&path)?;
+        
+        // Multi-part form manually for ureq (simplified)
+        let boundary = "phos-boundary";
+        let mut body = Vec::new();
+        
+        // Path field
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"path\"\r\n\r\n");
+        body.extend_from_slice(filename.as_bytes());
+        body.extend_from_slice(b"\r\n");
+        
+        // File field
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(format!("Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n", filename).as_bytes());
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(&file_bytes);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+        let resp = client.post(&upload_url)
+            .header("Content-Type", &format!("multipart/form-data; boundary={}", boundary))
+            .send(body);
+
+        match resp {
+            Ok(_) => pb.inc(1),
+            Err(e) => {
+                error!("Failed to upload {}: {}", filename, e);
+                // Continue with next file
+            }
+        }
+    }
+
+    pb.finish_with_message("Remote import complete!");
+    
+    // Trigger scan on remote
+    info!("Triggering scan on remote...");
+    let scan_url = format!("{}/api/scan", target_url.trim_end_matches('/'));
+    let _ = client.post(&scan_url)
+        .header("Content-Type", "application/json")
+        .send(serde_json::to_vec(&serde_json::json!({"path": "."}))?);
+
+    Ok(())
+}
+
 fn import_single_file(
     source_path: &Path,
     target: &Path,

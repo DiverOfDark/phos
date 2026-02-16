@@ -27,18 +27,22 @@ RUN apt-get update && apt-get install -y \
     libavfilter-dev \
     wget \
     unzip \
+    nasm \
+    yasm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
 # Create dummy src/main.rs to build dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
+RUN mkdir src && echo "fn main() {}" > src/main.rs && \
+    cargo build --release --features "" || true && \
+    rm -rf src
 
 COPY backend/src ./src
 RUN touch src/main.rs && cargo build --release
 
 # Stage 3: Final Image
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y \
     libssl3 \
     libsqlite3-0 \

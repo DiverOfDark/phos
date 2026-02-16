@@ -11,6 +11,7 @@ pub fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection> {
 }
 
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
+    tracing::info!("Initializing database at {:?}", path.as_ref());
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", "5000")?;

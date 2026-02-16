@@ -2,11 +2,12 @@ services:
   phos:
     build: .
     ports:
-      - "3000:3000"
+      - "33000:33000"
     volumes:
       - ./models:/app/models
       - ./library:/app/test_library
     environment:
       - RUST_LOG=info
       - PHOS_DUMMY_AI=1
+      - PHOS_LIBRARY_PATH=/app/test_library
     restart: unless-stopped

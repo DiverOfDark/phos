@@ -28,11 +28,11 @@ enum Commands {
     Serve,
     /// Import media files from source into organized target directory
     Import {
-        /// Source directory to import from
-        source: PathBuf,
-        /// Target directory for organized files and database
-        target: PathBuf,
-        /// Move files instead of copying
+        /// Source directory or URL to import from
+        source: String,
+        /// Target directory for organized files and database (local) or Remote URL
+        target: Option<String>,
+        /// Move files instead of copying (local only)
         #[arg(long)]
         r#move: bool,
     },
@@ -59,8 +59,20 @@ async fn main() {
             target,
             r#move,
         }) => {
-            if let Err(e) = import::run_import(&source, &target, r#move) {
-                eprintln!("Import failed: {}", e);
+            if let Some(ref target_str) = target {
+                if target_str.starts_with("http://") || target_str.starts_with("https://") {
+                    if let Err(e) = import::run_remote_import(&source, target_str) {
+                        eprintln!("Remote import failed: {}", e);
+                        std::process::exit(1);
+                    }
+                } else {
+                    if let Err(e) = import::run_import(Path::new(&source), Path::new(target_str), r#move) {
+                        eprintln!("Import failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                eprintln!("Target directory or URL is required for import");
                 std::process::exit(1);
             }
         }
@@ -86,8 +98,11 @@ async fn run_server() {
     }
 
     let db_path = root_path.join(".phos.db");
-    let conn = db::init_db(&db_path).expect("Failed to initialize database");
-    info!("Database initialized at {:?}", db_path);
+    info!("Initializing database at {:?}", db_path);
+    let conn = db::init_db(&db_path).map_err(|e| {
+        tracing::error!("Failed to initialize database: {}", e);
+        e
+    }).expect("Failed to initialize database");
 
     let shared_conn = Arc::new(Mutex::new(conn));
     let state = api::AppState {
