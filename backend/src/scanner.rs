@@ -957,6 +957,13 @@ fn extract_video_keyframes(
     let width = decoder.width();
     let height = decoder.height();
 
+    if width == 0 || height == 0 {
+        return Err(anyhow::anyhow!(
+            "Video stream in {:?} has zero dimensions ({}x{})",
+            path, width, height
+        ));
+    }
+
     let mut scaler = ffmpeg::software::scaling::Context::get(
         decoder.format(),
         width,
@@ -1062,6 +1069,13 @@ pub fn extract_first_video_frame(path: &Path) -> anyhow::Result<DynamicImage> {
 
     let width = decoder.width();
     let height = decoder.height();
+
+    if width == 0 || height == 0 {
+        return Err(anyhow::anyhow!(
+            "Video stream in {:?} has zero dimensions ({}x{})",
+            path, width, height
+        ));
+    }
 
     let mut scaler = ffmpeg::software::scaling::Context::get(
         decoder.format(),
