@@ -1,10 +1,12 @@
 # Multi-stage build for Phos
+# syntax=docker/dockerfile:1
 
 # Stage 1: Build Frontend
 FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
-RUN npm install
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
 COPY frontend/ ./
 RUN npm run build
 
@@ -34,12 +36,19 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
 # Create dummy src/main.rs to build dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs && \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/backend/target \
+    mkdir src && echo "fn main() {}" > src/main.rs && \
     cargo build --release --features "" || true && \
     rm -rf src
 
 COPY backend/src ./src
-RUN touch src/main.rs && cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/backend/target \
+    touch src/main.rs && cargo build --release && \
+    cp target/release/phos-backend /usr/local/bin/phos-backend
 
 # Stage 3: Final Image
 FROM debian:trixie-slim
@@ -55,7 +64,7 @@ RUN groupadd -g 1000 phos && useradd -u 1000 -g phos -m phos
 WORKDIR /app
 
 # Copy backend binary
-COPY --from=backend-builder /app/backend/target/release/phos-backend ./phos-backend
+COPY --from=backend-builder /usr/local/bin/phos-backend ./phos-backend
 
 # Copy frontend build
 COPY --from=frontend-builder /app/frontend/dist ./static
