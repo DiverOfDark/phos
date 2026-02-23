@@ -17,6 +17,7 @@ import {
   ArrowRightLeft,
   FolderOpen,
   AlertCircle,
+  Plus,
 } from 'lucide-vue-next'
 
 const route = useRoute()
@@ -152,15 +153,61 @@ function faceStyle(face) {
 const activeFaceId = ref(null)
 const faceSearch = ref('')
 const faceActionLoading = ref(false)
+const faceSuggestions = ref([])
+const loadingSuggestions = ref(false)
+const newPersonName = ref('')
+const creatingPerson = ref(false)
 
 function openFacePopover(faceId) {
   activeFaceId.value = faceId
   faceSearch.value = ''
+  newPersonName.value = ''
+  fetchFaceSuggestions(faceId)
 }
 
 function closeFacePopover() {
   activeFaceId.value = null
   faceSearch.value = ''
+  newPersonName.value = ''
+  faceSuggestions.value = []
+}
+
+async function fetchFaceSuggestions(faceId) {
+  loadingSuggestions.value = true
+  try {
+    const res = await fetch(`/api/faces/${faceId}/suggestions`)
+    if (res.ok) {
+      faceSuggestions.value = await res.json()
+    }
+  } catch (e) {
+    console.warn('Failed to fetch face suggestions:', e)
+  } finally {
+    loadingSuggestions.value = false
+  }
+}
+
+async function createPersonAndAssign(faceId) {
+  const name = newPersonName.value.trim()
+  if (!name || creatingPerson.value) return
+  creatingPerson.value = true
+  try {
+    const res = await fetch('/api/people', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const created = await res.json()
+    // Reassign face to the newly created person
+    await reassignFace(faceId, created.id)
+    // Refresh people list
+    peopleLoaded.value = false
+    fetchPeople()
+  } catch (e) {
+    console.error('Failed to create person:', e)
+  } finally {
+    creatingPerson.value = false
+  }
 }
 
 const filteredPeople = computed(() => {
@@ -169,7 +216,24 @@ const filteredPeople = computed(() => {
   if (q) {
     list = list.filter(p => (p.name || 'unnamed').toLowerCase().includes(q))
   }
+  // If we have suggestions, sort matching people by suggestion distance
+  if (faceSuggestions.value.length > 0) {
+    const distMap = {}
+    for (const s of faceSuggestions.value) {
+      distMap[s.person_id] = s.distance
+    }
+    list = [...list].sort((a, b) => {
+      const da = distMap[a.id] ?? 999
+      const db = distMap[b.id] ?? 999
+      return da - db
+    })
+  }
   return list
+})
+
+// Suggested person IDs for highlighting
+const suggestedPersonIds = computed(() => {
+  return new Set(faceSuggestions.value.map(s => s.person_id))
 })
 
 async function reassignFace(faceId, targetPersonId) {
@@ -354,12 +418,104 @@ async function confirmSplit() {
   }
 }
 
+// --- Action: Draw face mode ---
+const drawFaceMode = ref(false)
+const drawStart = ref(null)   // { x, y } in CSS pixels relative to image
+const drawCurrent = ref(null) // { x, y } during drag
+const addingFace = ref(false)
+const imageEl = ref(null)
+
+function enterDrawFaceMode() {
+  if (splitMode.value) exitSplitMode()
+  closeFacePopover()
+  closeReassignDropdown()
+  drawFaceMode.value = true
+  drawStart.value = null
+  drawCurrent.value = null
+}
+
+function exitDrawFaceMode() {
+  drawFaceMode.value = false
+  drawStart.value = null
+  drawCurrent.value = null
+}
+
+function onDrawMousedown(e) {
+  if (!drawFaceMode.value || !imageEl.value) return
+  e.preventDefault()
+  const rect = imageEl.value.getBoundingClientRect()
+  drawStart.value = { x: e.clientX - rect.left, y: e.clientY - rect.top }
+  drawCurrent.value = { ...drawStart.value }
+}
+
+function onDrawMousemove(e) {
+  if (!drawFaceMode.value || !drawStart.value || !imageEl.value) return
+  const rect = imageEl.value.getBoundingClientRect()
+  drawCurrent.value = {
+    x: Math.max(0, Math.min(e.clientX - rect.left, rect.width)),
+    y: Math.max(0, Math.min(e.clientY - rect.top, rect.height)),
+  }
+}
+
+async function onDrawMouseup() {
+  if (!drawFaceMode.value || !drawStart.value || !drawCurrent.value || !imageEl.value || !mainFile.value) return
+  if (addingFace.value) return
+
+  const rect = imageEl.value.getBoundingClientRect()
+  const scaleX = naturalWidth.value / rect.width
+  const scaleY = naturalHeight.value / rect.height
+
+  // Convert CSS pixels to natural image pixels
+  const x1 = Math.min(drawStart.value.x, drawCurrent.value.x) * scaleX
+  const y1 = Math.min(drawStart.value.y, drawCurrent.value.y) * scaleY
+  const x2 = Math.max(drawStart.value.x, drawCurrent.value.x) * scaleX
+  const y2 = Math.max(drawStart.value.y, drawCurrent.value.y) * scaleY
+
+  // Ignore tiny rectangles (likely accidental clicks)
+  if (x2 - x1 < 10 || y2 - y1 < 10) {
+    drawStart.value = null
+    drawCurrent.value = null
+    return
+  }
+
+  addingFace.value = true
+  try {
+    const res = await fetch(`/api/files/${mainFile.value.id}/faces`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ box_x1: x1, box_y1: y1, box_x2: x2, box_y2: y2 }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    if (currentShot.value) await fetchShotDetail(currentShot.value.id)
+  } catch (e) {
+    console.error('Failed to add manual face:', e)
+  } finally {
+    addingFace.value = false
+    exitDrawFaceMode()
+  }
+}
+
+const drawRectStyle = computed(() => {
+  if (!drawStart.value || !drawCurrent.value) return { display: 'none' }
+  const x1 = Math.min(drawStart.value.x, drawCurrent.value.x)
+  const y1 = Math.min(drawStart.value.y, drawCurrent.value.y)
+  const w = Math.abs(drawCurrent.value.x - drawStart.value.x)
+  const h = Math.abs(drawCurrent.value.y - drawStart.value.y)
+  return {
+    left: `${x1}px`,
+    top: `${y1}px`,
+    width: `${w}px`,
+    height: `${h}px`,
+  }
+})
+
 // --- Navigation ---
 function prevShot() {
   if (currentIndex.value > 0) {
     closeFacePopover()
     closeReassignDropdown()
     exitSplitMode()
+    exitDrawFaceMode()
     currentIndex.value--
   }
 }
@@ -369,6 +525,7 @@ function nextShot() {
     closeFacePopover()
     closeReassignDropdown()
     exitSplitMode()
+    exitDrawFaceMode()
     currentIndex.value++
   }
 }
@@ -379,7 +536,9 @@ function onKeydown(e) {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
 
   if (e.key === 'Escape') {
-    if (activeFaceId.value) {
+    if (drawFaceMode.value) {
+      exitDrawFaceMode()
+    } else if (activeFaceId.value) {
       closeFacePopover()
     } else if (showReassignDropdown.value) {
       closeReassignDropdown()
@@ -389,8 +548,8 @@ function onKeydown(e) {
     return
   }
 
-  // Don't handle other keys if a popover is open
-  if (activeFaceId.value || showReassignDropdown.value) return
+  // Don't handle other keys if a popover or draw mode is active
+  if (activeFaceId.value || showReassignDropdown.value || drawFaceMode.value) return
 
   if (e.key === 'Enter') {
     e.preventDefault()
@@ -405,6 +564,9 @@ function onKeydown(e) {
     } else {
       enterSplitMode()
     }
+  } else if (e.key === 'f' || e.key === 'F') {
+    e.preventDefault()
+    enterDrawFaceMode()
   } else if (e.key === 'ArrowLeft') {
     e.preventDefault()
     prevShot()
@@ -431,6 +593,7 @@ watch(currentIndex, () => {
   closeFacePopover()
   closeReassignDropdown()
   exitSplitMode()
+  exitDrawFaceMode()
 })
 
 // Expose for App.vue refresh pattern
@@ -545,8 +708,15 @@ defineExpose({ loadData: fetchShots })
             </div>
             <template v-else-if="mainFile">
               <div class="flex justify-center bg-zinc-900 rounded-lg overflow-hidden">
-              <div class="relative inline-block">
+              <div
+                class="relative inline-block"
+                :class="{ 'cursor-crosshair': drawFaceMode }"
+                @mousedown="onDrawMousedown"
+                @mousemove="onDrawMousemove"
+                @mouseup="onDrawMouseup"
+              >
                 <img
+                  ref="imageEl"
                   :src="`/api/files/${mainFile.id}`"
                   :alt="mainFile.path?.split('/').pop() || 'Shot'"
                   class="max-w-full max-h-[60vh] select-none block"
@@ -563,8 +733,24 @@ defineExpose({ loadData: fetchShots })
                   <span class="text-xs font-semibold text-yellow-300">Original</span>
                 </div>
 
+                <!-- Draw face rectangle preview -->
+                <div
+                  v-if="drawFaceMode && drawStart && drawCurrent"
+                  class="absolute border-2 border-dashed border-indigo-400 bg-indigo-500/10 rounded-sm pointer-events-none"
+                  :style="drawRectStyle"
+                />
+
+                <!-- Draw face mode indicator -->
+                <div
+                  v-if="drawFaceMode"
+                  class="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1.5 bg-indigo-600/80 backdrop-blur-sm border border-indigo-400/30 rounded-lg"
+                >
+                  <Plus class="w-3.5 h-3.5 text-white" />
+                  <span class="text-xs font-semibold text-white">Draw face</span>
+                </div>
+
                 <!-- Face overlays -->
-                <template v-if="faces.length > 0 && naturalWidth > 0">
+                <template v-if="faces.length > 0 && naturalWidth > 0 && !drawFaceMode">
                   <div
                     v-for="face in faces"
                     :key="face.id"
@@ -585,7 +771,7 @@ defineExpose({ loadData: fetchShots })
                       class="absolute top-full left-1/2 -translate-x-1/2 mt-8 z-50"
                       @click.stop
                     >
-                      <div class="w-60 bg-zinc-900 border border-white/10 rounded-xl shadow-2xl overflow-hidden">
+                      <div class="w-64 bg-zinc-900 border border-white/10 rounded-xl shadow-2xl overflow-hidden">
                         <div class="p-2 border-b border-white/5">
                           <div class="flex items-center justify-between mb-1.5 px-1">
                             <span class="text-xs font-semibold text-zinc-400">Reassign to</span>
@@ -607,24 +793,32 @@ defineExpose({ loadData: fetchShots })
                           </div>
                           <Input
                             v-model="faceSearch"
-                            placeholder="Search people..."
+                            placeholder="Search or type new name..."
                             class="h-7 text-xs bg-zinc-800/50 border-white/5"
                             @click.stop
+                            @keydown.enter.stop="faceSearch.trim() ? (newPersonName = faceSearch.trim(), createPersonAndAssign(face.id)) : null"
                           />
                         </div>
-                        <ScrollArea class="max-h-48">
+                        <ScrollArea class="max-h-56">
                           <div class="p-1">
-                            <div v-if="faceActionLoading" class="flex items-center justify-center py-4">
+                            <div v-if="faceActionLoading || creatingPerson" class="flex items-center justify-center py-4">
                               <RefreshCw class="w-4 h-4 text-indigo-400 animate-spin" />
                             </div>
                             <template v-else>
+                              <!-- Suggestions header -->
+                              <div v-if="faceSuggestions.length > 0 && !faceSearch" class="px-2 pt-1 pb-0.5">
+                                <span class="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Suggested</span>
+                              </div>
+
                               <button
                                 v-for="person in filteredPeople"
                                 :key="person.id"
                                 class="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left transition-colors"
                                 :class="face.person_id === person.id
                                   ? 'bg-indigo-600/20 text-indigo-300'
-                                  : 'text-zinc-300 hover:bg-white/5 hover:text-white'"
+                                  : suggestedPersonIds.has(person.id) && !faceSearch
+                                    ? 'bg-emerald-600/10 text-zinc-200 hover:bg-emerald-600/20'
+                                    : 'text-zinc-300 hover:bg-white/5 hover:text-white'"
                                 @click.stop="reassignFace(face.id, person.id)"
                               >
                                 <div class="w-6 h-6 rounded-full bg-zinc-800 border border-zinc-700 overflow-hidden flex items-center justify-center shrink-0">
@@ -637,8 +831,23 @@ defineExpose({ loadData: fetchShots })
                                 </div>
                                 <span class="text-xs font-medium truncate">{{ person.name || 'Unnamed' }}</span>
                                 <span v-if="face.person_id === person.id" class="ml-auto text-[10px] text-indigo-400">current</span>
+                                <span v-else-if="suggestedPersonIds.has(person.id) && !faceSearch" class="ml-auto text-[10px] text-emerald-400">match</span>
                               </button>
-                              <p v-if="filteredPeople.length === 0" class="text-xs text-zinc-500 text-center py-3">No people found</p>
+
+                              <!-- Create new person option (always visible when typing) -->
+                              <div v-if="faceSearch.trim()" class="p-1 border-t border-white/5">
+                                <button
+                                  class="w-full flex items-center gap-2 px-2 py-2 rounded-lg text-left bg-indigo-600/10 text-indigo-300 hover:bg-indigo-600/20 transition-colors"
+                                  @click.stop="newPersonName = faceSearch.trim(); createPersonAndAssign(face.id)"
+                                >
+                                  <div class="w-6 h-6 rounded-full bg-indigo-600/30 border border-indigo-500/30 flex items-center justify-center shrink-0">
+                                    <span class="text-xs font-bold text-indigo-300">+</span>
+                                  </div>
+                                  <span class="text-xs font-medium">Create "{{ faceSearch.trim() }}"</span>
+                                </button>
+                              </div>
+
+                              <p v-if="filteredPeople.length === 0 && !faceSearch.trim()" class="text-xs text-zinc-500 text-center py-3">No people found</p>
                             </template>
                           </div>
                         </ScrollArea>
@@ -862,6 +1071,18 @@ defineExpose({ loadData: fetchShots })
             <Scissors class="w-4 h-4" />
             Split
             <kbd class="ml-1 px-1.5 py-0.5 bg-white/10 rounded text-[10px] font-mono">S</kbd>
+          </Button>
+
+          <!-- Add Face -->
+          <Button
+            variant="outline"
+            class="border-white/10 text-zinc-300 hover:text-white gap-2"
+            title="Draw a face bounding box manually"
+            @click="enterDrawFaceMode"
+          >
+            <Plus class="w-4 h-4" />
+            Add Face
+            <kbd class="ml-1 px-1.5 py-0.5 bg-white/10 rounded text-[10px] font-mono">F</kbd>
           </Button>
 
           <!-- Mark Unsorted -->

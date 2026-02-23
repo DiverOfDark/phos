@@ -186,17 +186,13 @@ fn flush_pending(
     for (path, action) in actions {
         match action {
             FileAction::Upsert => {
-                // For upsert we use the provided AI pipeline if we have one.
-                // However, Scanner owns an Option<AiPipeline> -- to avoid
-                // lifetime issues we create a temporary Scanner without AI and
-                // call process_file directly.  The watcher scanner is AI-less
-                // for simplicity; the user can trigger a full re-scan via the
-                // API if they want AI processing.
-                // Actually, let's check if AI is available and use a scanner
-                // with no AI (face detection is heavy and not ideal for
-                // real-time).  The file will still be indexed, hashed, and get
-                // a dHash.
-                let _ = ai; // acknowledge but don't use in the watcher loop
+                // File may have been moved/deleted between the event and now
+                // (e.g. during reorganize). Skip silently.
+                if !path.exists() {
+                    debug!("Watcher: path {:?} no longer exists, skipping", path);
+                    continue;
+                }
+                let _ = ai;
                 if let Err(e) = scanner.process_file(&conn, &path, &dhash_cache) {
                     error!("Watcher: failed to process {:?}: {}", path, e);
                 }

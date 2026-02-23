@@ -300,24 +300,24 @@ impl Scanner {
             return Ok(());
         }
 
-        info!("Clustering {} faces", rows.len());
-
         // Build index: face_id -> (embedding, person_id)
         let face_ids: Vec<String> = rows.iter().map(|(id, _, _)| id.clone()).collect();
         let embeddings: Vec<Vec<f32>> = rows.iter().map(|(_, e, _)| e.clone()).collect();
         let mut assignments: Vec<Option<String>> =
             rows.iter().map(|(_, _, p)| p.clone()).collect();
 
-        // Clean up: delete all existing person records and reset assignments.
-        // We re-cluster from scratch each scan.
-        // Clear FK references first so DELETE FROM people doesn't violate constraints.
-        conn.execute("UPDATE faces SET person_id = NULL", [])?;
-        conn.execute("DELETE FROM people", [])?;
-        for a in assignments.iter_mut() {
-            *a = None;
+        let n = face_ids.len();
+        let unassigned_count = assignments.iter().filter(|a| a.is_none()).count();
+
+        if unassigned_count == 0 {
+            info!("All {} faces already assigned, nothing to cluster", n);
+            return Ok(());
         }
 
-        let n = face_ids.len();
+        info!(
+            "Clustering: {} total faces, {} unassigned",
+            n, unassigned_count
+        );
 
         // Build face_id -> index lookup
         let id_to_idx: HashMap<&str, usize> = face_ids
@@ -519,9 +519,10 @@ impl Scanner {
             }
         }
 
-        // Clean up persons with no faces
+        // Clean up unnamed persons with no faces (preserve user-created named people)
         conn.execute(
-            "DELETE FROM people WHERE id NOT IN (SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL)",
+            "DELETE FROM people WHERE (name IS NULL OR name = '') \
+             AND id NOT IN (SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL)",
             [],
         )?;
 
@@ -539,9 +540,20 @@ impl Scanner {
     pub fn process_file(&self, conn: &Connection, path: &Path, dhash_cache: &std::sync::Mutex<Vec<DHashCacheEntry>>) -> anyhow::Result<()> {
         // --- Phase 1: CPU-heavy work (no DB writes) ---
 
+        // Quick path duplicate check — catches concurrent processing of the
+        // same file (e.g. upload handler + watcher race).
+        {
+            let mut stmt = conn.prepare("SELECT id FROM files WHERE path = ?")?;
+            let mut rows = stmt.query(params![path.to_string_lossy().as_ref()])?;
+            if rows.next()?.is_some() {
+                debug!("File already indexed at path {:?}, skipping", path);
+                return Ok(());
+            }
+        }
+
         let hash = calculate_hash(path)?;
 
-        // Quick duplicate check (read-only)
+        // Hash duplicate check — same content at a different path
         {
             let mut stmt = conn.prepare("SELECT id FROM files WHERE hash = ?")?;
             let mut rows = stmt.query(params![hash])?;

@@ -32,18 +32,20 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/shots/batch/confirm", post(batch_confirm))
         .route("/api/shots/batch/reassign", post(batch_reassign))
         // People
-        .route("/api/people", get(get_people))
+        .route("/api/people", get(get_people).post(create_person))
         .route("/api/people/merge", post(merge_people))
         .route("/api/people/:id", get(get_person_shots).put(rename_person))
         .route("/api/people/:id/faces", get(get_person_faces))
         // Faces
         .route("/api/faces/:id/thumbnail", get(get_face_thumbnail))
         .route("/api/faces/:id/person", put(reassign_face))
+        .route("/api/faces/:id/suggestions", get(get_face_suggestions))
         .route("/api/faces/:id", delete(delete_face))
         // Files
         .route("/api/files/:id", get(get_file))
         .route("/api/files/:id/thumbnail", get(get_file_thumbnail))
         .route("/api/files/:id/set-original", put(set_file_original))
+        .route("/api/files/:id/faces", post(add_manual_face))
         // Stats + organize
         .route("/api/stats", get(get_stats))
         .route("/api/organize/stats", get(get_organize_stats))
@@ -590,6 +592,36 @@ struct PersonBrief {
     pending_count: i64,
 }
 
+/// Create a new person with a name
+#[derive(Deserialize)]
+struct CreatePersonPayload {
+    name: String,
+}
+
+async fn create_person(
+    State(state): State<AppState>,
+    Json(payload): Json<CreatePersonPayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let db = state.db.lock().await;
+    let id = uuid::Uuid::new_v4().to_string();
+
+    db.execute(
+        "INSERT INTO people (id, name) VALUES (?, ?)",
+        params![id, name],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to create person: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(serde_json::json!({"id": id, "name": name})))
+}
+
 async fn get_person_shots(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -784,6 +816,94 @@ fn get_shot_id_for_face(db: &Connection, face_id: &str) -> Result<String, Status
     })
 }
 
+/// Get suggested persons for a face based on embedding similarity.
+///
+/// Computes cosine similarity on-the-fly between the target face and the
+/// thumbnail face of every person, so results are always up-to-date even
+/// for newly created persons.
+#[derive(Serialize)]
+struct FaceSuggestion {
+    person_id: String,
+    person_name: Option<String>,
+    thumbnail_url: Option<String>,
+    distance: f32,
+}
+
+async fn get_face_suggestions(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<FaceSuggestion>>, StatusCode> {
+    use crate::ai::cosine_similarity;
+
+    let db = state.db.lock().await;
+
+    // Load the target face's embedding
+    let target_blob: Vec<u8> = db
+        .query_row(
+            "SELECT embedding FROM faces WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let target_embedding: Vec<f32> = bincode::deserialize(&target_blob).map_err(|e| {
+        tracing::error!("Failed to deserialize target face embedding: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if target_embedding.is_empty() {
+        return Ok(Json(vec![]));
+    }
+
+    // Load one representative face embedding per person (the thumbnail face)
+    let mut stmt = db
+        .prepare(
+            "SELECT p.id, p.name, p.thumbnail_face_id, f.embedding
+             FROM people p
+             JOIN faces f ON f.id = p.thumbnail_face_id
+             WHERE f.embedding IS NOT NULL",
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to prepare person embeddings query: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let mut suggestions: Vec<FaceSuggestion> = stmt
+        .query_map([], |row| {
+            let person_id: String = row.get(0)?;
+            let person_name: Option<String> = row.get(1)?;
+            let thumbnail_face_id: Option<String> = row.get(2)?;
+            let blob: Vec<u8> = row.get(3)?;
+            Ok((person_id, person_name, thumbnail_face_id, blob))
+        })
+        .map_err(|e| {
+            tracing::error!("Failed to query person embeddings: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .filter_map(|r| r.ok())
+        .filter_map(|(person_id, person_name, thumbnail_face_id, blob)| {
+            let embedding: Vec<f32> = bincode::deserialize(&blob).ok()?;
+            if embedding.len() != target_embedding.len() || embedding.is_empty() {
+                return None;
+            }
+            let sim = cosine_similarity(&target_embedding, &embedding);
+            let distance = 1.0 - sim;
+            Some(FaceSuggestion {
+                person_id,
+                person_name,
+                thumbnail_url: thumbnail_face_id
+                    .map(|fid| format!("/api/faces/{}/thumbnail", fid)),
+                distance,
+            })
+        })
+        .collect();
+
+    suggestions.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+    suggestions.truncate(10);
+
+    Ok(Json(suggestions))
+}
+
 /// Reassign a face to a different person
 #[derive(Deserialize)]
 struct ReassignFacePayload {
@@ -827,6 +947,12 @@ async fn reassign_face(
     if updated == 0 {
         return Err(StatusCode::NOT_FOUND);
     }
+
+    // Set thumbnail_face_id if the person doesn't have one yet
+    let _ = db.execute(
+        "UPDATE people SET thumbnail_face_id = ? WHERE id = ? AND thumbnail_face_id IS NULL",
+        params![id, payload.person_id],
+    );
 
     // Recalculate shot's primary_person_id (unless confirmed)
     recalculate_primary_person(&db, &shot_id)?;
@@ -1820,4 +1946,88 @@ async fn set_file_original(
     })?;
 
     Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /api/files/:id/faces - manually add a face bounding box.
+/// The server computes the embedding from the given bbox coordinates.
+#[derive(Deserialize)]
+struct AddManualFacePayload {
+    box_x1: f32,
+    box_y1: f32,
+    box_x2: f32,
+    box_y2: f32,
+}
+
+async fn add_manual_face(
+    Path(file_id): Path<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<AddManualFacePayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Validate bbox
+    if payload.box_x1 >= payload.box_x2 || payload.box_y1 >= payload.box_y2 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Look up the file path and shot_id
+    let (file_path, shot_id) = {
+        let db = state.db.lock().await;
+        db.query_row(
+            "SELECT path, shot_id FROM files WHERE id = ?",
+            params![file_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|_| StatusCode::NOT_FOUND)?
+    };
+
+    let bbox = (payload.box_x1, payload.box_y1, payload.box_x2, payload.box_y2);
+    let scanner = state.scanner.clone();
+    let file_path_owned = file_path.clone();
+
+    // Compute embedding on a blocking thread
+    let (face_id, embedding_blob) = tokio::task::spawn_blocking(move || -> Result<(String, Vec<u8>), String> {
+        let img = crate::scanner::open_image(std::path::Path::new(&file_path_owned))
+            .map_err(|e| format!("Failed to open image: {}", e))?;
+
+        let embedding = if let Some(ai) = scanner.ai() {
+            ai.extract_embedding(&img, None, bbox)
+                .map_err(|e| format!("Failed to extract embedding: {}", e))?
+        } else {
+            // Dummy mode
+            let mut emb = vec![0.1f32; 512];
+            emb[0] = bbox.0 / 1000.0;
+            emb[1] = bbox.1 / 1000.0;
+            emb
+        };
+
+        let blob = bincode::serialize(&embedding)
+            .map_err(|e| format!("Failed to serialize embedding: {}", e))?;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        Ok((id, blob))
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Manual face task panicked: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .map_err(|e| {
+        tracing::error!("Manual face extraction failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Insert the face and recalculate primary person
+    let db = state.db.lock().await;
+
+    db.execute(
+        "INSERT INTO faces (id, file_id, person_id, box_x1, box_y1, box_x2, box_y2, embedding, score) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 1.0)",
+        params![face_id, file_id, payload.box_x1, payload.box_y1, payload.box_x2, payload.box_y2, embedding_blob],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to insert manual face: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    recalculate_primary_person(&db, &shot_id)?;
+
+    Ok(Json(serde_json::json!({"id": face_id})))
 }
