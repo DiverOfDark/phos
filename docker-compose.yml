@@ -10,4 +10,12 @@ services:
       - RUST_LOG=info
       #- PHOS_DUMMY_AI=1  # Uncomment to skip AI model loading
       - PHOS_LIBRARY_PATH=/app/library
+      ## OIDC SSO (uncomment and configure to enable authentication)
+      #- PHOS_OIDC_ISSUER=https://auth.example.com/realms/phos
+      #- PHOS_OIDC_CLIENT_ID=phos
+      #- PHOS_OIDC_CLIENT_SECRET=your-client-secret
+      #- PHOS_OIDC_REDIRECT_URI=https://phos.example.com/api/auth/callback
+      #- PHOS_JWT_SECRET=your-random-secret
+      #- PHOS_JWT_TTL=3600
+      #- PHOS_OIDC_SCOPES=openid profile email
     restart: unless-stopped

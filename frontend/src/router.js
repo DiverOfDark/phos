@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { useAuth } from '@/composables/useAuth'
 import OrganizeDashboard from './components/OrganizeDashboard.vue'
 import ReviewQueue from './components/ReviewQueue.vue'
 import ShotDetail from './components/ShotDetail.vue'
@@ -6,8 +7,15 @@ import PersonDetail from './components/PersonDetail.vue'
 import Gallery from './components/Gallery.vue'
 import PeopleList from './components/PeopleList.vue'
 import Timeline from './components/Timeline.vue'
+import LoginPage from './components/LoginPage.vue'
 
 const routes = [
+  {
+    path: '/login',
+    name: 'login',
+    component: LoginPage,
+    meta: { public: true },
+  },
   {
     path: '/',
     name: 'organize',
@@ -55,4 +63,16 @@ const routes = [
 export const router = createRouter({
   history: createWebHistory(),
   routes,
+})
+
+router.beforeEach(async (to) => {
+  if (to.meta.public) return true
+
+  const { isAuthenticated, checked, fetchUser } = useAuth()
+  if (!checked.value) {
+    await fetchUser()
+  }
+  if (!isAuthenticated.value) {
+    return '/login'
+  }
 })

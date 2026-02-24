@@ -31,3 +31,5 @@ clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 rayon = "1.10"
 urlencoding = "2"
+openidconnect = "3"
+jsonwebtoken = "9"

@@ -2,6 +2,7 @@
 import { ref, onMounted, computed, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { cn } from '@/lib/utils'
+import { useAuth } from '@/composables/useAuth'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -39,7 +40,11 @@ import {
   ClipboardCheck,
   Users,
   Image as ImageIcon,
+  LogOut,
 } from 'lucide-vue-next'
+
+// --- Auth ---
+const { user, authEnabled, logout } = useAuth()
 
 // --- Router ---
 const route = useRoute()
@@ -411,6 +416,22 @@ onMounted(() => {
               </div>
             </SheetContent>
           </Sheet>
+
+          <!-- User menu / Logout -->
+          <template v-if="authEnabled && user">
+            <div class="hidden sm:flex items-center gap-2 text-sm text-zinc-400">
+              <span>{{ user.name || user.email || user.sub }}</span>
+            </div>
+            <Button
+              variant="ghost"
+              size="icon"
+              class="text-zinc-400 hover:text-white rounded-xl hover:bg-white/5"
+              title="Sign out"
+              @click="logout"
+            >
+              <LogOut class="w-4 h-4" />
+            </Button>
+          </template>
 
           <div class="h-6 w-[1px] bg-white/10 mx-1 hidden xs:block"></div>
 

@@ -1,5 +1,6 @@
 mod ai;
 mod api;
+mod auth;
 mod db;
 mod import;
 mod scanner;
@@ -131,6 +132,11 @@ async fn run_server() {
             tracing::error!("Scan failed: {}", e);
         }
 
+        // Reorganize files on disk to match clustering results.
+        if let Err(e) = import::run_reorganize(&scan_path, false) {
+            tracing::error!("Post-scan reorganize failed: {}", e);
+        }
+
         // Initial scan complete -- start watching for incremental changes.
         match watcher::start_watcher(watcher_library_path, watcher_db_path, None) {
             Ok(watcher_handle) => {
@@ -151,15 +157,71 @@ async fn run_server() {
     let serve_static = ServeDir::new(&static_dir)
         .not_found_service(ServeFile::new(index_path));
 
-    let app = Router::new()
-        .merge(api_router)
-        .fallback_service(serve_static)
-        .layer(CorsLayer::permissive());
-
     let port = std::env::var("PHOS_PORT")
         .unwrap_or_else(|_| "33000".to_string())
         .parse::<u16>()
         .unwrap_or(33000);
+
+    // OIDC authentication (optional — enabled when PHOS_OIDC_ISSUER is set)
+    let app = if let Ok(issuer) = std::env::var("PHOS_OIDC_ISSUER") {
+        let client_id = std::env::var("PHOS_OIDC_CLIENT_ID")
+            .expect("PHOS_OIDC_CLIENT_ID is required when PHOS_OIDC_ISSUER is set");
+        let client_secret = std::env::var("PHOS_OIDC_CLIENT_SECRET")
+            .expect("PHOS_OIDC_CLIENT_SECRET is required when PHOS_OIDC_ISSUER is set");
+        let redirect_uri = std::env::var("PHOS_OIDC_REDIRECT_URI")
+            .unwrap_or_else(|_| format!("http://localhost:{}/api/auth/callback", port));
+        let jwt_secret = std::env::var("PHOS_JWT_SECRET").unwrap_or_else(|_| {
+            let secret_path = root_path.join(".phos_jwt_secret");
+            if let Ok(s) = std::fs::read_to_string(&secret_path) {
+                return s.trim().to_string();
+            }
+            let s = uuid::Uuid::new_v4().to_string();
+            let _ = std::fs::write(&secret_path, &s);
+            info!("Generated JWT secret at {:?}", secret_path);
+            s
+        });
+        let jwt_ttl: u64 = std::env::var("PHOS_JWT_TTL")
+            .unwrap_or_else(|_| "3600".to_string())
+            .parse()
+            .unwrap_or(3600);
+        let scopes: Vec<String> = std::env::var("PHOS_OIDC_SCOPES")
+            .unwrap_or_else(|_| "openid profile email".to_string())
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+
+        info!("OIDC authentication enabled (issuer: {})", issuer);
+        let auth_state = auth::init_oidc(
+            &issuer,
+            &client_id,
+            &client_secret,
+            &redirect_uri,
+            &jwt_secret,
+            jwt_ttl,
+            scopes,
+        )
+        .await
+        .expect("Failed to initialize OIDC provider");
+
+        let auth_router = auth::create_auth_router(auth_state.clone());
+        let protected_api = api_router.layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            auth::require_auth,
+        ));
+
+        Router::new()
+            .merge(auth_router)
+            .merge(protected_api)
+            .fallback_service(serve_static)
+            .layer(CorsLayer::permissive())
+    } else {
+        info!("OIDC authentication disabled (set PHOS_OIDC_ISSUER to enable)");
+        Router::new()
+            .merge(api_router)
+            .fallback_service(serve_static)
+            .layer(CorsLayer::permissive())
+    };
+
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("listening on {}", addr);
 
