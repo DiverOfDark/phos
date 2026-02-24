@@ -707,9 +707,9 @@ defineExpose({ loadData: fetchShots })
               <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
             </div>
             <template v-else-if="mainFile">
-              <div class="flex justify-center bg-zinc-900 rounded-lg overflow-hidden">
+              <div class="flex justify-center bg-zinc-900 rounded-lg overflow-visible">
               <div
-                class="relative inline-block"
+                class="relative inline-block overflow-visible"
                 :class="{ 'cursor-crosshair': drawFaceMode }"
                 @mousedown="onDrawMousedown"
                 @mousemove="onDrawMousemove"
@@ -719,7 +719,7 @@ defineExpose({ loadData: fetchShots })
                   ref="imageEl"
                   :src="`/api/files/${mainFile.id}`"
                   :alt="mainFile.path?.split('/').pop() || 'Shot'"
-                  class="max-w-full max-h-[60vh] select-none block"
+                  class="max-w-full max-h-[60vh] select-none block rounded-lg"
                   draggable="false"
                   @load="onMainImageLoad"
                 />
