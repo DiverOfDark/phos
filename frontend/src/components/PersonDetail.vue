@@ -19,6 +19,7 @@ import {
   X,
   Merge,
   Search,
+  Trash2,
   Users,
   Image as ImageIcon,
 } from 'lucide-vue-next'
@@ -38,6 +39,10 @@ const error = ref(null)
 const isEditingName = ref(false)
 const editName = ref('')
 const savingName = ref(false)
+
+// Delete confirmation
+const showDeleteDialog = ref(false)
+const deleting = ref(false)
 
 // Merge dialog
 const showMergeDialog = ref(false)
@@ -147,6 +152,25 @@ async function mergeWith(targetId) {
     console.error('Failed to merge people:', e)
   } finally {
     merging.value = false
+  }
+}
+
+async function deletePerson() {
+  if (!personId.value || deleting.value) return
+
+  deleting.value = true
+  try {
+    const res = await fetch(`/api/people/${personId.value}`, {
+      method: 'DELETE',
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+
+    showDeleteDialog.value = false
+    router.push('/people')
+  } catch (e) {
+    console.error('Failed to delete person:', e)
+  } finally {
+    deleting.value = false
   }
 }
 
@@ -265,6 +289,15 @@ onMounted(loadData)
               <Merge class="w-3.5 h-3.5" />
               Merge with...
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              class="border-red-500/30 text-red-400 hover:text-red-300 hover:bg-red-500/10 gap-1.5"
+              @click="showDeleteDialog = true"
+            >
+              <Trash2 class="w-3.5 h-3.5" />
+              Delete
+            </Button>
           </div>
         </div>
       </div>
@@ -340,6 +373,35 @@ onMounted(loadData)
               </p>
             </div>
           </ScrollArea>
+        </div>
+      </DialogContent>
+    </Dialog>
+
+    <!-- Delete Confirmation Dialog -->
+    <Dialog v-model:open="showDeleteDialog">
+      <DialogContent class="sm:max-w-[400px]">
+        <DialogHeader>
+          <DialogTitle>Delete "{{ displayName }}"?</DialogTitle>
+          <DialogDescription>
+            This will remove all face markers from all photos of this person and delete the person record. The photos themselves will not be deleted.
+          </DialogDescription>
+        </DialogHeader>
+        <div class="flex justify-end gap-2 mt-4">
+          <Button
+            variant="outline"
+            class="border-white/10 text-zinc-300"
+            :disabled="deleting"
+            @click="showDeleteDialog = false"
+          >
+            Cancel
+          </Button>
+          <Button
+            class="bg-red-600 hover:bg-red-700 text-white"
+            :disabled="deleting"
+            @click="deletePerson"
+          >
+            {{ deleting ? 'Deleting...' : 'Delete' }}
+          </Button>
         </div>
       </DialogContent>
     </Dialog>

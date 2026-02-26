@@ -35,7 +35,7 @@ pub fn create_router(state: AppState) -> Router {
         // People
         .route("/api/people", get(get_people).post(create_person))
         .route("/api/people/merge", post(merge_people))
-        .route("/api/people/:id", get(get_person_shots).put(rename_person))
+        .route("/api/people/:id", get(get_person_shots).put(rename_person).delete(delete_person))
         .route("/api/people/:id/faces", get(get_person_faces))
         // Faces
         .route("/api/faces/:id/thumbnail", get(get_face_thumbnail))
@@ -313,6 +313,8 @@ struct ShotDetailResponse {
     primary_person_name: Option<String>,
     review_status: Option<String>,
     folder_number: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
     files: Vec<FileDetail>,
     faces: Vec<FaceDetail>,
     also_contains: Vec<AlsoContainsPerson>,
@@ -324,11 +326,13 @@ struct FileDetail {
     path: String,
     mime_type: Option<String>,
     is_original: bool,
+    file_size: Option<i64>,
 }
 
 #[derive(Serialize)]
 struct FaceDetail {
     id: String,
+    file_id: String,
     person_id: Option<String>,
     person_name: Option<String>,
     box_x1: f32,
@@ -353,7 +357,7 @@ async fn get_shot_detail(
     // Get shot metadata
     let shot_row = db
         .query_row(
-            "SELECT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number, p.name
+            "SELECT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number, p.name, s.width, s.height
              FROM shots s
              LEFT JOIN people p ON s.primary_person_id = p.id
              WHERE s.id = ?",
@@ -366,6 +370,8 @@ async fn get_shot_detail(
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<i64>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
                 ))
             },
         )
@@ -373,7 +379,7 @@ async fn get_shot_detail(
 
     // Get files for this shot
     let mut stmt = db
-        .prepare("SELECT id, path, mime_type, is_original FROM files WHERE shot_id = ?")
+        .prepare("SELECT id, path, mime_type, is_original, file_size FROM files WHERE shot_id = ?")
         .map_err(|e| {
             tracing::error!("Failed to prepare files query: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -385,6 +391,7 @@ async fn get_shot_detail(
                 path: row.get(1)?,
                 mime_type: row.get(2)?,
                 is_original: row.get::<_, bool>(3).unwrap_or(false),
+                file_size: row.get(4)?,
             })
         })
         .map_err(|e| {
@@ -397,7 +404,7 @@ async fn get_shot_detail(
     // Get faces for files in this shot, with person names
     let mut stmt = db
         .prepare(
-            "SELECT fa.id, fa.person_id, p.name, fa.box_x1, fa.box_y1, fa.box_x2, fa.box_y2
+            "SELECT fa.id, fa.file_id, fa.person_id, p.name, fa.box_x1, fa.box_y1, fa.box_x2, fa.box_y2
              FROM faces fa
              JOIN files f ON fa.file_id = f.id
              LEFT JOIN people p ON fa.person_id = p.id
@@ -411,12 +418,13 @@ async fn get_shot_detail(
         .query_map(params![id], |row| {
             Ok(FaceDetail {
                 id: row.get(0)?,
-                person_id: row.get(1)?,
-                person_name: row.get(2)?,
-                box_x1: row.get(3)?,
-                box_y1: row.get(4)?,
-                box_x2: row.get(5)?,
-                box_y2: row.get(6)?,
+                file_id: row.get(1)?,
+                person_id: row.get(2)?,
+                person_name: row.get(3)?,
+                box_x1: row.get(4)?,
+                box_y1: row.get(5)?,
+                box_x2: row.get(6)?,
+                box_y2: row.get(7)?,
             })
         })
         .map_err(|e| {
@@ -448,6 +456,8 @@ async fn get_shot_detail(
         primary_person_name: shot_row.5,
         review_status: shot_row.3,
         folder_number: shot_row.4,
+        width: shot_row.6,
+        height: shot_row.7,
         files,
         faces,
         also_contains,
@@ -773,6 +783,95 @@ async fn merge_people(
             tracing::error!("Failed to delete merged person: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+/// Delete a person and all their face records.
+/// Removes all faces belonging to this person, cleans up face_neighbors,
+/// recalculates primary_person_id for affected shots, and deletes the person.
+async fn delete_person(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let db = state.db.lock().await;
+
+    // Verify person exists
+    let exists: bool = db
+        .query_row(
+            "SELECT COUNT(*) FROM people WHERE id = ?",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .map_err(|e| {
+            tracing::error!("Failed to check person existence: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if !exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Find all shot_ids affected by this person's faces (for recalculation later)
+    let mut stmt = db
+        .prepare(
+            "SELECT DISTINCT f.shot_id FROM faces fa
+             JOIN files f ON fa.file_id = f.id
+             WHERE fa.person_id = ?",
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to prepare affected shots query: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let affected_shot_ids: Vec<String> = stmt
+        .query_map(params![id], |row| row.get(0))
+        .map_err(|e| {
+            tracing::error!("Failed to query affected shots: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Delete face_neighbors for all faces of this person
+    db.execute(
+        "DELETE FROM face_neighbors WHERE face_id_a IN (SELECT id FROM faces WHERE person_id = ?)
+         OR face_id_b IN (SELECT id FROM faces WHERE person_id = ?)",
+        params![id, id],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to delete face_neighbors for person {}: {}", id, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Delete all face records for this person
+    db.execute("DELETE FROM faces WHERE person_id = ?", params![id])
+        .map_err(|e| {
+            tracing::error!("Failed to delete faces for person {}: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Clear primary_person_id on shots that referenced this person
+    db.execute(
+        "UPDATE shots SET primary_person_id = NULL WHERE primary_person_id = ?",
+        params![id],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to clear primary_person_id: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Delete the person record
+    db.execute("DELETE FROM people WHERE id = ?", params![id])
+        .map_err(|e| {
+            tracing::error!("Failed to delete person {}: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Recalculate primary_person_id for all affected shots
+    for shot_id in &affected_shot_ids {
+        let _ = recalculate_primary_person(&db, shot_id);
+    }
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
