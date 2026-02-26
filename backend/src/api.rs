@@ -27,6 +27,7 @@ pub fn create_router(state: AppState) -> Router {
             get(get_shot_detail).put(update_shot).delete(delete_shot),
         )
         // Shot operations
+        .route("/api/shots/:id/similar", get(get_similar_shots))
         .route("/api/shots/:id/split", post(split_shot))
         .route("/api/shots/merge", post(merge_shots))
         .route("/api/shots/batch/confirm", post(batch_confirm))
@@ -190,6 +191,16 @@ struct ShotBrief {
     primary_person_name: Option<String>,
     review_status: Option<String>,
     folder_number: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct SimilarShotItem {
+    id: String,
+    thumbnail_url: String,
+    file_count: i64,
+    primary_person_name: Option<String>,
+    review_status: Option<String>,
+    distance: u32,
 }
 
 #[derive(Deserialize)]
@@ -747,6 +758,16 @@ async fn merge_people(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Update shots that reference the source person as their primary
+    db.execute(
+        "UPDATE shots SET primary_person_id = ? WHERE primary_person_id = ?",
+        params![payload.target_id, payload.source_id],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to reassign shots during merge: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     db.execute("DELETE FROM people WHERE id = ?", params![payload.source_id])
         .map_err(|e| {
             tracing::error!("Failed to delete merged person: {}", e);
@@ -1174,8 +1195,14 @@ async fn get_file(
 /// For images: resize to ~320px wide JPEG.
 /// For videos: extract the first frame, resize to ~320px wide JPEG.
 /// Thumbnails are cached in a `.phos_thumbnails` directory next to the DB.
+#[derive(Deserialize)]
+struct ThumbnailQuery {
+    w: Option<u32>,
+}
+
 async fn get_file_thumbnail(
     Path(id): Path<String>,
+    Query(query): Query<ThumbnailQuery>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let (file_path, mime_type, db_path) = {
@@ -1215,7 +1242,13 @@ async fn get_file_thumbnail(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let thumb_path = thumb_dir.join(format!("{}.jpg", id));
+    let target_width = query.w.unwrap_or(320).clamp(64, 1920);
+    let cache_suffix = if target_width == 320 {
+        format!("{}.jpg", id)
+    } else {
+        format!("{}_{}.jpg", id, target_width)
+    };
+    let thumb_path = thumb_dir.join(&cache_suffix);
 
     // Check if cached thumbnail exists
     if thumb_path.exists() {
@@ -1241,9 +1274,8 @@ async fn get_file_thumbnail(
                 .map_err(|e| format!("Failed to open image: {}", e))?
         };
 
-        // Resize to ~320px wide, maintaining aspect ratio
+        // Resize to target width, maintaining aspect ratio
         let (w, h) = img.dimensions();
-        let target_width = 320u32;
         let thumbnail = if w > target_width {
             let target_height = (h as f64 * target_width as f64 / w as f64) as u32;
             img.resize(
@@ -1725,6 +1757,106 @@ async fn split_shot(
     Ok(Json(
         serde_json::json!({"status": "ok", "new_shot_id": new_shot_id}),
     ))
+}
+
+/// GET /api/shots/:id/similar - find visually similar shots by dHash hamming distance
+async fn get_similar_shots(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<SimilarShotItem>>, StatusCode> {
+    let db = state.db.lock().await;
+
+    // Get current shot's primary_person_id and main_file_id
+    let (main_file_id, primary_person_id): (Option<String>, Option<String>) = db
+        .query_row(
+            "SELECT main_file_id, primary_person_id FROM shots WHERE id = ?",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let main_file_id = match main_file_id {
+        Some(fid) => fid,
+        None => return Ok(Json(vec![])),
+    };
+
+    // Load the main file's dHash
+    let current_dhash: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT visual_embedding FROM files WHERE id = ? AND visual_embedding IS NOT NULL",
+            params![main_file_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let current_dhash = match current_dhash {
+        Some(blob) if blob.len() == 8 => {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&blob);
+            arr
+        }
+        _ => return Ok(Json(vec![])),
+    };
+
+    // Load candidate shots (same person, only main files)
+    let mut stmt = db
+        .prepare(
+            "SELECT s.id, s.main_file_id, s.review_status, p.name,
+                    (SELECT COUNT(*) FROM files WHERE shot_id = s.id) as file_count,
+                    f.visual_embedding
+             FROM shots s
+             LEFT JOIN people p ON s.primary_person_id = p.id
+             JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
+             WHERE s.id != ?1
+               AND (s.primary_person_id = ?2 OR (?2 IS NULL AND s.primary_person_id IS NULL))",
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to prepare similar shots query: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let candidates: Vec<(String, String, Option<String>, Option<String>, i64, Vec<u8>)> = stmt
+        .query_map(params![id, primary_person_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .map_err(|e| {
+            tracing::error!("Failed to query similar shots: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut results: Vec<SimilarShotItem> = candidates
+        .into_iter()
+        .filter_map(|(shot_id, main_fid, review_status, person_name, file_count, blob)| {
+            if blob.len() != 8 {
+                return None;
+            }
+            let mut candidate_dhash = [0u8; 8];
+            candidate_dhash.copy_from_slice(&blob);
+            let distance = crate::scanner::hamming_distance(&current_dhash, &candidate_dhash);
+            Some(SimilarShotItem {
+                id: shot_id,
+                thumbnail_url: format!("/api/files/{}/thumbnail", main_fid),
+                file_count,
+                primary_person_name: person_name,
+                review_status,
+                distance,
+            })
+        })
+        .collect();
+
+    results.sort_by_key(|r| r.distance);
+    results.truncate(10);
+
+    Ok(Json(results))
 }
 
 /// POST /api/shots/merge - move all files from source to target shot. Delete source.

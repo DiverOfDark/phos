@@ -12,6 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import ShotCard from '@/components/ShotCard.vue'
 import {
   ArrowLeft,
   Star,
@@ -30,6 +31,7 @@ import {
   Check,
   FileImage,
   Film,
+  Merge,
 } from 'lucide-vue-next'
 
 const route = useRoute()
@@ -63,6 +65,12 @@ const splitSelection = ref(new Set())
 // --- Delete confirmation ---
 const showDeleteDialog = ref(false)
 const deleting = ref(false)
+
+// --- Similar shots ---
+const similarShots = ref([])
+const showMergeConfirm = ref(false)
+const mergeTargetShot = ref(null)
+const merging = ref(false)
 
 // --- Image natural dimensions (for face overlays) ---
 const naturalWidth = ref(0)
@@ -379,6 +387,45 @@ async function confirmSplit() {
   }
 }
 
+// --- Similar shots ---
+async function fetchSimilarShots() {
+  try {
+    const res = await fetch(`/api/shots/${shotId.value}/similar`)
+    if (res.ok) similarShots.value = await res.json()
+  } catch (e) {
+    console.warn('Failed to fetch similar shots', e)
+  }
+}
+
+function openMergeConfirm(shot) {
+  mergeTargetShot.value = shot
+  showMergeConfirm.value = true
+}
+
+async function confirmMerge() {
+  if (!mergeTargetShot.value) return
+  merging.value = true
+  try {
+    const res = await fetch('/api/shots/merge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source_id: mergeTargetShot.value.id,
+        target_id: shotId.value,
+      }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    showMergeConfirm.value = false
+    mergeTargetShot.value = null
+    await fetchShot()
+    await fetchSimilarShots()
+  } catch (e) {
+    console.error('Failed to merge shot', e)
+  } finally {
+    merging.value = false
+  }
+}
+
 // --- Delete shot ---
 async function deleteShot() {
   deleting.value = true
@@ -401,11 +448,12 @@ function goBack() {
 
 // --- Keyboard shortcuts ---
 function onKeydown(e) {
-  if (reassignFaceId.value || showReassignDropdown.value || showDeleteDialog.value) {
+  if (reassignFaceId.value || showReassignDropdown.value || showDeleteDialog.value || showMergeConfirm.value) {
     if (e.key === 'Escape') {
       closeReassign()
       closeReassignDropdown()
       showDeleteDialog.value = false
+      showMergeConfirm.value = false
     }
     return
   }
@@ -434,6 +482,7 @@ function onDocumentClick(e) {
 onMounted(() => {
   fetchShot()
   fetchPeople()
+  fetchSimilarShots()
   window.addEventListener('keydown', onKeydown)
   document.addEventListener('click', onDocumentClick)
 })
@@ -447,6 +496,7 @@ onUnmounted(() => {
 watch(() => route.params.id, () => {
   if (route.params.id) {
     fetchShot()
+    fetchSimilarShots()
   }
 })
 </script>
@@ -893,6 +943,35 @@ watch(() => route.params.id, () => {
             </div>
           </div>
 
+          <!-- Similar shots -->
+          <div
+            v-if="similarShots.length"
+            class="rounded-xl bg-zinc-800/30 border border-white/5 p-4 space-y-3"
+          >
+            <h3 class="text-sm font-semibold text-zinc-300">Similar Shots</h3>
+            <div class="grid grid-cols-2 gap-2">
+              <div
+                v-for="sim in similarShots"
+                :key="sim.id"
+                class="relative group/sim"
+              >
+                <router-link :to="`/shot/${sim.id}`">
+                  <ShotCard :shot="sim" />
+                </router-link>
+                <!-- Merge button overlay -->
+                <button
+                  class="absolute inset-0 flex items-center justify-center bg-black/60 opacity-0 group-hover/sim:opacity-100 transition-opacity rounded-lg"
+                  @click.prevent.stop="openMergeConfirm(sim)"
+                >
+                  <span class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors">
+                    <Merge class="w-3.5 h-3.5" />
+                    Merge
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
+
           <!-- Files list (detailed) -->
           <div class="rounded-xl bg-zinc-800/30 border border-white/5 p-4 space-y-3">
             <h3 class="text-sm font-semibold text-zinc-300">Files</h3>
@@ -965,6 +1044,36 @@ watch(() => route.params.id, () => {
             <RefreshCw v-if="deleting" class="w-4 h-4 mr-1 animate-spin" />
             <Trash2 v-else class="w-4 h-4 mr-1" />
             {{ deleting ? 'Deleting...' : 'Delete Shot' }}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+
+    <!-- Merge Confirmation Dialog -->
+    <Dialog v-model:open="showMergeConfirm">
+      <DialogContent class="sm:max-w-[400px]">
+        <DialogHeader>
+          <DialogTitle>Merge Shot</DialogTitle>
+          <DialogDescription>
+            This will move all files from the selected shot into this shot. The other shot will be deleted.
+          </DialogDescription>
+        </DialogHeader>
+        <div class="flex items-center justify-end gap-2 mt-4">
+          <Button
+            variant="ghost"
+            class="text-zinc-400"
+            @click="showMergeConfirm = false"
+          >
+            Cancel
+          </Button>
+          <Button
+            class="bg-indigo-600 hover:bg-indigo-500 text-white"
+            :disabled="merging"
+            @click="confirmMerge"
+          >
+            <RefreshCw v-if="merging" class="w-4 h-4 mr-1 animate-spin" />
+            <Merge v-else class="w-4 h-4 mr-1" />
+            {{ merging ? 'Merging...' : 'Merge' }}
           </Button>
         </div>
       </DialogContent>
