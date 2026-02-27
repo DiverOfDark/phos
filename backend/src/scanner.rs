@@ -261,6 +261,7 @@ impl Scanner {
                 |row| row.get(0),
             )?;
             if face_count == 0 {
+                conn.execute("UPDATE shots SET primary_person_id = NULL WHERE primary_person_id = ?", params![person_id])?;
                 conn.execute("DELETE FROM people WHERE id = ?", params![person_id])?;
                 info!("Removed orphaned person record {}", person_id);
             }
@@ -519,10 +520,19 @@ impl Scanner {
             }
         }
 
-        // Clean up unnamed persons with no faces (preserve user-created named people)
+        // Clean up people with no remaining faces
+        // First clear stale shots.primary_person_id references to avoid FK violations
         conn.execute(
-            "DELETE FROM people WHERE (name IS NULL OR name = '') \
-             AND id NOT IN (SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL)",
+            "UPDATE shots SET primary_person_id = NULL \
+             WHERE primary_person_id IN ( \
+                 SELECT p.id FROM people p \
+                 WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id) \
+             )",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM people \
+             WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = people.id)",
             [],
         )?;
 
@@ -559,7 +569,7 @@ impl Scanner {
             let mut rows = stmt.query(params![hash])?;
             if let Some(row) = rows.next()? {
                 let existing_id: String = row.get(0)?;
-                info!(
+                debug!(
                     "File already exists with hash {}, ID: {}",
                     hash, existing_id
                 );

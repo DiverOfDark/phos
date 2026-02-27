@@ -940,6 +940,7 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
 
                 Ok(())
             })() {
+                error!("Reorganize failed for {}: {}", file_row.path, e);
                 pb.println(format!("ERROR: {} -- {}", file_row.path, e));
                 errors += 1;
                 pb.inc(1);
@@ -952,6 +953,26 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     }
 
     pb.finish_and_clear();
+
+    // Clean up orphaned people (persons with no remaining faces)
+    let orphaned = conn.execute(
+        "UPDATE shots SET primary_person_id = NULL \
+         WHERE primary_person_id IN ( \
+             SELECT p.id FROM people p \
+             WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id) \
+         )",
+        [],
+    )?;
+    let deleted_people = conn.execute(
+        "DELETE FROM people WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = people.id)",
+        [],
+    )?;
+    if deleted_people > 0 {
+        info!(
+            "Removed {} orphaned people ({} shot references cleared)",
+            deleted_people, orphaned
+        );
+    }
 
     // Clean up empty directories (but never the library root or .phos.db)
     if !dry_run {

@@ -923,6 +923,42 @@ fn recalculate_primary_person(db: &Connection, shot_id: &str) -> Result<(), Stat
     Ok(())
 }
 
+/// Delete a person record if they have no remaining faces.
+/// Clears primary_person_id on any shots referencing this person.
+fn cleanup_orphaned_person(db: &Connection, person_id: &str) -> Result<(), StatusCode> {
+    let face_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM faces WHERE person_id = ?",
+            params![person_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to count faces for person {}: {}", person_id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if face_count == 0 {
+        db.execute(
+            "UPDATE shots SET primary_person_id = NULL WHERE primary_person_id = ?",
+            params![person_id],
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to clear primary_person_id for person {}: {}", person_id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        db.execute("DELETE FROM people WHERE id = ?", params![person_id])
+            .map_err(|e| {
+                tracing::error!("Failed to delete orphaned person {}: {}", person_id, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        tracing::info!("Deleted orphaned person {}", person_id);
+    }
+
+    Ok(())
+}
+
 /// Find the shot_id for a given face
 fn get_shot_id_for_face(db: &Connection, face_id: &str) -> Result<String, StatusCode> {
     db.query_row(
@@ -1051,8 +1087,12 @@ async fn reassign_face(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Find the shot_id for this face before updating
+    // Find the shot_id and old person_id for this face before updating
     let shot_id = get_shot_id_for_face(&db, &id)?;
+    let old_person_id: Option<String> = db
+        .query_row("SELECT person_id FROM faces WHERE id = ?", params![id], |row| row.get(0))
+        .ok()
+        .flatten();
 
     let updated = db
         .execute(
@@ -1077,6 +1117,13 @@ async fn reassign_face(
     // Recalculate shot's primary_person_id (unless confirmed)
     recalculate_primary_person(&db, &shot_id)?;
 
+    // If the old person has no remaining faces, delete them
+    if let Some(pid) = &old_person_id {
+        if pid != &payload.person_id {
+            cleanup_orphaned_person(&db, pid)?;
+        }
+    }
+
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -1087,8 +1134,12 @@ async fn delete_face(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db.lock().await;
 
-    // Find the shot_id for this face before deleting
+    // Find the shot_id and person_id for this face before deleting
     let shot_id = get_shot_id_for_face(&db, &id)?;
+    let old_person_id: Option<String> = db
+        .query_row("SELECT person_id FROM faces WHERE id = ?", params![id], |row| row.get(0))
+        .ok()
+        .flatten();
 
     // Delete face_neighbors entries where this face appears
     db.execute(
@@ -1114,6 +1165,11 @@ async fn delete_face(
 
     // Recalculate shot's primary_person_id from remaining faces
     recalculate_primary_person(&db, &shot_id)?;
+
+    // If the person has no remaining faces, delete them
+    if let Some(pid) = &old_person_id {
+        cleanup_orphaned_person(&db, pid)?;
+    }
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
