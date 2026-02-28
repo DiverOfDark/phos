@@ -2835,8 +2835,7 @@ async fn get_similar_shot_groups(
          FROM shots s
          LEFT JOIN people p ON s.primary_person_id = p.id
          JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
-         ORDER BY s.timestamp DESC
-         LIMIT 2000"
+         ORDER BY s.timestamp DESC"
     ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     struct ShotData {
