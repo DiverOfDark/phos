@@ -922,6 +922,50 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                 continue;
             }
 
+            // If source file doesn't exist, clean up the DB records
+            if !current_path.exists() {
+                warn!("File missing, removing DB records: {}", file_row.path);
+                pb.println(format!("CLEANUP: {} (file missing)", file_row.path));
+
+                // Collect person_ids that might become orphaned
+                let affected_person_ids: Vec<String> = conn
+                    .prepare("SELECT DISTINCT person_id FROM faces WHERE file_id = ? AND person_id IS NOT NULL")
+                    .and_then(|mut s| {
+                        s.query_map(params![file_row.file_id], |row| row.get(0))
+                            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    })
+                    .unwrap_or_default();
+
+                let _ = conn.execute("DELETE FROM face_neighbors WHERE face_id_a IN (SELECT id FROM faces WHERE file_id = ?) OR face_id_b IN (SELECT id FROM faces WHERE file_id = ?)", params![file_row.file_id, file_row.file_id]);
+                let _ = conn.execute("DELETE FROM faces WHERE file_id = ?", params![file_row.file_id]);
+                let _ = conn.execute("DELETE FROM video_keyframes WHERE video_file_id = ?", params![file_row.file_id]);
+                let _ = conn.execute("DELETE FROM files WHERE id = ?", params![file_row.file_id]);
+
+                // Delete shot if no files remain
+                let remaining: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM files WHERE shot_id = ?", params![file_row.shot_id], |row| row.get(0))
+                    .unwrap_or(0);
+                if remaining == 0 {
+                    let _ = conn.execute("DELETE FROM shots WHERE id = ?", params![file_row.shot_id]);
+                    info!("Removed orphaned shot {}", file_row.shot_id);
+                }
+
+                // Clean up orphaned people
+                for person_id in &affected_person_ids {
+                    let face_count: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM faces WHERE person_id = ?", params![person_id], |row| row.get(0))
+                        .unwrap_or(1);
+                    if face_count == 0 {
+                        let _ = conn.execute("UPDATE shots SET primary_person_id = NULL WHERE primary_person_id = ?", params![person_id]);
+                        let _ = conn.execute("DELETE FROM people WHERE id = ?", params![person_id]);
+                        info!("Removed orphaned person {}", person_id);
+                    }
+                }
+
+                pb.inc(1);
+                continue;
+            }
+
             // Actually move the file
             if let Err(e) = (|| -> anyhow::Result<()> {
                 fs::create_dir_all(&target_dir)?;

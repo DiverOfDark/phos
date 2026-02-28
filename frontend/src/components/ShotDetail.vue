@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import ShotCard from '@/components/ShotCard.vue'
+import EnhanceDialog from '@/components/EnhanceDialog.vue'
 import {
   ArrowLeft,
   Star,
@@ -32,6 +33,10 @@ import {
   FileImage,
   Film,
   Merge,
+  Wand2,
+  AlertCircle,
+  RotateCcw,
+  Play,
 } from 'lucide-vue-next'
 
 const route = useRoute()
@@ -44,6 +49,7 @@ const error = ref('')
 
 // --- Selected file in filmstrip ---
 const selectedFileIndex = ref(0)
+const videoPlaying = ref(false)
 
 // --- People list for reassign dropdowns ---
 const people = ref([])
@@ -66,11 +72,24 @@ const splitSelection = ref(new Set())
 const showDeleteDialog = ref(false)
 const deleting = ref(false)
 
+// --- Delete file copy ---
+const confirmDeleteFile = ref(false)
+const deletingFile = ref(false)
+
 // --- Similar shots ---
 const similarShots = ref([])
 const showMergeConfirm = ref(false)
 const mergeTargetShot = ref(null)
 const merging = ref(false)
+
+// --- ComfyUI enhance ---
+const comfyuiAvailable = ref(false)
+const showEnhanceDialog = ref(false)
+const shotTasks = ref([])
+let taskPollInterval = null
+
+// Reset video playback state when switching files
+watch(selectedFileIndex, () => { videoPlaying.value = false; confirmDeleteFile.value = false })
 
 // --- Image natural dimensions (for face overlays) ---
 const naturalWidth = ref(0)
@@ -105,8 +124,8 @@ const selectedFilename = computed(() => {
 })
 
 const facesForSelectedFile = computed(() => {
-  if (!shot.value?.faces?.length || isVideo.value) return []
-  return shot.value.faces
+  if (!shot.value?.faces?.length || !selectedFile.value) return []
+  return shot.value.faces.filter(f => f.file_id === selectedFile.value.id)
 })
 
 const peopleMap = computed(() => {
@@ -154,6 +173,14 @@ const statusLabel = computed(() => {
       return 'Pending'
   }
 })
+
+function formatFileSize(bytes) {
+  if (bytes == null) return null
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
 
 // --- Metadata computed ---
 const metadata = computed(() => {
@@ -250,6 +277,21 @@ async function setOriginal(fileId) {
   }
 }
 
+async function deleteFileCopy(fileId) {
+  deletingFile.value = true
+  try {
+    const res = await fetch(`/api/files/${fileId}`, { method: 'DELETE' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    confirmDeleteFile.value = false
+    selectedFileIndex.value = 0
+    await fetchShot()
+  } catch (e) {
+    console.error('Failed to delete file', e)
+  } finally {
+    deletingFile.value = false
+  }
+}
+
 // --- Face overlay helpers ---
 function onImageLoad(e) {
   naturalWidth.value = e.target.naturalWidth
@@ -257,11 +299,14 @@ function onImageLoad(e) {
 }
 
 function faceStyle(face) {
-  if (!naturalWidth.value || !naturalHeight.value) return { display: 'none' }
-  const left = (face.box_x1 / naturalWidth.value) * 100
-  const top = (face.box_y1 / naturalHeight.value) * 100
-  const width = ((face.box_x2 - face.box_x1) / naturalWidth.value) * 100
-  const height = ((face.box_y2 - face.box_y1) / naturalHeight.value) * 100
+  // For videos, face coords are from the original frame, so use shot dimensions
+  const w = isVideo.value ? (shot.value?.width || naturalWidth.value) : naturalWidth.value
+  const h = isVideo.value ? (shot.value?.height || naturalHeight.value) : naturalHeight.value
+  if (!w || !h) return { display: 'none' }
+  const left = (face.box_x1 / w) * 100
+  const top = (face.box_y1 / h) * 100
+  const width = ((face.box_x2 - face.box_x1) / w) * 100
+  const height = ((face.box_y2 - face.box_y1) / h) * 100
   return {
     left: `${left}%`,
     top: `${top}%`,
@@ -441,6 +486,76 @@ async function deleteShot() {
   }
 }
 
+// --- ComfyUI functions ---
+async function checkComfyuiHealth() {
+  try {
+    const res = await fetch('/api/comfyui/health')
+    if (!res.ok) throw new Error()
+    const data = await res.json()
+    comfyuiAvailable.value = data.status === 'ok'
+  } catch {
+    comfyuiAvailable.value = false
+  }
+}
+
+async function fetchShotTasks() {
+  if (!shotId.value) return
+  try {
+    const res = await fetch(`/api/comfyui/tasks?shot_id=${shotId.value}`)
+    if (!res.ok) return
+    shotTasks.value = await res.json()
+  } catch {
+    // ignore
+  }
+}
+
+function startTaskPolling() {
+  stopTaskPolling()
+  taskPollInterval = setInterval(async () => {
+    await fetchShotTasks()
+    // Check if any task just completed - refetch shot for new files
+    const hasActive = shotTasks.value.some(t => t.status === 'pending' || t.status === 'running')
+    if (!hasActive) {
+      stopTaskPolling()
+      // Refetch shot data in case new files appeared
+      await fetchShot()
+    }
+  }, 3000)
+}
+
+function stopTaskPolling() {
+  if (taskPollInterval) {
+    clearInterval(taskPollInterval)
+    taskPollInterval = null
+  }
+}
+
+function onTaskCreated(task) {
+  fetchShotTasks()
+  startTaskPolling()
+}
+
+async function retryTask(taskId) {
+  try {
+    const res = await fetch(`/api/comfyui/tasks/${taskId}/retry`, { method: 'POST' })
+    if (!res.ok) throw new Error()
+    await fetchShotTasks()
+    startTaskPolling()
+  } catch (e) {
+    console.error('Failed to retry task', e)
+  }
+}
+
+function taskStatusBadgeClass(status) {
+  switch (status) {
+    case 'completed': return 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+    case 'failed': return 'bg-red-500/10 text-red-400 border-red-500/20'
+    case 'running': return 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20'
+    case 'cancelled': return 'bg-zinc-500/10 text-zinc-400 border-zinc-500/20'
+    default: return 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20'
+  }
+}
+
 // --- Navigation ---
 function goBack() {
   router.back()
@@ -483,6 +598,8 @@ onMounted(() => {
   fetchShot()
   fetchPeople()
   fetchSimilarShots()
+  checkComfyuiHealth()
+  fetchShotTasks()
   window.addEventListener('keydown', onKeydown)
   document.addEventListener('click', onDocumentClick)
 })
@@ -490,6 +607,7 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
   document.removeEventListener('click', onDocumentClick)
+  stopTaskPolling()
 })
 
 // Refetch when route changes
@@ -497,6 +615,7 @@ watch(() => route.params.id, () => {
   if (route.params.id) {
     fetchShot()
     fetchSimilarShots()
+    fetchShotTasks()
   }
 })
 </script>
@@ -528,6 +647,18 @@ watch(() => route.params.id, () => {
           <div :class="cn('w-2 h-2 rounded-full', statusDot)" />
           <span class="text-xs font-medium text-zinc-300">{{ statusLabel }}</span>
         </div>
+
+        <!-- Enhance button (ComfyUI) -->
+        <Button
+          v-if="comfyuiAvailable && shot"
+          variant="ghost"
+          size="sm"
+          class="gap-1.5 text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10"
+          @click="showEnhanceDialog = true"
+        >
+          <Wand2 class="w-3.5 h-3.5" />
+          Enhance
+        </Button>
 
         <!-- Split button -->
         <Button
@@ -755,27 +886,39 @@ watch(() => route.params.id, () => {
         <!-- Main image area -->
         <div class="flex-1 min-w-0">
           <!-- Selected file with face overlays -->
-          <div class="relative rounded-xl overflow-hidden bg-zinc-900 border border-white/5">
-            <!-- Video -->
+          <div class="relative rounded-xl overflow-visible bg-zinc-900 border border-white/5">
+            <!-- Video in playback mode -->
             <video
-              v-if="selectedFileUrl && isVideo"
+              v-if="selectedFileUrl && isVideo && videoPlaying"
               :src="selectedFileUrl"
               controls
-              class="w-full max-h-[60vh] object-contain bg-black"
+              autoplay
+              class="w-full max-h-[60vh] object-contain bg-black rounded-xl"
             />
 
-            <!-- Image with face overlays -->
+            <!-- Image (or video thumbnail with play button) with face overlays -->
             <div
               v-else-if="selectedFileUrl"
               class="relative"
             >
               <img
-                :src="selectedFileUrl"
+                :src="isVideo ? selectedFileThumbnailUrl : selectedFileUrl"
                 :alt="selectedFilename"
-                class="w-full max-h-[60vh] object-contain block"
+                class="w-full max-h-[60vh] object-contain block rounded-xl"
                 draggable="false"
                 @load="onImageLoad"
               />
+
+              <!-- Play button overlay for videos -->
+              <button
+                v-if="isVideo"
+                class="absolute inset-0 flex items-center justify-center bg-black/20 hover:bg-black/30 transition-colors cursor-pointer group/play"
+                @click="videoPlaying = true"
+              >
+                <div class="w-16 h-16 rounded-full bg-black/60 group-hover/play:bg-black/80 flex items-center justify-center backdrop-blur-sm transition-colors">
+                  <Play class="w-8 h-8 text-white fill-white ml-1" />
+                </div>
+              </button>
 
               <!-- Face bounding boxes -->
               <template v-if="facesForSelectedFile.length">
@@ -871,11 +1014,17 @@ watch(() => route.params.id, () => {
 
           <!-- File info bar below image -->
           <div class="mt-3 flex items-center justify-between gap-4">
-            <div class="flex items-center gap-3 min-w-0">
+            <div class="flex items-center gap-3 min-w-0 flex-wrap">
               <span class="text-sm font-medium text-zinc-300 truncate">{{ selectedFilename }}</span>
               <span v-if="selectedFile?.is_original" class="flex items-center gap-1 px-1.5 py-0.5 rounded bg-yellow-500/10 border border-yellow-500/20">
                 <Star class="w-3 h-3 text-yellow-500" />
                 <span class="text-[10px] font-medium text-yellow-400">Original</span>
+              </span>
+              <span v-if="shot.width && shot.height" class="text-xs text-zinc-500">
+                {{ shot.width }} &times; {{ shot.height }}
+              </span>
+              <span v-if="formatFileSize(selectedFile?.file_size)" class="text-xs text-zinc-500">
+                {{ formatFileSize(selectedFile.file_size) }}
               </span>
               <span v-if="facesForSelectedFile.length" class="flex items-center gap-1 text-xs text-zinc-500">
                 <User class="w-3 h-3" />
@@ -883,17 +1032,52 @@ watch(() => route.params.id, () => {
               </span>
             </div>
 
-            <!-- Set as original button (for non-original files) -->
-            <Button
-              v-if="selectedFile && !selectedFile.is_original"
-              variant="ghost"
-              size="sm"
-              class="gap-1.5 text-zinc-400 hover:text-yellow-400 hover:bg-yellow-500/10 shrink-0"
-              @click="setOriginal(selectedFile.id)"
-            >
-              <Star class="w-3.5 h-3.5" />
-              Set as Original
-            </Button>
+            <div v-if="selectedFile && !selectedFile.is_original" class="flex items-center gap-2 shrink-0">
+              <!-- Set as original button -->
+              <Button
+                variant="ghost"
+                size="sm"
+                class="gap-1.5 text-zinc-400 hover:text-yellow-400 hover:bg-yellow-500/10"
+                @click="setOriginal(selectedFile.id)"
+              >
+                <Star class="w-3.5 h-3.5" />
+                Set as Original
+              </Button>
+              <!-- Delete copy button -->
+              <Button
+                v-if="!confirmDeleteFile"
+                variant="ghost"
+                size="sm"
+                class="gap-1.5 text-zinc-400 hover:text-red-400 hover:bg-red-500/10"
+                @click="confirmDeleteFile = true"
+              >
+                <Trash2 class="w-3.5 h-3.5" />
+                Delete Copy
+              </Button>
+              <!-- Confirm / Cancel -->
+              <template v-else>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  class="gap-1.5 text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                  :disabled="deletingFile"
+                  @click="deleteFileCopy(selectedFile.id)"
+                >
+                  <Trash2 v-if="!deletingFile" class="w-3.5 h-3.5" />
+                  <RefreshCw v-else class="w-3.5 h-3.5 animate-spin" />
+                  Confirm Delete
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  class="text-zinc-500 hover:text-zinc-300"
+                  :disabled="deletingFile"
+                  @click="confirmDeleteFile = false"
+                >
+                  Cancel
+                </Button>
+              </template>
+            </div>
           </div>
         </div>
 
@@ -1015,6 +1199,50 @@ watch(() => route.params.id, () => {
               </div>
             </div>
           </div>
+
+          <!-- AI Enhancements -->
+          <div
+            v-if="shotTasks.length"
+            class="rounded-xl bg-zinc-800/30 border border-white/5 p-4 space-y-3"
+          >
+            <h3 class="text-sm font-semibold text-zinc-300 flex items-center gap-2">
+              <Wand2 class="w-3.5 h-3.5 text-indigo-400" />
+              AI Enhancements
+            </h3>
+            <div class="space-y-2">
+              <div
+                v-for="task in shotTasks"
+                :key="task.id"
+                class="flex items-center gap-2 px-2 py-2 rounded-lg bg-zinc-900/30 border border-white/5"
+              >
+                <div class="flex-1 min-w-0">
+                  <p class="text-xs font-medium text-zinc-300 truncate">{{ task.workflow_name || 'Enhancement' }}</p>
+                  <div class="flex items-center gap-1.5 mt-0.5">
+                    <span
+                      :class="cn(
+                        'px-1.5 py-0.5 rounded text-[10px] font-medium border',
+                        taskStatusBadgeClass(task.status)
+                      )"
+                    >
+                      <RefreshCw v-if="task.status === 'running'" class="w-2.5 h-2.5 inline animate-spin mr-0.5" />
+                      {{ task.status }}
+                    </span>
+                  </div>
+                  <p v-if="task.error" class="text-[10px] text-red-400 mt-0.5 truncate">{{ task.error }}</p>
+                </div>
+                <button
+                  v-if="task.status === 'failed'"
+                  class="p-1 rounded text-zinc-500 hover:text-indigo-400 hover:bg-indigo-500/10 transition-colors shrink-0"
+                  title="Retry"
+                  @click="retryTask(task.id)"
+                >
+                  <RotateCcw class="w-3.5 h-3.5" />
+                </button>
+                <Check v-if="task.status === 'completed'" class="w-4 h-4 text-emerald-400 shrink-0" />
+                <AlertCircle v-if="task.status === 'failed'" class="w-4 h-4 text-red-400 shrink-0" />
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </template>
@@ -1051,13 +1279,19 @@ watch(() => route.params.id, () => {
 
     <!-- Merge Confirmation Dialog -->
     <Dialog v-model:open="showMergeConfirm">
-      <DialogContent class="sm:max-w-[400px]">
+      <DialogContent class="sm:max-w-[480px]">
         <DialogHeader>
           <DialogTitle>Merge Shot</DialogTitle>
           <DialogDescription>
             This will move all files from the selected shot into this shot. The other shot will be deleted.
           </DialogDescription>
         </DialogHeader>
+        <div v-if="mergeTargetShot" class="mt-3 rounded-xl overflow-hidden border border-white/10 bg-zinc-900">
+          <img
+            :src="mergeTargetShot.thumbnail_url"
+            class="w-full max-h-[300px] object-contain bg-black"
+          />
+        </div>
         <div class="flex items-center justify-end gap-2 mt-4">
           <Button
             variant="ghost"
@@ -1078,5 +1312,12 @@ watch(() => route.params.id, () => {
         </div>
       </DialogContent>
     </Dialog>
+
+    <!-- Enhance Dialog -->
+    <EnhanceDialog
+      v-model:open="showEnhanceDialog"
+      :shot-id="shotId"
+      @task-created="onTaskCreated"
+    />
   </div>
 </template>

@@ -130,6 +130,41 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         [],
     )?;
 
+    // ComfyUI workflow templates
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS comfyui_workflows (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            workflow_json TEXT NOT NULL,
+            inputs_json TEXT,
+            outputs_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )?;
+
+    // Enhancement tasks
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS enhancement_tasks (
+            id TEXT PRIMARY KEY,
+            shot_id TEXT NOT NULL,
+            workflow_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            comfyui_prompt_id TEXT,
+            text_overrides TEXT DEFAULT '{}',
+            output_file_id TEXT,
+            error_message TEXT,
+            retry_count INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            started_at DATETIME,
+            completed_at DATETIME,
+            FOREIGN KEY(shot_id) REFERENCES shots(id),
+            FOREIGN KEY(workflow_id) REFERENCES comfyui_workflows(id),
+            FOREIGN KEY(output_file_id) REFERENCES files(id)
+        )",
+        [],
+    )?;
+
     // Add representative_embedding column to people if it doesn't exist (migration)
     // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we check via pragma
     let people_columns: Vec<String> = conn

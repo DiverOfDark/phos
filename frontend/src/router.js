@@ -8,6 +8,7 @@ import Gallery from './components/Gallery.vue'
 import PeopleList from './components/PeopleList.vue'
 import Timeline from './components/Timeline.vue'
 import LoginPage from './components/LoginPage.vue'
+import WorkflowsPage from './components/WorkflowsPage.vue'
 
 const routes = [
   {
@@ -57,6 +58,12 @@ const routes = [
     name: 'timeline',
     component: Timeline,
     meta: { view: 'timeline' },
+  },
+  {
+    path: '/workflows',
+    name: 'workflows',
+    component: WorkflowsPage,
+    meta: { view: 'workflows' },
   },
 ]
 

@@ -1,6 +1,7 @@
 mod ai;
 mod api;
 mod auth;
+mod comfyui;
 mod db;
 mod import;
 mod scanner;
@@ -117,32 +118,57 @@ async fn run_server() {
     let ai = ai::AiPipeline::new().expect("Failed to load AI models");
     let scanner = Arc::new(scanner::Scanner::new(db_path.to_path_buf(), Some(ai)));
 
+    let comfyui_url = std::env::var("PHOS_COMFYUI_URL").ok();
+    if let Some(ref url) = comfyui_url {
+        info!("ComfyUI integration enabled (url: {})", url);
+    }
+
     let state = api::AppState {
         db: shared_conn.clone(),
         scanner: scanner.clone(),
+        comfyui_url: comfyui_url.clone(),
     };
+
+    // Shutdown coordination: a condvar that the blocking background task
+    // can wait on, and the signal handler sets.
+    let shutdown_flag = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
 
     // Run a scan in the background, then start the file watcher once done.
     let scan_path = root_path.to_path_buf();
     let watcher_library_path = root_path.to_path_buf();
     let watcher_db_path = db_path.to_path_buf();
+    let bg_shutdown = shutdown_flag.clone();
 
-    tokio::task::spawn_blocking(move || {
+    let bg_handle = tokio::task::spawn_blocking(move || {
+        let (lock, cvar) = &*bg_shutdown;
+        if *lock.lock().unwrap() {
+            return;
+        }
         if let Err(e) = scanner.scan(&scan_path) {
             tracing::error!("Scan failed: {}", e);
         }
 
+        if *lock.lock().unwrap() {
+            return;
+        }
         // Reorganize files on disk to match clustering results.
         if let Err(e) = import::run_reorganize(&scan_path, false) {
             tracing::error!("Post-scan reorganize failed: {}", e);
         }
 
+        if *lock.lock().unwrap() {
+            return;
+        }
         // Initial scan complete -- start watching for incremental changes.
         match watcher::start_watcher(watcher_library_path, watcher_db_path, None) {
             Ok(watcher_handle) => {
                 info!("File watcher active after initial scan");
-                let (_tx, rx) = std::sync::mpsc::channel::<()>();
-                let _ = rx.recv(); // blocks until program exit
+                // Block until shutdown is requested. Dropping the watcher handle
+                // closes the notify channel, which makes the watcher loop flush
+                // pending events and exit cleanly.
+                let guard = lock.lock().unwrap();
+                let _guard = cvar.wait_while(guard, |stopped| !*stopped).unwrap();
+                info!("Shutdown signal received, stopping file watcher");
                 drop(watcher_handle);
             }
             Err(e) => {
@@ -150,6 +176,18 @@ async fn run_server() {
             }
         }
     });
+
+    // Optionally spawn the ComfyUI enhancement worker
+    let _comfyui_handle = if let Some(ref url) = comfyui_url {
+        let comfyui_shutdown = shutdown_flag.clone();
+        Some(comfyui::spawn_enhancement_worker(
+            db_path.to_path_buf(),
+            url.clone(),
+            comfyui_shutdown,
+        ))
+    } else {
+        None
+    };
 
     let api_router = api::create_router(state);
     let static_dir = std::env::var("PHOS_STATIC_DIR").unwrap_or_else(|_| "static".to_string());
@@ -226,5 +264,42 @@ async fn run_server() {
     info!("listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+
+    info!("HTTP server stopped, signalling background tasks...");
+    // Wake the blocking background task so it can exit.
+    {
+        let (lock, cvar) = &*shutdown_flag;
+        let mut stopped = lock.lock().unwrap();
+        *stopped = true;
+        cvar.notify_all();
+    }
+    // Give it a moment to flush cleanly.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), bg_handle).await;
+    info!("Shutdown complete");
+}
+
+/// Wait for SIGTERM or Ctrl-C.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => info!("Received Ctrl-C, shutting down"),
+            _ = sigterm.recv() => info!("Received SIGTERM, shutting down"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.expect("failed to listen for Ctrl-C");
+        info!("Received Ctrl-C, shutting down");
+    }
 }
