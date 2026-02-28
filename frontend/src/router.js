@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { useAuth } from '@/composables/useAuth'
 import OrganizeDashboard from './components/OrganizeDashboard.vue'
 import ReviewQueue from './components/ReviewQueue.vue'
+import VariationsQueue from './components/VariationsQueue.vue'
 import ShotDetail from './components/ShotDetail.vue'
 import PersonDetail from './components/PersonDetail.vue'
 import Gallery from './components/Gallery.vue'
@@ -28,6 +29,12 @@ const routes = [
     name: 'review',
     component: ReviewQueue,
     meta: { view: 'review' },
+  },
+  {
+    path: '/variations',
+    name: 'variations',
+    component: VariationsQueue,
+    meta: { view: 'variations' },
   },
   {
     path: '/shot/:id',
