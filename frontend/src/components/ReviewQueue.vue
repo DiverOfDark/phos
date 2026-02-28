@@ -18,6 +18,7 @@ import {
   FolderOpen,
   AlertCircle,
   Plus,
+  Video,
 } from 'lucide-vue-next'
 
 const route = useRoute()
@@ -94,6 +95,14 @@ watch(currentShot, (shot) => {
 const files = computed(() => detail.value?.files || [])
 const originalFile = computed(() => files.value.find(f => f.is_original))
 const mainFile = computed(() => originalFile.value || files.value[0] || null)
+const mainFileIsVideo = computed(() => mainFile.value?.mime_type?.startsWith('video/'))
+// For videos, show a large thumbnail (first frame) so face overlays can work on a static image
+const mainFileMediaUrl = computed(() => {
+  if (!mainFile.value) return ''
+  return mainFileIsVideo.value
+    ? `/api/files/${mainFile.value.id}/thumbnail?w=1280`
+    : `/api/files/${mainFile.value.id}`
+})
 
 // --- People list (for reassignment) ---
 const people = ref([])
@@ -717,12 +726,22 @@ defineExpose({ loadData: fetchShots })
               >
                 <img
                   ref="imageEl"
-                  :src="`/api/files/${mainFile.id}`"
+                  :src="mainFileMediaUrl"
                   :alt="mainFile.path?.split('/').pop() || 'Shot'"
                   class="max-w-full max-h-[60vh] select-none block rounded-lg"
                   draggable="false"
                   @load="onMainImageLoad"
+                  @click="closeFacePopover"
                 />
+
+                <!-- Video badge -->
+                <div
+                  v-if="mainFileIsVideo"
+                  class="absolute top-3 right-14 flex items-center gap-1 px-2 py-1 bg-purple-500/20 backdrop-blur-sm border border-purple-500/30 rounded-lg"
+                >
+                  <Video class="w-3.5 h-3.5 text-purple-400" />
+                  <span class="text-xs font-semibold text-purple-300">Video</span>
+                </div>
 
                 <!-- Original badge on main image -->
                 <div
@@ -784,7 +803,7 @@ defineExpose({ loadData: fetchShots })
                                 <Trash2 class="w-3.5 h-3.5" />
                               </button>
                               <button
-                                class="text-zinc-500 hover:text-white transition-colors"
+                                class="p-1 text-zinc-500 hover:text-white transition-colors rounded"
                                 @click.stop="closeFacePopover"
                               >
                                 <X class="w-3.5 h-3.5" />

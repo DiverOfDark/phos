@@ -52,10 +52,10 @@ const statusLabel = computed(() => {
 
     <!-- File count badge (top-right) -->
     <div
-      v-if="shot.file_count > 1"
+      v-if="shot.file_count >= 1"
       class="absolute top-2 right-2 px-1.5 py-0.5 rounded bg-black/60 backdrop-blur-sm border border-white/10 text-xs font-medium text-white"
     >
-      {{ shot.file_count }} files
+      {{ shot.file_count }} {{ shot.file_count === 1 ? 'file' : 'files' }}
     </div>
 
     <!-- Review status dot (top-left) -->
