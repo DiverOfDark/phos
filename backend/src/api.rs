@@ -28,9 +28,11 @@ pub fn create_router(state: AppState) -> Router {
             get(get_shot_detail).put(update_shot).delete(delete_shot),
         )
         // Shot operations
+        .route("/api/shots/similar-groups", get(get_similar_shot_groups))
+        .route("/api/shots/merge", post(merge_shots))
+        .route("/api/shots/merge/ignore", post(ignore_merge))
         .route("/api/shots/:id/similar", get(get_similar_shots))
         .route("/api/shots/:id/split", post(split_shot))
-        .route("/api/shots/merge", post(merge_shots))
         .route("/api/shots/batch/confirm", post(batch_confirm))
         .route("/api/shots/batch/reassign", post(batch_reassign))
         // People
@@ -2788,4 +2790,159 @@ async fn comfyui_retry_task(
     })?;
 
     Ok(Json(serde_json::json!({"status": "pending"})))
+}
+#[derive(Deserialize)]
+struct IgnoreMergePayload {
+    shot_id_1: String,
+    shot_id_2: String,
+}
+
+async fn ignore_merge(
+    State(state): State<AppState>,
+    Json(payload): Json<IgnoreMergePayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let db = state.db.lock().await;
+    let (s1, s2) = if payload.shot_id_1 < payload.shot_id_2 {
+        (&payload.shot_id_1, &payload.shot_id_2)
+    } else {
+        (&payload.shot_id_2, &payload.shot_id_1)
+    };
+    db.execute(
+        "INSERT OR IGNORE INTO ignored_merges (shot_id_1, shot_id_2) VALUES (?, ?)",
+        params![s1, s2],
+    ).map_err(|e| {
+        tracing::error!("Failed to insert ignored_merge: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+#[derive(Serialize)]
+struct SimilarShotGroup {
+    primary: SimilarShotItem,
+    candidates: Vec<SimilarShotItem>,
+}
+
+async fn get_similar_shot_groups(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SimilarShotGroup>>, StatusCode> {
+    let db = state.db.lock().await;
+
+    let mut stmt = db.prepare(
+        "SELECT s.id, s.main_file_id, s.review_status, p.name,
+                (SELECT COUNT(*) FROM files WHERE shot_id = s.id) as file_count,
+                f.visual_embedding
+         FROM shots s
+         LEFT JOIN people p ON s.primary_person_id = p.id
+         JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
+         ORDER BY s.timestamp DESC"
+    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    struct ShotData {
+        id: String,
+        main_fid: String,
+        review_status: Option<String>,
+        person_name: Option<String>,
+        file_count: i64,
+        dhash: [u8; 8],
+    }
+
+    let candidates: Vec<ShotData> = stmt.query_map([], |row| {
+        let blob: Vec<u8> = row.get(5)?;
+        let mut dhash = [0u8; 8];
+        if blob.len() == 8 {
+            dhash.copy_from_slice(&blob);
+        }
+        Ok(ShotData {
+            id: row.get(0)?,
+            main_fid: row.get(1)?,
+            review_status: row.get(2)?,
+            person_name: row.get(3)?,
+            file_count: row.get(4)?,
+            dhash,
+        })
+    }).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    let mut ignored = std::collections::HashSet::new();
+    if let Ok(mut ignore_stmt) = db.prepare("SELECT shot_id_1, shot_id_2 FROM ignored_merges") {
+        let _ = ignore_stmt.query_map([], |row| {
+            let s1: String = row.get(0)?;
+            let s2: String = row.get(1)?;
+            ignored.insert((s1, s2));
+            Ok(())
+        });
+    }
+
+    let mut groups: Vec<SimilarShotGroup> = Vec::new();
+    let mut used = std::collections::HashSet::new();
+
+    for i in 0..candidates.len() {
+        if used.contains(&candidates[i].id) { continue; }
+        
+        let mut current_group = Vec::new();
+        for j in (i+1)..candidates.len() {
+            if used.contains(&candidates[j].id) { continue; }
+
+            let (s1, s2) = if candidates[i].id < candidates[j].id {
+                (&candidates[i].id, &candidates[j].id)
+            } else {
+                (&candidates[j].id, &candidates[i].id)
+            };
+
+            if ignored.contains(&(s1.clone(), s2.clone())) {
+                continue;
+            }
+
+            let dist = crate::scanner::hamming_distance(&candidates[i].dhash, &candidates[j].dhash);
+            if dist <= 10 { // Threshold for similarity
+                current_group.push(j);
+            }
+        }
+
+        if !current_group.is_empty() {
+            let mut candidates_items = Vec::new();
+            for idx in current_group {
+                used.insert(candidates[idx].id.clone());
+                candidates_items.push(SimilarShotItem {
+                    id: candidates[idx].id.clone(),
+                    thumbnail_url: format!("/api/files/{}/thumbnail", candidates[idx].main_fid),
+                    file_count: candidates[idx].file_count,
+                    primary_person_name: candidates[idx].person_name.clone(),
+                    review_status: candidates[idx].review_status.clone(),
+                    distance: crate::scanner::hamming_distance(&candidates[i].dhash, &candidates[idx].dhash),
+                });
+            }
+
+            used.insert(candidates[i].id.clone());
+            
+            let primary_item = SimilarShotItem {
+                id: candidates[i].id.clone(),
+                thumbnail_url: format!("/api/files/{}/thumbnail", candidates[i].main_fid),
+                file_count: candidates[i].file_count,
+                primary_person_name: candidates[i].person_name.clone(),
+                review_status: candidates[i].review_status.clone(),
+                distance: 0,
+            };
+
+            let mut all_items = vec![primary_item];
+            all_items.extend(candidates_items);
+            // Sort by file_count descending, so the fattest shot is primary
+            all_items.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+
+            let actual_primary = all_items.remove(0);
+            
+            groups.push(SimilarShotGroup {
+                primary: actual_primary,
+                candidates: all_items,
+            });
+
+            if groups.len() >= 20 {
+                break;
+            }
+        }
+    }
+
+    Ok(Json(groups))
 }

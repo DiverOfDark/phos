@@ -165,6 +165,17 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         [],
     )?;
 
+    // Ignored merges (for Variations Queue)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ignored_merges (
+            shot_id_1 TEXT NOT NULL,
+            shot_id_2 TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (shot_id_1, shot_id_2)
+        )",
+        [],
+    )?;
+
     // Add representative_embedding column to people if it doesn't exist (migration)
     // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we check via pragma
     let people_columns: Vec<String> = conn

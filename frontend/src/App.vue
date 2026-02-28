@@ -42,6 +42,7 @@ import {
   Image as ImageIcon,
   LogOut,
   Wand2,
+  Layers,
 } from 'lucide-vue-next'
 
 // --- Auth ---
@@ -283,6 +284,21 @@ onMounted(() => {
                 >
                   {{ pendingCount }}
                 </span>
+              </Button>
+            </router-link>
+            <router-link to="/variations" custom v-slot="{ navigate }">
+              <Button
+                variant="ghost"
+                :class="cn(
+                  'gap-2 px-3 transition-colors',
+                  currentView === 'variations'
+                    ? 'text-white bg-white/10'
+                    : 'text-zinc-400 hover:text-white hover:bg-white/5'
+                )"
+                @click="navigate"
+              >
+                <Layers class="w-4 h-4" />
+                Variations
               </Button>
             </router-link>
             <router-link to="/people" custom v-slot="{ navigate }">
