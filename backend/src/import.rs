@@ -774,6 +774,11 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     info!("Running face clustering...");
     scanner.cluster_faces(&conn)?;
 
+    // Reassign primary persons and folder numbers after re-clustering
+    scanner::assign_primary_persons(&conn)?;
+    scanner::assign_folder_numbers(&conn)?;
+    scanner::compact_folder_numbers(&conn)?;
+
     // Ensure all people have folder_name set (use UUID for unnamed people)
     ensure_folder_names(&conn)?;
 

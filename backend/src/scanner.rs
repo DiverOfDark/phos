@@ -197,6 +197,9 @@ impl Scanner {
         // Assign folder numbers to shots that don't have one yet
         assign_folder_numbers(&conn)?;
 
+        // Compact folder numbers to remove gaps from reassignments
+        compact_folder_numbers(&conn)?;
+
         Ok(())
     }
 
@@ -755,18 +758,22 @@ impl Scanner {
 pub fn assign_primary_persons(conn: &Connection) -> anyhow::Result<()> {
     // Find shots that need primary person assignment (not confirmed by user)
     let mut shot_stmt = conn.prepare(
-        "SELECT id FROM shots WHERE review_status != 'confirmed' OR review_status IS NULL"
+        "SELECT id, primary_person_id FROM shots WHERE review_status != 'confirmed' OR review_status IS NULL"
     )?;
-    let shot_ids: Vec<String> = shot_stmt
-        .query_map([], |row| row.get(0))?
+    let shots: Vec<(String, Option<String>)> = shot_stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .filter_map(|r| r.ok())
         .collect();
 
-    if shot_ids.is_empty() {
+    if shots.is_empty() {
         return Ok(());
     }
 
-    let mut update_stmt = conn.prepare(
+    // When person changes, also reset folder_number so assign_folder_numbers will reassign it
+    let mut update_with_reset_stmt = conn.prepare(
+        "UPDATE shots SET primary_person_id = ?, folder_number = NULL WHERE id = ?"
+    )?;
+    let mut update_same_stmt = conn.prepare(
         "UPDATE shots SET primary_person_id = ? WHERE id = ?"
     )?;
 
@@ -782,7 +789,8 @@ pub fn assign_primary_persons(conn: &Connection) -> anyhow::Result<()> {
 
     let mut assigned = 0;
     let mut cleared = 0;
-    for shot_id in &shot_ids {
+    let mut reassigned = 0;
+    for (shot_id, old_person_id) in &shots {
         let best_person: Option<String> = face_stmt
             .query_row(params![shot_id], |row| row.get(0))
             .ok();
@@ -792,12 +800,18 @@ pub fn assign_primary_persons(conn: &Connection) -> anyhow::Result<()> {
             None => cleared += 1,
         }
 
-        update_stmt.execute(params![best_person, shot_id])?;
+        if &best_person != old_person_id {
+            // Person changed — reset folder_number so it gets reassigned
+            update_with_reset_stmt.execute(params![best_person, shot_id])?;
+            reassigned += 1;
+        } else {
+            update_same_stmt.execute(params![best_person, shot_id])?;
+        }
     }
 
     info!(
-        "Primary person assignment: {} shots assigned, {} set to unsorted (NULL)",
-        assigned, cleared
+        "Primary person assignment: {} shots assigned, {} set to unsorted (NULL), {} reassigned (folder_number reset)",
+        assigned, cleared, reassigned
     );
 
     Ok(())
@@ -856,6 +870,70 @@ pub fn assign_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
     }
 
     info!("Folder number assignment: {} shots assigned numbers", total_assigned);
+
+    Ok(())
+}
+
+/// Compact folder numbers so they are sequential (1, 2, 3, ...) per person, removing gaps.
+///
+/// For each person (including NULL for unsorted), queries all shots ordered by
+/// current `folder_number` (with `created_at` as tiebreaker), then reassigns
+/// folder_numbers as 1, 2, 3, ... Only updates shots whose number actually changed.
+pub fn compact_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
+    // Get all distinct person IDs (including NULL for unsorted)
+    let mut person_stmt = conn.prepare(
+        "SELECT DISTINCT primary_person_id FROM shots WHERE folder_number IS NOT NULL"
+    )?;
+    let person_ids: Vec<Option<String>> = person_stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut update_stmt = conn.prepare(
+        "UPDATE shots SET folder_number = ? WHERE id = ?"
+    )?;
+
+    let mut person_shots_stmt = conn.prepare(
+        "SELECT id, folder_number FROM shots
+         WHERE primary_person_id = ? AND folder_number IS NOT NULL
+         ORDER BY folder_number, created_at"
+    )?;
+    let mut unsorted_shots_stmt = conn.prepare(
+        "SELECT id, folder_number FROM shots
+         WHERE primary_person_id IS NULL AND folder_number IS NOT NULL
+         ORDER BY folder_number, created_at"
+    )?;
+
+    let mut total_compacted = 0;
+    for person_id in &person_ids {
+        // Get shots for this person ordered by folder_number, then created_at
+        let shots: Vec<(String, i64)> = match person_id {
+            Some(pid) => {
+                person_shots_stmt
+                    .query_map(params![pid], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            }
+            None => {
+                unsorted_shots_stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            }
+        };
+
+        for (i, (shot_id, current_number)) in shots.iter().enumerate() {
+            let new_number = (i as i64) + 1;
+            if new_number != *current_number {
+                update_stmt.execute(params![new_number, shot_id])?;
+                total_compacted += 1;
+            }
+        }
+    }
+
+    if total_compacted > 0 {
+        info!("Folder number compaction: {} shots renumbered", total_compacted);
+    }
 
     Ok(())
 }
