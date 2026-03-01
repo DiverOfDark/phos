@@ -214,6 +214,13 @@ struct SimilarShotItem {
     distance: u32,
 }
 
+#[derive(Serialize)]
+struct SimilarShotsGrouped {
+    person_id: Option<String>,
+    person_name: Option<String>,
+    shots: Vec<SimilarShotItem>,
+}
+
 #[derive(Deserialize)]
 struct ShotsQuery {
     q: Option<String>,
@@ -1953,11 +1960,11 @@ async fn split_shot(
     ))
 }
 
-/// GET /api/shots/:id/similar - find visually similar shots by dHash hamming distance
+/// GET /api/shots/:id/similar - find visually similar shots by dHash hamming distance, grouped by person
 async fn get_similar_shots(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<SimilarShotItem>>, StatusCode> {
+) -> Result<Json<Vec<SimilarShotsGrouped>>, StatusCode> {
     let db = state.db.lock().await;
 
     // Get current shot's primary_person_id and main_file_id
@@ -1992,64 +1999,121 @@ async fn get_similar_shots(
         _ => return Ok(Json(vec![])),
     };
 
-    // Load candidate shots (same person, only main files)
-    let mut stmt = db
-        .prepare(
-            "SELECT s.id, s.main_file_id, s.review_status, p.name,
-                    (SELECT COUNT(*) FROM files WHERE shot_id = s.id) as file_count,
-                    f.visual_embedding
-             FROM shots s
-             LEFT JOIN people p ON s.primary_person_id = p.id
-             JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
-             WHERE s.id != ?1
-               AND (s.primary_person_id = ?2 OR (?2 IS NULL AND s.primary_person_id IS NULL))",
-        )
-        .map_err(|e| {
-            tracing::error!("Failed to prepare similar shots query: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // Collect all person IDs from this shot's faces (primary + also_contains)
+    let mut person_ids: Vec<(Option<String>, Option<String>)> = Vec::new();
 
-    let candidates: Vec<(String, String, Option<String>, Option<String>, i64, Vec<u8>)> = stmt
-        .query_map(params![id, primary_person_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        })
-        .map_err(|e| {
-            tracing::error!("Failed to query similar shots: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    // Add primary person
+    if primary_person_id.is_some() {
+        let primary_name: Option<String> = primary_person_id.as_ref().and_then(|pid| {
+            db.query_row("SELECT name FROM people WHERE id = ?", params![pid], |row| row.get(0)).ok()
+        });
+        person_ids.push((primary_person_id.clone(), primary_name));
+    }
 
-    let mut results: Vec<SimilarShotItem> = candidates
-        .into_iter()
-        .filter_map(|(shot_id, main_fid, review_status, person_name, file_count, blob)| {
-            if blob.len() != 8 {
-                return None;
-            }
-            let mut candidate_dhash = [0u8; 8];
-            candidate_dhash.copy_from_slice(&blob);
-            let distance = crate::scanner::hamming_distance(&current_dhash, &candidate_dhash);
-            Some(SimilarShotItem {
-                id: shot_id,
-                thumbnail_url: format!("/api/files/{}/thumbnail", main_fid),
-                file_count,
-                primary_person_name: person_name,
-                review_status,
-                distance,
+    // Add secondary people from faces on this shot's files
+    {
+        let mut stmt = db
+            .prepare(
+                "SELECT DISTINCT fa.person_id, p.name
+                 FROM faces fa
+                 JOIN files fi ON fi.id = fa.file_id
+                 JOIN people p ON p.id = fa.person_id
+                 WHERE fi.shot_id = ?1
+                   AND fa.person_id IS NOT NULL
+                   AND (?2 IS NULL OR fa.person_id != ?2)",
+            )
+            .map_err(|e| {
+                tracing::error!("Failed to prepare faces query: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let secondary: Vec<(Option<String>, Option<String>)> = stmt
+            .query_map(params![id, primary_person_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
             })
-        })
-        .collect();
+            .map_err(|e| {
+                tracing::error!("Failed to query faces: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        person_ids.extend(secondary);
+    }
 
-    results.sort_by_key(|r| r.distance);
+    // If no people at all, query shots with NULL primary_person_id
+    if person_ids.is_empty() {
+        person_ids.push((None, None));
+    }
 
-    Ok(Json(results))
+    // For each person, find similar shots
+    let mut groups: Vec<SimilarShotsGrouped> = Vec::new();
+
+    for (person_id, person_name) in &person_ids {
+        let mut stmt = db
+            .prepare(
+                "SELECT s.id, s.main_file_id, s.review_status, p.name,
+                        (SELECT COUNT(*) FROM files WHERE shot_id = s.id) as file_count,
+                        f.visual_embedding
+                 FROM shots s
+                 LEFT JOIN people p ON s.primary_person_id = p.id
+                 JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
+                 WHERE s.id != ?1
+                   AND (s.primary_person_id = ?2 OR (?2 IS NULL AND s.primary_person_id IS NULL))",
+            )
+            .map_err(|e| {
+                tracing::error!("Failed to prepare similar shots query: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let candidates: Vec<(String, String, Option<String>, Option<String>, i64, Vec<u8>)> = stmt
+            .query_map(params![id, person_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .map_err(|e| {
+                tracing::error!("Failed to query similar shots: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut results: Vec<SimilarShotItem> = candidates
+            .into_iter()
+            .filter_map(|(shot_id, main_fid, review_status, pname, file_count, blob)| {
+                if blob.len() != 8 {
+                    return None;
+                }
+                let mut candidate_dhash = [0u8; 8];
+                candidate_dhash.copy_from_slice(&blob);
+                let distance = crate::scanner::hamming_distance(&current_dhash, &candidate_dhash);
+                Some(SimilarShotItem {
+                    id: shot_id,
+                    thumbnail_url: format!("/api/files/{}/thumbnail", main_fid),
+                    file_count,
+                    primary_person_name: pname,
+                    review_status,
+                    distance,
+                })
+            })
+            .collect();
+
+        results.sort_by_key(|r| r.distance);
+
+        if !results.is_empty() {
+            groups.push(SimilarShotsGrouped {
+                person_id: person_id.clone(),
+                person_name: person_name.clone(),
+                shots: results,
+            });
+        }
+    }
+
+    Ok(Json(groups))
 }
 
 /// POST /api/shots/merge - move all files from source to target shot. Delete source.
@@ -2057,6 +2121,7 @@ async fn get_similar_shots(
 struct MergeShotsPayload {
     source_id: String,
     target_id: String,
+    person_id: Option<String>,
 }
 
 async fn merge_shots(
@@ -2105,6 +2170,18 @@ async fn merge_shots(
         tracing::error!("Failed to delete source shot during merge: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // If person_id is provided, update the target shot's primary person
+    if let Some(ref person_id) = payload.person_id {
+        db.execute(
+            "UPDATE shots SET primary_person_id = ?, folder_number = NULL WHERE id = ?",
+            params![person_id, payload.target_id],
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to update primary_person_id during merge: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }

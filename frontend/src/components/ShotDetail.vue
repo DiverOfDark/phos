@@ -79,9 +79,10 @@ const confirmDeleteFile = ref(false)
 const deletingFile = ref(false)
 
 // --- Similar shots ---
-const similarShots = ref([])
+const similarShots = ref([]) // Array<{person_id, person_name, shots: SimilarShotItem[]}>
 const showMergeConfirm = ref(false)
 const mergeTargetShot = ref(null)
+const mergeTargetPersonId = ref(null)
 const merging = ref(false)
 
 // --- ComfyUI enhance ---
@@ -458,8 +459,9 @@ async function fetchSimilarShots() {
   }
 }
 
-function openMergeConfirm(shot) {
+function openMergeConfirm(shot, personId = null) {
   mergeTargetShot.value = shot
+  mergeTargetPersonId.value = personId
   showMergeConfirm.value = true
 }
 
@@ -467,17 +469,20 @@ async function confirmMerge() {
   if (!mergeTargetShot.value) return
   merging.value = true
   try {
+    const body = {
+      source_id: mergeTargetShot.value.id,
+      target_id: shotId.value,
+    }
+    if (mergeTargetPersonId.value) body.person_id = mergeTargetPersonId.value
     const res = await fetch('/api/shots/merge', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        source_id: mergeTargetShot.value.id,
-        target_id: shotId.value,
-      }),
+      body: JSON.stringify(body),
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     showMergeConfirm.value = false
     mergeTargetShot.value = null
+    mergeTargetPersonId.value = null
     await fetchShot()
     await fetchSimilarShots()
   } catch (e) {
@@ -1263,15 +1268,16 @@ watch(() => route.params.id, () => {
         </div>
       </div>
 
-      <!-- Same person shots (below the main content area) -->
+      <!-- Similar shots grouped by person (below the main content area) -->
       <div
-        v-if="similarShots.length"
+        v-for="group in similarShots"
+        :key="group.person_id || 'unknown'"
         class="rounded-xl bg-zinc-800/30 border border-white/5 p-4 space-y-3"
       >
-        <h3 class="text-sm font-semibold text-zinc-300">Same Person ({{ similarShots.length }})</h3>
+        <h3 class="text-sm font-semibold text-zinc-300">{{ group.person_name || 'Unknown Person' }} ({{ group.shots.length }})</h3>
         <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-3">
           <div
-            v-for="sim in similarShots"
+            v-for="sim in group.shots"
             :key="sim.id"
             class="relative group/sim"
           >
@@ -1281,7 +1287,7 @@ watch(() => route.params.id, () => {
             <!-- Merge button overlay -->
             <button
               class="absolute inset-0 flex items-center justify-center bg-black/60 opacity-0 group-hover/sim:opacity-100 transition-opacity rounded-lg"
-              @click.prevent.stop="openMergeConfirm(sim)"
+              @click.prevent.stop="openMergeConfirm(sim, group.person_id)"
             >
               <span class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors">
                 <Merge class="w-3.5 h-3.5" />
