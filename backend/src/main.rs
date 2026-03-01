@@ -163,11 +163,22 @@ async fn run_server() {
         match watcher::start_watcher(watcher_library_path, watcher_db_path, None) {
             Ok(watcher_handle) => {
                 info!("File watcher active after initial scan");
-                // Block until shutdown is requested. Dropping the watcher handle
-                // closes the notify channel, which makes the watcher loop flush
-                // pending events and exit cleanly.
-                let guard = lock.lock().unwrap();
-                let _guard = cvar.wait_while(guard, |stopped| !*stopped).unwrap();
+                // Periodically re-run reorganize (every 5 minutes) until shutdown.
+                let reorganize_interval = std::time::Duration::from_secs(30 * 60);
+                let mut guard = lock.lock().unwrap();
+                loop {
+                    let (g, timeout) = cvar.wait_timeout_while(guard, reorganize_interval, |stopped| !*stopped).unwrap();
+                    guard = g;
+                    if *guard {
+                        break;
+                    }
+                    if timeout.timed_out() {
+                        info!("Periodic reorganize triggered");
+                        if let Err(e) = import::run_reorganize(&scan_path, false) {
+                            tracing::error!("Periodic reorganize failed: {}", e);
+                        }
+                    }
+                }
                 info!("Shutdown signal received, stopping file watcher");
                 drop(watcher_handle);
             }

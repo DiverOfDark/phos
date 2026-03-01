@@ -25,6 +25,8 @@ import {
   X,
   RefreshCw,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   MapPin,
   Clock,
   Maximize2,
@@ -372,6 +374,20 @@ function closeReassignDropdown() {
   reassignShotSearch.value = ''
 }
 
+async function approveShot() {
+  try {
+    const res = await fetch(`/api/shots/${shotId.value}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ review_status: 'confirmed' }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    await fetchShot()
+  } catch (e) {
+    console.error('Failed to approve shot', e)
+  }
+}
+
 async function reassignShot(personId) {
   try {
     const payload = {
@@ -639,6 +655,26 @@ watch(() => route.params.id, () => {
             {{ shot.files?.length || 0 }} file{{ (shot.files?.length || 0) !== 1 ? 's' : '' }}
           </p>
         </div>
+        <div class="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            class="text-zinc-400 hover:text-white rounded-xl hover:bg-white/5"
+            :disabled="!shot?.prev_shot_id"
+            @click="router.push(`/shot/${shot.prev_shot_id}`)"
+          >
+            <ChevronLeft class="w-5 h-5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            class="text-zinc-400 hover:text-white rounded-xl hover:bg-white/5"
+            :disabled="!shot?.next_shot_id"
+            @click="router.push(`/shot/${shot.next_shot_id}`)"
+          >
+            <ChevronRight class="w-5 h-5" />
+          </Button>
+        </div>
       </div>
 
       <div class="flex items-center gap-2">
@@ -647,6 +683,16 @@ watch(() => route.params.id, () => {
           <div :class="cn('w-2 h-2 rounded-full', statusDot)" />
           <span class="text-xs font-medium text-zinc-300">{{ statusLabel }}</span>
         </div>
+        <Button
+          v-if="shot?.review_status !== 'confirmed'"
+          variant="ghost"
+          size="sm"
+          class="gap-1.5 text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10"
+          @click="approveShot"
+        >
+          <Check class="w-3.5 h-3.5" />
+          Approve
+        </Button>
 
         <!-- Enhance button (ComfyUI) -->
         <Button
@@ -1127,35 +1173,6 @@ watch(() => route.params.id, () => {
             </div>
           </div>
 
-          <!-- Similar shots -->
-          <div
-            v-if="similarShots.length"
-            class="rounded-xl bg-zinc-800/30 border border-white/5 p-4 space-y-3"
-          >
-            <h3 class="text-sm font-semibold text-zinc-300">Similar Shots</h3>
-            <div class="grid grid-cols-2 gap-2">
-              <div
-                v-for="sim in similarShots"
-                :key="sim.id"
-                class="relative group/sim"
-              >
-                <router-link :to="`/shot/${sim.id}`">
-                  <ShotCard :shot="sim" />
-                </router-link>
-                <!-- Merge button overlay -->
-                <button
-                  class="absolute inset-0 flex items-center justify-center bg-black/60 opacity-0 group-hover/sim:opacity-100 transition-opacity rounded-lg"
-                  @click.prevent.stop="openMergeConfirm(sim)"
-                >
-                  <span class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors">
-                    <Merge class="w-3.5 h-3.5" />
-                    Merge
-                  </span>
-                </button>
-              </div>
-            </div>
-          </div>
-
           <!-- Files list (detailed) -->
           <div class="rounded-xl bg-zinc-800/30 border border-white/5 p-4 space-y-3">
             <h3 class="text-sm font-semibold text-zinc-300">Files</h3>
@@ -1242,6 +1259,35 @@ watch(() => route.params.id, () => {
                 <AlertCircle v-if="task.status === 'failed'" class="w-4 h-4 text-red-400 shrink-0" />
               </div>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Same person shots (below the main content area) -->
+      <div
+        v-if="similarShots.length"
+        class="rounded-xl bg-zinc-800/30 border border-white/5 p-4 space-y-3"
+      >
+        <h3 class="text-sm font-semibold text-zinc-300">Same Person ({{ similarShots.length }})</h3>
+        <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-3">
+          <div
+            v-for="sim in similarShots"
+            :key="sim.id"
+            class="relative group/sim"
+          >
+            <router-link :to="`/shot/${sim.id}`">
+              <ShotCard :shot="sim" />
+            </router-link>
+            <!-- Merge button overlay -->
+            <button
+              class="absolute inset-0 flex items-center justify-center bg-black/60 opacity-0 group-hover/sim:opacity-100 transition-opacity rounded-lg"
+              @click.prevent.stop="openMergeConfirm(sim)"
+            >
+              <span class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors">
+                <Merge class="w-3.5 h-3.5" />
+                Merge
+              </span>
+            </button>
           </div>
         </div>
       </div>

@@ -329,6 +329,8 @@ struct ShotDetailResponse {
     files: Vec<FileDetail>,
     faces: Vec<FaceDetail>,
     also_contains: Vec<AlsoContainsPerson>,
+    prev_shot_id: Option<String>,
+    next_shot_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -390,7 +392,7 @@ async fn get_shot_detail(
 
     // Get files for this shot
     let mut stmt = db
-        .prepare("SELECT id, path, mime_type, is_original, file_size FROM files WHERE shot_id = ?")
+        .prepare("SELECT id, path, mime_type, is_original, file_size FROM files WHERE shot_id = ? ORDER BY is_original DESC, path ASC")
         .map_err(|e| {
             tracing::error!("Failed to prepare files query: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -460,6 +462,30 @@ async fn get_shot_detail(
         }
     }
 
+    // Previous shot (newer timestamp, or same timestamp with id > current for stable ordering)
+    let prev_shot_id: Option<String> = db
+        .query_row(
+            "SELECT id FROM shots
+             WHERE (timestamp > ?1 OR (timestamp = ?1 AND id > ?2) OR (timestamp IS NULL AND ?1 IS NOT NULL))
+             ORDER BY timestamp ASC, id ASC
+             LIMIT 1",
+            params![shot_row.1, id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    // Next shot (older timestamp, or same timestamp with id < current for stable ordering)
+    let next_shot_id: Option<String> = db
+        .query_row(
+            "SELECT id FROM shots
+             WHERE (timestamp < ?1 OR (timestamp = ?1 AND id < ?2) OR (?1 IS NULL AND timestamp IS NOT NULL))
+             ORDER BY timestamp DESC, id DESC
+             LIMIT 1",
+            params![shot_row.1, id],
+            |row| row.get(0),
+        )
+        .ok();
+
     Ok(Json(ShotDetailResponse {
         id: shot_row.0,
         timestamp: shot_row.1,
@@ -472,6 +498,8 @@ async fn get_shot_detail(
         files,
         faces,
         also_contains,
+        prev_shot_id,
+        next_shot_id,
     }))
 }
 
@@ -592,7 +620,7 @@ async fn get_people(State(state): State<AppState>) -> Json<Vec<PersonBrief>> {
              LEFT JOIN faces fa ON fa.person_id = p.id
              LEFT JOIN shots s_primary ON s_primary.primary_person_id = p.id
              GROUP BY p.id
-             ORDER BY face_count DESC",
+             ORDER BY p.name ASC NULLS LAST, face_count DESC",
         )
         .unwrap();
     let rows = stmt
@@ -2020,7 +2048,6 @@ async fn get_similar_shots(
         .collect();
 
     results.sort_by_key(|r| r.distance);
-    results.truncate(10);
 
     Ok(Json(results))
 }
@@ -2823,9 +2850,24 @@ struct SimilarShotGroup {
     candidates: Vec<SimilarShotItem>,
 }
 
+#[derive(Deserialize)]
+struct SimilarGroupsQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct SimilarGroupsResponse {
+    groups: Vec<SimilarShotGroup>,
+    total: usize,
+    offset: usize,
+    limit: usize,
+}
+
 async fn get_similar_shot_groups(
     State(state): State<AppState>,
-) -> Result<Json<Vec<SimilarShotGroup>>, StatusCode> {
+    Query(query): Query<SimilarGroupsQuery>,
+) -> Result<Json<SimilarGroupsResponse>, StatusCode> {
     let db = state.db.lock().await;
 
     let mut stmt = db.prepare(
@@ -2867,12 +2909,15 @@ async fn get_similar_shot_groups(
 
     let mut ignored = std::collections::HashSet::new();
     if let Ok(mut ignore_stmt) = db.prepare("SELECT shot_id_1, shot_id_2 FROM ignored_merges") {
-        let _ = ignore_stmt.query_map([], |row| {
+        if let Ok(rows) = ignore_stmt.query_map([], |row| {
             let s1: String = row.get(0)?;
             let s2: String = row.get(1)?;
-            ignored.insert((s1, s2));
-            Ok(())
-        });
+            Ok((s1, s2))
+        }) {
+            for pair in rows.flatten() {
+                ignored.insert(pair);
+            }
+        }
     }
 
     let mut groups: Vec<SimilarShotGroup> = Vec::new();
@@ -2938,11 +2983,18 @@ async fn get_similar_shot_groups(
                 candidates: all_items,
             });
 
-            if groups.len() >= 20 {
-                break;
-            }
         }
     }
 
-    Ok(Json(groups))
+    let total = groups.len();
+    let offset = query.offset.unwrap_or(0).min(total);
+    let limit = query.limit.unwrap_or(50).min(200);
+    let page = groups.into_iter().skip(offset).take(limit).collect();
+
+    Ok(Json(SimilarGroupsResponse {
+        groups: page,
+        total,
+        offset,
+        limit,
+    }))
 }

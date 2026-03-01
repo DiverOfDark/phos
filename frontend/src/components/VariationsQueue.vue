@@ -7,6 +7,9 @@ const router = useRouter()
 const groups = ref([])
 const currentIndex = ref(0)
 const loading = ref(true)
+const totalGroups = ref(0)
+const pageOffset = ref(0)
+const pageLimit = 50
 
 // For the current group, track which candidates are selected for merge
 const selectedCandidates = ref(new Set())
@@ -22,12 +25,21 @@ onUnmounted(() => {
   window.removeEventListener('keydown', handleKeydown)
 })
 
-async function fetchGroups() {
+async function fetchGroups(append = false) {
   loading.value = true
   try {
-    const res = await fetch('/api/shots/similar-groups')
+    const offset = append ? pageOffset.value : 0
+    const res = await fetch(`/api/shots/similar-groups?offset=${offset}&limit=${pageLimit}`)
     if (res.ok) {
-      groups.value = await res.json()
+      const data = await res.json()
+      if (append) {
+        groups.value.push(...data.groups)
+      } else {
+        groups.value = data.groups
+        currentIndex.value = 0
+      }
+      totalGroups.value = data.total
+      pageOffset.value = offset + data.groups.length
       initSelection()
     }
   } catch (e) {
@@ -101,7 +113,9 @@ function nextGroup() {
   currentIndex.value++
   initSelection()
   if (currentIndex.value >= groups.value.length) {
-    fetchGroups() // fetch next batch
+    if (pageOffset.value < totalGroups.value) {
+      fetchGroups(true) // fetch next batch, appending
+    }
   }
 }
 
@@ -125,7 +139,7 @@ function viewShot(id) {
       <div class="flex items-center gap-4">
         <h1 class="text-lg font-medium tracking-tight">Variations Queue</h1>
         <span v-if="!loading && groups.length > 0" class="text-sm text-zinc-500">
-          Group {{ currentIndex + 1 }} of {{ groups.length }}
+          Group {{ currentIndex + 1 }} of {{ totalGroups }}
         </span>
       </div>
       <div class="flex items-center gap-3 text-sm text-zinc-400">
@@ -134,58 +148,61 @@ function viewShot(id) {
       </div>
     </header>
 
-    <div class="flex-1 overflow-y-auto p-6">
-      <div v-if="loading" class="flex h-full items-center justify-center text-zinc-500">
+    <div class="flex-1 flex flex-col min-h-0">
+      <div v-if="loading" class="flex flex-1 items-center justify-center text-zinc-500">
         Finding similar shots...
       </div>
-      <div v-else-if="groups.length === 0" class="flex flex-col h-full items-center justify-center text-zinc-500 gap-4">
+      <div v-else-if="groups.length === 0" class="flex flex-col flex-1 items-center justify-center text-zinc-500 gap-4">
         <Layers class="w-12 h-12 text-zinc-700" />
         <p>No similar groups found.</p>
         <button @click="router.push('/')" class="text-indigo-400 hover:text-indigo-300">Back to Library</button>
       </div>
-      <div v-else-if="currentGroup" class="flex gap-8 h-full max-h-[800px]">
-        <!-- Primary Shot -->
-        <div class="flex-1 flex flex-col items-center gap-4 border-r border-white/10 pr-8">
-          <h2 class="text-sm font-semibold text-zinc-400 uppercase tracking-wider">Primary Target</h2>
-          <div class="relative rounded-lg overflow-hidden border border-indigo-500/50 shadow-[0_0_15px_rgba(99,102,241,0.2)] bg-zinc-900 cursor-pointer" @click="viewShot(currentGroup.primary.id)">
-            <img :src="currentGroup.primary.thumbnail_url" class="max-h-[600px] object-contain" />
-            <div class="absolute top-3 left-3 bg-indigo-500 text-white text-xs font-bold px-2 py-1 rounded-md shadow flex items-center gap-1">
-              <Layers class="w-3.5 h-3.5" />
-              Primary ({{ currentGroup.primary.file_count }} files)
+      <template v-else-if="currentGroup">
+        <!-- Primary + actions bar -->
+        <div class="shrink-0 flex items-center gap-6 px-6 py-4 border-b border-white/10">
+          <div class="relative rounded-lg overflow-hidden border border-indigo-500/50 shadow-[0_0_15px_rgba(99,102,241,0.2)] bg-zinc-900 cursor-pointer shrink-0" @click="viewShot(currentGroup.primary.id)">
+            <img :src="currentGroup.primary.thumbnail_url" class="h-32 object-contain" />
+            <div class="absolute top-2 left-2 bg-indigo-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shadow flex items-center gap-1">
+              <Layers class="w-3 h-3" />
+              Primary
             </div>
           </div>
-          <button @click="handleMerge" class="mt-4 px-6 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-medium rounded-lg shadow-md transition-colors flex items-center gap-2">
-            <Merge class="w-4 h-4" />
-            Merge {{ selectedCandidates.size }} into Primary
-          </button>
-          <button @click="handleIgnoreAll" class="text-sm text-zinc-500 hover:text-zinc-300 transition-colors">
-            Keep All Separate
-          </button>
+          <div class="flex flex-col gap-2">
+            <span class="text-sm text-zinc-400">{{ currentGroup.primary.file_count }} files</span>
+            <button @click="handleMerge" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-lg shadow transition-colors flex items-center gap-2">
+              <Merge class="w-4 h-4" />
+              Merge {{ selectedCandidates.size }} into Primary
+            </button>
+            <button @click="handleIgnoreAll" class="text-xs text-zinc-500 hover:text-zinc-300 transition-colors text-left">
+              Keep All Separate
+            </button>
+          </div>
         </div>
 
-        <!-- Candidates -->
-        <div class="flex-[1.5] flex flex-col gap-4">
-          <h2 class="text-sm font-semibold text-zinc-400 uppercase tracking-wider">Merge Candidates</h2>
-          <div class="grid grid-cols-2 lg:grid-cols-3 gap-4 overflow-y-auto pr-2 pb-8">
-            <div 
-              v-for="candidate in currentGroup.candidates" 
+        <!-- Candidates grid — takes all remaining space and scrolls -->
+        <div class="flex-1 min-h-0 overflow-y-auto p-6">
+          <div class="grid gap-4" style="grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));">
+            <div
+              v-for="candidate in currentGroup.candidates"
               :key="candidate.id"
-              class="relative rounded-lg overflow-hidden border transition-all duration-200 cursor-pointer bg-zinc-900 flex flex-col"
+              class="relative rounded-lg border transition-all duration-200 cursor-pointer bg-zinc-900 flex flex-col"
               :class="selectedCandidates.has(candidate.id) ? 'border-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.3)]' : 'border-white/10 opacity-60 hover:opacity-100'"
               @click="toggleCandidate(candidate.id)"
             >
-              <img :src="candidate.thumbnail_url" class="w-full h-48 object-cover" />
-              
+              <div class="overflow-hidden rounded-t-lg">
+                <img :src="candidate.thumbnail_url" class="w-full aspect-[4/3] object-cover" />
+              </div>
+
               <div class="absolute top-2 left-2 flex items-center justify-center w-6 h-6 rounded-full border-2"
                    :class="selectedCandidates.has(candidate.id) ? 'bg-indigo-500 border-indigo-500 text-white' : 'bg-black/50 border-white/30 text-transparent'">
                 <Check class="w-4 h-4" v-if="selectedCandidates.has(candidate.id)" />
               </div>
-              
-              <div class="p-3 bg-zinc-900 border-t border-white/10 text-xs flex justify-between items-center">
-                <span class="text-zinc-400">Files: {{ candidate.file_count }}</span>
-                <button 
-                  @click.stop="setAsPrimary(candidate)" 
-                  class="text-indigo-400 hover:text-indigo-300 font-medium z-10 relative"
+
+              <div class="p-2.5 border-t border-white/10 text-xs flex justify-between items-center gap-2">
+                <span class="text-zinc-400 whitespace-nowrap">{{ candidate.file_count }} files</span>
+                <button
+                  @click.stop="setAsPrimary(candidate)"
+                  class="text-indigo-400 hover:text-indigo-300 font-medium whitespace-nowrap"
                 >
                   Make Primary
                 </button>
@@ -193,7 +210,7 @@ function viewShot(id) {
             </div>
           </div>
         </div>
-      </div>
+      </template>
     </div>
   </div>
 </template>
