@@ -110,9 +110,8 @@ async fn login(State(auth): State<AuthState>) -> impl IntoResponse {
     let state_jwt = encode(&Header::default(), &state_claims, &auth.jwt_encoding_key)
         .expect("JWT encode should not fail");
 
-    let cookie = format!(
-        "{OIDC_STATE_COOKIE}={state_jwt}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600"
-    );
+    let cookie =
+        format!("{OIDC_STATE_COOKIE}={state_jwt}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600");
 
     (
         AppendHeaders([(header::SET_COOKIE, cookie)]),
@@ -149,8 +148,7 @@ async fn callback(
     let code = params.code.ok_or(StatusCode::BAD_REQUEST)?;
 
     // Recover flow state from the signed cookie.
-    let state_jwt = get_cookie_value(&headers, OIDC_STATE_COOKIE)
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    let state_jwt = get_cookie_value(&headers, OIDC_STATE_COOKIE).ok_or(StatusCode::BAD_REQUEST)?;
     let state_claims: OidcStateClaims = decode(
         &state_jwt,
         &auth.jwt_decoding_key,
@@ -177,9 +175,7 @@ async fn callback(
         })?;
 
     // Validate the ID token.
-    let id_token = token_response
-        .id_token()
-        .ok_or(StatusCode::BAD_GATEWAY)?;
+    let id_token = token_response.id_token().ok_or(StatusCode::BAD_GATEWAY)?;
     let nonce = Nonce::new(state_claims.nonce);
     let claims = id_token
         .claims(&auth.oidc_client.id_token_verifier(), &nonce)
@@ -197,16 +193,12 @@ async fn callback(
             .and_then(|n| n.get(None))
             .map(|n| n.to_string())
             .unwrap_or_default(),
-        email: claims
-            .email()
-            .map(|e| e.to_string())
-            .unwrap_or_default(),
+        email: claims.email().map(|e| e.to_string()).unwrap_or_default(),
         exp: now + auth.jwt_ttl_secs as usize,
         iat: now,
     };
-    let session_jwt =
-        encode(&Header::default(), &session, &auth.jwt_encoding_key)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let session_jwt = encode(&Header::default(), &session, &auth.jwt_encoding_key)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let session_cookie = format!(
         "{SESSION_COOKIE}={session_jwt}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",

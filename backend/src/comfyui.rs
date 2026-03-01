@@ -28,7 +28,9 @@ impl ComfyUiClient {
     /// Check if ComfyUI is reachable.
     pub fn health_check(&self) -> anyhow::Result<()> {
         let url = format!("{}/system_stats", self.base_url);
-        let resp = ureq::get(&url).call().map_err(|e| anyhow::anyhow!("ComfyUI health check failed: {}", e))?;
+        let resp = ureq::get(&url)
+            .call()
+            .map_err(|e| anyhow::anyhow!("ComfyUI health check failed: {}", e))?;
         if resp.status() != 200 {
             anyhow::bail!("ComfyUI returned status {}", resp.status());
         }
@@ -425,7 +427,12 @@ fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient) {
         let (image_data, upload_name) = match get_source_image(conn, &shot_id) {
             Ok(v) => v,
             Err(e) => {
-                mark_failed(conn, &task_id, &format!("Source image extraction failed: {}", e), true);
+                mark_failed(
+                    conn,
+                    &task_id,
+                    &format!("Source image extraction failed: {}", e),
+                    true,
+                );
                 continue;
             }
         };
@@ -443,7 +450,12 @@ fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient) {
         let workflow: Value = match serde_json::from_str(&workflow_json_str) {
             Ok(v) => v,
             Err(e) => {
-                mark_failed(conn, &task_id, &format!("Invalid workflow JSON: {}", e), true);
+                mark_failed(
+                    conn,
+                    &task_id,
+                    &format!("Invalid workflow JSON: {}", e),
+                    true,
+                );
                 continue;
             }
         };
@@ -598,13 +610,7 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
 
                         if let Some(filename) = filename {
                             match download_and_save_output(
-                                conn,
-                                client,
-                                &task_id,
-                                &shot_id,
-                                filename,
-                                subfolder,
-                                out_type,
+                                conn, client, &task_id, &shot_id, filename, subfolder, out_type,
                             ) {
                                 Ok(_) => {
                                     downloaded = true;
@@ -635,13 +641,7 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
 
                         if let Some(filename) = filename {
                             match download_and_save_output(
-                                conn,
-                                client,
-                                &task_id,
-                                &shot_id,
-                                filename,
-                                subfolder,
-                                out_type,
+                                conn, client, &task_id, &shot_id, filename, subfolder, out_type,
                             ) {
                                 Ok(_) => {
                                     downloaded = true;
@@ -666,7 +666,12 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
             );
             info!("Task {} completed successfully", task_id);
         } else {
-            mark_failed(conn, &task_id, "No output images found in ComfyUI response", false);
+            mark_failed(
+                conn,
+                &task_id,
+                "No output images found in ComfyUI response",
+                false,
+            );
         }
     }
 }
@@ -807,11 +812,7 @@ fn check_retries(conn: &Connection) {
             .unwrap_or(false);
 
         if ready {
-            info!(
-                "Retrying task {} (attempt {})",
-                task_id,
-                retry_count + 1
-            );
+            info!("Retrying task {} (attempt {})", task_id, retry_count + 1);
             let _ = conn.execute(
                 "UPDATE enhancement_tasks SET status = 'pending', retry_count = retry_count + 1, error_message = NULL WHERE id = ?1",
                 params![task_id],

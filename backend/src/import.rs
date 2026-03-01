@@ -29,7 +29,9 @@ struct StoredFileRecord {
 
 /// Load all files with visual_embedding (dHash) from the DB.
 fn load_dhash_cache(conn: &Connection) -> Vec<StoredFileRecord> {
-    let mut stmt = match conn.prepare("SELECT path, visual_embedding FROM files WHERE visual_embedding IS NOT NULL") {
+    let mut stmt = match conn
+        .prepare("SELECT path, visual_embedding FROM files WHERE visual_embedding IS NOT NULL")
+    {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to load dHash cache: {}", e);
@@ -98,9 +100,17 @@ struct ImportStats {
     skipped_error: AtomicU64,
 }
 
-pub fn run_import(source: &Path, target: &Path, move_files: bool, threads: usize) -> anyhow::Result<()> {
+pub fn run_import(
+    source: &Path,
+    target: &Path,
+    move_files: bool,
+    threads: usize,
+) -> anyhow::Result<()> {
     // AI is mandatory for import — reject dummy mode
-    if std::env::var("PHOS_DUMMY_AI").ok().is_some_and(|v| v == "1") {
+    if std::env::var("PHOS_DUMMY_AI")
+        .ok()
+        .is_some_and(|v| v == "1")
+    {
         anyhow::bail!(
             "PHOS_DUMMY_AI is set but AI models are required for import. \
              Unset PHOS_DUMMY_AI and ensure models can be downloaded."
@@ -108,7 +118,10 @@ pub fn run_import(source: &Path, target: &Path, move_files: bool, threads: usize
     }
     info!("Loading AI models (mandatory for import)...");
     let ai = AiPipeline::new().map_err(|e| {
-        anyhow::anyhow!("AI models are required for import but failed to load: {}", e)
+        anyhow::anyhow!(
+            "AI models are required for import but failed to load: {}",
+            e
+        )
     })?;
 
     // Ensure target directory exists
@@ -199,10 +212,22 @@ pub fn run_import(source: &Path, target: &Path, move_files: bool, threads: usize
     println!();
     println!("=== Import Summary ===");
     println!("  Total files found:     {}", stats.total);
-    println!("  Successfully imported: {}", stats.imported.load(Ordering::Relaxed));
-    println!("  Grouped as variations: {}", stats.variations.load(Ordering::Relaxed));
-    println!("  Skipped (duplicate):   {}", stats.skipped_duplicate.load(Ordering::Relaxed));
-    println!("  Skipped (error):       {}", stats.skipped_error.load(Ordering::Relaxed));
+    println!(
+        "  Successfully imported: {}",
+        stats.imported.load(Ordering::Relaxed)
+    );
+    println!(
+        "  Grouped as variations: {}",
+        stats.variations.load(Ordering::Relaxed)
+    );
+    println!(
+        "  Skipped (duplicate):   {}",
+        stats.skipped_duplicate.load(Ordering::Relaxed)
+    );
+    println!(
+        "  Skipped (error):       {}",
+        stats.skipped_error.load(Ordering::Relaxed)
+    );
     println!("======================");
     println!();
 
@@ -267,7 +292,8 @@ pub fn run_remote_import(source_str: &str, target_url: &str, threads: usize) -> 
             let encoded_filename = urlencoding::encode(&filename);
             let url = format!("{}?filename={}", base_url, encoded_filename);
 
-            match client.put(&url)
+            match client
+                .put(&url)
                 .header("Content-Type", "application/octet-stream")
                 .send(file_bytes)
             {
@@ -285,10 +311,7 @@ pub fn run_remote_import(source_str: &str, target_url: &str, threads: usize) -> 
 
     // Trigger server-side face clustering and reorganization
     info!("Triggering post-import finalization on server...");
-    let finalize_url = format!(
-        "{}/api/import/finalize",
-        target_url.trim_end_matches('/')
-    );
+    let finalize_url = format!("{}/api/import/finalize", target_url.trim_end_matches('/'));
     let client = ureq::Agent::new_with_defaults();
     match client.post(&finalize_url).send_empty() {
         Ok(_) => {
@@ -326,7 +349,10 @@ fn import_single_file(
             .ok();
 
         if existing.is_some() {
-            warn!("Skipping exact duplicate: {:?} (hash {})", source_path, hash);
+            warn!(
+                "Skipping exact duplicate: {:?} (hash {})",
+                source_path, hash
+            );
             stats.skipped_duplicate.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
@@ -361,9 +387,10 @@ fn import_single_file(
         // Check against all stored dHashes (brief lock)
         let variation_match = {
             let cache = dhash_cache.lock().unwrap();
-            cache.iter().find(|stored| {
-                hamming_distance(&dhash, &stored.dhash) <= 10
-            }).map(|stored| stored.path.clone())
+            cache
+                .iter()
+                .find(|stored| hamming_distance(&dhash, &stored.dhash) <= 10)
+                .map(|stored| stored.path.clone())
         };
 
         if let Some(matched_path) = variation_match {
@@ -487,7 +514,12 @@ fn determine_person_folder(
             let face_h = y2.saturating_sub(y1);
 
             if face_w >= 10 && face_h >= 10 {
-                let bbox = (largest.box_x1, largest.box_y1, largest.box_x2, largest.box_y2);
+                let bbox = (
+                    largest.box_x1,
+                    largest.box_y1,
+                    largest.box_x2,
+                    largest.box_y2,
+                );
                 let embedding = ai
                     .extract_embedding(img, largest.landmarks.as_deref(), bbox)
                     .unwrap_or_default();
@@ -676,8 +708,7 @@ pub fn rename_person_folder(
         )
         .map_err(|_| anyhow::anyhow!("Person '{}' not found", person_id))?;
 
-    let old_folder_name = old_folder_name
-        .unwrap_or_else(|| person_id.to_string());
+    let old_folder_name = old_folder_name.unwrap_or_else(|| person_id.to_string());
 
     // Compute new folder_name with collision handling
     let sanitized = sanitize_folder_name(new_name);
@@ -701,16 +732,10 @@ pub fn rename_person_folder(
     // Rename directory on disk if it exists
     if old_dir.exists() {
         if new_dir.exists() {
-            anyhow::bail!(
-                "Target directory {:?} already exists on disk",
-                new_dir
-            );
+            anyhow::bail!("Target directory {:?} already exists on disk", new_dir);
         }
         fs::rename(&old_dir, &new_dir)?;
-        info!(
-            "Renamed directory {:?} -> {:?}",
-            old_dir, new_dir
-        );
+        info!("Renamed directory {:?} -> {:?}", old_dir, new_dir);
     }
 
     // Batch-update files.path: replace old folder_name prefix with new one
@@ -789,7 +814,7 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                 p.folder_name
          FROM shots s
          JOIN files f ON f.shot_id = s.id
-         LEFT JOIN people p ON s.primary_person_id = p.id"
+         LEFT JOIN people p ON s.primary_person_id = p.id",
     )?;
 
     struct FileRow {
@@ -838,7 +863,7 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     let mut skipped = 0u64;
     let mut errors = 0u64;
 
-    for (_shot_id, files) in &shots {
+    for files in shots.values() {
         // All files in a shot share the same primary_person_id and folder_number,
         // so use the first file's metadata.
         let first = files[0];
@@ -921,26 +946,44 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                     .unwrap_or_default();
 
                 let _ = conn.execute("DELETE FROM face_neighbors WHERE face_id_a IN (SELECT id FROM faces WHERE file_id = ?) OR face_id_b IN (SELECT id FROM faces WHERE file_id = ?)", params![file_row.file_id, file_row.file_id]);
-                let _ = conn.execute("DELETE FROM faces WHERE file_id = ?", params![file_row.file_id]);
-                let _ = conn.execute("DELETE FROM video_keyframes WHERE video_file_id = ?", params![file_row.file_id]);
+                let _ = conn.execute(
+                    "DELETE FROM faces WHERE file_id = ?",
+                    params![file_row.file_id],
+                );
+                let _ = conn.execute(
+                    "DELETE FROM video_keyframes WHERE video_file_id = ?",
+                    params![file_row.file_id],
+                );
                 let _ = conn.execute("DELETE FROM files WHERE id = ?", params![file_row.file_id]);
 
                 // Delete shot if no files remain
                 let remaining: i64 = conn
-                    .query_row("SELECT COUNT(*) FROM files WHERE shot_id = ?", params![file_row.shot_id], |row| row.get(0))
+                    .query_row(
+                        "SELECT COUNT(*) FROM files WHERE shot_id = ?",
+                        params![file_row.shot_id],
+                        |row| row.get(0),
+                    )
                     .unwrap_or(0);
                 if remaining == 0 {
-                    let _ = conn.execute("DELETE FROM shots WHERE id = ?", params![file_row.shot_id]);
+                    let _ =
+                        conn.execute("DELETE FROM shots WHERE id = ?", params![file_row.shot_id]);
                     info!("Removed orphaned shot {}", file_row.shot_id);
                 }
 
                 // Clean up orphaned people
                 for person_id in &affected_person_ids {
                     let face_count: i64 = conn
-                        .query_row("SELECT COUNT(*) FROM faces WHERE person_id = ?", params![person_id], |row| row.get(0))
+                        .query_row(
+                            "SELECT COUNT(*) FROM faces WHERE person_id = ?",
+                            params![person_id],
+                            |row| row.get(0),
+                        )
                         .unwrap_or(1);
                     if face_count == 0 {
-                        let _ = conn.execute("UPDATE shots SET primary_person_id = NULL WHERE primary_person_id = ?", params![person_id]);
+                        let _ = conn.execute(
+                            "UPDATE shots SET primary_person_id = NULL WHERE primary_person_id = ?",
+                            params![person_id],
+                        );
                         let _ = conn.execute("DELETE FROM people WHERE id = ?", params![person_id]);
                         info!("Removed orphaned person {}", person_id);
                     }

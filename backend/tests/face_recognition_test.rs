@@ -56,7 +56,12 @@ fn detect_largest_face_embedding(ai: &AiPipeline, img: &image::DynamicImage) -> 
         largest.box_y2,
     );
 
-    let bbox = (largest.box_x1, largest.box_y1, largest.box_x2, largest.box_y2);
+    let bbox = (
+        largest.box_x1,
+        largest.box_y1,
+        largest.box_x2,
+        largest.box_y2,
+    );
     let embedding = ai
         .extract_embedding(img, largest.landmarks.as_deref(), bbox)
         .expect("extract_embedding failed");

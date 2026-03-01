@@ -38,7 +38,12 @@ pub fn create_router(state: AppState) -> Router {
         // People
         .route("/api/people", get(get_people).post(create_person))
         .route("/api/people/merge", post(merge_people))
-        .route("/api/people/:id", get(get_person_shots).put(rename_person).delete(delete_person))
+        .route(
+            "/api/people/:id",
+            get(get_person_shots)
+                .put(rename_person)
+                .delete(delete_person),
+        )
         .route("/api/people/:id/faces", get(get_person_faces))
         // Faces
         .route("/api/faces/:id/thumbnail", get(get_face_thumbnail))
@@ -63,8 +68,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/import/finalize", post(finalize_import))
         // ComfyUI integration
         .route("/api/comfyui/health", get(comfyui_health))
-        .route("/api/comfyui/workflows", get(comfyui_list_workflows).post(comfyui_import_workflow))
-        .route("/api/comfyui/workflows/:id", delete(comfyui_delete_workflow))
+        .route(
+            "/api/comfyui/workflows",
+            get(comfyui_list_workflows).post(comfyui_import_workflow),
+        )
+        .route(
+            "/api/comfyui/workflows/:id",
+            delete(comfyui_delete_workflow),
+        )
         .route("/api/comfyui/enhance", post(comfyui_enhance))
         .route("/api/comfyui/tasks", get(comfyui_list_tasks))
         .route("/api/comfyui/tasks/:id", get(comfyui_get_task))
@@ -88,7 +99,8 @@ async fn upload_file_raw(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let library_path = std::env::var("PHOS_LIBRARY_PATH").unwrap_or_else(|_| "./library".to_string());
+    let library_path =
+        std::env::var("PHOS_LIBRARY_PATH").unwrap_or_else(|_| "./library".to_string());
     let base_path = std::path::Path::new(&library_path).join(&query.filename);
 
     if let Some(parent) = base_path.parent() {
@@ -100,7 +112,10 @@ async fn upload_file_raw(
 
     // Deduplicate filename if it already exists on disk
     let target_path = if base_path.exists() {
-        let stem = base_path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+        let stem = base_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file");
         let ext = base_path.extension().and_then(|s| s.to_str()).unwrap_or("");
         let parent = base_path.parent().unwrap();
         let mut i = 1u32;
@@ -137,7 +152,11 @@ async fn upload_file_raw(
         };
         let dhash_cache = std::sync::Mutex::new(Vec::<crate::scanner::DHashCacheEntry>::new());
         if let Err(e) = scanner.process_file(&conn, &target_path_owned, &dhash_cache) {
-            tracing::error!("Failed to index uploaded file {:?}: {}", target_path_owned, e);
+            tracing::error!(
+                "Failed to index uploaded file {:?}: {}",
+                target_path_owned,
+                e
+            );
         }
     })
     .await
@@ -637,8 +656,7 @@ async fn get_people(State(state): State<AppState>) -> Json<Vec<PersonBrief>> {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 face_count: row.get(2)?,
-                thumbnail_url: thumbnail_face_id
-                    .map(|fid| format!("/api/faces/{}/thumbnail", fid)),
+                thumbnail_url: thumbnail_face_id.map(|fid| format!("/api/faces/{}/thumbnail", fid)),
                 shot_count: row.get(4)?,
                 pending_count: row.get(5)?,
             })
@@ -824,11 +842,14 @@ async fn merge_people(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    db.execute("DELETE FROM people WHERE id = ?", params![payload.source_id])
-        .map_err(|e| {
-            tracing::error!("Failed to delete merged person: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    db.execute(
+        "DELETE FROM people WHERE id = ?",
+        params![payload.source_id],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to delete merged person: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
@@ -989,7 +1010,11 @@ fn cleanup_orphaned_person(db: &Connection, person_id: &str) -> Result<(), Statu
             params![person_id],
         )
         .map_err(|e| {
-            tracing::error!("Failed to clear primary_person_id for person {}: {}", person_id, e);
+            tracing::error!(
+                "Failed to clear primary_person_id for person {}: {}",
+                person_id,
+                e
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -1093,14 +1118,17 @@ async fn get_face_suggestions(
             Some(FaceSuggestion {
                 person_id,
                 person_name,
-                thumbnail_url: thumbnail_face_id
-                    .map(|fid| format!("/api/faces/{}/thumbnail", fid)),
+                thumbnail_url: thumbnail_face_id.map(|fid| format!("/api/faces/{}/thumbnail", fid)),
                 distance,
             })
         })
         .collect();
 
-    suggestions.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+    suggestions.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     suggestions.truncate(10);
 
     Ok(Json(suggestions))
@@ -1136,7 +1164,11 @@ async fn reassign_face(
     // Find the shot_id and old person_id for this face before updating
     let shot_id = get_shot_id_for_face(&db, &id)?;
     let old_person_id: Option<String> = db
-        .query_row("SELECT person_id FROM faces WHERE id = ?", params![id], |row| row.get(0))
+        .query_row(
+            "SELECT person_id FROM faces WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        )
         .ok()
         .flatten();
 
@@ -1183,7 +1215,11 @@ async fn delete_face(
     // Find the shot_id and person_id for this face before deleting
     let shot_id = get_shot_id_for_face(&db, &id)?;
     let old_person_id: Option<String> = db
-        .query_row("SELECT person_id FROM faces WHERE id = ?", params![id], |row| row.get(0))
+        .query_row(
+            "SELECT person_id FROM faces WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        )
         .ok()
         .flatten();
 
@@ -2005,7 +2041,12 @@ async fn get_similar_shots(
     // Add primary person
     if primary_person_id.is_some() {
         let primary_name: Option<String> = primary_person_id.as_ref().and_then(|pid| {
-            db.query_row("SELECT name FROM people WHERE id = ?", params![pid], |row| row.get(0)).ok()
+            db.query_row(
+                "SELECT name FROM people WHERE id = ?",
+                params![pid],
+                |row| row.get(0),
+            )
+            .ok()
         });
         person_ids.push((primary_person_id.clone(), primary_name));
     }
@@ -2084,22 +2125,25 @@ async fn get_similar_shots(
 
         let mut results: Vec<SimilarShotItem> = candidates
             .into_iter()
-            .filter_map(|(shot_id, main_fid, review_status, pname, file_count, blob)| {
-                if blob.len() != 8 {
-                    return None;
-                }
-                let mut candidate_dhash = [0u8; 8];
-                candidate_dhash.copy_from_slice(&blob);
-                let distance = crate::scanner::hamming_distance(&current_dhash, &candidate_dhash);
-                Some(SimilarShotItem {
-                    id: shot_id,
-                    thumbnail_url: format!("/api/files/{}/thumbnail", main_fid),
-                    file_count,
-                    primary_person_name: pname,
-                    review_status,
-                    distance,
-                })
-            })
+            .filter_map(
+                |(shot_id, main_fid, review_status, pname, file_count, blob)| {
+                    if blob.len() != 8 {
+                        return None;
+                    }
+                    let mut candidate_dhash = [0u8; 8];
+                    candidate_dhash.copy_from_slice(&blob);
+                    let distance =
+                        crate::scanner::hamming_distance(&current_dhash, &candidate_dhash);
+                    Some(SimilarShotItem {
+                        id: shot_id,
+                        thumbnail_url: format!("/api/files/{}/thumbnail", main_fid),
+                        file_count,
+                        primary_person_name: pname,
+                        review_status,
+                        distance,
+                    })
+                },
+            )
             .collect();
 
         results.sort_by_key(|r| r.distance);
@@ -2162,14 +2206,11 @@ async fn merge_shots(
     })?;
 
     // Delete the source shot
-    db.execute(
-        "DELETE FROM shots WHERE id = ?",
-        params![payload.source_id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to delete source shot during merge: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    db.execute("DELETE FROM shots WHERE id = ?", params![payload.source_id])
+        .map_err(|e| {
+            tracing::error!("Failed to delete source shot during merge: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // If person_id is provided, update the target shot's primary person
     if let Some(ref person_id) = payload.person_id {
@@ -2328,14 +2369,11 @@ async fn set_file_original(
     })?;
 
     // Set this file as original
-    db.execute(
-        "UPDATE files SET is_original = 1 WHERE id = ?",
-        params![id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to set is_original on file: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    db.execute("UPDATE files SET is_original = 1 WHERE id = ?", params![id])
+        .map_err(|e| {
+            tracing::error!("Failed to set is_original on file: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Update shots.main_file_id
     db.execute(
@@ -2398,11 +2436,14 @@ async fn delete_file(
         })?;
 
     // Delete video keyframes
-    db.execute("DELETE FROM video_keyframes WHERE video_file_id = ?", params![id])
-        .map_err(|e| {
-            tracing::error!("Failed to delete video_keyframes: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    db.execute(
+        "DELETE FROM video_keyframes WHERE video_file_id = ?",
+        params![id],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to delete video_keyframes: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Delete the file record
     db.execute("DELETE FROM files WHERE id = ?", params![id])
@@ -2470,41 +2511,47 @@ async fn add_manual_face(
         .map_err(|_| StatusCode::NOT_FOUND)?
     };
 
-    let bbox = (payload.box_x1, payload.box_y1, payload.box_x2, payload.box_y2);
+    let bbox = (
+        payload.box_x1,
+        payload.box_y1,
+        payload.box_x2,
+        payload.box_y2,
+    );
     let scanner = state.scanner.clone();
     let file_path_owned = file_path.clone();
 
     // Compute embedding on a blocking thread
-    let (face_id, embedding_blob) = tokio::task::spawn_blocking(move || -> Result<(String, Vec<u8>), String> {
-        let img = crate::scanner::open_image(std::path::Path::new(&file_path_owned))
-            .map_err(|e| format!("Failed to open image: {}", e))?;
+    let (face_id, embedding_blob) =
+        tokio::task::spawn_blocking(move || -> Result<(String, Vec<u8>), String> {
+            let img = crate::scanner::open_image(std::path::Path::new(&file_path_owned))
+                .map_err(|e| format!("Failed to open image: {}", e))?;
 
-        let embedding = if let Some(ai) = scanner.ai() {
-            ai.extract_embedding(&img, None, bbox)
-                .map_err(|e| format!("Failed to extract embedding: {}", e))?
-        } else {
-            // Dummy mode
-            let mut emb = vec![0.1f32; 512];
-            emb[0] = bbox.0 / 1000.0;
-            emb[1] = bbox.1 / 1000.0;
-            emb
-        };
+            let embedding = if let Some(ai) = scanner.ai() {
+                ai.extract_embedding(&img, None, bbox)
+                    .map_err(|e| format!("Failed to extract embedding: {}", e))?
+            } else {
+                // Dummy mode
+                let mut emb = vec![0.1f32; 512];
+                emb[0] = bbox.0 / 1000.0;
+                emb[1] = bbox.1 / 1000.0;
+                emb
+            };
 
-        let blob = bincode::serialize(&embedding)
-            .map_err(|e| format!("Failed to serialize embedding: {}", e))?;
+            let blob = bincode::serialize(&embedding)
+                .map_err(|e| format!("Failed to serialize embedding: {}", e))?;
 
-        let id = uuid::Uuid::new_v4().to_string();
-        Ok((id, blob))
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!("Manual face task panicked: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .map_err(|e| {
-        tracing::error!("Manual face extraction failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+            let id = uuid::Uuid::new_v4().to_string();
+            Ok((id, blob))
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("Manual face task panicked: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map_err(|e| {
+            tracing::error!("Manual face extraction failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Insert the face and recalculate primary person
     let db = state.db.lock().await;
@@ -2640,9 +2687,12 @@ async fn comfyui_import_workflow(
     let outputs = crate::comfyui::detect_outputs(&payload.workflow);
 
     let id = uuid::Uuid::new_v4().to_string();
-    let workflow_json = serde_json::to_string(&payload.workflow).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let inputs_json = serde_json::to_string(&inputs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let outputs_json = serde_json::to_string(&outputs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let workflow_json =
+        serde_json::to_string(&payload.workflow).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let inputs_json =
+        serde_json::to_string(&inputs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let outputs_json =
+        serde_json::to_string(&outputs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let db = state.db.lock().await;
     db.execute(
@@ -2914,7 +2964,8 @@ async fn ignore_merge(
     db.execute(
         "INSERT OR IGNORE INTO ignored_merges (shot_id_1, shot_id_2) VALUES (?, ?)",
         params![s1, s2],
-    ).map_err(|e| {
+    )
+    .map_err(|e| {
         tracing::error!("Failed to insert ignored_merge: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -2947,15 +2998,17 @@ async fn get_similar_shot_groups(
 ) -> Result<Json<SimilarGroupsResponse>, StatusCode> {
     let db = state.db.lock().await;
 
-    let mut stmt = db.prepare(
-        "SELECT s.id, s.main_file_id, s.review_status, p.name,
+    let mut stmt = db
+        .prepare(
+            "SELECT s.id, s.main_file_id, s.review_status, p.name,
                 (SELECT COUNT(*) FROM files WHERE shot_id = s.id) as file_count,
                 f.visual_embedding
          FROM shots s
          LEFT JOIN people p ON s.primary_person_id = p.id
          JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
-         ORDER BY s.timestamp DESC"
-    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+         ORDER BY s.timestamp DESC",
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     struct ShotData {
         id: String,
@@ -2966,23 +3019,25 @@ async fn get_similar_shot_groups(
         dhash: [u8; 8],
     }
 
-    let candidates: Vec<ShotData> = stmt.query_map([], |row| {
-        let blob: Vec<u8> = row.get(5)?;
-        let mut dhash = [0u8; 8];
-        if blob.len() == 8 {
-            dhash.copy_from_slice(&blob);
-        }
-        Ok(ShotData {
-            id: row.get(0)?,
-            main_fid: row.get(1)?,
-            review_status: row.get(2)?,
-            person_name: row.get(3)?,
-            file_count: row.get(4)?,
-            dhash,
+    let candidates: Vec<ShotData> = stmt
+        .query_map([], |row| {
+            let blob: Vec<u8> = row.get(5)?;
+            let mut dhash = [0u8; 8];
+            if blob.len() == 8 {
+                dhash.copy_from_slice(&blob);
+            }
+            Ok(ShotData {
+                id: row.get(0)?,
+                main_fid: row.get(1)?,
+                review_status: row.get(2)?,
+                person_name: row.get(3)?,
+                file_count: row.get(4)?,
+                dhash,
+            })
         })
-    }).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .filter_map(|r| r.ok())
-    .collect();
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .filter_map(|r| r.ok())
+        .collect();
 
     let mut ignored = std::collections::HashSet::new();
     if let Ok(mut ignore_stmt) = db.prepare("SELECT shot_id_1, shot_id_2 FROM ignored_merges") {
@@ -3001,11 +3056,15 @@ async fn get_similar_shot_groups(
     let mut used = std::collections::HashSet::new();
 
     for i in 0..candidates.len() {
-        if used.contains(&candidates[i].id) { continue; }
-        
+        if used.contains(&candidates[i].id) {
+            continue;
+        }
+
         let mut current_group = Vec::new();
-        for j in (i+1)..candidates.len() {
-            if used.contains(&candidates[j].id) { continue; }
+        for j in (i + 1)..candidates.len() {
+            if used.contains(&candidates[j].id) {
+                continue;
+            }
 
             let (s1, s2) = if candidates[i].id < candidates[j].id {
                 (&candidates[i].id, &candidates[j].id)
@@ -3018,7 +3077,8 @@ async fn get_similar_shot_groups(
             }
 
             let dist = crate::scanner::hamming_distance(&candidates[i].dhash, &candidates[j].dhash);
-            if dist <= 10 { // Threshold for similarity
+            if dist <= 10 {
+                // Threshold for similarity
                 current_group.push(j);
             }
         }
@@ -3033,12 +3093,15 @@ async fn get_similar_shot_groups(
                     file_count: candidates[idx].file_count,
                     primary_person_name: candidates[idx].person_name.clone(),
                     review_status: candidates[idx].review_status.clone(),
-                    distance: crate::scanner::hamming_distance(&candidates[i].dhash, &candidates[idx].dhash),
+                    distance: crate::scanner::hamming_distance(
+                        &candidates[i].dhash,
+                        &candidates[idx].dhash,
+                    ),
                 });
             }
 
             used.insert(candidates[i].id.clone());
-            
+
             let primary_item = SimilarShotItem {
                 id: candidates[i].id.clone(),
                 thumbnail_url: format!("/api/files/{}/thumbnail", candidates[i].main_fid),
@@ -3054,12 +3117,11 @@ async fn get_similar_shot_groups(
             all_items.sort_by(|a, b| b.file_count.cmp(&a.file_count));
 
             let actual_primary = all_items.remove(0);
-            
+
             groups.push(SimilarShotGroup {
                 primary: actual_primary,
                 candidates: all_items,
             });
-
         }
     }
 

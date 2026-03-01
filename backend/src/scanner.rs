@@ -5,10 +5,10 @@ use ffmpeg_next as ffmpeg;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, RgbImage};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -50,7 +50,9 @@ fn apply_exif_orientation(img: DynamicImage, path: &Path) -> DynamicImage {
     let orientation = (|| -> Option<u32> {
         let file = File::open(path).ok()?;
         let mut bufreader = BufReader::new(file);
-        let exif = exif::Reader::new().read_from_container(&mut bufreader).ok()?;
+        let exif = exif::Reader::new()
+            .read_from_container(&mut bufreader)
+            .ok()?;
         let field = exif.get_field(Tag::Orientation, In::PRIMARY)?;
         field.value.get_uint(0)
     })();
@@ -159,7 +161,11 @@ impl Scanner {
                     if blob.len() == 8 {
                         let mut dhash = [0u8; 8];
                         dhash.copy_from_slice(&blob);
-                        Some(DHashCacheEntry { file_id, shot_id, dhash })
+                        Some(DHashCacheEntry {
+                            file_id,
+                            shot_id,
+                            dhash,
+                        })
                     } else {
                         None
                     }
@@ -264,7 +270,10 @@ impl Scanner {
                 |row| row.get(0),
             )?;
             if face_count == 0 {
-                conn.execute("UPDATE shots SET primary_person_id = NULL WHERE primary_person_id = ?", params![person_id])?;
+                conn.execute(
+                    "UPDATE shots SET primary_person_id = NULL WHERE primary_person_id = ?",
+                    params![person_id],
+                )?;
                 conn.execute("DELETE FROM people WHERE id = ?", params![person_id])?;
                 info!("Removed orphaned person record {}", person_id);
             }
@@ -307,8 +316,7 @@ impl Scanner {
         // Build index: face_id -> (embedding, person_id)
         let face_ids: Vec<String> = rows.iter().map(|(id, _, _)| id.clone()).collect();
         let embeddings: Vec<Vec<f32>> = rows.iter().map(|(_, e, _)| e.clone()).collect();
-        let mut assignments: Vec<Option<String>> =
-            rows.iter().map(|(_, _, p)| p.clone()).collect();
+        let mut assignments: Vec<Option<String>> = rows.iter().map(|(_, _, p)| p.clone()).collect();
 
         let n = face_ids.len();
         let unassigned_count = assignments.iter().filter(|a| a.is_none()).count();
@@ -335,18 +343,16 @@ impl Scanner {
         let mut cached_faces: HashSet<String> = HashSet::new();
 
         {
-            let mut load_stmt = conn.prepare(
-                "SELECT face_id_a, face_id_b, distance FROM face_neighbors"
-            )?;
+            let mut load_stmt =
+                conn.prepare("SELECT face_id_a, face_id_b, distance FROM face_neighbors")?;
             let cached_rows: Vec<(String, String, f32)> = load_stmt
-                .query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .filter_map(|r| r.ok())
                 .collect();
 
             for (a, b, dist) in &cached_rows {
-                if let (Some(&i), Some(&j)) = (id_to_idx.get(a.as_str()), id_to_idx.get(b.as_str())) {
+                if let (Some(&i), Some(&j)) = (id_to_idx.get(a.as_str()), id_to_idx.get(b.as_str()))
+                {
                     neighbors[i].push((j, *dist));
                     cached_faces.insert(a.clone());
                 }
@@ -410,7 +416,6 @@ impl Scanner {
                 neighbors[i] = nbrs;
                 pb.inc(1);
             }
-
         }
 
         // Sort all neighbor lists by distance
@@ -441,9 +446,7 @@ impl Scanner {
             let nbrs = &neighbors[i];
             if nbrs.len() >= MIN_FACES_FOR_CORE {
                 // Core face: look for an assigned neighbor
-                let assigned_neighbor = nbrs
-                    .iter()
-                    .find(|(j, _)| assignments[*j].is_some());
+                let assigned_neighbor = nbrs.iter().find(|(j, _)| assignments[*j].is_some());
 
                 let person_id = if let Some((j, _)) = assigned_neighbor {
                     assignments[*j].clone().unwrap()
@@ -478,9 +481,7 @@ impl Scanner {
             }
 
             // Find closest assigned neighbor
-            let closest = neighbors[i]
-                .iter()
-                .find(|(j, _)| assignments[*j].is_some());
+            let closest = neighbors[i].iter().find(|(j, _)| assignments[*j].is_some());
 
             if let Some((j, _)) = closest {
                 assignments[i] = assignments[*j].clone();
@@ -491,8 +492,7 @@ impl Scanner {
         pb.finish_and_clear();
 
         // Write assignments back to DB
-        let mut update_stmt =
-            conn.prepare("UPDATE faces SET person_id = ? WHERE id = ?")?;
+        let mut update_stmt = conn.prepare("UPDATE faces SET person_id = ? WHERE id = ?")?;
         let mut assigned_count = 0;
         for i in 0..n {
             if let Some(ref person_id) = assignments[i] {
@@ -539,7 +539,8 @@ impl Scanner {
             [],
         )?;
 
-        let person_count: i64 = conn.query_row("SELECT COUNT(*) FROM people", [], |row| row.get(0))?;
+        let person_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM people", [], |row| row.get(0))?;
         info!(
             "Clustering complete: {} faces assigned to {} persons ({} unassigned)",
             assigned_count,
@@ -550,7 +551,12 @@ impl Scanner {
         Ok(())
     }
 
-    pub fn process_file(&self, conn: &Connection, path: &Path, dhash_cache: &std::sync::Mutex<Vec<DHashCacheEntry>>) -> anyhow::Result<()> {
+    pub fn process_file(
+        &self,
+        conn: &Connection,
+        path: &Path,
+        dhash_cache: &std::sync::Mutex<Vec<DHashCacheEntry>>,
+    ) -> anyhow::Result<()> {
         // --- Phase 1: CPU-heavy work (no DB writes) ---
 
         // Quick path duplicate check — catches concurrent processing of the
@@ -599,7 +605,8 @@ impl Scanner {
         let metadata = std::fs::metadata(path)?;
         let file_size = metadata.len() as i64;
 
-        let (width, height) = if mime_type.starts_with("image/") || mime_type.starts_with("video/") {
+        let (width, height) = if mime_type.starts_with("image/") || mime_type.starts_with("video/")
+        {
             get_video_dimensions(path)
         } else {
             (None, None)
@@ -621,7 +628,9 @@ impl Scanner {
         let dhash: Option<[u8; 8]> = if mime_type.starts_with("image/") {
             open_image(path).ok().map(|img| compute_dhash(&img))
         } else if mime_type.starts_with("video/") {
-            extract_first_video_frame(path).ok().map(|frame| compute_dhash(&frame))
+            extract_first_video_frame(path)
+                .ok()
+                .map(|frame| compute_dhash(&frame))
         } else {
             None
         };
@@ -645,7 +654,11 @@ impl Scanner {
                             faces: detect_faces_collect(ai, &kf.image),
                         });
                     }
-                    debug!("Processed {} keyframes for video {:?}", keyframes.len(), path);
+                    debug!(
+                        "Processed {} keyframes for video {:?}",
+                        keyframes.len(),
+                        path
+                    );
                 }
             }
         }
@@ -656,9 +669,9 @@ impl Scanner {
         // No match: create new shot (is_original = true).
         let (actual_shot_id, is_new_shot, is_original) = if let Some(ref file_dhash) = dhash {
             let cache = dhash_cache.lock().unwrap();
-            let matched = cache.iter().find(|entry| {
-                hamming_distance(&entry.dhash, file_dhash) <= 10
-            });
+            let matched = cache
+                .iter()
+                .find(|entry| hamming_distance(&entry.dhash, file_dhash) <= 10);
             if let Some(entry) = matched {
                 (entry.shot_id.clone(), false, false)
             } else {
@@ -770,12 +783,10 @@ pub fn assign_primary_persons(conn: &Connection) -> anyhow::Result<()> {
     }
 
     // When person changes, also reset folder_number so assign_folder_numbers will reassign it
-    let mut update_with_reset_stmt = conn.prepare(
-        "UPDATE shots SET primary_person_id = ?, folder_number = NULL WHERE id = ?"
-    )?;
-    let mut update_same_stmt = conn.prepare(
-        "UPDATE shots SET primary_person_id = ? WHERE id = ?"
-    )?;
+    let mut update_with_reset_stmt =
+        conn.prepare("UPDATE shots SET primary_person_id = ?, folder_number = NULL WHERE id = ?")?;
+    let mut update_same_stmt =
+        conn.prepare("UPDATE shots SET primary_person_id = ? WHERE id = ?")?;
 
     // For each shot, find the face with the largest bbox area that has a person_id
     let mut face_stmt = conn.prepare(
@@ -784,16 +795,15 @@ pub fn assign_primary_persons(conn: &Connection) -> anyhow::Result<()> {
          JOIN files fl ON f.file_id = fl.id
          WHERE fl.shot_id = ? AND f.person_id IS NOT NULL
          ORDER BY area DESC
-         LIMIT 1"
+         LIMIT 1",
     )?;
 
     let mut assigned = 0;
     let mut cleared = 0;
     let mut reassigned = 0;
     for (shot_id, old_person_id) in &shots {
-        let best_person: Option<String> = face_stmt
-            .query_row(params![shot_id], |row| row.get(0))
-            .ok();
+        let best_person: Option<String> =
+            face_stmt.query_row(params![shot_id], |row| row.get(0)).ok();
 
         match &best_person {
             Some(_) => assigned += 1,
@@ -826,7 +836,7 @@ pub fn assign_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
     // Get all shots needing folder number assignment, grouped by primary_person_id
     // We handle NULL primary_person_id (unsorted) as a separate group
     let mut shots_stmt = conn.prepare(
-        "SELECT id, primary_person_id FROM shots WHERE folder_number IS NULL ORDER BY created_at"
+        "SELECT id, primary_person_id FROM shots WHERE folder_number IS NULL ORDER BY created_at",
     )?;
     let shots: Vec<(String, Option<String>)> = shots_stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -837,9 +847,7 @@ pub fn assign_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut update_stmt = conn.prepare(
-        "UPDATE shots SET folder_number = ? WHERE id = ?"
-    )?;
+    let mut update_stmt = conn.prepare("UPDATE shots SET folder_number = ? WHERE id = ?")?;
 
     // Cache the current max folder_number per person (including NULL for unsorted)
     let mut max_numbers: HashMap<Option<String>, i64> = HashMap::new();
@@ -859,17 +867,17 @@ pub fn assign_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
 
     let mut total_assigned = 0;
     for (shot_id, person_id) in &shots {
-        let next_number = max_numbers
-            .get(person_id)
-            .map(|n| n + 1)
-            .unwrap_or(1);
+        let next_number = max_numbers.get(person_id).map(|n| n + 1).unwrap_or(1);
 
         update_stmt.execute(params![next_number, shot_id])?;
         max_numbers.insert(person_id.clone(), next_number);
         total_assigned += 1;
     }
 
-    info!("Folder number assignment: {} shots assigned numbers", total_assigned);
+    info!(
+        "Folder number assignment: {} shots assigned numbers",
+        total_assigned
+    );
 
     Ok(())
 }
@@ -881,45 +889,38 @@ pub fn assign_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
 /// folder_numbers as 1, 2, 3, ... Only updates shots whose number actually changed.
 pub fn compact_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
     // Get all distinct person IDs (including NULL for unsorted)
-    let mut person_stmt = conn.prepare(
-        "SELECT DISTINCT primary_person_id FROM shots WHERE folder_number IS NOT NULL"
-    )?;
+    let mut person_stmt = conn
+        .prepare("SELECT DISTINCT primary_person_id FROM shots WHERE folder_number IS NOT NULL")?;
     let person_ids: Vec<Option<String>> = person_stmt
         .query_map([], |row| row.get(0))?
         .filter_map(|r| r.ok())
         .collect();
 
-    let mut update_stmt = conn.prepare(
-        "UPDATE shots SET folder_number = ? WHERE id = ?"
-    )?;
+    let mut update_stmt = conn.prepare("UPDATE shots SET folder_number = ? WHERE id = ?")?;
 
     let mut person_shots_stmt = conn.prepare(
         "SELECT id, folder_number FROM shots
          WHERE primary_person_id = ? AND folder_number IS NOT NULL
-         ORDER BY folder_number, created_at"
+         ORDER BY folder_number, created_at",
     )?;
     let mut unsorted_shots_stmt = conn.prepare(
         "SELECT id, folder_number FROM shots
          WHERE primary_person_id IS NULL AND folder_number IS NOT NULL
-         ORDER BY folder_number, created_at"
+         ORDER BY folder_number, created_at",
     )?;
 
     let mut total_compacted = 0;
     for person_id in &person_ids {
         // Get shots for this person ordered by folder_number, then created_at
         let shots: Vec<(String, i64)> = match person_id {
-            Some(pid) => {
-                person_shots_stmt
-                    .query_map(params![pid], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .filter_map(|r| r.ok())
-                    .collect()
-            }
-            None => {
-                unsorted_shots_stmt
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .filter_map(|r| r.ok())
-                    .collect()
-            }
+            Some(pid) => person_shots_stmt
+                .query_map(params![pid], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect(),
+            None => unsorted_shots_stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect(),
         };
 
         for (i, (shot_id, current_number)) in shots.iter().enumerate() {
@@ -932,17 +933,17 @@ pub fn compact_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
     }
 
     if total_compacted > 0 {
-        info!("Folder number compaction: {} shots renumbered", total_compacted);
+        info!(
+            "Folder number compaction: {} shots renumbered",
+            total_compacted
+        );
     }
 
     Ok(())
 }
 
 /// Run face detection on an image and collect results without writing to DB.
-fn detect_faces_collect(
-    ai: &crate::ai::AiPipeline,
-    img: &DynamicImage,
-) -> Vec<FaceResult> {
+fn detect_faces_collect(ai: &crate::ai::AiPipeline, img: &DynamicImage) -> Vec<FaceResult> {
     let (img_w, img_h) = img.dimensions();
     let detections = ai.detect_faces(img).unwrap_or_default();
     let mut results = Vec::new();
@@ -1060,7 +1061,9 @@ fn extract_video_keyframes(
     if width == 0 || height == 0 {
         return Err(anyhow::anyhow!(
             "Video stream in {:?} has zero dimensions ({}x{})",
-            path, width, height
+            path,
+            width,
+            height
         ));
     }
 
@@ -1173,7 +1176,9 @@ pub fn extract_first_video_frame(path: &Path) -> anyhow::Result<DynamicImage> {
     if width == 0 || height == 0 {
         return Err(anyhow::anyhow!(
             "Video stream in {:?} has zero dimensions ({}x{})",
-            path, width, height
+            path,
+            width,
+            height
         ));
     }
 
@@ -1361,7 +1366,9 @@ mod tests {
         {
             let conn = scanner.open_db().unwrap();
             let dhash_cache = std::sync::Mutex::new(Vec::<DHashCacheEntry>::new());
-            scanner.process_file(&conn, &shot_path, &dhash_cache).unwrap();
+            scanner
+                .process_file(&conn, &shot_path, &dhash_cache)
+                .unwrap();
 
             let count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))

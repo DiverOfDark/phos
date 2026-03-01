@@ -192,10 +192,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
     }
 
     if !people_columns.contains(&"folder_name".to_string()) {
-        conn.execute(
-            "ALTER TABLE people ADD COLUMN folder_name TEXT UNIQUE",
-            [],
-        )?;
+        conn.execute("ALTER TABLE people ADD COLUMN folder_name TEXT UNIQUE", [])?;
     }
 
     // Add score column to faces if it doesn't exist (migration)
@@ -218,16 +215,10 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
 
     if !shots_columns.is_empty() {
         if !shots_columns.contains(&"primary_person_id".to_string()) {
-            conn.execute(
-                "ALTER TABLE shots ADD COLUMN primary_person_id TEXT",
-                [],
-            )?;
+            conn.execute("ALTER TABLE shots ADD COLUMN primary_person_id TEXT", [])?;
         }
         if !shots_columns.contains(&"folder_number".to_string()) {
-            conn.execute(
-                "ALTER TABLE shots ADD COLUMN folder_number INTEGER",
-                [],
-            )?;
+            conn.execute("ALTER TABLE shots ADD COLUMN folder_number INTEGER", [])?;
         }
         if !shots_columns.contains(&"review_status".to_string()) {
             conn.execute(
@@ -305,7 +296,7 @@ fn migrate_photos_to_shots<P: AsRef<Path>>(conn: &Connection, db_path: P) -> Res
 
     // Populate folder_name from name or id
     conn.execute_batch(
-        "UPDATE people SET folder_name = COALESCE(name, id) WHERE folder_name IS NULL"
+        "UPDATE people SET folder_name = COALESCE(name, id) WHERE folder_name IS NULL",
     )?;
 
     // Ensure exactly one is_original = 1 per shot.
@@ -317,7 +308,7 @@ fn migrate_photos_to_shots<P: AsRef<Path>>(conn: &Connection, db_path: P) -> Res
              LEFT JOIN (SELECT shot_id FROM files WHERE is_original = 1) o ON f.shot_id = o.shot_id
              WHERE o.shot_id IS NULL
              GROUP BY f.shot_id
-         )"
+         )",
     )?;
 
     // Drop the old photos table

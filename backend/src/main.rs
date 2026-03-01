@@ -74,11 +74,11 @@ async fn main() {
                         eprintln!("Remote import failed: {}", e);
                         std::process::exit(1);
                     }
-                } else {
-                    if let Err(e) = import::run_import(Path::new(&source), Path::new(target_str), r#move, threads) {
-                        eprintln!("Import failed: {}", e);
-                        std::process::exit(1);
-                    }
+                } else if let Err(e) =
+                    import::run_import(Path::new(&source), Path::new(target_str), r#move, threads)
+                {
+                    eprintln!("Import failed: {}", e);
+                    std::process::exit(1);
                 }
             } else {
                 eprintln!("Target directory or URL is required for import");
@@ -108,10 +108,12 @@ async fn run_server() {
 
     let db_path = root_path.join(".phos.db");
     info!("Initializing database at {:?}", db_path);
-    let conn = db::init_db(&db_path).map_err(|e| {
-        tracing::error!("Failed to initialize database: {}", e);
-        e
-    }).expect("Failed to initialize database");
+    let conn = db::init_db(&db_path)
+        .map_err(|e| {
+            tracing::error!("Failed to initialize database: {}", e);
+            e
+        })
+        .expect("Failed to initialize database");
 
     let shared_conn = Arc::new(Mutex::new(conn));
 
@@ -167,7 +169,9 @@ async fn run_server() {
                 let reorganize_interval = std::time::Duration::from_secs(30 * 60);
                 let mut guard = lock.lock().unwrap();
                 loop {
-                    let (g, timeout) = cvar.wait_timeout_while(guard, reorganize_interval, |stopped| !*stopped).unwrap();
+                    let (g, timeout) = cvar
+                        .wait_timeout_while(guard, reorganize_interval, |stopped| !*stopped)
+                        .unwrap();
                     guard = g;
                     if *guard {
                         break;
@@ -203,8 +207,7 @@ async fn run_server() {
     let api_router = api::create_router(state);
     let static_dir = std::env::var("PHOS_STATIC_DIR").unwrap_or_else(|_| "static".to_string());
     let index_path = format!("{}/index.html", static_dir);
-    let serve_static = ServeDir::new(&static_dir)
-        .not_found_service(ServeFile::new(index_path));
+    let serve_static = ServeDir::new(&static_dir).not_found_service(ServeFile::new(index_path));
 
     let port = std::env::var("PHOS_PORT")
         .unwrap_or_else(|_| "33000".to_string())
@@ -299,9 +302,8 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
         tokio::select! {
             _ = ctrl_c => info!("Received Ctrl-C, shutting down"),
             _ = sigterm.recv() => info!("Received SIGTERM, shutting down"),

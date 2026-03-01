@@ -178,7 +178,7 @@ fn estimate_similarity_transform(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -
     // We solve via normal equations: (A^T A) params = A^T rhs
 
     let mut ata = [0.0f64; 16]; // 4x4
-    let mut atb = [0.0f64; 4];  // 4x1
+    let mut atb = [0.0f64; 4]; // 4x1
 
     for i in 0..5 {
         let (sx, sy) = (src[i].0 as f64, src[i].1 as f64);
@@ -257,11 +257,15 @@ fn affine_warp_face(img: &DynamicImage, forward: &[f32; 6]) -> RgbImage {
     let (src_w, src_h) = (rgb.width(), rgb.height());
 
     // Invert the 2x3 similarity matrix [[a, -b, tx], [b, a, ty]]
-    let (a, mb, tx, b, a2, ty) = (forward[0], forward[1], forward[2], forward[3], forward[4], forward[5]);
+    let (a, mb, tx, b, a2, ty) = (
+        forward[0], forward[1], forward[2], forward[3], forward[4], forward[5],
+    );
     let det = a * a2 - mb * b;
     if det.abs() < 1e-10 {
         // Degenerate — just resize the image
-        return img.resize_exact(size, size, image::imageops::FilterType::Triangle).to_rgb8();
+        return img
+            .resize_exact(size, size, image::imageops::FilterType::Triangle)
+            .to_rgb8();
     }
     let inv_det = 1.0 / det;
     // Inverse: [[a2, -mb, mb*ty - a2*tx], [-b, a, b*tx - a*ty]] / det
@@ -346,7 +350,10 @@ pub fn align_face(
 
 impl AiPipeline {
     pub fn new() -> Result<Self> {
-        if std::env::var("PHOS_DUMMY_AI").ok().is_some_and(|v| v == "1") {
+        if std::env::var("PHOS_DUMMY_AI")
+            .ok()
+            .is_some_and(|v| v == "1")
+        {
             return Ok(Self {
                 face_detector: None,
                 face_recognizer: None,
@@ -369,9 +376,12 @@ impl AiPipeline {
     }
 
     pub fn detect_faces(&self, img: &DynamicImage) -> Result<Vec<FaceDetection>> {
-        if let (Some(detector_mutex), false) =
-            (&self.face_detector, std::env::var("PHOS_DUMMY_AI").ok().is_some_and(|v| v == "1"))
-        {
+        if let (Some(detector_mutex), false) = (
+            &self.face_detector,
+            std::env::var("PHOS_DUMMY_AI")
+                .ok()
+                .is_some_and(|v| v == "1"),
+        ) {
             let (orig_w, orig_h) = img.dimensions();
             let target_size: u32 = 640;
             let resized = img.resize_exact(
@@ -835,7 +845,9 @@ impl AiPipeline {
     ) -> Result<Vec<f32>> {
         if let (Some(recognizer_mutex), false) = (
             &self.face_recognizer,
-            std::env::var("PHOS_DUMMY_AI").ok().is_some_and(|v| v == "1"),
+            std::env::var("PHOS_DUMMY_AI")
+                .ok()
+                .is_some_and(|v| v == "1"),
         ) {
             let rgb_img = align_face(img, landmarks, bbox);
 
