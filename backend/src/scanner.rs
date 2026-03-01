@@ -101,7 +101,6 @@ pub fn hamming_distance(a: &[u8; 8], b: &[u8; 8]) -> u32 {
 
 /// Entry in the in-memory dHash cache used for shot grouping during scanning.
 pub struct DHashCacheEntry {
-    pub file_id: String,
     pub shot_id: String,
     pub dhash: [u8; 8],
 }
@@ -147,25 +146,20 @@ impl Scanner {
         let dhash_cache = {
             let conn = self.open_db()?;
             let mut stmt = conn.prepare(
-                "SELECT f.id, f.shot_id, f.visual_embedding FROM files f WHERE f.visual_embedding IS NOT NULL"
+                "SELECT f.shot_id, f.visual_embedding FROM files f WHERE f.visual_embedding IS NOT NULL"
             )?;
             let entries: Vec<DHashCacheEntry> = stmt
                 .query_map([], |row| {
-                    let file_id: String = row.get(0)?;
-                    let shot_id: String = row.get(1)?;
-                    let blob: Vec<u8> = row.get(2)?;
-                    Ok((file_id, shot_id, blob))
+                    let shot_id: String = row.get(0)?;
+                    let blob: Vec<u8> = row.get(1)?;
+                    Ok((shot_id, blob))
                 })?
                 .filter_map(|r| r.ok())
-                .filter_map(|(file_id, shot_id, blob)| {
+                .filter_map(|(shot_id, blob)| {
                     if blob.len() == 8 {
                         let mut dhash = [0u8; 8];
                         dhash.copy_from_slice(&blob);
-                        Some(DHashCacheEntry {
-                            file_id,
-                            shot_id,
-                            dhash,
-                        })
+                        Some(DHashCacheEntry { shot_id, dhash })
                     } else {
                         None
                     }
@@ -288,7 +282,7 @@ impl Scanner {
     ///   - "Core" faces (≥ `MIN_FACES_FOR_CORE` neighbors) are assigned to the
     ///     closest neighbor's person, or a new person is created.
     ///   - Non-core faces are deferred.
-    /// Pass 2: Deferred faces are re-checked — some may now have assigned neighbors.
+    ///     Pass 2: Deferred faces are re-checked — some may now have assigned neighbors.
     pub fn cluster_faces(&self, conn: &Connection) -> anyhow::Result<()> {
         // Load all face embeddings
         let mut stmt =
@@ -745,7 +739,6 @@ impl Scanner {
                 if let Some(ref file_dhash) = dhash {
                     let mut cache = dhash_cache.lock().unwrap();
                     cache.push(DHashCacheEntry {
-                        file_id: id.clone(),
                         shot_id: actual_shot_id.clone(),
                         dhash: *file_dhash,
                     });

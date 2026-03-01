@@ -210,9 +210,9 @@ fn estimate_similarity_transform(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -
         // Partial pivoting
         let mut max_row = col;
         let mut max_val = aug[col][col].abs();
-        for row in (col + 1)..4 {
-            if aug[row][col].abs() > max_val {
-                max_val = aug[row][col].abs();
+        for (row, aug_row) in aug.iter().enumerate().skip(col + 1) {
+            if aug_row[col].abs() > max_val {
+                max_val = aug_row[col].abs();
                 max_row = row;
             }
         }
@@ -224,16 +224,18 @@ fn estimate_similarity_transform(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -
             return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         }
 
-        for c in col..5 {
-            aug[col][c] /= pivot;
+        for item in &mut aug[col][col..5] {
+            *item /= pivot;
         }
         for row in 0..4 {
             if row == col {
                 continue;
             }
             let factor = aug[row][col];
-            for c in col..5 {
-                aug[row][c] -= factor * aug[col][c];
+            // Split borrow: copy pivot row slice, then mutate target row
+            let pivot_row: [f64; 5] = aug[col];
+            for (dest, &src) in aug[row][col..5].iter_mut().zip(&pivot_row[col..5]) {
+                *dest -= factor * src;
             }
         }
     }

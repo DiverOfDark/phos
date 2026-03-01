@@ -1848,6 +1848,7 @@ async fn split_shot(
     }
 
     // Get the source shot's metadata
+    #[allow(clippy::type_complexity)]
     let (timestamp, width, height, latitude, longitude): (
         Option<String>,
         Option<i64>,
@@ -2105,7 +2106,15 @@ async fn get_similar_shots(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-        let candidates: Vec<(String, String, Option<String>, Option<String>, i64, Vec<u8>)> = stmt
+        #[allow(clippy::type_complexity)]
+        let candidates: Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            Vec<u8>,
+        )> = stmt
             .query_map(params![id, person_id], |row| {
                 Ok((
                     row.get(0)?,

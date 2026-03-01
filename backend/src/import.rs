@@ -1105,7 +1105,7 @@ fn cleanup_empty_dirs(root: &Path) -> anyhow::Result<()> {
         .collect();
 
     // Sort by path length descending so we process deepest dirs first
-    dirs.sort_by(|a, b| b.as_os_str().len().cmp(&a.as_os_str().len()));
+    dirs.sort_by_key(|b| std::cmp::Reverse(b.as_os_str().len()));
 
     for dir in dirs {
         if let Ok(mut entries) = fs::read_dir(&dir) {
