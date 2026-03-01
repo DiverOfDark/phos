@@ -125,6 +125,109 @@ impl Scanner {
         Ok(db::open_connection(&self.db_path)?)
     }
 
+    /// Recompute SHA256 hashes for all files in the DB.
+    /// Updates the hash if it changed; removes the record if the file is missing from disk.
+    pub fn rehash_files(&self) -> anyhow::Result<()> {
+        let conn = self.open_db()?;
+
+        let mut stmt = conn.prepare("SELECT id, path, hash FROM files")?;
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let total = rows.len();
+        info!("Rehashing {} files...", total);
+
+        let pb = ProgressBar::new(total as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+
+        let mut updated = 0u64;
+        let mut removed = 0u64;
+
+        for (file_id, file_path, old_hash) in &rows {
+            let path = Path::new(file_path);
+            pb.set_message(
+                path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            );
+
+            if !path.exists() {
+                // File missing from disk — remove from DB
+                let _ = conn.execute(
+                    "DELETE FROM face_neighbors WHERE face_id_a IN (SELECT id FROM faces WHERE file_id = ?) OR face_id_b IN (SELECT id FROM faces WHERE file_id = ?)",
+                    params![file_id, file_id],
+                );
+                let _ = conn.execute("DELETE FROM faces WHERE file_id = ?", params![file_id]);
+                let _ = conn.execute(
+                    "DELETE FROM video_keyframes WHERE video_file_id = ?",
+                    params![file_id],
+                );
+                let _ = conn.execute("DELETE FROM files WHERE id = ?", params![file_id]);
+                removed += 1;
+                pb.inc(1);
+                continue;
+            }
+
+            match calculate_hash(path) {
+                Ok(new_hash) => {
+                    if new_hash != *old_hash {
+                        let _ = conn.execute(
+                            "UPDATE files SET hash = ? WHERE id = ?",
+                            params![new_hash, file_id],
+                        );
+                        updated += 1;
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to hash {:?}: {}", path, e);
+                }
+            }
+            pb.inc(1);
+        }
+
+        pb.finish_and_clear();
+
+        if updated > 0 || removed > 0 {
+            info!(
+                "Rehash complete: {} updated, {} removed (of {} total)",
+                updated, removed, total
+            );
+        } else {
+            info!("Rehash complete: all {} hashes up to date", total);
+        }
+
+        // Clean up orphaned shots (no files remaining)
+        let orphaned_shots = conn.execute(
+            "DELETE FROM shots WHERE id NOT IN (SELECT DISTINCT shot_id FROM files)",
+            [],
+        )?;
+        if orphaned_shots > 0 {
+            info!("Removed {} orphaned shots", orphaned_shots);
+        }
+
+        // Clean up orphaned people (no faces remaining)
+        let _ = conn.execute(
+            "UPDATE shots SET primary_person_id = NULL WHERE primary_person_id IN (SELECT p.id FROM people p WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id))",
+            [],
+        );
+        let orphaned_people = conn.execute(
+            "DELETE FROM people WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = people.id)",
+            [],
+        )?;
+        if orphaned_people > 0 {
+            info!("Removed {} orphaned people", orphaned_people);
+        }
+
+        Ok(())
+    }
+
     pub fn scan(&self, root: &Path) -> anyhow::Result<()> {
         let files: Vec<PathBuf> = WalkDir::new(root)
             .into_iter()

@@ -146,6 +146,13 @@ async fn run_server() {
         if *lock.lock().unwrap() {
             return;
         }
+        if let Err(e) = scanner.rehash_files() {
+            tracing::error!("Rehash failed: {}", e);
+        }
+
+        if *lock.lock().unwrap() {
+            return;
+        }
         if let Err(e) = scanner.scan(&scan_path) {
             tracing::error!("Scan failed: {}", e);
         }
