@@ -906,27 +906,6 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                 }
             }
 
-            // Compare paths
-            if target_path == current_path {
-                if dry_run {
-                    pb.println(format!("SKIP: {} (already correct)", file_row.path));
-                }
-                skipped += 1;
-                pb.inc(1);
-                continue;
-            }
-
-            if dry_run {
-                pb.println(format!(
-                    "MOVE: {} -> {}",
-                    file_row.path,
-                    target_path.to_string_lossy()
-                ));
-                moved += 1;
-                pb.inc(1);
-                continue;
-            }
-
             // If source file doesn't exist, clean up the DB records
             if !current_path.exists() {
                 warn!("File missing, removing DB records: {}", file_row.path);
@@ -967,6 +946,27 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                     }
                 }
 
+                pb.inc(1);
+                continue;
+            }
+
+            // Compare paths — skip if file is already in the correct location
+            if target_path == current_path {
+                if dry_run {
+                    pb.println(format!("SKIP: {} (already correct)", file_row.path));
+                }
+                skipped += 1;
+                pb.inc(1);
+                continue;
+            }
+
+            if dry_run {
+                pb.println(format!(
+                    "MOVE: {} -> {}",
+                    file_row.path,
+                    target_path.to_string_lossy()
+                ));
+                moved += 1;
                 pb.inc(1);
                 continue;
             }
