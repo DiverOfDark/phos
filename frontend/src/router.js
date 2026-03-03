@@ -5,9 +5,7 @@ import ReviewQueue from './components/ReviewQueue.vue'
 import VariationsQueue from './components/VariationsQueue.vue'
 import ShotDetail from './components/ShotDetail.vue'
 import PersonDetail from './components/PersonDetail.vue'
-import Gallery from './components/Gallery.vue'
 import PeopleList from './components/PeopleList.vue'
-import Timeline from './components/Timeline.vue'
 import LoginPage from './components/LoginPage.vue'
 import WorkflowsPage from './components/WorkflowsPage.vue'
 
@@ -49,22 +47,10 @@ const routes = [
     meta: { view: 'people' },
   },
   {
-    path: '/browse',
-    name: 'browse',
-    component: Gallery,
-    meta: { view: 'browse' },
-  },
-  {
     path: '/people',
     name: 'people',
     component: PeopleList,
     meta: { view: 'people' },
-  },
-  {
-    path: '/timeline',
-    name: 'timeline',
-    component: Timeline,
-    meta: { view: 'timeline' },
   },
   {
     path: '/workflows',

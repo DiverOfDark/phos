@@ -381,6 +381,24 @@ async function markUnsorted() {
   }
 }
 
+// --- Action: Delete shot ---
+const deleting = ref(false)
+async function deleteShot() {
+  if (!currentShot.value || deleting.value) return
+  deleting.value = true
+  try {
+    const res = await fetch(`/api/shots/${currentShot.value.id}`, {
+      method: 'DELETE',
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    removeCurrentAndAdvance()
+  } catch (e) {
+    console.error('Failed to delete shot:', e)
+  } finally {
+    deleting.value = false
+  }
+}
+
 // --- Action: Split mode ---
 const splitMode = ref(false)
 const splitSelection = ref(new Set())
@@ -1112,6 +1130,18 @@ defineExpose({ loadData: fetchShots })
           >
             <FolderOpen class="w-4 h-4" />
             Mark Unsorted
+          </Button>
+
+          <!-- Delete (unsorted view only) -->
+          <Button
+            v-if="statusFilter === 'unsorted'"
+            variant="outline"
+            class="border-red-500/30 text-red-400 hover:text-red-300 hover:bg-red-500/10 gap-2"
+            :disabled="deleting"
+            @click="deleteShot"
+          >
+            <Trash2 class="w-4 h-4" />
+            Delete
           </Button>
 
           <!-- Keyboard hints -->

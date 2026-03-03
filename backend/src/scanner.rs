@@ -235,7 +235,7 @@ impl Scanner {
                 // Skip .phos* directories (thumbnails cache, db files)
                 if e.file_type().is_dir() {
                     if let Some(name) = e.file_name().to_str() {
-                        return !name.starts_with(".phos");
+                        return !name.starts_with(".phos") && name != ".duplicates";
                     }
                 }
                 true
@@ -669,15 +669,64 @@ impl Scanner {
 
         let hash = calculate_hash(path)?;
 
-        // Hash duplicate check — same content at a different path
+        // Hash duplicate check — same content at a different path.
+        // Move the duplicate into {root}/.duplicates/ preserving relative path.
         {
-            let mut stmt = conn.prepare("SELECT id FROM files WHERE hash = ?")?;
+            let mut stmt = conn.prepare("SELECT id, path FROM files WHERE hash = ?")?;
             let mut rows = stmt.query(params![hash])?;
             if let Some(row) = rows.next()? {
                 let existing_id: String = row.get(0)?;
-                debug!(
-                    "File already exists with hash {}, ID: {}",
-                    hash, existing_id
+                let existing_path: String = row.get(1)?;
+
+                let root_dir = self.db_path.parent().unwrap();
+                let rel = path
+                    .strip_prefix(root_dir)
+                    .unwrap_or(path);
+                let duplicates_dir = root_dir.join(".duplicates");
+                let mut target_path = duplicates_dir.join(rel);
+
+                // Handle filename collisions
+                if target_path.exists() {
+                    let stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("file");
+                    let ext = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    let target_dir = target_path.parent().unwrap().to_path_buf();
+                    let mut i = 1u32;
+                    loop {
+                        let candidate = if ext.is_empty() {
+                            target_dir.join(format!("{}_{}", stem, i))
+                        } else {
+                            target_dir.join(format!("{}_{}.{}", stem, i, ext))
+                        };
+                        if !candidate.exists() {
+                            target_path = candidate;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+
+                if let Some(parent) = target_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                // Try rename first (same filesystem), fall back to copy+delete
+                if std::fs::rename(path, &target_path).is_err() {
+                    std::fs::copy(path, &target_path)?;
+                    std::fs::remove_file(path)?;
+                }
+
+                info!(
+                    "Duplicate of {} (id {}) moved: {} -> {}",
+                    existing_path,
+                    existing_id,
+                    path.display(),
+                    target_path.display()
                 );
                 return Ok(());
             }

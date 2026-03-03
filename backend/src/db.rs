@@ -135,6 +135,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         "CREATE TABLE IF NOT EXISTS comfyui_workflows (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
+            description TEXT,
             workflow_json TEXT NOT NULL,
             inputs_json TEXT,
             outputs_json TEXT,
@@ -226,6 +227,22 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
                 [],
             )?;
         }
+    }
+
+    // Add description column to comfyui_workflows if it doesn't exist
+    let workflows_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(comfyui_workflows)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if !workflows_columns.is_empty()
+        && !workflows_columns.contains(&"description".to_string())
+    {
+        conn.execute(
+            "ALTER TABLE comfyui_workflows ADD COLUMN description TEXT",
+            [],
+        )?;
     }
 
     Ok(conn)

@@ -78,7 +78,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/comfyui/enhance", post(comfyui_enhance))
         .route("/api/comfyui/tasks", get(comfyui_list_tasks))
-        .route("/api/comfyui/tasks/:id", get(comfyui_get_task))
+        .route(
+            "/api/comfyui/tasks/:id",
+            get(comfyui_get_task).delete(comfyui_delete_task),
+        )
         .route("/api/comfyui/tasks/:id/retry", post(comfyui_retry_task))
         .with_state(state)
 }
@@ -273,8 +276,12 @@ async fn get_shots(
     }
 
     if let Some(ref status) = params.status {
-        conditions.push("s.review_status = ?".to_string());
-        bind_values.push(status.clone());
+        if status == "unsorted" {
+            conditions.push("s.primary_person_id IS NULL".to_string());
+        } else {
+            conditions.push("s.review_status = ?".to_string());
+            bind_values.push(status.clone());
+        }
     }
 
     if let Some(ref q) = params.q {
@@ -2624,7 +2631,7 @@ async fn comfyui_list_workflows(
 
     let mut stmt = db
         .prepare(
-            "SELECT id, name, inputs_json, outputs_json, created_at FROM comfyui_workflows ORDER BY created_at DESC",
+            "SELECT id, name, description, inputs_json, outputs_json, created_at FROM comfyui_workflows ORDER BY created_at DESC",
         )
         .map_err(|e| {
             tracing::error!("Failed to list workflows: {}", e);
@@ -2635,9 +2642,10 @@ async fn comfyui_list_workflows(
         .query_map([], |row| {
             let id: String = row.get(0)?;
             let name: String = row.get(1)?;
-            let inputs_str: Option<String> = row.get(2)?;
-            let outputs_str: Option<String> = row.get(3)?;
-            let created_at: String = row.get(4)?;
+            let description: Option<String> = row.get(2)?;
+            let inputs_str: Option<String> = row.get(3)?;
+            let outputs_str: Option<String> = row.get(4)?;
+            let created_at: String = row.get(5)?;
 
             let inputs: serde_json::Value = inputs_str
                 .and_then(|s| serde_json::from_str(&s).ok())
@@ -2649,6 +2657,7 @@ async fn comfyui_list_workflows(
             Ok(serde_json::json!({
                 "id": id,
                 "name": name,
+                "description": description,
                 "inputs": inputs,
                 "outputs": outputs,
                 "created_at": created_at,
@@ -2668,6 +2677,7 @@ async fn comfyui_list_workflows(
 #[derive(Deserialize)]
 struct ImportWorkflowPayload {
     name: String,
+    description: Option<String>,
     workflow: serde_json::Value,
 }
 
@@ -2705,8 +2715,8 @@ async fn comfyui_import_workflow(
 
     let db = state.db.lock().await;
     db.execute(
-        "INSERT INTO comfyui_workflows (id, name, workflow_json, inputs_json, outputs_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, payload.name, workflow_json, inputs_json, outputs_json],
+        "INSERT INTO comfyui_workflows (id, name, description, workflow_json, inputs_json, outputs_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, payload.name, payload.description, workflow_json, inputs_json, outputs_json],
     )
     .map_err(|e| {
         tracing::error!("Failed to insert workflow: {}", e);
@@ -2716,6 +2726,7 @@ async fn comfyui_import_workflow(
     Ok(Json(serde_json::json!({
         "id": id,
         "name": payload.name,
+        "description": payload.description,
         "inputs": inputs,
         "outputs": outputs,
     })))
@@ -2829,9 +2840,12 @@ async fn comfyui_list_tasks(
 }
 
 fn task_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+    let shot_id: String = row.get(1)?;
+    let main_file_id: Option<String> = row.get(11)?;
+    let thumbnail_url = main_file_id.map(|fid| format!("/api/files/{}/thumbnail", fid));
     Ok(serde_json::json!({
         "id": row.get::<_, String>(0)?,
-        "shot_id": row.get::<_, String>(1)?,
+        "shot_id": shot_id,
         "workflow_id": row.get::<_, String>(2)?,
         "workflow_name": row.get::<_, String>(3)?,
         "status": row.get::<_, String>(4)?,
@@ -2841,6 +2855,7 @@ fn task_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> 
         "created_at": row.get::<_, String>(8)?,
         "started_at": row.get::<_, Option<String>>(9)?,
         "completed_at": row.get::<_, Option<String>>(10)?,
+        "thumbnail_url": thumbnail_url,
     }))
 }
 
@@ -2852,9 +2867,11 @@ fn query_tasks(
         let mut stmt = db
             .prepare(
                 "SELECT t.id, t.shot_id, t.workflow_id, w.name, t.status, t.error_message,
-                        t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at
+                        t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
+                        s.main_file_id
                  FROM enhancement_tasks t
                  JOIN comfyui_workflows w ON t.workflow_id = w.id
+                 LEFT JOIN shots s ON t.shot_id = s.id
                  WHERE t.shot_id = ?1
                  ORDER BY t.created_at DESC",
             )
@@ -2876,9 +2893,11 @@ fn query_tasks(
         let mut stmt = db
             .prepare(
                 "SELECT t.id, t.shot_id, t.workflow_id, w.name, t.status, t.error_message,
-                        t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at
+                        t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
+                        s.main_file_id
                  FROM enhancement_tasks t
                  JOIN comfyui_workflows w ON t.workflow_id = w.id
+                 LEFT JOIN shots s ON t.shot_id = s.id
                  ORDER BY t.created_at DESC
                  LIMIT 100",
             )
@@ -2910,9 +2929,11 @@ async fn comfyui_get_task(
     let task = db
         .query_row(
             "SELECT t.id, t.shot_id, t.workflow_id, w.name, t.status, t.error_message,
-                    t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at
+                    t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
+                    s.main_file_id
              FROM enhancement_tasks t
              JOIN comfyui_workflows w ON t.workflow_id = w.id
+             LEFT JOIN shots s ON t.shot_id = s.id
              WHERE t.id = ?1",
             params![id],
             task_row_to_json,
@@ -2954,6 +2975,40 @@ async fn comfyui_retry_task(
 
     Ok(Json(serde_json::json!({"status": "pending"})))
 }
+
+/// DELETE /api/comfyui/tasks/:id — remove a failed or completed task
+async fn comfyui_delete_task(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _ = require_comfyui(&state)?;
+    let db = state.db.lock().await;
+
+    // Only allow deleting failed or completed tasks
+    let status: String = db
+        .query_row(
+            "SELECT status FROM enhancement_tasks WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    if status != "failed" && status != "completed" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    db.execute(
+        "DELETE FROM enhancement_tasks WHERE id = ?1",
+        params![id],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to delete task: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
 #[derive(Deserialize)]
 struct IgnoreMergePayload {
     shot_id_1: String,

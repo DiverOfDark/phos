@@ -73,10 +73,10 @@ watch(selectedWorkflow, (wf) => {
     return
   }
   const overrides = {}
-  const inputs = wf.detected_inputs || []
+  const inputs = wf.inputs || []
   for (const input of inputs) {
-    if (input.type === 'text' || input.type === 'string') {
-      overrides[input.node_id] = input.default_value || ''
+    if (input.node_type !== 'LoadImage') {
+      overrides[input.node_id] = typeof input.current_value === 'string' ? input.current_value : ''
     }
   }
   textOverrides.value = overrides
@@ -98,14 +98,14 @@ function selectWorkflow(id) {
 
 const textInputs = computed(() => {
   if (!selectedWorkflow.value) return []
-  return (selectedWorkflow.value.detected_inputs || []).filter(
-    i => i.type === 'text' || i.type === 'string'
+  return (selectedWorkflow.value.inputs || []).filter(
+    i => i.node_type !== 'LoadImage'
   )
 })
 
 const outputType = computed(() => {
-  if (!selectedWorkflow.value?.detected_outputs?.length) return null
-  return selectedWorkflow.value.detected_outputs[0].type || 'image'
+  if (!selectedWorkflow.value?.outputs?.length) return null
+  return selectedWorkflow.value.outputs[0].node_type || 'image'
 })
 
 async function enhance() {
@@ -211,13 +211,13 @@ async function enhance() {
           <Label class="text-zinc-400">Input Overrides</Label>
           <div v-for="input in textInputs" :key="input.node_id" class="space-y-1.5">
             <label class="text-xs font-medium text-zinc-400">
-              {{ input.name || `Node ${input.node_id}` }}
+              {{ input.field_name }} <span class="text-zinc-600">({{ input.node_type }}, node {{ input.node_id }})</span>
             </label>
             <textarea
               v-model="textOverrides[input.node_id]"
               rows="2"
               class="flex w-full rounded-lg border border-white/10 bg-zinc-800/50 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 focus-visible:ring-offset-0 resize-y"
-              :placeholder="input.default_value || 'Enter value...'"
+              :placeholder="typeof input.current_value === 'string' ? input.current_value : 'Enter value...'"
             />
           </div>
         </div>

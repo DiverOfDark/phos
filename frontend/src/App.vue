@@ -30,7 +30,6 @@ import {
   Upload,
   LayoutGrid,
   RefreshCw,
-  Clock,
   HardDrive,
   Shield,
   Zap,
@@ -39,7 +38,6 @@ import {
   AlertCircle,
   ClipboardCheck,
   Users,
-  Image as ImageIcon,
   LogOut,
   Wand2,
   Layers,
@@ -214,9 +212,57 @@ const handleImportScan = async () => {
   }
 }
 
-const handleDrop = (e) => {
+const uploadProgress = ref({ current: 0, total: 0 })
+const isUploading = ref(false)
+
+const handleDrop = async (e) => {
   isDragging.value = false
-  importMessage.value = 'Phos scans server-side directories. Enter a path above and click "Scan Directory".'
+  importMessage.value = ''
+  importError.value = ''
+
+  const files = Array.from(e.dataTransfer?.files || [])
+  const mediaFiles = files.filter(f => /\.(jpe?g|png|webp|mp4|mov|mkv|avi|webm)$/i.test(f.name))
+  if (mediaFiles.length === 0) {
+    importError.value = 'No supported media files found. Supported: JPEG, PNG, WebP, MP4, MOV, MKV, AVI, WebM.'
+    return
+  }
+
+  isUploading.value = true
+  uploadProgress.value = { current: 0, total: mediaFiles.length }
+  let failed = 0
+
+  for (const file of mediaFiles) {
+    try {
+      const res = await fetch(`/api/import/upload?filename=${encodeURIComponent(file.name)}`, {
+        method: 'PUT',
+        body: file,
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    } catch (e) {
+      console.error(`Failed to upload ${file.name}:`, e)
+      failed++
+    }
+    uploadProgress.value.current++
+  }
+
+  isUploading.value = false
+  const succeeded = mediaFiles.length - failed
+  if (failed === 0) {
+    importMessage.value = `Uploaded ${succeeded} file${succeeded === 1 ? '' : 's'} successfully.`
+  } else {
+    importMessage.value = `Uploaded ${succeeded} of ${mediaFiles.length} files.`
+    importError.value = `${failed} file${failed === 1 ? '' : 's'} failed to upload.`
+  }
+
+  // Refresh UI
+  await fetchPendingCount()
+  const comp = routeComponentRef.value
+  if (comp) {
+    comp.loadData?.()
+    comp.fetchPhotos?.()
+    comp.fetchPeople?.()
+    comp.fetchShots?.()
+  }
 }
 
 // --- Settings: Save library path ---
@@ -321,36 +367,6 @@ onMounted(() => {
             <div class="h-5 w-[1px] bg-white/10 mx-2"></div>
 
             <!-- Secondary Nav -->
-            <router-link to="/browse" custom v-slot="{ navigate }">
-              <Button
-                variant="ghost"
-                :class="cn(
-                  'gap-2 px-3 transition-colors text-sm',
-                  currentView === 'browse'
-                    ? 'text-white bg-white/10'
-                    : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/5'
-                )"
-                @click="navigate"
-              >
-                <ImageIcon class="w-3.5 h-3.5" />
-                Browse
-              </Button>
-            </router-link>
-            <router-link to="/timeline" custom v-slot="{ navigate }">
-              <Button
-                variant="ghost"
-                :class="cn(
-                  'gap-2 px-3 transition-colors text-sm',
-                  currentView === 'timeline'
-                    ? 'text-white bg-white/10'
-                    : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/5'
-                )"
-                @click="navigate"
-              >
-                <Clock class="w-3.5 h-3.5" />
-                Timeline
-              </Button>
-            </router-link>
             <router-link to="/workflows" custom v-slot="{ navigate }">
               <Button
                 variant="ghost"
@@ -516,7 +532,7 @@ onMounted(() => {
                 </div>
               </div>
 
-              <!-- Drop zone (still present but with guidance) -->
+              <!-- Drop zone for file upload -->
               <div
                 @dragover.prevent="isDragging = true"
                 @dragleave.prevent="isDragging = false"
@@ -526,11 +542,17 @@ onMounted(() => {
                   isDragging ? 'border-indigo-500 bg-indigo-500/10 scale-[0.98]' : 'border-white/10 bg-zinc-900/50 hover:border-white/20'
                 )"
               >
-                <div class="w-12 h-12 rounded-full bg-zinc-800 flex items-center justify-center mb-4">
-                  <HardDrive :class="cn('w-6 h-6 transition-colors', isDragging ? 'text-indigo-400' : 'text-zinc-500')" />
-                </div>
-                <p class="text-sm font-medium text-white">Server-side scanning</p>
-                <p class="text-xs text-zinc-500 mt-1 text-center">Phos scans directories on the server where it runs. Enter a path above to begin.</p>
+                <template v-if="isUploading">
+                  <RefreshCw class="w-6 h-6 text-indigo-400 animate-spin mb-3" />
+                  <p class="text-sm font-medium text-white">Uploading {{ uploadProgress.current }} / {{ uploadProgress.total }}</p>
+                </template>
+                <template v-else>
+                  <div class="w-12 h-12 rounded-full bg-zinc-800 flex items-center justify-center mb-4">
+                    <Upload :class="cn('w-6 h-6 transition-colors', isDragging ? 'text-indigo-400' : 'text-zinc-500')" />
+                  </div>
+                  <p class="text-sm font-medium text-white">Drop files to upload</p>
+                  <p class="text-xs text-zinc-500 mt-1 text-center">Drag photos or videos here to upload and index them.</p>
+                </template>
               </div>
             </DialogContent>
           </Dialog>
@@ -607,34 +629,6 @@ onMounted(() => {
               @click="navigate"
             >
                <Users class="w-5 h-5" />
-            </Button>
-          </router-link>
-          <!-- Secondary: Browse -->
-          <router-link to="/browse" custom v-slot="{ navigate }">
-            <Button
-              variant="ghost"
-              size="icon"
-              :class="cn(
-                'rounded-xl',
-                currentView === 'browse' ? 'text-indigo-500 bg-white/5' : 'text-zinc-400'
-              )"
-              @click="navigate"
-            >
-               <ImageIcon class="w-5 h-5" />
-            </Button>
-          </router-link>
-          <!-- Secondary: Timeline -->
-          <router-link to="/timeline" custom v-slot="{ navigate }">
-            <Button
-              variant="ghost"
-              size="icon"
-              :class="cn(
-                'rounded-xl',
-                currentView === 'timeline' ? 'text-indigo-500 bg-white/5' : 'text-zinc-400'
-              )"
-              @click="navigate"
-            >
-               <Clock class="w-5 h-5" />
             </Button>
           </router-link>
           <!-- Secondary: Workflows -->

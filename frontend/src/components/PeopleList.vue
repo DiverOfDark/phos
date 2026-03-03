@@ -2,12 +2,13 @@
 import { ref, computed, onMounted, defineExpose } from 'vue'
 import { useRouter } from 'vue-router'
 import { Button } from '@/components/ui/button'
-import { UserPlus } from 'lucide-vue-next'
+import { UserPlus, HelpCircle } from 'lucide-vue-next'
 import PersonNamer from '@/components/PersonNamer.vue'
 
 const router = useRouter()
 
 const people = ref([])
+const unsortedCount = ref(0)
 const loading = ref(false)
 const error = ref(null)
 const showNamer = ref(false)
@@ -18,9 +19,16 @@ async function fetchPeople() {
   loading.value = true
   error.value = null
   try {
-    const res = await fetch('/api/people')
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    people.value = await res.json()
+    const [peopleRes, statsRes] = await Promise.all([
+      fetch('/api/people'),
+      fetch('/api/organize/stats'),
+    ])
+    if (!peopleRes.ok) throw new Error(`HTTP ${peopleRes.status}`)
+    people.value = await peopleRes.json()
+    if (statsRes.ok) {
+      const stats = await statsRes.json()
+      unsortedCount.value = stats.unsorted || 0
+    }
   } catch (e) {
     console.error("Failed to fetch people", e)
     error.value = e.message
@@ -61,6 +69,19 @@ defineExpose({ fetchPeople })
     </div>
 
     <div class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-6">
+      <!-- Unsorted shots -->
+      <div
+        v-if="unsortedCount > 0"
+        class="flex flex-col items-center space-y-2 group cursor-pointer"
+        @click="router.push('/review?status=unsorted')"
+      >
+        <div class="w-24 h-24 rounded-full bg-zinc-800 border-2 border-dashed border-zinc-600 group-hover:border-yellow-500 overflow-hidden flex items-center justify-center transition-colors">
+          <HelpCircle class="w-10 h-10 text-zinc-600 group-hover:text-yellow-500 transition-colors" />
+        </div>
+        <span class="text-sm font-medium text-zinc-400 group-hover:text-yellow-400 transition-colors">Unsorted</span>
+        <span class="text-xs text-zinc-500">{{ unsortedCount }} {{ unsortedCount === 1 ? 'shot' : 'shots' }}</span>
+      </div>
+
       <div v-for="person in people" :key="person.id" class="flex flex-col items-center space-y-2 group cursor-pointer" @click="router.push({ name: 'person-detail', params: { id: person.id } })">
         <div class="w-24 h-24 rounded-full bg-zinc-800 border-2 border-zinc-700 group-hover:border-indigo-500 overflow-hidden flex items-center justify-center transition-colors">
           <img

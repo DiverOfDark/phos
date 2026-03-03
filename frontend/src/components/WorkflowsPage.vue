@@ -1,5 +1,6 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -116,7 +117,7 @@ async function importWorkflow() {
       body: JSON.stringify({
         name: importName.value.trim(),
         description: importDescription.value.trim(),
-        workflow_json: importJson.value.trim(),
+        workflow: JSON.parse(importJson.value),
       }),
     })
     if (!res.ok) {
@@ -195,6 +196,16 @@ async function retryTask(taskId) {
   }
 }
 
+async function deleteTask(taskId) {
+  try {
+    const res = await fetch(`/api/comfyui/tasks/${taskId}`, { method: 'DELETE' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    await fetchTasks()
+  } catch (e) {
+    console.error('Failed to delete task', e)
+  }
+}
+
 function statusBadgeClass(status) {
   switch (status) {
     case 'completed':
@@ -229,11 +240,13 @@ function formatDate(dateStr) {
   return new Date(dateStr).toLocaleDateString()
 }
 
-// --- Active tab tracking ---
-const activeTab = ref('workflows')
+// --- Active tab tracking (synced with URL) ---
+const route = useRoute()
+const router = useRouter()
+const activeTab = computed(() => route.query.tab === 'queue' ? 'queue' : 'workflows')
 
 function onTabChange(val) {
-  activeTab.value = val
+  router.replace({ query: { ...route.query, tab: val === 'workflows' ? undefined : val } })
   if (val === 'queue') {
     fetchTasks()
     startTaskPolling()
@@ -246,6 +259,10 @@ function onTabChange(val) {
 onMounted(() => {
   checkHealth()
   fetchWorkflows()
+  if (activeTab.value === 'queue') {
+    fetchTasks()
+    startTaskPolling()
+  }
 })
 
 onUnmounted(() => {
@@ -282,7 +299,7 @@ onUnmounted(() => {
     </div>
 
     <!-- Tabs -->
-    <Tabs default-value="workflows" @update:model-value="onTabChange">
+    <Tabs :model-value="activeTab" @update:model-value="onTabChange">
       <TabsList class="grid w-full grid-cols-2 max-w-xs">
         <TabsTrigger value="workflows">Workflows</TabsTrigger>
         <TabsTrigger value="queue">Queue</TabsTrigger>
@@ -337,13 +354,13 @@ onUnmounted(() => {
 
                 <div class="flex items-center gap-2 mt-2">
                   <span
-                    v-if="wf.detected_outputs?.length"
+                    v-if="wf.outputs?.length"
                     class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
                   >
-                    {{ wf.detected_outputs[0].type || 'output' }}
+                    {{ wf.outputs[0].node_type || 'output' }}
                   </span>
-                  <span v-if="wf.detected_inputs?.length" class="text-[10px] text-zinc-500">
-                    {{ wf.detected_inputs.length }} input{{ wf.detected_inputs.length !== 1 ? 's' : '' }}
+                  <span v-if="wf.inputs?.length" class="text-[10px] text-zinc-500">
+                    {{ wf.inputs.length }} input{{ wf.inputs.length !== 1 ? 's' : '' }}
                   </span>
                   <span class="text-[10px] text-zinc-600 ml-auto">{{ formatDate(wf.created_at) }}</span>
                 </div>
@@ -424,36 +441,35 @@ onUnmounted(() => {
               </div>
 
               <!-- Detected Inputs -->
-              <div v-if="selectedWorkflow.detected_inputs?.length" class="space-y-2">
+              <div v-if="selectedWorkflow.inputs?.length" class="space-y-2">
                 <h4 class="text-sm font-medium text-zinc-300">Detected Inputs</h4>
                 <div class="space-y-1.5">
                   <div
-                    v-for="input in selectedWorkflow.detected_inputs"
+                    v-for="input in selectedWorkflow.inputs"
                     :key="input.node_id"
                     class="flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-900/50 border border-white/5"
                   >
                     <span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-zinc-800 text-zinc-400 border border-white/5">
-                      {{ input.type }}
+                      {{ input.node_type }}
                     </span>
-                    <span class="text-sm text-zinc-300">{{ input.name || `Node ${input.node_id}` }}</span>
-                    <span v-if="input.default_value" class="text-xs text-zinc-500 ml-auto truncate max-w-[200px]">
-                      default: {{ input.default_value }}
+                    <span class="text-sm text-zinc-300">{{ input.field_name }} <span class="text-zinc-600">(node {{ input.node_id }})</span></span>
+                    <span v-if="input.current_value && typeof input.current_value === 'string'" class="text-xs text-zinc-500 ml-auto truncate max-w-[200px]">
+                      {{ input.current_value }}
                     </span>
                   </div>
                 </div>
               </div>
 
               <!-- Detected Outputs -->
-              <div v-if="selectedWorkflow.detected_outputs?.length" class="space-y-2">
+              <div v-if="selectedWorkflow.outputs?.length" class="space-y-2">
                 <h4 class="text-sm font-medium text-zinc-300">Detected Outputs</h4>
                 <div class="flex flex-wrap gap-2">
                   <span
-                    v-for="(output, i) in selectedWorkflow.detected_outputs"
+                    v-for="(output, i) in selectedWorkflow.outputs"
                     :key="i"
                     class="px-2 py-1 rounded-lg text-xs font-medium bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
                   >
-                    {{ output.type || 'output' }}
-                    <span v-if="output.name" class="text-indigo-300 ml-1">{{ output.name }}</span>
+                    {{ output.node_type || 'output' }}
                   </span>
                 </div>
               </div>
@@ -577,6 +593,16 @@ onUnmounted(() => {
                   @click="retryTask(task.id)"
                 >
                   <RotateCcw class="w-3.5 h-3.5" />
+                </Button>
+                <Button
+                  v-if="task.status === 'failed'"
+                  variant="ghost"
+                  size="sm"
+                  class="gap-1 text-zinc-500 hover:text-red-400 hover:bg-red-500/10"
+                  title="Remove"
+                  @click="deleteTask(task.id)"
+                >
+                  <Trash2 class="w-3.5 h-3.5" />
                 </Button>
                 <router-link
                   v-if="task.status === 'completed' && task.shot_id"

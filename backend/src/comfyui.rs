@@ -358,6 +358,7 @@ pub fn spawn_enhancement_worker(
             process_pending_tasks(&conn, &client);
             poll_active_tasks(&conn, &client, timeout_secs);
             check_retries(&conn);
+            cleanup_completed_tasks(&conn);
 
             // Sleep 3 seconds or until shutdown
             let guard = lock.lock().unwrap();
@@ -818,5 +819,17 @@ fn check_retries(conn: &Connection) {
                 params![task_id],
             );
         }
+    }
+}
+
+/// Remove completed tasks older than 5 minutes.
+fn cleanup_completed_tasks(conn: &Connection) {
+    match conn.execute(
+        "DELETE FROM enhancement_tasks WHERE status = 'completed' AND completed_at IS NOT NULL AND (strftime('%s','now') - strftime('%s', completed_at)) > 300",
+        [],
+    ) {
+        Ok(n) if n > 0 => info!("Cleaned up {} completed enhancement tasks", n),
+        Err(e) => warn!("Failed to clean up completed tasks: {}", e),
+        _ => {}
     }
 }
