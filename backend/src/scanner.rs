@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -107,17 +108,28 @@ pub struct DHashCacheEntry {
 
 pub struct Scanner {
     db_path: PathBuf,
-    ai: Option<AiPipeline>,
+    ai: Option<Arc<AiPipeline>>,
 }
 
 impl Scanner {
     pub fn new(db_path: PathBuf, ai: Option<AiPipeline>) -> Self {
-        Self { db_path, ai }
+        Self {
+            db_path,
+            ai: ai.map(Arc::new),
+        }
+    }
+
+    /// Create a scanner that shares an existing AI pipeline but uses a different DB path.
+    pub fn with_db_path(&self, db_path: PathBuf) -> Self {
+        Self {
+            db_path,
+            ai: self.ai.clone(),
+        }
     }
 
     /// Access the AI pipeline, if loaded.
     pub fn ai(&self) -> Option<&AiPipeline> {
-        self.ai.as_ref()
+        self.ai.as_deref()
     }
 
     /// Open a connection to the scanner's database with WAL mode and busy timeout.
@@ -302,6 +314,9 @@ impl Scanner {
 
         // Compact folder numbers to remove gaps from reassignments
         compact_folder_numbers(&conn)?;
+
+        // Clean up empty directories left behind by duplicate moves or deletions
+        crate::import::cleanup_empty_dirs(root)?;
 
         Ok(())
     }

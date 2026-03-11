@@ -811,7 +811,7 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     // using shots.primary_person_id and shots.folder_number
     let mut stmt = conn.prepare(
         "SELECT s.id, f.id, f.path, s.primary_person_id, s.folder_number,
-                p.folder_name
+                p.folder_name, s.review_status
          FROM shots s
          JOIN files f ON f.shot_id = s.id
          LEFT JOIN people p ON s.primary_person_id = p.id",
@@ -824,6 +824,7 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
         primary_person_id: Option<String>,
         folder_number: Option<i64>,
         person_folder_name: Option<String>,
+        review_status: Option<String>,
     }
 
     let rows: Vec<FileRow> = stmt
@@ -835,6 +836,7 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                 primary_person_id: row.get(3)?,
                 folder_number: row.get(4)?,
                 person_folder_name: row.get(5)?,
+                review_status: row.get(6)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -869,14 +871,18 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
         let first = files[0];
 
         // Determine the person folder name:
-        // - If primary_person_id is set, use person.folder_name (or person_id as fallback)
-        // - Otherwise, use "unsorted"
+        // - Only confirmed shots go into person folders
+        // - Pending/unreviewed shots stay in "unsorted" even if AI assigned a person
+        let is_confirmed = first
+            .review_status
+            .as_deref()
+            == Some("confirmed");
         let person_folder = match &first.primary_person_id {
-            Some(pid) => first
+            Some(pid) if is_confirmed => first
                 .person_folder_name
                 .clone()
                 .unwrap_or_else(|| pid.clone()),
-            None => "unsorted".to_string(),
+            _ => "unsorted".to_string(),
         };
 
         // Determine the folder_number subfolder. If NULL, use "000" as a fallback
@@ -1095,7 +1101,7 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
 
 /// Remove empty directories under `root`, walking bottom-up.
 /// Never removes the root directory itself.
-fn cleanup_empty_dirs(root: &Path) -> anyhow::Result<()> {
+pub fn cleanup_empty_dirs(root: &Path) -> anyhow::Result<()> {
     let mut dirs: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
         .filter_map(|e| e.ok())

@@ -1,6 +1,7 @@
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query},
     http::{header, StatusCode},
+    middleware::Next,
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
@@ -8,15 +9,126 @@ use axum::{
 use image::GenericImageView;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub scanner: Arc<crate::scanner::Scanner>,
     pub comfyui_url: Option<String>,
+    pub library_root: PathBuf,
+    pub multi_user: bool,
+    pub user_dbs: Arc<RwLock<HashMap<String, Arc<Mutex<Connection>>>>>,
+    pub shutdown_flag: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+/// Per-request state extractor. In multi-user mode, resolves to the per-user
+/// AppState (set by the `resolve_user_db` middleware). Falls back to the
+/// router-level state in single-user mode.
+pub struct UState(pub AppState);
+
+#[axum::async_trait]
+impl axum::extract::FromRequestParts<AppState> for UState {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(user_state) = parts.extensions.get::<AppState>() {
+            Ok(UState(user_state.clone()))
+        } else {
+            Ok(UState(state.clone()))
+        }
+    }
+}
+
+/// Middleware that resolves the per-user database and library path.
+/// In multi-user mode (OIDC enabled), creates a per-user AppState with
+/// the user's own DB connection and library subfolder.
+pub async fn resolve_user_db(
+    UState(state): UState,
+    mut request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let user_state = if state.multi_user {
+        if let Some(claims) = request
+            .extensions()
+            .get::<crate::auth::SessionClaims>()
+            .cloned()
+        {
+            let user_sub = &claims.sub;
+            let db = match get_or_create_user_db(&state, user_sub).await {
+                Ok(db) => db,
+                Err(status) => return status.into_response(),
+            };
+            let user_library = state.library_root.join(user_sub);
+            let user_scanner =
+                Arc::new(state.scanner.with_db_path(user_library.join(".phos.db")));
+            AppState {
+                db,
+                scanner: user_scanner,
+                comfyui_url: state.comfyui_url.clone(),
+                library_root: user_library,
+                multi_user: state.multi_user,
+                user_dbs: state.user_dbs.clone(),
+                shutdown_flag: state.shutdown_flag.clone(),
+            }
+        } else {
+            state
+        }
+    } else {
+        state
+    };
+    request.extensions_mut().insert(user_state);
+    next.run(request).await
+}
+
+async fn get_or_create_user_db(
+    state: &AppState,
+    user_sub: &str,
+) -> Result<Arc<Mutex<Connection>>, StatusCode> {
+    // Fast path: read lock
+    {
+        let dbs = state.user_dbs.read().await;
+        if let Some(db) = dbs.get(user_sub) {
+            return Ok(db.clone());
+        }
+    }
+    // Slow path: write lock (re-check to avoid TOCTOU race)
+    let mut dbs = state.user_dbs.write().await;
+    if let Some(db) = dbs.get(user_sub) {
+        return Ok(db.clone());
+    }
+    // Create under the write lock so no two requests init the same user
+    let user_dir = state.library_root.join(user_sub);
+    std::fs::create_dir_all(&user_dir).map_err(|e| {
+        tracing::error!("Failed to create user directory {:?}: {}", user_dir, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let db_path = user_dir.join(".phos.db");
+    let conn = crate::db::init_db(&db_path).map_err(|e| {
+        tracing::error!("Failed to initialize database for user {}: {}", user_sub, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let shared = Arc::new(Mutex::new(conn));
+    dbs.insert(user_sub.to_string(), shared.clone());
+    drop(dbs);
+
+    // Spawn a ComfyUI enhancement worker for the new user
+    if let Some(ref url) = state.comfyui_url {
+        tracing::info!("Spawning ComfyUI worker for user {}", user_sub);
+        crate::comfyui::spawn_enhancement_worker(
+            db_path,
+            url.clone(),
+            state.shutdown_flag.clone(),
+        );
+    }
+    Ok(shared)
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -83,6 +195,10 @@ pub fn create_router(state: AppState) -> Router {
             get(comfyui_get_task).delete(comfyui_delete_task),
         )
         .route("/api/comfyui/tasks/:id/retry", post(comfyui_retry_task))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            resolve_user_db,
+        ))
         .with_state(state)
 }
 
@@ -94,7 +210,7 @@ struct UploadQuery {
 }
 
 async fn upload_file_raw(
-    State(state): State<AppState>,
+    UState(state): UState,
     Query(query): Query<UploadQuery>,
     body: axum::body::Bytes,
 ) -> Result<StatusCode, StatusCode> {
@@ -102,9 +218,7 @@ async fn upload_file_raw(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let library_path =
-        std::env::var("PHOS_LIBRARY_PATH").unwrap_or_else(|_| "./library".to_string());
-    let base_path = std::path::Path::new(&library_path).join(&query.filename);
+    let base_path = state.library_root.join(&query.filename);
 
     if let Some(parent) = base_path.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -173,15 +287,12 @@ async fn upload_file_raw(
 
 /// POST /api/import/finalize -- run face clustering and reorganization after bulk upload.
 async fn finalize_import(
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let scanner = state.scanner.clone();
 
+    let library_root = state.library_root.clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let library_path =
-            std::env::var("PHOS_LIBRARY_PATH").unwrap_or_else(|_| "./library".to_string());
-        let library = std::path::Path::new(&library_path);
-
         // 1. Run face clustering (drop connection before reorganize)
         tracing::info!("Finalize: running face clustering...");
         {
@@ -195,7 +306,7 @@ async fn finalize_import(
 
         // 2. Reorganize files to match clustering
         tracing::info!("Finalize: reorganizing files...");
-        crate::import::run_reorganize(library, false)
+        crate::import::run_reorganize(&library_root, false)
             .map_err(|e| format!("Reorganize failed: {}", e))?;
 
         tracing::info!("Finalize: complete");
@@ -254,7 +365,7 @@ struct ShotsQuery {
 
 /// GET /api/shots - list shots with query params: person_id, status, q, from, to
 async fn get_shots(
-    State(state): State<AppState>,
+    UState(state): UState,
     Query(params): Query<ShotsQuery>,
 ) -> Json<Vec<ShotBrief>> {
     let db = state.db.lock().await;
@@ -396,7 +507,7 @@ struct AlsoContainsPerson {
 /// GET /api/shots/:id - detail with files, faces, primary person, also_contains
 async fn get_shot_detail(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<ShotDetailResponse>, StatusCode> {
     let db = state.db.lock().await;
 
@@ -538,7 +649,7 @@ async fn get_shot_detail(
 
 async fn delete_shot(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db.lock().await;
 
@@ -625,7 +736,7 @@ async fn delete_shot(
         }
     }
 
-    // Clean up cached thumbnails (best-effort)
+    // Clean up cached thumbnails and empty directories (best-effort)
     let db_path: String = db
         .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
         .unwrap_or_default();
@@ -637,12 +748,13 @@ async fn delete_shot(
         for (fid, _) in &files {
             let _ = std::fs::remove_file(thumb_dir.join(format!("{}.jpg", fid)));
         }
+        let _ = crate::import::cleanup_empty_dirs(db_dir);
     }
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
-async fn get_people(State(state): State<AppState>) -> Json<Vec<PersonBrief>> {
+async fn get_people(UState(state): UState) -> Json<Vec<PersonBrief>> {
     let db = state.db.lock().await;
     let mut stmt = db
         .prepare(
@@ -691,7 +803,7 @@ struct CreatePersonPayload {
 }
 
 async fn create_person(
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<CreatePersonPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let name = payload.name.trim().to_string();
@@ -716,7 +828,7 @@ async fn create_person(
 
 async fn get_person_shots(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Json<Vec<ShotBrief>> {
     let db = state.db.lock().await;
     let mut stmt = db
@@ -767,7 +879,7 @@ struct PersonFaceBrief {
 
 async fn get_person_faces(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Json<Vec<PersonFaceBrief>> {
     let db = state.db.lock().await;
     let mut stmt = db
@@ -795,17 +907,12 @@ struct RenamePersonPayload {
 
 async fn rename_person(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<RenamePersonPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db.lock().await;
 
-    // Determine the library path so we can rename the folder on disk
-    let library_path =
-        std::env::var("PHOS_LIBRARY_PATH").unwrap_or_else(|_| "./library".to_string());
-    let library = std::path::Path::new(&library_path);
-
-    crate::import::rename_person_folder(&db, library, &id, &payload.name).map_err(|e| {
+    crate::import::rename_person_folder(&db, &state.library_root, &id, &payload.name).map_err(|e| {
         tracing::error!("Failed to rename person folder: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -821,7 +928,7 @@ struct MergePeoplePayload {
 }
 
 async fn merge_people(
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<MergePeoplePayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if payload.source_id == payload.target_id {
@@ -866,7 +973,7 @@ async fn merge_people(
 /// recalculates primary_person_id for affected shots, and deletes the person.
 async fn delete_person(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db.lock().await;
 
@@ -1065,7 +1172,7 @@ struct FaceSuggestion {
 
 async fn get_face_suggestions(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<Vec<FaceSuggestion>>, StatusCode> {
     use crate::ai::cosine_similarity;
 
@@ -1149,7 +1256,7 @@ struct ReassignFacePayload {
 
 async fn reassign_face(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<ReassignFacePayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db.lock().await;
@@ -1215,7 +1322,7 @@ async fn reassign_face(
 /// Delete a face detection (remove false positive / irrelevant face)
 async fn delete_face(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db.lock().await;
 
@@ -1266,7 +1373,7 @@ async fn delete_face(
 /// Serve a face thumbnail: crop face from source image, resize, cache as JPEG
 async fn get_face_thumbnail(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<impl IntoResponse, StatusCode> {
     let (file_path, box_x1, box_y1, box_x2, box_y2, db_path) = {
         let db = state.db.lock().await;
@@ -1390,7 +1497,7 @@ async fn get_face_thumbnail(
 /// Serve a file by its database ID
 async fn get_file(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<impl IntoResponse, StatusCode> {
     let (file_path, mime_type) = {
         let db = state.db.lock().await;
@@ -1447,7 +1554,7 @@ struct ThumbnailQuery {
 async fn get_file_thumbnail(
     Path(id): Path<String>,
     Query(query): Query<ThumbnailQuery>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<impl IntoResponse, StatusCode> {
     let (file_path, mime_type, db_path) = {
         let db = state.db.lock().await;
@@ -1564,7 +1671,7 @@ struct StatsResponse {
     total_files: i64,
 }
 
-async fn get_stats(State(state): State<AppState>) -> Json<StatsResponse> {
+async fn get_stats(UState(state): UState) -> Json<StatsResponse> {
     let db = state.db.lock().await;
 
     let total_shots: i64 = db
@@ -1596,7 +1703,7 @@ struct OrganizeStatsResponse {
     unnamed_people: i64,
 }
 
-async fn get_organize_stats(State(state): State<AppState>) -> Json<OrganizeStatsResponse> {
+async fn get_organize_stats(UState(state): UState) -> Json<OrganizeStatsResponse> {
     let db = state.db.lock().await;
 
     let total_shots: i64 = db
@@ -1649,13 +1756,10 @@ async fn get_organize_stats(State(state): State<AppState>) -> Json<OrganizeStats
 }
 
 /// Trigger filesystem reorganization in a background thread
-async fn trigger_reorganize() -> Json<serde_json::Value> {
+async fn trigger_reorganize(UState(state): UState) -> Json<serde_json::Value> {
+    let library_root = state.library_root.clone();
     std::thread::spawn(move || {
-        let library_path =
-            std::env::var("PHOS_LIBRARY_PATH").unwrap_or_else(|_| "./library".to_string());
-        let library = std::path::Path::new(&library_path);
-
-        if let Err(e) = crate::import::run_reorganize(library, false) {
+        if let Err(e) = crate::import::run_reorganize(&library_root, false) {
             tracing::error!("Background reorganize failed: {}", e);
         } else {
             tracing::info!("Background reorganize completed successfully");
@@ -1671,7 +1775,7 @@ pub struct ScanParams {
 }
 
 async fn trigger_scan(
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<ScanParams>,
 ) -> Json<serde_json::Value> {
     let db_path_result: Result<String, rusqlite::Error> = {
@@ -1703,7 +1807,7 @@ struct UpdateShotPayload {
 
 async fn update_shot(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<UpdateShotPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db.lock().await;
@@ -1802,7 +1906,7 @@ struct SplitShotPayload {
 
 async fn split_shot(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<SplitShotPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if payload.file_ids.is_empty() {
@@ -2006,7 +2110,7 @@ async fn split_shot(
 
 /// GET /api/shots/:id/similar - find visually similar shots by dHash hamming distance, grouped by person
 async fn get_similar_shots(
-    State(state): State<AppState>,
+    UState(state): UState,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<SimilarShotsGrouped>>, StatusCode> {
     let db = state.db.lock().await;
@@ -2185,7 +2289,7 @@ struct MergeShotsPayload {
 }
 
 async fn merge_shots(
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<MergeShotsPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if payload.source_id == payload.target_id {
@@ -2250,7 +2354,7 @@ struct BatchConfirmPayload {
 }
 
 async fn batch_confirm(
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<BatchConfirmPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if payload.shot_ids.is_empty() {
@@ -2286,7 +2390,7 @@ struct BatchReassignPayload {
 }
 
 async fn batch_reassign(
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<BatchReassignPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if payload.shot_ids.is_empty() {
@@ -2361,7 +2465,7 @@ async fn batch_reassign(
 /// is_original=false on all other files in the same shot. Update shots.main_file_id.
 async fn set_file_original(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db.lock().await;
 
@@ -2408,7 +2512,7 @@ async fn set_file_original(
 /// Removes the file from disk, cleans up faces/keyframes, and updates the shot.
 async fn delete_file(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db.lock().await;
 
@@ -2473,16 +2577,16 @@ async fn delete_file(
         tracing::warn!("Failed to delete file from disk {:?}: {}", file_path, e);
     }
 
-    // Delete cached thumbnail (best-effort)
+    // Delete cached thumbnail and clean up empty directories (best-effort)
     let db_path: String = db
         .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
         .unwrap_or_default();
     if !db_path.is_empty() {
-        let thumb_dir = std::path::Path::new(&db_path)
+        let db_dir = std::path::Path::new(&db_path)
             .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join(".phos_thumbnails");
-        let _ = std::fs::remove_file(thumb_dir.join(format!("{}.jpg", id)));
+            .unwrap_or(std::path::Path::new("."));
+        let _ = std::fs::remove_file(db_dir.join(".phos_thumbnails").join(format!("{}.jpg", id)));
+        let _ = crate::import::cleanup_empty_dirs(db_dir);
     }
 
     // Recalculate primary person for the shot
@@ -2508,7 +2612,7 @@ struct AddManualFacePayload {
 
 async fn add_manual_face(
     Path(file_id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<AddManualFacePayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Validate bbox
@@ -2600,7 +2704,7 @@ fn require_comfyui(state: &AppState) -> Result<String, StatusCode> {
 
 /// GET /api/comfyui/health
 async fn comfyui_health(
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let url = require_comfyui(&state)?;
     let client = crate::comfyui::ComfyUiClient::new(&url);
@@ -2624,7 +2728,7 @@ async fn comfyui_health(
 
 /// GET /api/comfyui/workflows
 async fn comfyui_list_workflows(
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let _ = require_comfyui(&state)?;
     let db = state.db.lock().await;
@@ -2682,7 +2786,7 @@ struct ImportWorkflowPayload {
 }
 
 async fn comfyui_import_workflow(
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<ImportWorkflowPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
@@ -2735,7 +2839,7 @@ async fn comfyui_import_workflow(
 /// DELETE /api/comfyui/workflows/:id
 async fn comfyui_delete_workflow(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
     let db = state.db.lock().await;
@@ -2764,7 +2868,7 @@ struct EnhancePayload {
 }
 
 async fn comfyui_enhance(
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<EnhancePayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
@@ -2824,7 +2928,7 @@ struct TasksQuery {
 }
 
 async fn comfyui_list_tasks(
-    State(state): State<AppState>,
+    UState(state): UState,
     Query(query): Query<TasksQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let _ = require_comfyui(&state)?;
@@ -2921,7 +3025,7 @@ fn query_tasks(
 /// GET /api/comfyui/tasks/:id
 async fn comfyui_get_task(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
     let db = state.db.lock().await;
@@ -2946,7 +3050,7 @@ async fn comfyui_get_task(
 /// POST /api/comfyui/tasks/:id/retry — retry a failed task
 async fn comfyui_retry_task(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
     let db = state.db.lock().await;
@@ -2979,7 +3083,7 @@ async fn comfyui_retry_task(
 /// DELETE /api/comfyui/tasks/:id — remove a failed or completed task
 async fn comfyui_delete_task(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
     let db = state.db.lock().await;
@@ -3016,7 +3120,7 @@ struct IgnoreMergePayload {
 }
 
 async fn ignore_merge(
-    State(state): State<AppState>,
+    UState(state): UState,
     Json(payload): Json<IgnoreMergePayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let db = state.db.lock().await;
@@ -3057,7 +3161,7 @@ struct SimilarGroupsResponse {
 }
 
 async fn get_similar_shot_groups(
-    State(state): State<AppState>,
+    UState(state): UState,
     Query(query): Query<SimilarGroupsQuery>,
 ) -> Result<Json<SimilarGroupsResponse>, StatusCode> {
     let db = state.db.lock().await;

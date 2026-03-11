@@ -238,10 +238,11 @@ async fn logout() -> impl IntoResponse {
 pub async fn require_auth(
     State(auth): State<AuthState>,
     headers: HeaderMap,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    parse_session_cookie(&headers, &auth.jwt_decoding_key)?;
+    let claims = parse_session_cookie(&headers, &auth.jwt_decoding_key)?;
+    request.extensions_mut().insert(claims);
     Ok(next.run(request).await)
 }
 

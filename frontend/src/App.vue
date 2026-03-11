@@ -22,7 +22,6 @@ import {
 } from '@/components/ui/sheet'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 import {
   Settings,
@@ -30,9 +29,6 @@ import {
   Upload,
   LayoutGrid,
   RefreshCw,
-  HardDrive,
-  Shield,
-  Zap,
   FolderOpen,
   Check,
   AlertCircle,
@@ -45,6 +41,7 @@ import {
 
 // --- Auth ---
 const { user, authEnabled, logout } = useAuth()
+const userDisplayName = computed(() => user.value?.name || user.value?.email || user.value?.sub || '?')
 
 // --- Router ---
 const route = useRoute()
@@ -407,13 +404,7 @@ onMounted(() => {
                 <SheetDescription>Configure your personal photo laboratory.</SheetDescription>
               </SheetHeader>
 
-              <Tabs default-value="general" class="w-full">
-                <TabsList class="grid w-full grid-cols-2 mb-6">
-                  <TabsTrigger value="general">General</TabsTrigger>
-                  <TabsTrigger value="ai">AI Models</TabsTrigger>
-                </TabsList>
-
-                <TabsContent value="general" class="space-y-6">
+              <div class="space-y-6">
                   <div class="space-y-2">
                     <Label>Library Path</Label>
                     <div class="flex gap-2">
@@ -444,31 +435,18 @@ onMounted(() => {
                       </div>
                     </div>
                   </div>
-                </TabsContent>
-
-                <TabsContent value="ai" class="space-y-4 text-center py-12">
-                   <Zap class="w-12 h-12 text-indigo-500 mx-auto mb-4 opacity-20" />
-                   <p class="text-white font-medium">Neural Engine v1.2</p>
-                   <p class="text-sm text-zinc-500">Face detection and object recognition models are currently managed by the system.</p>
-                </TabsContent>
-              </Tabs>
-
-              <div class="absolute bottom-8 left-6 right-6">
-                 <div class="p-4 rounded-2xl bg-zinc-900 border border-white/5 flex items-center gap-3">
-                    <Shield class="w-5 h-5 text-emerald-500" />
-                    <div>
-                       <p class="text-xs font-bold text-white uppercase tracking-wider">Privacy Mode</p>
-                       <p class="text-[10px] text-zinc-500">All processing is strictly local.</p>
-                    </div>
-                 </div>
               </div>
             </SheetContent>
           </Sheet>
 
           <!-- User menu / Logout -->
           <template v-if="authEnabled && user">
-            <div class="hidden sm:flex items-center gap-2 text-sm text-zinc-400">
-              <span>{{ user.name || user.email || user.sub }}</span>
+            <div class="flex items-center gap-2 text-sm text-zinc-400">
+              <div class="w-7 h-7 rounded-full bg-indigo-600/30 border border-indigo-500/40 flex items-center justify-center text-xs font-bold text-indigo-300 uppercase shrink-0"
+                   :title="userDisplayName">
+                {{ userDisplayName.charAt(0) }}
+              </div>
+              <span class="hidden sm:inline max-w-[120px] truncate">{{ userDisplayName }}</span>
             </div>
             <Button
               variant="ghost"
@@ -571,12 +549,8 @@ onMounted(() => {
 
     <!-- Footer Meta -->
     <footer class="mt-auto py-12 border-t border-white/5 text-center">
-      <div class="flex items-center justify-center gap-2 mb-4 opacity-40">
-        <HardDrive class="w-3 h-3" />
-        <span class="text-[10px] font-bold tracking-widest uppercase">Local Environment</span>
-      </div>
       <p class="text-[10px] text-zinc-600 font-bold tracking-[0.2em] uppercase">
-        Phos v0.1.0-alpha &bull; Precision &bull; Privacy
+        Phos v1.0.0
       </p>
     </footer>
 

@@ -9,10 +9,11 @@ mod watcher;
 
 use axum::Router;
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
@@ -97,6 +98,16 @@ async fn main() {
     }
 }
 
+fn init_shared_db(path: &Path) -> Arc<Mutex<rusqlite::Connection>> {
+    let conn = db::init_db(path)
+        .map_err(|e| {
+            tracing::error!("Failed to initialize database at {:?}: {}", path, e);
+            e
+        })
+        .expect("Failed to initialize database");
+    Arc::new(Mutex::new(conn))
+}
+
 async fn run_server() {
     let library_path =
         std::env::var("PHOS_LIBRARY_PATH").unwrap_or_else(|_| "./library".to_string());
@@ -106,16 +117,15 @@ async fn run_server() {
         std::fs::create_dir_all(root_path).unwrap();
     }
 
-    let db_path = root_path.join(".phos.db");
-    info!("Initializing database at {:?}", db_path);
-    let conn = db::init_db(&db_path)
-        .map_err(|e| {
-            tracing::error!("Failed to initialize database: {}", e);
-            e
-        })
-        .expect("Failed to initialize database");
+    let multi_user = std::env::var("PHOS_OIDC_ISSUER").is_ok();
 
-    let shared_conn = Arc::new(Mutex::new(conn));
+    let db_path = root_path.join(".phos.db");
+    if multi_user {
+        info!("Multi-user mode: each SSO user gets their own library subfolder");
+    } else {
+        info!("Initializing database at {:?}", db_path);
+    }
+    let shared_conn = init_shared_db(&db_path);
 
     let ai = ai::AiPipeline::new().expect("Failed to load AI models");
     let scanner = Arc::new(scanner::Scanner::new(db_path.to_path_buf(), Some(ai)));
@@ -125,88 +135,171 @@ async fn run_server() {
         info!("ComfyUI integration enabled (url: {})", url);
     }
 
-    let state = api::AppState {
-        db: shared_conn.clone(),
-        scanner: scanner.clone(),
-        comfyui_url: comfyui_url.clone(),
-    };
+    let user_dbs: Arc<RwLock<HashMap<String, Arc<Mutex<rusqlite::Connection>>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     // Shutdown coordination: a condvar that the blocking background task
     // can wait on, and the signal handler sets.
     let shutdown_flag = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
 
-    // Run a scan in the background, then start the file watcher once done.
-    let scan_path = root_path.to_path_buf();
-    let watcher_library_path = root_path.to_path_buf();
-    let watcher_db_path = db_path.to_path_buf();
+    let state = api::AppState {
+        db: shared_conn.clone(),
+        scanner: scanner.clone(),
+        comfyui_url: comfyui_url.clone(),
+        library_root: root_path.to_path_buf(),
+        multi_user,
+        user_dbs: user_dbs.clone(),
+        shutdown_flag: shutdown_flag.clone(),
+    };
+
     let bg_shutdown = shutdown_flag.clone();
 
-    let bg_handle = tokio::task::spawn_blocking(move || {
-        let (lock, cvar) = &*bg_shutdown;
-        if *lock.lock().unwrap() {
-            return;
-        }
-        if let Err(e) = scanner.rehash_files() {
-            tracing::error!("Rehash failed: {}", e);
-        }
+    let bg_handle = if multi_user {
+        // Multi-user mode: scan all existing user subdirectories at startup
+        let root = root_path.to_path_buf();
+        let scanner_ref = scanner.clone();
+        let comfyui_url_bg = comfyui_url.clone();
+        let comfyui_shutdown = shutdown_flag.clone();
+        tokio::task::spawn_blocking(move || {
+            let (lock, _cvar) = &*bg_shutdown;
+            if *lock.lock().unwrap() {
+                return;
+            }
 
-        if *lock.lock().unwrap() {
-            return;
-        }
-        if let Err(e) = scanner.scan(&scan_path) {
-            tracing::error!("Scan failed: {}", e);
-        }
+            // Find existing user directories (those with a .phos.db)
+            let user_dirs: Vec<PathBuf> = match std::fs::read_dir(&root) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .filter(|e| {
+                        let name = e.file_name();
+                        let name_str = name.to_string_lossy();
+                        !name_str.starts_with('.')
+                    })
+                    .filter(|e| e.path().join(".phos.db").exists())
+                    .map(|e| e.path())
+                    .collect(),
+                Err(e) => {
+                    tracing::error!("Failed to read library root: {}", e);
+                    Vec::new()
+                }
+            };
 
-        if *lock.lock().unwrap() {
-            return;
-        }
-        // Reorganize files on disk to match clustering results.
-        if let Err(e) = import::run_reorganize(&scan_path, false) {
-            tracing::error!("Post-scan reorganize failed: {}", e);
-        }
+            for user_dir in &user_dirs {
+                if *lock.lock().unwrap() {
+                    return;
+                }
+                let user_db_path = user_dir.join(".phos.db");
+                let user_scanner = scanner_ref.with_db_path(user_db_path.clone());
+                let user_name = user_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                info!("Scanning user library: {}", user_name);
 
-        if *lock.lock().unwrap() {
-            return;
-        }
-        // Initial scan complete -- start watching for incremental changes.
-        match watcher::start_watcher(watcher_library_path, watcher_db_path, None) {
-            Ok(watcher_handle) => {
-                info!("File watcher active after initial scan");
-                // Periodically re-run reorganize (every 5 minutes) until shutdown.
-                let reorganize_interval = std::time::Duration::from_secs(30 * 60);
-                let mut guard = lock.lock().unwrap();
-                loop {
-                    let (g, timeout) = cvar
-                        .wait_timeout_while(guard, reorganize_interval, |stopped| !*stopped)
-                        .unwrap();
-                    guard = g;
-                    if *guard {
-                        break;
-                    }
-                    if timeout.timed_out() {
-                        info!("Periodic reorganize triggered");
-                        if let Err(e) = import::run_reorganize(&scan_path, false) {
-                            tracing::error!("Periodic reorganize failed: {}", e);
+                if let Err(e) = user_scanner.rehash_files() {
+                    tracing::error!("Rehash failed for user {}: {}", user_name, e);
+                }
+                if let Err(e) = user_scanner.scan(user_dir) {
+                    tracing::error!("Scan failed for user {}: {}", user_name, e);
+                }
+                if let Err(e) = import::run_reorganize(user_dir, false) {
+                    tracing::error!("Reorganize failed for user {}: {}", user_name, e);
+                }
+
+                // Spawn a ComfyUI worker for each existing user
+                if let Some(ref url) = comfyui_url_bg {
+                    info!("Spawning ComfyUI worker for user {}", user_name);
+                    comfyui::spawn_enhancement_worker(
+                        user_db_path,
+                        url.clone(),
+                        comfyui_shutdown.clone(),
+                    );
+                }
+            }
+            info!(
+                "Multi-user startup scan complete ({} user libraries)",
+                user_dirs.len()
+            );
+        })
+    } else {
+        // Single-user mode: scan the root library as before
+        let scan_path = root_path.to_path_buf();
+        let watcher_library_path = root_path.to_path_buf();
+        let watcher_db_path = db_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let (lock, cvar) = &*bg_shutdown;
+            if *lock.lock().unwrap() {
+                return;
+            }
+            if let Err(e) = scanner.rehash_files() {
+                tracing::error!("Rehash failed: {}", e);
+            }
+
+            if *lock.lock().unwrap() {
+                return;
+            }
+            if let Err(e) = scanner.scan(&scan_path) {
+                tracing::error!("Scan failed: {}", e);
+            }
+
+            if *lock.lock().unwrap() {
+                return;
+            }
+            // Reorganize files on disk to match clustering results.
+            if let Err(e) = import::run_reorganize(&scan_path, false) {
+                tracing::error!("Post-scan reorganize failed: {}", e);
+            }
+
+            if *lock.lock().unwrap() {
+                return;
+            }
+            // Initial scan complete -- start watching for incremental changes.
+            match watcher::start_watcher(watcher_library_path, watcher_db_path, None) {
+                Ok(watcher_handle) => {
+                    info!("File watcher active after initial scan");
+                    // Periodically re-run reorganize (every 30 minutes) until shutdown.
+                    let reorganize_interval = std::time::Duration::from_secs(30 * 60);
+                    let mut guard = lock.lock().unwrap();
+                    loop {
+                        let (g, timeout) = cvar
+                            .wait_timeout_while(guard, reorganize_interval, |stopped| !*stopped)
+                            .unwrap();
+                        guard = g;
+                        if *guard {
+                            break;
+                        }
+                        if timeout.timed_out() {
+                            info!("Periodic reorganize triggered");
+                            if let Err(e) = import::run_reorganize(&scan_path, false) {
+                                tracing::error!("Periodic reorganize failed: {}", e);
+                            }
                         }
                     }
+                    info!("Shutdown signal received, stopping file watcher");
+                    drop(watcher_handle);
                 }
-                info!("Shutdown signal received, stopping file watcher");
-                drop(watcher_handle);
+                Err(e) => {
+                    tracing::error!("Failed to start file watcher: {}", e);
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to start file watcher: {}", e);
-            }
-        }
-    });
+        })
+    };
 
-    // Optionally spawn the ComfyUI enhancement worker
-    let _comfyui_handle = if let Some(ref url) = comfyui_url {
-        let comfyui_shutdown = shutdown_flag.clone();
-        Some(comfyui::spawn_enhancement_worker(
-            db_path.to_path_buf(),
-            url.clone(),
-            comfyui_shutdown,
-        ))
+    // Spawn ComfyUI enhancement worker for single-user mode.
+    // In multi-user mode, workers are spawned per user in the background scan
+    // and dynamically when new users are created.
+    let _comfyui_handle = if !multi_user {
+        if let Some(ref url) = comfyui_url {
+            let comfyui_shutdown = shutdown_flag.clone();
+            Some(comfyui::spawn_enhancement_worker(
+                db_path.to_path_buf(),
+                url.clone(),
+                comfyui_shutdown,
+            ))
+        } else {
+            None
+        }
     } else {
         None
     };
