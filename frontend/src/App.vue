@@ -39,6 +39,9 @@ import {
   Layers,
 } from 'lucide-vue-next'
 
+// --- Version ---
+const version = __PHOS_VERSION__
+
 // --- Auth ---
 const { user, authEnabled, logout } = useAuth()
 const userDisplayName = computed(() => user.value?.name || user.value?.email || user.value?.sub || '?')
@@ -550,7 +553,7 @@ onMounted(() => {
     <!-- Footer Meta -->
     <footer class="mt-auto py-12 border-t border-white/5 text-center">
       <p class="text-[10px] text-zinc-600 font-bold tracking-[0.2em] uppercase">
-        Phos v1.0.0
+        Phos {{ version }}
       </p>
     </footer>
 

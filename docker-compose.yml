@@ -1,6 +1,9 @@
 services:
   phos:
-    build: .
+    build:
+      context: .
+      args:
+        PHOS_VERSION: "${PHOS_VERSION:-dev}"
     ports:
       - "33000:33000"
     volumes:

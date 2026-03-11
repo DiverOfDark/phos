@@ -131,6 +131,10 @@ async fn get_or_create_user_db(
     Ok(shared)
 }
 
+async fn get_version() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "version": env!("PHOS_VERSION") }))
+}
+
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         // Shot CRUD
@@ -195,6 +199,7 @@ pub fn create_router(state: AppState) -> Router {
             get(comfyui_get_task).delete(comfyui_delete_task),
         )
         .route("/api/comfyui/tasks/:id/retry", post(comfyui_retry_task))
+        .route("/api/version", get(get_version))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             resolve_user_db,

@@ -1,17 +1,22 @@
 # Multi-stage build for Phos
 # syntax=docker/dockerfile:1
 
+ARG PHOS_VERSION=dev
+
 # Stage 1: Build Frontend
 FROM node:20-slim AS frontend-builder
+ARG PHOS_VERSION
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN --mount=type=cache,target=/root/.npm \
     npm ci
 COPY frontend/ ./
-RUN npm run build
+RUN PHOS_VERSION=${PHOS_VERSION} npm run build
 
 # Stage 2: Build Backend
 FROM rust:latest AS backend-builder
+ARG PHOS_VERSION
+ENV PHOS_VERSION=${PHOS_VERSION}
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
@@ -35,6 +40,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
+COPY backend/build.rs ./
 # Create dummy src/main.rs to build dependencies
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

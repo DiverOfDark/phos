@@ -55,6 +55,7 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+    info!("Phos {} starting", env!("PHOS_VERSION"));
     ffmpeg_next::init().expect("Failed to initialize ffmpeg");
     // Suppress noisy FFmpeg warnings (deprecated pixel formats, probesize hints)
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Error);
