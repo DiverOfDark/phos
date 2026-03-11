@@ -178,7 +178,7 @@ async fn callback(
     let id_token = token_response.id_token().ok_or(StatusCode::BAD_GATEWAY)?;
     let nonce = Nonce::new(state_claims.nonce);
     let claims = id_token
-        .claims(&auth.oidc_client.id_token_verifier(), &nonce)
+        .claims(&auth.oidc_client.id_token_verifier().set_other_audience_verifier_fn(|_| true), &nonce)
         .map_err(|e| {
             tracing::error!("ID token verification failed: {}", e);
             StatusCode::BAD_GATEWAY
