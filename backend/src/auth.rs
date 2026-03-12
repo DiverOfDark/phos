@@ -46,6 +46,8 @@ pub struct AuthState {
     jwt_decoding_key: DecodingKey,
     jwt_ttl_secs: u64,
     scopes: Vec<String>,
+    issuer_url: String,
+    client_id: String,
 }
 
 /// Discover the OIDC provider and build the auth state.
@@ -78,6 +80,8 @@ pub async fn init_oidc(
         jwt_decoding_key: DecodingKey::from_secret(jwt_secret.as_bytes()),
         jwt_ttl_secs,
         scopes,
+        issuer_url: issuer_url.to_string(),
+        client_id: client_id.to_string(),
     })
 }
 
@@ -298,6 +302,39 @@ pub async fn require_auth(
 }
 
 // ---------------------------------------------------------------------------
+// Auth config — returns OIDC configuration so mobile clients only need the server URL
+// ---------------------------------------------------------------------------
+
+/// Response for the auth config endpoint.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct AuthConfigResponse {
+    issuer: String,
+    client_id: String,
+    scopes: Vec<String>,
+}
+
+/// GET /api/auth/config — return OIDC configuration for mobile clients.
+#[utoipa::path(
+    get,
+    path = "/api/auth/config",
+    tag = "auth",
+    summary = "Get OIDC configuration",
+    description = "Returns the OIDC issuer URL, client ID, and scopes so mobile clients only need the Phos server URL to self-configure authentication.",
+    responses(
+        (status = 200, description = "OIDC configuration", body = AuthConfigResponse),
+    )
+)]
+pub(crate) async fn auth_config(
+    State(auth): State<AuthState>,
+) -> Json<AuthConfigResponse> {
+    Json(AuthConfigResponse {
+        issuer: auth.issuer_url.clone(),
+        client_id: auth.client_id.clone(),
+        scopes: auth.scopes.clone(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Token exchange — mobile clients exchange an OIDC ID token for a session JWT
 // ---------------------------------------------------------------------------
 
@@ -376,6 +413,7 @@ pub fn create_auth_router(auth: AuthState) -> Router {
         .route("/api/auth/me", get(me))
         .route("/api/auth/logout", get(logout))
         .route("/api/auth/token", post(token_exchange))
+        .route("/api/auth/config", get(auth_config))
         .with_state(auth)
 }
 

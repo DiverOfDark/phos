@@ -52,17 +52,38 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Export OpenAPI spec as JSON
+    #[command(name = "openapi")]
+    OpenApi {
+        /// Output file path (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+
+    // OpenAPI export doesn't need any runtime initialization
+    if let Some(Commands::OpenApi { output }) = cli.command {
+        let spec = api::ApiDoc::openapi()
+            .to_pretty_json()
+            .expect("Failed to serialize OpenAPI spec");
+        if let Some(path) = output {
+            std::fs::write(&path, &spec).expect("Failed to write OpenAPI spec file");
+            eprintln!("OpenAPI spec written to {}", path.display());
+        } else {
+            println!("{}", spec);
+        }
+        return;
+    }
+
     tracing_subscriber::fmt::init();
     info!("Phos {} starting", env!("PHOS_VERSION"));
     ffmpeg_next::init().expect("Failed to initialize ffmpeg");
     // Suppress noisy FFmpeg warnings (deprecated pixel formats, probesize hints)
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Error);
-
-    let cli = Cli::parse();
 
     match cli.command {
         Some(Commands::Import {
@@ -95,6 +116,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::OpenApi { .. }) => unreachable!("handled above"),
         Some(Commands::Serve) | None => {
             run_server().await;
         }

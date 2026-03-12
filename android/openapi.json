@@ -1,0 +1,2892 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Phos API",
+    "description": "AI-powered photo/video manager",
+    "license": {
+      "name": "MIT"
+    },
+    "version": "feat/android-client-prd"
+  },
+  "paths": {
+    "/api/auth/callback": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Handle OIDC callback",
+        "description": "Handles the OIDC provider callback after user authentication. Validates the CSRF token, exchanges the authorization code for tokens, verifies the ID token, and issues a session JWT cookie.",
+        "operationId": "callback",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "description": "Authorization code from OIDC provider",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "CSRF state token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "description": "Error code from OIDC provider",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error_description",
+            "in": "query",
+            "description": "Error description from OIDC provider",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to app after successful auth"
+          },
+          "400": {
+            "description": "Invalid callback parameters"
+          },
+          "502": {
+            "description": "Token exchange or ID token verification failed"
+          }
+        }
+      }
+    },
+    "/api/auth/config": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Get OIDC configuration",
+        "description": "Returns the OIDC issuer URL, client ID, and scopes so mobile clients only need the Phos server URL to self-configure authentication.",
+        "operationId": "auth_config",
+        "responses": {
+          "200": {
+            "description": "OIDC configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthConfigResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/login": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Initiate OIDC login",
+        "description": "Initiates the OIDC login flow by redirecting the user to the configured identity provider. Stores PKCE and CSRF state in a signed cookie for the callback.",
+        "operationId": "login",
+        "responses": {
+          "302": {
+            "description": "Redirect to OIDC provider"
+          }
+        }
+      }
+    },
+    "/api/auth/logout": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Log out",
+        "description": "Clears the session cookie and redirects the user to the login page.",
+        "operationId": "logout",
+        "responses": {
+          "302": {
+            "description": "Redirect to login page after clearing session"
+          }
+        }
+      }
+    },
+    "/api/auth/me": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Get current user",
+        "description": "Returns the current authenticated user's session claims (subject, name, email) from the session JWT cookie.",
+        "operationId": "me",
+        "responses": {
+          "200": {
+            "description": "Current user session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionClaims"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        },
+        "security": [
+          {
+            "session_cookie": []
+          }
+        ]
+      }
+    },
+    "/api/auth/token": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Exchange OIDC ID token for session JWT",
+        "description": "Mobile clients perform the OIDC Authorization Code + PKCE flow directly with the identity provider, then send the resulting ID token here. Phos validates it against the provider's JWKS and returns a session JWT that can be used in the `Authorization: Bearer` header.",
+        "operationId": "token_exchange",
+        "requestBody": {
+          "description": "OIDC ID token to exchange",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenExchangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Session JWT token",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid ID token format"
+          },
+          "401": {
+            "description": "ID token verification failed"
+          }
+        }
+      }
+    },
+    "/api/comfyui/enhance": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Queue enhancement task",
+        "description": "Queue an image enhancement task using a ComfyUI workflow. Creates a background task that processes the shot's original file.",
+        "operationId": "comfyui_enhance",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnhancePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Enhancement task queued"
+          },
+          "404": {
+            "description": "Shot or workflow not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/health": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Check ComfyUI health",
+        "description": "Check whether ComfyUI is configured and reachable. Returns the connection status and system info.",
+        "operationId": "comfyui_health",
+        "responses": {
+          "200": {
+            "description": "ComfyUI health status"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/tasks": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "List enhancement tasks",
+        "description": "List ComfyUI enhancement tasks with optional status filtering and pagination.",
+        "operationId": "comfyui_list_tasks",
+        "parameters": [
+          {
+            "name": "shot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of enhancement tasks"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/tasks/{id}": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Get enhancement task",
+        "description": "Retrieve details and current status of a specific enhancement task.",
+        "operationId": "comfyui_get_task",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Enhancement task ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Task details"
+          },
+          "404": {
+            "description": "Task not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Delete enhancement task",
+        "description": "Delete a completed or failed enhancement task record.",
+        "operationId": "comfyui_delete_task",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Enhancement task ID to delete",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Task deleted successfully"
+          },
+          "400": {
+            "description": "Task is not in failed or completed state"
+          },
+          "404": {
+            "description": "Task not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/tasks/{id}/retry": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Retry enhancement task",
+        "description": "Retry a failed enhancement task. Resets it to pending status for reprocessing.",
+        "operationId": "comfyui_retry_task",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Enhancement task ID to retry",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Task retried successfully"
+          },
+          "400": {
+            "description": "Task is not in failed state"
+          },
+          "404": {
+            "description": "Task not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/workflows": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "List workflows",
+        "description": "List all imported ComfyUI enhancement workflows available for use.",
+        "operationId": "comfyui_list_workflows",
+        "responses": {
+          "200": {
+            "description": "List of workflows"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Import a workflow",
+        "description": "Import a ComfyUI workflow JSON for use as an enhancement pipeline.",
+        "operationId": "comfyui_import_workflow",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportWorkflowPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Workflow imported successfully"
+          },
+          "400": {
+            "description": "Invalid workflow payload"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/workflows/{id}": {
+      "delete": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Delete a workflow",
+        "description": "Delete an imported ComfyUI workflow by ID.",
+        "operationId": "comfyui_delete_workflow",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Workflow ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow deleted successfully"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/faces/{id}": {
+      "delete": {
+        "tags": [
+          "faces"
+        ],
+        "summary": "Delete a face",
+        "description": "Delete a face detection record. Cleans up orphaned people and recalculates shot assignments.",
+        "operationId": "delete_face",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Face ID to delete",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Face deleted successfully"
+          },
+          "404": {
+            "description": "Face not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/faces/{id}/person": {
+      "put": {
+        "tags": [
+          "faces"
+        ],
+        "summary": "Reassign a face",
+        "description": "Reassign a face to a different person. Updates the shot's primary person if needed.",
+        "operationId": "reassign_face",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Face ID to reassign",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReassignFacePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Face reassigned successfully"
+          },
+          "404": {
+            "description": "Face or target person not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/faces/{id}/suggestions": {
+      "get": {
+        "tags": [
+          "faces"
+        ],
+        "summary": "Get face suggestions",
+        "description": "Get person assignment suggestions for a face based on embedding similarity to existing people.",
+        "operationId": "get_face_suggestions",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Face ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of person suggestions sorted by similarity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FaceSuggestion"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Face not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/faces/{id}/thumbnail": {
+      "get": {
+        "tags": [
+          "faces"
+        ],
+        "summary": "Get face thumbnail",
+        "description": "Retrieve the cropped JPEG thumbnail image for a detected face.",
+        "operationId": "get_face_thumbnail",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Face ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JPEG face thumbnail",
+            "content": {
+              "image/jpeg": {}
+            }
+          },
+          "404": {
+            "description": "Face not found or source image missing"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/files/{id}": {
+      "get": {
+        "tags": [
+          "files"
+        ],
+        "summary": "Download a file",
+        "description": "Download the original file content by file ID. Returns the raw bytes with the appropriate content type.",
+        "operationId": "get_file",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "File ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File content",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "404": {
+            "description": "File not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "files"
+        ],
+        "summary": "Delete a file",
+        "description": "Delete a non-original file from a shot. The original file cannot be deleted directly — delete the shot instead.",
+        "operationId": "delete_file",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "File ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Cannot delete original file"
+          },
+          "404": {
+            "description": "File not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/files/{id}/faces": {
+      "post": {
+        "tags": [
+          "faces"
+        ],
+        "summary": "Add manual face",
+        "description": "Manually add a face region to a file with a specified bounding box and person assignment.",
+        "operationId": "add_manual_face",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "File ID to add a manual face to",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddManualFacePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Face added successfully"
+          },
+          "400": {
+            "description": "Invalid bounding box coordinates"
+          },
+          "404": {
+            "description": "File not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/files/{id}/set-original": {
+      "put": {
+        "tags": [
+          "files"
+        ],
+        "summary": "Set file as original",
+        "description": "Mark a file as the original (primary) file for its shot, demoting the current original.",
+        "operationId": "set_file_original",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "File ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "File not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/files/{id}/thumbnail": {
+      "get": {
+        "tags": [
+          "files"
+        ],
+        "summary": "Get file thumbnail",
+        "description": "Retrieve a resized thumbnail or video preview for a file. Supports configurable dimensions via query parameters.",
+        "operationId": "get_file_thumbnail",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "File ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "w",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Thumbnail JPEG image",
+            "content": {
+              "image/jpeg": {}
+            }
+          },
+          "404": {
+            "description": "File not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/import/finalize": {
+      "post": {
+        "tags": [
+          "import"
+        ],
+        "summary": "Finalize import",
+        "description": "Finalize the import process by running a full library scan and reorganization on newly imported files.",
+        "operationId": "finalize_import",
+        "responses": {
+          "200": {
+            "description": "Import finalized successfully"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/import/upload": {
+      "put": {
+        "tags": [
+          "import"
+        ],
+        "summary": "Upload a file",
+        "description": "Upload a raw file for import. The file is written to the import staging area and indexed. Supports up to 1 GB files.",
+        "operationId": "upload_file_raw",
+        "parameters": [
+          {
+            "name": "filename",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Raw file bytes",
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "File uploaded and indexed successfully"
+          },
+          "400": {
+            "description": "Invalid filename"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/organize/stats": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Get organization statistics",
+        "description": "Return detailed organization statistics including pending reviews, confirmed shots, unsorted shots, and unnamed people.",
+        "operationId": "get_organize_stats",
+        "responses": {
+          "200": {
+            "description": "Detailed organize statistics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizeStatsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/people": {
+      "get": {
+        "tags": [
+          "people"
+        ],
+        "summary": "List people",
+        "description": "List all detected people with their name, face count, and a representative thumbnail face ID.",
+        "operationId": "get_people",
+        "responses": {
+          "200": {
+            "description": "List all people",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PersonBrief"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "people"
+        ],
+        "summary": "Create a person",
+        "description": "Create a new named person record that faces can be assigned to.",
+        "operationId": "create_person",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePersonPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/people/merge": {
+      "post": {
+        "tags": [
+          "people"
+        ],
+        "summary": "Merge people",
+        "description": "Merge two or more people into a single person. All faces from the source people are reassigned to the target person.",
+        "operationId": "merge_people",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergePeoplePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/people/{id}": {
+      "get": {
+        "tags": [
+          "people"
+        ],
+        "summary": "Get person's shots",
+        "description": "Retrieve all shots associated with a specific person, ordered by date.",
+        "operationId": "get_person_shots",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Person ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Shots for a person",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ShotBrief"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "people"
+        ],
+        "summary": "Rename a person",
+        "description": "Rename an existing person.",
+        "operationId": "rename_person",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Person ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenamePersonPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "people"
+        ],
+        "summary": "Delete a person",
+        "description": "Delete a person and unassign all their faces. Shots will have their primary person recalculated.",
+        "operationId": "delete_person",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Person ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/people/{id}/browse": {
+      "get": {
+        "tags": [
+          "people"
+        ],
+        "summary": "Get person browse graph",
+        "description": "Returns a complete person browse graph with all shots and their file variants in a single response. Designed for offline-first browsing clients.",
+        "operationId": "get_person_browse",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Person ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Person browse graph",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonBrowseResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Person not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/people/{id}/faces": {
+      "get": {
+        "tags": [
+          "people"
+        ],
+        "summary": "Get person's faces",
+        "description": "Retrieve all face thumbnail IDs belonging to a specific person.",
+        "operationId": "get_person_faces",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Person ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Face thumbnails for a person",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PersonFaceBrief"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/reorganize": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Trigger reorganization",
+        "description": "Trigger a background filesystem reorganization that moves files into person-based folder structure.",
+        "operationId": "trigger_reorganize",
+        "responses": {
+          "200": {
+            "description": "Reorganization started",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/scan": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Trigger library scan",
+        "description": "Trigger a background library scan on the specified path to detect new or changed media files and run face detection.",
+        "operationId": "trigger_scan",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScanParams"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Scan started",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/shots": {
+      "get": {
+        "tags": [
+          "shots"
+        ],
+        "summary": "List shots",
+        "description": "List shots with optional filtering by person, date range, review status, and pagination. Returns brief shot metadata suitable for gallery views.",
+        "operationId": "get_shots",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "person_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of shots",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ShotBrief"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/shots/batch/confirm": {
+      "post": {
+        "tags": [
+          "shots"
+        ],
+        "summary": "Batch confirm shots",
+        "description": "Confirm the person assignment for multiple shots at once, setting their review status to confirmed.",
+        "operationId": "batch_confirm",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchConfirmPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Shots confirmed successfully"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/shots/batch/reassign": {
+      "post": {
+        "tags": [
+          "shots"
+        ],
+        "summary": "Batch reassign shots",
+        "description": "Reassign multiple shots to a different person in a single operation.",
+        "operationId": "batch_reassign",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchReassignPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Shots reassigned successfully"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/shots/merge": {
+      "post": {
+        "tags": [
+          "shots"
+        ],
+        "summary": "Merge shots",
+        "description": "Merge two or more shots into a single shot. All files from the source shots are moved to the target shot.",
+        "operationId": "merge_shots",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergeShotsPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Shots merged successfully"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Shot not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/shots/merge/ignore": {
+      "post": {
+        "tags": [
+          "shots"
+        ],
+        "summary": "Ignore merge suggestion",
+        "description": "Mark a pair of similar shots as intentionally separate so they are no longer suggested for merging.",
+        "operationId": "ignore_merge",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IgnoreMergePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Merge pair ignored successfully"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/shots/similar-groups": {
+      "get": {
+        "tags": [
+          "shots"
+        ],
+        "summary": "List similar shot groups",
+        "description": "Retrieve paginated groups of similar shots across the entire library for bulk deduplication review.",
+        "operationId": "get_similar_shot_groups",
+        "parameters": [
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated similar shot groups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SimilarGroupsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/shots/{id}": {
+      "get": {
+        "tags": [
+          "shots"
+        ],
+        "summary": "Get shot details",
+        "description": "Retrieve full details for a single shot including all associated files, detected faces, and person assignments.",
+        "operationId": "get_shot_detail",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Shot ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Shot detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShotDetailResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Shot not found"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "shots"
+        ],
+        "summary": "Update a shot",
+        "description": "Update shot metadata such as the primary person assignment and review status.",
+        "operationId": "update_shot",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Shot ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateShotPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Shot updated successfully"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Shot not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "shots"
+        ],
+        "summary": "Delete a shot",
+        "description": "Delete a shot and all its associated files from disk and database. This action is irreversible.",
+        "operationId": "delete_shot",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Shot ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Shot deleted successfully"
+          },
+          "404": {
+            "description": "Shot not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/shots/{id}/similar": {
+      "get": {
+        "tags": [
+          "shots"
+        ],
+        "summary": "Find similar shots",
+        "description": "Find shots visually similar to the given shot, grouped by the person they are assigned to. Uses perceptual hash comparison.",
+        "operationId": "get_similar_shots",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Shot ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Similar shots grouped by person",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SimilarShotsGrouped"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Shot not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/shots/{id}/split": {
+      "post": {
+        "tags": [
+          "shots"
+        ],
+        "summary": "Split a shot",
+        "description": "Split selected files out of a shot into a new separate shot. Useful when the scanner incorrectly groups unrelated files together.",
+        "operationId": "split_shot",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Shot ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SplitShotPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Shot split successfully"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Shot not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/stats": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Get library statistics",
+        "description": "Return aggregate library statistics including total shots, people, and files.",
+        "operationId": "get_stats",
+        "responses": {
+          "200": {
+            "description": "Aggregate library statistics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/sync": {
+      "get": {
+        "tags": [
+          "sync"
+        ],
+        "summary": "Incremental sync",
+        "description": "Returns all people, shots, and files changed since the given timestamp. If no `since` parameter is provided, returns everything (full sync).",
+        "operationId": "get_sync",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "ISO8601 timestamp. If omitted, returns everything (full sync).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sync data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/version": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Get server version",
+        "description": "Return the current server version string.",
+        "operationId": "get_version",
+        "responses": {
+          "200": {
+            "description": "Returns the server version",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AddManualFacePayload": {
+        "type": "object",
+        "description": "POST /api/files/:id/faces - manually add a face bounding box.\nThe server computes the embedding from the given bbox coordinates.",
+        "required": [
+          "box_x1",
+          "box_y1",
+          "box_x2",
+          "box_y2"
+        ],
+        "properties": {
+          "box_x1": {
+            "type": "number",
+            "format": "float"
+          },
+          "box_x2": {
+            "type": "number",
+            "format": "float"
+          },
+          "box_y1": {
+            "type": "number",
+            "format": "float"
+          },
+          "box_y2": {
+            "type": "number",
+            "format": "float"
+          }
+        }
+      },
+      "AlsoContainsPerson": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "AuthConfigResponse": {
+        "type": "object",
+        "description": "Response for the auth config endpoint.",
+        "required": [
+          "issuer",
+          "client_id",
+          "scopes"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "BatchConfirmPayload": {
+        "type": "object",
+        "description": "POST /api/shots/batch/confirm - batch set review_status = 'confirmed'",
+        "required": [
+          "shot_ids"
+        ],
+        "properties": {
+          "shot_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "BatchReassignPayload": {
+        "type": "object",
+        "description": "POST /api/shots/batch/reassign - batch set primary_person_id, assign new folder numbers, set confirmed.",
+        "required": [
+          "shot_ids",
+          "person_id"
+        ],
+        "properties": {
+          "person_id": {
+            "type": "string"
+          },
+          "shot_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "BrowseFileDetail": {
+        "type": "object",
+        "required": [
+          "id",
+          "is_original",
+          "thumbnail_url"
+        ],
+        "properties": {
+          "file_size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "is_original": {
+            "type": "boolean"
+          },
+          "mime_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thumbnail_url": {
+            "type": "string"
+          }
+        }
+      },
+      "BrowseShotDetail": {
+        "type": "object",
+        "required": [
+          "id",
+          "files"
+        ],
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BrowseFileDetail"
+            }
+          },
+          "id": {
+            "type": "string"
+          },
+          "review_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timestamp": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "CreatePersonPayload": {
+        "type": "object",
+        "description": "Create a new person with a name",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "EnhancePayload": {
+        "type": "object",
+        "description": "POST /api/comfyui/enhance — queue an enhancement task",
+        "required": [
+          "shot_id",
+          "workflow_id"
+        ],
+        "properties": {
+          "shot_id": {
+            "type": "string"
+          },
+          "text_overrides": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "workflow_id": {
+            "type": "string"
+          }
+        }
+      },
+      "FaceDetail": {
+        "type": "object",
+        "required": [
+          "id",
+          "file_id",
+          "box_x1",
+          "box_y1",
+          "box_x2",
+          "box_y2"
+        ],
+        "properties": {
+          "box_x1": {
+            "type": "number",
+            "format": "float"
+          },
+          "box_x2": {
+            "type": "number",
+            "format": "float"
+          },
+          "box_y1": {
+            "type": "number",
+            "format": "float"
+          },
+          "box_y2": {
+            "type": "number",
+            "format": "float"
+          },
+          "file_id": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "person_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "person_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "FaceSuggestion": {
+        "type": "object",
+        "description": "Get suggested persons for a face based on embedding similarity.\n\nComputes cosine similarity on-the-fly between the target face and the\nthumbnail face of every person, so results are always up-to-date even\nfor newly created persons.",
+        "required": [
+          "person_id",
+          "distance"
+        ],
+        "properties": {
+          "distance": {
+            "type": "number",
+            "format": "float"
+          },
+          "person_id": {
+            "type": "string"
+          },
+          "person_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thumbnail_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "FileDetail": {
+        "type": "object",
+        "required": [
+          "id",
+          "path",
+          "is_original",
+          "thumbnail_url"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "file_size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "height": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "is_original": {
+            "type": "boolean"
+          },
+          "mime_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "thumbnail_url": {
+            "type": "string"
+          },
+          "width": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "IgnoreMergePayload": {
+        "type": "object",
+        "required": [
+          "shot_id_1",
+          "shot_id_2"
+        ],
+        "properties": {
+          "shot_id_1": {
+            "type": "string"
+          },
+          "shot_id_2": {
+            "type": "string"
+          }
+        }
+      },
+      "ImportWorkflowPayload": {
+        "type": "object",
+        "description": "POST /api/comfyui/workflows — import a workflow template",
+        "required": [
+          "name",
+          "workflow"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "workflow": {}
+        }
+      },
+      "MergePeoplePayload": {
+        "type": "object",
+        "description": "Merge two people: move all faces from source to target, then delete source",
+        "required": [
+          "source_id",
+          "target_id"
+        ],
+        "properties": {
+          "source_id": {
+            "type": "string"
+          },
+          "target_id": {
+            "type": "string"
+          }
+        }
+      },
+      "MergeShotsPayload": {
+        "type": "object",
+        "description": "POST /api/shots/merge - move all files from source to target shot. Delete source.",
+        "required": [
+          "source_id",
+          "target_id"
+        ],
+        "properties": {
+          "person_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_id": {
+            "type": "string"
+          },
+          "target_id": {
+            "type": "string"
+          }
+        }
+      },
+      "OrganizeStatsResponse": {
+        "type": "object",
+        "description": "Return detailed organize stats about the library",
+        "required": [
+          "total_shots",
+          "total_files",
+          "total_people",
+          "pending_review",
+          "confirmed",
+          "unsorted",
+          "unnamed_people"
+        ],
+        "properties": {
+          "confirmed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "pending_review": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_files": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_people": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_shots": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unnamed_people": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unsorted": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "PersonBrief": {
+        "type": "object",
+        "required": [
+          "id",
+          "face_count",
+          "shot_count",
+          "pending_count"
+        ],
+        "properties": {
+          "cover_shot_thumbnail_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "face_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "shot_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "thumbnail_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PersonBrowseResponse": {
+        "type": "object",
+        "required": [
+          "person",
+          "shots"
+        ],
+        "properties": {
+          "person": {
+            "$ref": "#/components/schemas/PersonMeta"
+          },
+          "shots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BrowseShotDetail"
+            }
+          }
+        }
+      },
+      "PersonFaceBrief": {
+        "type": "object",
+        "description": "Get up to 12 face IDs with thumbnail URLs for a person",
+        "required": [
+          "id",
+          "thumbnail_url"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "thumbnail_url": {
+            "type": "string"
+          }
+        }
+      },
+      "PersonMeta": {
+        "type": "object",
+        "description": "Browse a person: returns person metadata + all shots + all files per shot.\nSolves the N+1 problem for the mobile client.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ReassignFacePayload": {
+        "type": "object",
+        "description": "Reassign a face to a different person",
+        "required": [
+          "person_id"
+        ],
+        "properties": {
+          "person_id": {
+            "type": "string"
+          }
+        }
+      },
+      "RenamePersonPayload": {
+        "type": "object",
+        "description": "Rename a person",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ScanParams": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "SessionClaims": {
+        "type": "object",
+        "description": "JWT claims for the user session cookie.",
+        "required": [
+          "sub",
+          "name",
+          "email",
+          "exp",
+          "iat"
+        ],
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "exp": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "iat": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "sub": {
+            "type": "string"
+          }
+        }
+      },
+      "ShotBrief": {
+        "type": "object",
+        "required": [
+          "id",
+          "thumbnail_url",
+          "file_count"
+        ],
+        "properties": {
+          "file_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "folder_number": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "primary_person_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "primary_person_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "review_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thumbnail_url": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ShotDetailResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "files",
+          "faces",
+          "also_contains"
+        ],
+        "properties": {
+          "also_contains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AlsoContainsPerson"
+            }
+          },
+          "faces": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FaceDetail"
+            }
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileDetail"
+            }
+          },
+          "folder_number": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "height": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "next_shot_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prev_shot_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "primary_person_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "primary_person_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "review_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timestamp": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "width": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "SimilarGroupsResponse": {
+        "type": "object",
+        "required": [
+          "groups",
+          "total",
+          "offset",
+          "limit"
+        ],
+        "properties": {
+          "groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SimilarShotGroup"
+            }
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "SimilarShotGroup": {
+        "type": "object",
+        "required": [
+          "primary",
+          "candidates"
+        ],
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SimilarShotItem"
+            }
+          },
+          "primary": {
+            "$ref": "#/components/schemas/SimilarShotItem"
+          }
+        }
+      },
+      "SimilarShotItem": {
+        "type": "object",
+        "required": [
+          "id",
+          "thumbnail_url",
+          "file_count",
+          "distance"
+        ],
+        "properties": {
+          "distance": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "file_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "primary_person_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "review_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thumbnail_url": {
+            "type": "string"
+          }
+        }
+      },
+      "SimilarShotsGrouped": {
+        "type": "object",
+        "required": [
+          "shots"
+        ],
+        "properties": {
+          "person_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "person_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "shots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SimilarShotItem"
+            }
+          }
+        }
+      },
+      "SplitShotPayload": {
+        "type": "object",
+        "description": "POST /api/shots/:id/split - create new shot from specified files.\nNew shot inherits primary person from faces. Both shots get review_status = 'pending'.",
+        "required": [
+          "file_ids"
+        ],
+        "properties": {
+          "file_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "StatsResponse": {
+        "type": "object",
+        "description": "Return aggregate stats about the library",
+        "required": [
+          "total_shots",
+          "total_people",
+          "total_files"
+        ],
+        "properties": {
+          "total_files": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_people": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_shots": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "SyncFile": {
+        "type": "object",
+        "required": [
+          "id",
+          "shot_id",
+          "is_original",
+          "deleted"
+        ],
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "file_size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "is_original": {
+            "type": "boolean"
+          },
+          "mime_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "shot_id": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "SyncPerson": {
+        "type": "object",
+        "required": [
+          "id",
+          "shot_count",
+          "deleted"
+        ],
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "shot_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "thumbnail_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "SyncQuery": {
+        "type": "object",
+        "properties": {
+          "since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO8601 timestamp. If omitted, returns everything (full sync)."
+          }
+        }
+      },
+      "SyncResponse": {
+        "type": "object",
+        "required": [
+          "people",
+          "shots",
+          "files",
+          "sync_token"
+        ],
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SyncFile"
+            }
+          },
+          "people": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SyncPerson"
+            }
+          },
+          "shots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SyncShot"
+            }
+          },
+          "sync_token": {
+            "type": "string",
+            "description": "ISO8601 timestamp to use as `since` in the next request."
+          }
+        }
+      },
+      "SyncShot": {
+        "type": "object",
+        "required": [
+          "id",
+          "deleted"
+        ],
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "primary_person_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "review_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timestamp": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "TokenExchangeRequest": {
+        "type": "object",
+        "required": [
+          "id_token"
+        ],
+        "properties": {
+          "id_token": {
+            "type": "string"
+          }
+        }
+      },
+      "UpdateShotPayload": {
+        "type": "object",
+        "description": "PUT /api/shots/:id - update primary_person_id and/or review_status.\nWhen primary_person changes, assign new folder_number (MAX+1 for that person).",
+        "properties": {
+          "primary_person_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "review_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "session_cookie": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Session JWT set as HttpOnly cookie (phos_session) after OIDC login"
+      }
+    }
+  },
+  "security": [
+    {
+      "session_cookie": []
+    }
+  ]
+}

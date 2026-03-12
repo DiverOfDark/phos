@@ -27,6 +27,7 @@ use utoipa::OpenApi;
         title = "Phos API",
         description = "AI-powered photo/video manager",
         version = env!("PHOS_VERSION"),
+        license(name = "MIT"),
     ),
     paths(
         // Auth
@@ -35,6 +36,7 @@ use utoipa::OpenApi;
         crate::auth::me,
         crate::auth::logout,
         crate::auth::token_exchange,
+        crate::auth::auth_config,
         // Shots
         shots::get_shots,
         shots::get_shot_detail,
@@ -93,6 +95,7 @@ use utoipa::OpenApi;
             // Auth
             crate::auth::SessionClaims,
             crate::auth::TokenExchangeRequest,
+            crate::auth::AuthConfigResponse,
             // Shots
             shots::ShotBrief,
             shots::SimilarShotItem,

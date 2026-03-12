@@ -1,7 +1,7 @@
 backend/target/
 frontend/node_modules/
 .phos.db
-data
+/data
 backend/Parsed
 .idea
 .claude/worktrees
