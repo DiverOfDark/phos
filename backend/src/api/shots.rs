@@ -5,10 +5,11 @@ use axum::{
 };
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use super::UState;
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct ShotBrief {
     pub id: String,
     pub thumbnail_url: String,
@@ -20,7 +21,7 @@ pub(crate) struct ShotBrief {
     pub folder_number: Option<i64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct SimilarShotItem {
     id: String,
     thumbnail_url: String,
@@ -30,14 +31,14 @@ pub(super) struct SimilarShotItem {
     distance: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct SimilarShotsGrouped {
     person_id: Option<String>,
     person_name: Option<String>,
     shots: Vec<SimilarShotItem>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub(super) struct ShotsQuery {
     q: Option<String>,
     person_id: Option<String>,
@@ -47,6 +48,17 @@ pub(super) struct ShotsQuery {
 }
 
 /// GET /api/shots - list shots with query params: person_id, status, q, from, to
+#[utoipa::path(
+    get,
+    path = "/api/shots",
+    tag = "shots",
+    summary = "List shots",
+    description = "List shots with optional filtering by person, date range, review status, and pagination. Returns brief shot metadata suitable for gallery views.",
+    params(ShotsQuery),
+    responses(
+        (status = 200, description = "List of shots", body = Vec<ShotBrief>)
+    )
+)]
 pub(super) async fn get_shots(
     UState(state): UState,
     Query(params): Query<ShotsQuery>,
@@ -143,7 +155,7 @@ pub(super) async fn get_shots(
     Json(shots)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct ShotDetailResponse {
     id: String,
     timestamp: Option<String>,
@@ -160,7 +172,7 @@ pub(super) struct ShotDetailResponse {
     next_shot_id: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct FileDetail {
     id: String,
     path: String,
@@ -169,7 +181,7 @@ pub(super) struct FileDetail {
     file_size: Option<i64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct FaceDetail {
     id: String,
     file_id: String,
@@ -181,13 +193,25 @@ pub(super) struct FaceDetail {
     box_y2: f32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct AlsoContainsPerson {
     id: String,
     name: Option<String>,
 }
 
 /// GET /api/shots/:id - detail with files, faces, primary person, also_contains
+#[utoipa::path(
+    get,
+    path = "/api/shots/{id}",
+    tag = "shots",
+    summary = "Get shot details",
+    description = "Retrieve full details for a single shot including all associated files, detected faces, and person assignments.",
+    params(("id" = String, Path, description = "Shot ID")),
+    responses(
+        (status = 200, description = "Shot detail", body = ShotDetailResponse),
+        (status = 404, description = "Shot not found")
+    )
+)]
 pub(super) async fn get_shot_detail(
     Path(id): Path<String>,
     UState(state): UState,
@@ -330,6 +354,19 @@ pub(super) async fn get_shot_detail(
     }))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/shots/{id}",
+    tag = "shots",
+    summary = "Delete a shot",
+    description = "Delete a shot and all its associated files from disk and database. This action is irreversible.",
+    params(("id" = String, Path, description = "Shot ID")),
+    responses(
+        (status = 200, description = "Shot deleted successfully"),
+        (status = 404, description = "Shot not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn delete_shot(
     Path(id): Path<String>,
     UState(state): UState,
@@ -439,12 +476,27 @@ pub(super) async fn delete_shot(
 
 /// PUT /api/shots/:id - update primary_person_id and/or review_status.
 /// When primary_person changes, assign new folder_number (MAX+1 for that person).
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct UpdateShotPayload {
     primary_person_id: Option<String>,
     review_status: Option<String>,
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/shots/{id}",
+    tag = "shots",
+    summary = "Update a shot",
+    description = "Update shot metadata such as the primary person assignment and review status.",
+    params(("id" = String, Path, description = "Shot ID")),
+    request_body = UpdateShotPayload,
+    responses(
+        (status = 200, description = "Shot updated successfully"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Shot not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn update_shot(
     Path(id): Path<String>,
     UState(state): UState,
@@ -539,11 +591,26 @@ pub(super) async fn update_shot(
 
 /// POST /api/shots/:id/split - create new shot from specified files.
 /// New shot inherits primary person from faces. Both shots get review_status = 'pending'.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct SplitShotPayload {
     file_ids: Vec<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/shots/{id}/split",
+    tag = "shots",
+    summary = "Split a shot",
+    description = "Split selected files out of a shot into a new separate shot. Useful when the scanner incorrectly groups unrelated files together.",
+    params(("id" = String, Path, description = "Shot ID")),
+    request_body = SplitShotPayload,
+    responses(
+        (status = 200, description = "Shot split successfully"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Shot not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn split_shot(
     Path(id): Path<String>,
     UState(state): UState,
@@ -749,6 +816,19 @@ pub(super) async fn split_shot(
 }
 
 /// GET /api/shots/:id/similar - find visually similar shots by dHash hamming distance, grouped by person
+#[utoipa::path(
+    get,
+    path = "/api/shots/{id}/similar",
+    tag = "shots",
+    summary = "Find similar shots",
+    description = "Find shots visually similar to the given shot, grouped by the person they are assigned to. Uses perceptual hash comparison.",
+    params(("id" = String, Path, description = "Shot ID")),
+    responses(
+        (status = 200, description = "Similar shots grouped by person", body = Vec<SimilarShotsGrouped>),
+        (status = 404, description = "Shot not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn get_similar_shots(
     UState(state): UState,
     Path(id): Path<String>,
@@ -921,13 +1001,27 @@ pub(super) async fn get_similar_shots(
 }
 
 /// POST /api/shots/merge - move all files from source to target shot. Delete source.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct MergeShotsPayload {
     source_id: String,
     target_id: String,
     person_id: Option<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/shots/merge",
+    tag = "shots",
+    summary = "Merge shots",
+    description = "Merge two or more shots into a single shot. All files from the source shots are moved to the target shot.",
+    request_body = MergeShotsPayload,
+    responses(
+        (status = 200, description = "Shots merged successfully"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Shot not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn merge_shots(
     UState(state): UState,
     Json(payload): Json<MergeShotsPayload>,
@@ -988,11 +1082,24 @@ pub(super) async fn merge_shots(
 }
 
 /// POST /api/shots/batch/confirm - batch set review_status = 'confirmed'
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct BatchConfirmPayload {
     shot_ids: Vec<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/shots/batch/confirm",
+    tag = "shots",
+    summary = "Batch confirm shots",
+    description = "Confirm the person assignment for multiple shots at once, setting their review status to confirmed.",
+    request_body = BatchConfirmPayload,
+    responses(
+        (status = 200, description = "Shots confirmed successfully"),
+        (status = 400, description = "Invalid request"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn batch_confirm(
     UState(state): UState,
     Json(payload): Json<BatchConfirmPayload>,
@@ -1023,12 +1130,25 @@ pub(super) async fn batch_confirm(
 }
 
 /// POST /api/shots/batch/reassign - batch set primary_person_id, assign new folder numbers, set confirmed.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct BatchReassignPayload {
     shot_ids: Vec<String>,
     person_id: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/shots/batch/reassign",
+    tag = "shots",
+    summary = "Batch reassign shots",
+    description = "Reassign multiple shots to a different person in a single operation.",
+    request_body = BatchReassignPayload,
+    responses(
+        (status = 200, description = "Shots reassigned successfully"),
+        (status = 400, description = "Invalid request"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn batch_reassign(
     UState(state): UState,
     Json(payload): Json<BatchReassignPayload>,
@@ -1101,12 +1221,24 @@ pub(super) async fn batch_reassign(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct IgnoreMergePayload {
     shot_id_1: String,
     shot_id_2: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/shots/merge/ignore",
+    tag = "shots",
+    summary = "Ignore merge suggestion",
+    description = "Mark a pair of similar shots as intentionally separate so they are no longer suggested for merging.",
+    request_body = IgnoreMergePayload,
+    responses(
+        (status = 200, description = "Merge pair ignored successfully"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn ignore_merge(
     UState(state): UState,
     Json(payload): Json<IgnoreMergePayload>,
@@ -1128,19 +1260,19 @@ pub(super) async fn ignore_merge(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct SimilarShotGroup {
     primary: SimilarShotItem,
     candidates: Vec<SimilarShotItem>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub(super) struct SimilarGroupsQuery {
     offset: Option<usize>,
     limit: Option<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct SimilarGroupsResponse {
     groups: Vec<SimilarShotGroup>,
     total: usize,
@@ -1148,6 +1280,18 @@ pub(super) struct SimilarGroupsResponse {
     limit: usize,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/shots/similar-groups",
+    tag = "shots",
+    summary = "List similar shot groups",
+    description = "Retrieve paginated groups of similar shots across the entire library for bulk deduplication review.",
+    params(SimilarGroupsQuery),
+    responses(
+        (status = 200, description = "Paginated similar shot groups", body = SimilarGroupsResponse),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn get_similar_shot_groups(
     UState(state): UState,
     Query(query): Query<SimilarGroupsQuery>,

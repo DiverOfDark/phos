@@ -8,6 +8,7 @@ use image::GenericImageView;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
+use utoipa::ToSchema;
 
 use super::UState;
 
@@ -29,7 +30,7 @@ fn get_shot_id_for_face(db: &rusqlite::Connection, face_id: &str) -> Result<Stri
 /// Computes cosine similarity on-the-fly between the target face and the
 /// thumbnail face of every person, so results are always up-to-date even
 /// for newly created persons.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct FaceSuggestion {
     person_id: String,
     person_name: Option<String>,
@@ -37,6 +38,21 @@ pub(super) struct FaceSuggestion {
     distance: f32,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/faces/{id}/suggestions",
+    tag = "faces",
+    summary = "Get face suggestions",
+    description = "Get person assignment suggestions for a face based on embedding similarity to existing people.",
+    params(
+        ("id" = String, Path, description = "Face ID")
+    ),
+    responses(
+        (status = 200, body = Vec<FaceSuggestion>, description = "List of person suggestions sorted by similarity"),
+        (status = 404, description = "Face not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn get_face_suggestions(
     Path(id): Path<String>,
     UState(state): UState,
@@ -116,11 +132,27 @@ pub(super) async fn get_face_suggestions(
 }
 
 /// Reassign a face to a different person
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct ReassignFacePayload {
     person_id: String,
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/faces/{id}/person",
+    tag = "faces",
+    summary = "Reassign a face",
+    description = "Reassign a face to a different person. Updates the shot's primary person if needed.",
+    params(
+        ("id" = String, Path, description = "Face ID to reassign")
+    ),
+    request_body = ReassignFacePayload,
+    responses(
+        (status = 200, description = "Face reassigned successfully"),
+        (status = 404, description = "Face or target person not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn reassign_face(
     Path(id): Path<String>,
     UState(state): UState,
@@ -187,6 +219,21 @@ pub(super) async fn reassign_face(
 }
 
 /// Delete a face detection (remove false positive / irrelevant face)
+#[utoipa::path(
+    delete,
+    path = "/api/faces/{id}",
+    tag = "faces",
+    summary = "Delete a face",
+    description = "Delete a face detection record. Cleans up orphaned people and recalculates shot assignments.",
+    params(
+        ("id" = String, Path, description = "Face ID to delete")
+    ),
+    responses(
+        (status = 200, description = "Face deleted successfully"),
+        (status = 404, description = "Face not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn delete_face(
     Path(id): Path<String>,
     UState(state): UState,
@@ -238,6 +285,21 @@ pub(super) async fn delete_face(
 }
 
 /// Serve a face thumbnail: crop face from source image, resize, cache as JPEG
+#[utoipa::path(
+    get,
+    path = "/api/faces/{id}/thumbnail",
+    tag = "faces",
+    summary = "Get face thumbnail",
+    description = "Retrieve the cropped JPEG thumbnail image for a detected face.",
+    params(
+        ("id" = String, Path, description = "Face ID")
+    ),
+    responses(
+        (status = 200, content_type = "image/jpeg", description = "JPEG face thumbnail"),
+        (status = 404, description = "Face not found or source image missing"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn get_face_thumbnail(
     Path(id): Path<String>,
     UState(state): UState,
@@ -363,7 +425,7 @@ pub(super) async fn get_face_thumbnail(
 
 /// POST /api/files/:id/faces - manually add a face bounding box.
 /// The server computes the embedding from the given bbox coordinates.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct AddManualFacePayload {
     box_x1: f32,
     box_y1: f32,
@@ -371,6 +433,23 @@ pub(super) struct AddManualFacePayload {
     box_y2: f32,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/files/{id}/faces",
+    tag = "faces",
+    summary = "Add manual face",
+    description = "Manually add a face region to a file with a specified bounding box and person assignment.",
+    params(
+        ("id" = String, Path, description = "File ID to add a manual face to")
+    ),
+    request_body = AddManualFacePayload,
+    responses(
+        (status = 200, description = "Face added successfully"),
+        (status = 400, description = "Invalid bounding box coordinates"),
+        (status = 404, description = "File not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn add_manual_face(
     Path(file_id): Path<String>,
     UState(state): UState,

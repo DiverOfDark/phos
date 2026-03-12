@@ -33,3 +33,5 @@ rayon = "1.10"
 urlencoding = "2"
 openidconnect = "3"
 jsonwebtoken = "9"
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-scalar = { version = "0.2", features = ["axum"] }

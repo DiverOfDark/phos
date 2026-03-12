@@ -8,16 +8,31 @@ use image::GenericImageView;
 use rusqlite::params;
 use serde::Deserialize;
 use std::io::Cursor;
+use utoipa::IntoParams;
 
 use super::UState;
 
 /// Simple raw-body upload: PUT /api/import/upload?filename=foo.jpg
 /// Body is the raw file bytes. No multipart overhead.
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 pub(super) struct UploadQuery {
     filename: String,
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/import/upload",
+    tag = "import",
+    summary = "Upload a file",
+    description = "Upload a raw file for import. The file is written to the import staging area and indexed. Supports up to 1 GB files.",
+    params(UploadQuery),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream", description = "Raw file bytes"),
+    responses(
+        (status = 200, description = "File uploaded and indexed successfully"),
+        (status = 400, description = "Invalid filename"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
 pub(super) async fn upload_file_raw(
     UState(state): UState,
     Query(query): Query<UploadQuery>,
@@ -95,6 +110,17 @@ pub(super) async fn upload_file_raw(
 }
 
 /// POST /api/import/finalize -- run face clustering and reorganization after bulk upload.
+#[utoipa::path(
+    post,
+    path = "/api/import/finalize",
+    tag = "import",
+    summary = "Finalize import",
+    description = "Finalize the import process by running a full library scan and reorganization on newly imported files.",
+    responses(
+        (status = 200, description = "Import finalized successfully"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
 pub(super) async fn finalize_import(
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -135,6 +161,19 @@ pub(super) async fn finalize_import(
 }
 
 /// Serve a file by its database ID
+#[utoipa::path(
+    get,
+    path = "/api/files/{id}",
+    tag = "files",
+    summary = "Download a file",
+    description = "Download the original file content by file ID. Returns the raw bytes with the appropriate content type.",
+    params(("id" = String, Path, description = "File ID")),
+    responses(
+        (status = 200, content_type = "application/octet-stream", description = "File content"),
+        (status = 404, description = "File not found"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
 pub(super) async fn get_file(
     Path(id): Path<String>,
     UState(state): UState,
@@ -186,11 +225,27 @@ pub(super) async fn get_file(
 /// For images: resize to ~320px wide JPEG.
 /// For videos: extract the first frame, resize to ~320px wide JPEG.
 /// Thumbnails are cached in a `.phos_thumbnails` directory next to the DB.
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 pub(super) struct ThumbnailQuery {
     w: Option<u32>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/files/{id}/thumbnail",
+    tag = "files",
+    summary = "Get file thumbnail",
+    description = "Retrieve a resized thumbnail or video preview for a file. Supports configurable dimensions via query parameters.",
+    params(
+        ("id" = String, Path, description = "File ID"),
+        ThumbnailQuery,
+    ),
+    responses(
+        (status = 200, content_type = "image/jpeg", description = "Thumbnail JPEG image"),
+        (status = 404, description = "File not found"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
 pub(super) async fn get_file_thumbnail(
     Path(id): Path<String>,
     Query(query): Query<ThumbnailQuery>,
@@ -305,6 +360,19 @@ pub(super) async fn get_file_thumbnail(
 
 /// PUT /api/files/:id/set-original - set is_original=true on this file,
 /// is_original=false on all other files in the same shot. Update shots.main_file_id.
+#[utoipa::path(
+    put,
+    path = "/api/files/{id}/set-original",
+    tag = "files",
+    summary = "Set file as original",
+    description = "Mark a file as the original (primary) file for its shot, demoting the current original.",
+    params(("id" = String, Path, description = "File ID")),
+    responses(
+        (status = 200, description = "Success"),
+        (status = 404, description = "File not found"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
 pub(super) async fn set_file_original(
     Path(id): Path<String>,
     UState(state): UState,
@@ -352,6 +420,20 @@ pub(super) async fn set_file_original(
 
 /// DELETE /api/files/:id - delete a non-original file from a shot.
 /// Removes the file from disk, cleans up faces/keyframes, and updates the shot.
+#[utoipa::path(
+    delete,
+    path = "/api/files/{id}",
+    tag = "files",
+    summary = "Delete a file",
+    description = "Delete a non-original file from a shot. The original file cannot be deleted directly — delete the shot instead.",
+    params(("id" = String, Path, description = "File ID")),
+    responses(
+        (status = 200, description = "Success"),
+        (status = 400, description = "Cannot delete original file"),
+        (status = 404, description = "File not found"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
 pub(super) async fn delete_file(
     Path(id): Path<String>,
     UState(state): UState,

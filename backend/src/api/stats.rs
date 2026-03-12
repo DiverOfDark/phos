@@ -1,20 +1,42 @@
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use super::UState;
 
+#[utoipa::path(
+    get,
+    path = "/api/version",
+    tag = "system",
+    summary = "Get server version",
+    description = "Return the current server version string.",
+    responses(
+        (status = 200, description = "Returns the server version", body = serde_json::Value)
+    )
+)]
 pub(super) async fn get_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "version": env!("PHOS_VERSION") }))
 }
 
 /// Return aggregate stats about the library
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct StatsResponse {
     total_shots: i64,
     total_people: i64,
     total_files: i64,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/stats",
+    tag = "system",
+    summary = "Get library statistics",
+    description = "Return aggregate library statistics including total shots, people, and files.",
+    responses(
+        (status = 200, description = "Aggregate library statistics", body = StatsResponse),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn get_stats(UState(state): UState) -> Json<StatsResponse> {
     let db = state.db.lock().await;
 
@@ -36,7 +58,7 @@ pub(super) async fn get_stats(UState(state): UState) -> Json<StatsResponse> {
 }
 
 /// Return detailed organize stats about the library
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct OrganizeStatsResponse {
     total_shots: i64,
     total_files: i64,
@@ -47,6 +69,17 @@ pub(super) struct OrganizeStatsResponse {
     unnamed_people: i64,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/organize/stats",
+    tag = "system",
+    summary = "Get organization statistics",
+    description = "Return detailed organization statistics including pending reviews, confirmed shots, unsorted shots, and unnamed people.",
+    responses(
+        (status = 200, description = "Detailed organize statistics", body = OrganizeStatsResponse),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn get_organize_stats(UState(state): UState) -> Json<OrganizeStatsResponse> {
     let db = state.db.lock().await;
 
@@ -100,6 +133,17 @@ pub(super) async fn get_organize_stats(UState(state): UState) -> Json<OrganizeSt
 }
 
 /// Trigger filesystem reorganization in a background thread
+#[utoipa::path(
+    post,
+    path = "/api/reorganize",
+    tag = "system",
+    summary = "Trigger reorganization",
+    description = "Trigger a background filesystem reorganization that moves files into person-based folder structure.",
+    responses(
+        (status = 200, description = "Reorganization started", body = serde_json::Value),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn trigger_reorganize(UState(state): UState) -> Json<serde_json::Value> {
     let library_root = state.library_root.clone();
     std::thread::spawn(move || {
@@ -113,11 +157,23 @@ pub(super) async fn trigger_reorganize(UState(state): UState) -> Json<serde_json
     Json(serde_json::json!({"status": "started"}))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct ScanParams {
     path: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/scan",
+    tag = "system",
+    summary = "Trigger library scan",
+    description = "Trigger a background library scan on the specified path to detect new or changed media files and run face detection.",
+    request_body = ScanParams,
+    responses(
+        (status = 200, description = "Scan started", body = serde_json::Value),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn trigger_scan(
     UState(state): UState,
     Json(payload): Json<ScanParams>,

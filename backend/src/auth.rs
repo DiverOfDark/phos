@@ -14,12 +14,13 @@ use openidconnect::{
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 const SESSION_COOKIE: &str = "phos_session";
 const OIDC_STATE_COOKIE: &str = "phos_oidc_state";
 
 /// JWT claims for the user session cookie.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SessionClaims {
     pub sub: String,
     pub name: String,
@@ -85,7 +86,17 @@ pub async fn init_oidc(
 // ---------------------------------------------------------------------------
 
 /// GET /api/auth/login — redirect to the OIDC provider.
-async fn login(State(auth): State<AuthState>) -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/api/auth/login",
+    tag = "auth",
+    summary = "Initiate OIDC login",
+    description = "Initiates the OIDC login flow by redirecting the user to the configured identity provider. Stores PKCE and CSRF state in a signed cookie for the callback.",
+    responses(
+        (status = 302, description = "Redirect to OIDC provider"),
+    )
+)]
+pub(crate) async fn login(State(auth): State<AuthState>) -> impl IntoResponse {
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
     let mut req = auth.oidc_client.authorize_url(
@@ -121,7 +132,7 @@ async fn login(State(auth): State<AuthState>) -> impl IntoResponse {
 
 /// Query parameters returned by the OIDC provider on callback.
 #[derive(Deserialize)]
-struct CallbackParams {
+pub(crate) struct CallbackParams {
     code: Option<String>,
     state: String,
     error: Option<String>,
@@ -129,7 +140,25 @@ struct CallbackParams {
 }
 
 /// GET /api/auth/callback — exchange authorization code for tokens.
-async fn callback(
+#[utoipa::path(
+    get,
+    path = "/api/auth/callback",
+    tag = "auth",
+    summary = "Handle OIDC callback",
+    description = "Handles the OIDC provider callback after user authentication. Validates the CSRF token, exchanges the authorization code for tokens, verifies the ID token, and issues a session JWT cookie.",
+    params(
+        ("code" = Option<String>, Query, description = "Authorization code from OIDC provider"),
+        ("state" = String, Query, description = "CSRF state token"),
+        ("error" = Option<String>, Query, description = "Error code from OIDC provider"),
+        ("error_description" = Option<String>, Query, description = "Error description from OIDC provider"),
+    ),
+    responses(
+        (status = 302, description = "Redirect to app after successful auth"),
+        (status = 400, description = "Invalid callback parameters"),
+        (status = 502, description = "Token exchange or ID token verification failed"),
+    )
+)]
+pub(crate) async fn callback(
     State(auth): State<AuthState>,
     headers: HeaderMap,
     Query(params): Query<CallbackParams>,
@@ -215,7 +244,19 @@ async fn callback(
 }
 
 /// GET /api/auth/me — return the current user's claims.
-async fn me(
+#[utoipa::path(
+    get,
+    path = "/api/auth/me",
+    tag = "auth",
+    summary = "Get current user",
+    description = "Returns the current authenticated user's session claims (subject, name, email) from the session JWT cookie.",
+    responses(
+        (status = 200, description = "Current user session", body = SessionClaims),
+        (status = 401, description = "Not authenticated"),
+    ),
+    security(("session_cookie" = []))
+)]
+pub(crate) async fn me(
     State(auth): State<AuthState>,
     headers: HeaderMap,
 ) -> Result<Json<SessionClaims>, StatusCode> {
@@ -224,7 +265,17 @@ async fn me(
 }
 
 /// GET /api/auth/logout — clear the session cookie.
-async fn logout() -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/api/auth/logout",
+    tag = "auth",
+    summary = "Log out",
+    description = "Clears the session cookie and redirects the user to the login page.",
+    responses(
+        (status = 302, description = "Redirect to login page after clearing session"),
+    )
+)]
+pub(crate) async fn logout() -> impl IntoResponse {
     (
         AppendHeaders([(header::SET_COOKIE, clear_cookie(SESSION_COOKIE))]),
         Redirect::to("/login"),

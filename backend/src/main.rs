@@ -17,6 +17,8 @@ use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
+use utoipa::OpenApi;
+use utoipa_scalar::{Scalar, Servable};
 
 #[derive(Parser)]
 #[command(name = "phos", about = "AI-powered photo/video manager")]
@@ -365,12 +367,14 @@ async fn run_server() {
         Router::new()
             .merge(auth_router)
             .merge(protected_api)
+            .merge(Scalar::with_url("/api/docs", api::ApiDoc::openapi()))
             .fallback_service(serve_static)
             .layer(CorsLayer::permissive())
     } else {
         info!("OIDC authentication disabled (set PHOS_OIDC_ISSUER to enable)");
         Router::new()
             .merge(api_router)
+            .merge(Scalar::with_url("/api/docs", api::ApiDoc::openapi()))
             .fallback_service(serve_static)
             .layer(CorsLayer::permissive())
     };

@@ -5,11 +5,12 @@ use axum::{
 };
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use super::UState;
 use super::shots::ShotBrief;
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct PersonBrief {
     id: String,
     name: Option<String>,
@@ -19,6 +20,17 @@ pub(super) struct PersonBrief {
     pending_count: i64,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/people",
+    tag = "people",
+    summary = "List people",
+    description = "List all detected people with their name, face count, and a representative thumbnail face ID.",
+    responses(
+        (status = 200, description = "List all people", body = Vec<PersonBrief>),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn get_people(UState(state): UState) -> Json<Vec<PersonBrief>> {
     let db = state.db.lock().await;
     let mut stmt = db
@@ -52,11 +64,24 @@ pub(super) async fn get_people(UState(state): UState) -> Json<Vec<PersonBrief>> 
 }
 
 /// Create a new person with a name
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct CreatePersonPayload {
     name: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/people",
+    tag = "people",
+    summary = "Create a person",
+    description = "Create a new named person record that faces can be assigned to.",
+    request_body = CreatePersonPayload,
+    responses(
+        (status = 200, description = "Success"),
+        (status = 400, description = "Bad request"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn create_person(
     UState(state): UState,
     Json(payload): Json<CreatePersonPayload>,
@@ -81,6 +106,20 @@ pub(super) async fn create_person(
     Ok(Json(serde_json::json!({"id": id, "name": name})))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/people/{id}",
+    tag = "people",
+    summary = "Get person's shots",
+    description = "Retrieve all shots associated with a specific person, ordered by date.",
+    params(
+        ("id" = String, Path, description = "Person ID")
+    ),
+    responses(
+        (status = 200, description = "Shots for a person", body = Vec<ShotBrief>),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn get_person_shots(
     Path(id): Path<String>,
     UState(state): UState,
@@ -126,12 +165,26 @@ pub(super) async fn get_person_shots(
 }
 
 /// Get up to 12 face IDs with thumbnail URLs for a person
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(super) struct PersonFaceBrief {
     id: String,
     thumbnail_url: String,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/people/{id}/faces",
+    tag = "people",
+    summary = "Get person's faces",
+    description = "Retrieve all face thumbnail IDs belonging to a specific person.",
+    params(
+        ("id" = String, Path, description = "Person ID")
+    ),
+    responses(
+        (status = 200, description = "Face thumbnails for a person", body = Vec<PersonFaceBrief>),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn get_person_faces(
     Path(id): Path<String>,
     UState(state): UState,
@@ -155,11 +208,26 @@ pub(super) async fn get_person_faces(
 }
 
 /// Rename a person
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct RenamePersonPayload {
     name: String,
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/people/{id}",
+    tag = "people",
+    summary = "Rename a person",
+    description = "Rename an existing person.",
+    params(
+        ("id" = String, Path, description = "Person ID")
+    ),
+    request_body = RenamePersonPayload,
+    responses(
+        (status = 200, description = "Success"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn rename_person(
     Path(id): Path<String>,
     UState(state): UState,
@@ -176,12 +244,25 @@ pub(super) async fn rename_person(
 }
 
 /// Merge two people: move all faces from source to target, then delete source
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct MergePeoplePayload {
     source_id: String,
     target_id: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/people/merge",
+    tag = "people",
+    summary = "Merge people",
+    description = "Merge two or more people into a single person. All faces from the source people are reassigned to the target person.",
+    request_body = MergePeoplePayload,
+    responses(
+        (status = 200, description = "Success"),
+        (status = 400, description = "Bad request"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn merge_people(
     UState(state): UState,
     Json(payload): Json<MergePeoplePayload>,
@@ -226,6 +307,21 @@ pub(super) async fn merge_people(
 /// Delete a person and all their face records.
 /// Removes all faces belonging to this person, cleans up face_neighbors,
 /// recalculates primary_person_id for affected shots, and deletes the person.
+#[utoipa::path(
+    delete,
+    path = "/api/people/{id}",
+    tag = "people",
+    summary = "Delete a person",
+    description = "Delete a person and unassign all their faces. Shots will have their primary person recalculated.",
+    params(
+        ("id" = String, Path, description = "Person ID")
+    ),
+    responses(
+        (status = 200, description = "Success"),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub(super) async fn delete_person(
     Path(id): Path<String>,
     UState(state): UState,

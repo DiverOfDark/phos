@@ -18,6 +18,134 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use utoipa::OpenApi;
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Phos API",
+        description = "AI-powered photo/video manager",
+        version = env!("PHOS_VERSION"),
+    ),
+    paths(
+        // Auth
+        crate::auth::login,
+        crate::auth::callback,
+        crate::auth::me,
+        crate::auth::logout,
+        // Shots
+        shots::get_shots,
+        shots::get_shot_detail,
+        shots::delete_shot,
+        shots::update_shot,
+        shots::split_shot,
+        shots::get_similar_shots,
+        shots::merge_shots,
+        shots::ignore_merge,
+        shots::batch_confirm,
+        shots::batch_reassign,
+        shots::get_similar_shot_groups,
+        // People
+        people::get_people,
+        people::create_person,
+        people::get_person_shots,
+        people::get_person_faces,
+        people::rename_person,
+        people::merge_people,
+        people::delete_person,
+        // Faces
+        faces::get_face_thumbnail,
+        faces::reassign_face,
+        faces::get_face_suggestions,
+        faces::delete_face,
+        faces::add_manual_face,
+        // Files
+        files::get_file,
+        files::delete_file,
+        files::get_file_thumbnail,
+        files::set_file_original,
+        files::upload_file_raw,
+        files::finalize_import,
+        // System
+        stats::get_stats,
+        stats::get_organize_stats,
+        stats::trigger_reorganize,
+        stats::trigger_scan,
+        stats::get_version,
+        // ComfyUI
+        comfyui::comfyui_health,
+        comfyui::comfyui_list_workflows,
+        comfyui::comfyui_import_workflow,
+        comfyui::comfyui_delete_workflow,
+        comfyui::comfyui_enhance,
+        comfyui::comfyui_list_tasks,
+        comfyui::comfyui_get_task,
+        comfyui::comfyui_retry_task,
+        comfyui::comfyui_delete_task,
+    ),
+    components(
+        schemas(
+            // Auth
+            crate::auth::SessionClaims,
+            // Shots
+            shots::ShotBrief,
+            shots::SimilarShotItem,
+            shots::SimilarShotsGrouped,
+            shots::ShotDetailResponse,
+            shots::FileDetail,
+            shots::FaceDetail,
+            shots::AlsoContainsPerson,
+            shots::UpdateShotPayload,
+            shots::SplitShotPayload,
+            shots::MergeShotsPayload,
+            shots::BatchConfirmPayload,
+            shots::BatchReassignPayload,
+            shots::IgnoreMergePayload,
+            shots::SimilarShotGroup,
+            shots::SimilarGroupsResponse,
+            // People
+            people::PersonBrief,
+            people::PersonFaceBrief,
+            people::CreatePersonPayload,
+            people::RenamePersonPayload,
+            people::MergePeoplePayload,
+            // Faces
+            faces::FaceSuggestion,
+            faces::ReassignFacePayload,
+            faces::AddManualFacePayload,
+            // Stats
+            stats::StatsResponse,
+            stats::OrganizeStatsResponse,
+            stats::ScanParams,
+            // ComfyUI
+            comfyui::ImportWorkflowPayload,
+            comfyui::EnhancePayload,
+        )
+    ),
+    modifiers(&SecurityAddon),
+    security(("session_cookie" = [])),
+)]
+pub struct ApiDoc;
+
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "session_cookie",
+            utoipa::openapi::security::SecurityScheme::Http(
+                utoipa::openapi::security::HttpBuilder::new()
+                    .scheme(utoipa::openapi::security::HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .description(Some(
+                        "Session JWT set as HttpOnly cookie (phos_session) after OIDC login",
+                    ))
+                    .build(),
+            ),
+        );
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {

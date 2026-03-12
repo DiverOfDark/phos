@@ -5,6 +5,7 @@ use axum::{
 };
 use rusqlite::params;
 use serde::Deserialize;
+use utoipa::ToSchema;
 
 use super::{AppState, UState};
 
@@ -17,6 +18,18 @@ fn require_comfyui(state: &AppState) -> Result<String, StatusCode> {
 }
 
 /// GET /api/comfyui/health
+#[utoipa::path(
+    get,
+    path = "/api/comfyui/health",
+    tag = "comfyui",
+    summary = "Check ComfyUI health",
+    description = "Check whether ComfyUI is configured and reachable. Returns the connection status and system info.",
+    responses(
+        (status = 200, description = "ComfyUI health status"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
 pub(super) async fn comfyui_health(
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -41,6 +54,18 @@ pub(super) async fn comfyui_health(
 }
 
 /// GET /api/comfyui/workflows
+#[utoipa::path(
+    get,
+    path = "/api/comfyui/workflows",
+    tag = "comfyui",
+    summary = "List workflows",
+    description = "List all imported ComfyUI enhancement workflows available for use.",
+    responses(
+        (status = 200, description = "List of workflows"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
 pub(super) async fn comfyui_list_workflows(
     UState(state): UState,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
@@ -92,13 +117,27 @@ pub(super) async fn comfyui_list_workflows(
 }
 
 /// POST /api/comfyui/workflows — import a workflow template
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct ImportWorkflowPayload {
     name: String,
     description: Option<String>,
     workflow: serde_json::Value,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/comfyui/workflows",
+    tag = "comfyui",
+    summary = "Import a workflow",
+    description = "Import a ComfyUI workflow JSON for use as an enhancement pipeline.",
+    request_body = ImportWorkflowPayload,
+    responses(
+        (status = 200, description = "Workflow imported successfully"),
+        (status = 400, description = "Invalid workflow payload"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
 pub(super) async fn comfyui_import_workflow(
     UState(state): UState,
     Json(payload): Json<ImportWorkflowPayload>,
@@ -151,6 +190,20 @@ pub(super) async fn comfyui_import_workflow(
 }
 
 /// DELETE /api/comfyui/workflows/:id
+#[utoipa::path(
+    delete,
+    path = "/api/comfyui/workflows/{id}",
+    tag = "comfyui",
+    summary = "Delete a workflow",
+    description = "Delete an imported ComfyUI workflow by ID.",
+    params(("id" = String, Path, description = "Workflow ID")),
+    responses(
+        (status = 200, description = "Workflow deleted successfully"),
+        (status = 404, description = "Workflow not found"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
 pub(super) async fn comfyui_delete_workflow(
     Path(id): Path<String>,
     UState(state): UState,
@@ -173,7 +226,7 @@ pub(super) async fn comfyui_delete_workflow(
 }
 
 /// POST /api/comfyui/enhance — queue an enhancement task
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(super) struct EnhancePayload {
     shot_id: String,
     workflow_id: String,
@@ -181,6 +234,20 @@ pub(super) struct EnhancePayload {
     text_overrides: std::collections::HashMap<String, String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/comfyui/enhance",
+    tag = "comfyui",
+    summary = "Queue enhancement task",
+    description = "Queue an image enhancement task using a ComfyUI workflow. Creates a background task that processes the shot's original file.",
+    request_body = EnhancePayload,
+    responses(
+        (status = 200, description = "Enhancement task queued"),
+        (status = 404, description = "Shot or workflow not found"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
 pub(super) async fn comfyui_enhance(
     UState(state): UState,
     Json(payload): Json<EnhancePayload>,
@@ -236,11 +303,24 @@ pub(super) async fn comfyui_enhance(
 }
 
 /// GET /api/comfyui/tasks?shot_id=X
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub(super) struct TasksQuery {
     shot_id: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/comfyui/tasks",
+    tag = "comfyui",
+    summary = "List enhancement tasks",
+    description = "List ComfyUI enhancement tasks with optional status filtering and pagination.",
+    params(TasksQuery),
+    responses(
+        (status = 200, description = "List of enhancement tasks"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
 pub(super) async fn comfyui_list_tasks(
     UState(state): UState,
     Query(query): Query<TasksQuery>,
@@ -337,6 +417,20 @@ fn query_tasks(
 }
 
 /// GET /api/comfyui/tasks/:id
+#[utoipa::path(
+    get,
+    path = "/api/comfyui/tasks/{id}",
+    tag = "comfyui",
+    summary = "Get enhancement task",
+    description = "Retrieve details and current status of a specific enhancement task.",
+    params(("id" = String, Path, description = "Enhancement task ID")),
+    responses(
+        (status = 200, description = "Task details"),
+        (status = 404, description = "Task not found"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
 pub(super) async fn comfyui_get_task(
     Path(id): Path<String>,
     UState(state): UState,
@@ -362,6 +456,21 @@ pub(super) async fn comfyui_get_task(
 }
 
 /// POST /api/comfyui/tasks/:id/retry — retry a failed task
+#[utoipa::path(
+    post,
+    path = "/api/comfyui/tasks/{id}/retry",
+    tag = "comfyui",
+    summary = "Retry enhancement task",
+    description = "Retry a failed enhancement task. Resets it to pending status for reprocessing.",
+    params(("id" = String, Path, description = "Enhancement task ID to retry")),
+    responses(
+        (status = 200, description = "Task retried successfully"),
+        (status = 400, description = "Task is not in failed state"),
+        (status = 404, description = "Task not found"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
 pub(super) async fn comfyui_retry_task(
     Path(id): Path<String>,
     UState(state): UState,
@@ -395,6 +504,21 @@ pub(super) async fn comfyui_retry_task(
 }
 
 /// DELETE /api/comfyui/tasks/:id — remove a failed or completed task
+#[utoipa::path(
+    delete,
+    path = "/api/comfyui/tasks/{id}",
+    tag = "comfyui",
+    summary = "Delete enhancement task",
+    description = "Delete a completed or failed enhancement task record.",
+    params(("id" = String, Path, description = "Enhancement task ID to delete")),
+    responses(
+        (status = 200, description = "Task deleted successfully"),
+        (status = 400, description = "Task is not in failed or completed state"),
+        (status = 404, description = "Task not found"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
 pub(super) async fn comfyui_delete_task(
     Path(id): Path<String>,
     UState(state): UState,
