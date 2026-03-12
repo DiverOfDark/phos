@@ -138,7 +138,7 @@ fn collect_event(pending: &mut HashMap<PathBuf, (FileAction, Instant)>, event: &
             if path.components().any(|c| {
                 c.as_os_str()
                     .to_str()
-                    .map(|s| s.starts_with(".phos"))
+                    .map(|s| s.starts_with(".phos") || s == ".duplicates")
                     .unwrap_or(false)
             }) {
                 continue;
