@@ -48,7 +48,8 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             thumbnail_face_id TEXT,
             representative_embedding BLOB,
             folder_name TEXT UNIQUE,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )",
         [],
     )?;
@@ -67,6 +68,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             folder_number INTEGER,
             review_status TEXT DEFAULT 'pending',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(primary_person_id) REFERENCES people(id)
         )",
         [],
@@ -84,6 +86,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             is_original BOOLEAN DEFAULT 0,
             visual_embedding BLOB,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(shot_id) REFERENCES shots(id)
         )",
         [],
@@ -228,6 +231,72 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             )?;
         }
     }
+
+    // Add updated_at column to people if it doesn't exist
+    // Note: SQLite does not allow CURRENT_TIMESTAMP as a default in ALTER TABLE,
+    // so we add the column without a default and backfill.
+    if !people_columns.contains(&"updated_at".to_string()) {
+        conn.execute(
+            "ALTER TABLE people ADD COLUMN updated_at DATETIME",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE people SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL",
+            [],
+        )?;
+    }
+
+    // Add updated_at column to shots if it doesn't exist
+    if !shots_columns.contains(&"updated_at".to_string()) {
+        conn.execute(
+            "ALTER TABLE shots ADD COLUMN updated_at DATETIME",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE shots SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL",
+            [],
+        )?;
+    }
+
+    // Add updated_at column to files if it doesn't exist
+    let files_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(files)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if !files_columns.contains(&"updated_at".to_string()) {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN updated_at DATETIME",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE files SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL",
+            [],
+        )?;
+    }
+
+    // Create triggers to auto-update updated_at on modifications
+    // Use a conditional check to avoid infinite recursion
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS people_updated_at AFTER UPDATE ON people
+         FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
+         BEGIN
+             UPDATE people SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS shots_updated_at AFTER UPDATE ON shots
+         FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
+         BEGIN
+             UPDATE shots SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS files_updated_at AFTER UPDATE ON files
+         FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
+         BEGIN
+             UPDATE files SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+         END;"
+    )?;
 
     // Add description column to comfyui_workflows if it doesn't exist
     let workflows_columns: Vec<String> = conn

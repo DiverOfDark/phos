@@ -179,6 +179,10 @@ pub(super) struct FileDetail {
     mime_type: Option<String>,
     is_original: bool,
     file_size: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
+    duration_ms: Option<i64>,
+    thumbnail_url: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -248,14 +252,21 @@ pub(super) async fn get_shot_detail(
             tracing::error!("Failed to prepare files query: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    let files: Vec<FileDetail> = stmt
+    let shot_width = shot_row.6;
+    let shot_height = shot_row.7;
+    let mut files: Vec<FileDetail> = stmt
         .query_map(params![id], |row| {
+            let file_id: String = row.get(0)?;
             Ok(FileDetail {
-                id: row.get(0)?,
+                thumbnail_url: format!("/api/files/{}/thumbnail", file_id),
+                id: file_id,
                 path: row.get(1)?,
                 mime_type: row.get(2)?,
                 is_original: row.get::<_, bool>(3).unwrap_or(false),
                 file_size: row.get(4)?,
+                width: None,
+                height: None,
+                duration_ms: None,
             })
         })
         .map_err(|e| {
@@ -264,6 +275,12 @@ pub(super) async fn get_shot_detail(
         })?
         .filter_map(|r| r.ok())
         .collect();
+
+    // Set width/height from shot metadata
+    for file in &mut files {
+        file.width = shot_width;
+        file.height = shot_height;
+    }
 
     // Get faces for files in this shot, with person names
     let mut stmt = db

@@ -18,6 +18,8 @@ pub(super) struct PersonBrief {
     thumbnail_url: Option<String>,
     shot_count: i64,
     pending_count: i64,
+    updated_at: Option<String>,
+    cover_shot_thumbnail_url: Option<String>,
 }
 
 #[utoipa::path(
@@ -37,7 +39,12 @@ pub(super) async fn get_people(UState(state): UState) -> Json<Vec<PersonBrief>> 
         .prepare(
             "SELECT p.id, p.name, COUNT(DISTINCT fa.id) as face_count, p.thumbnail_face_id,
                     COUNT(DISTINCT CASE WHEN s_primary.id IS NOT NULL THEN s_primary.id END) as shot_count,
-                    COUNT(DISTINCT CASE WHEN s_primary.id IS NOT NULL AND s_primary.review_status = 'pending' THEN s_primary.id END) as pending_count
+                    COUNT(DISTINCT CASE WHEN s_primary.id IS NOT NULL AND s_primary.review_status = 'pending' THEN s_primary.id END) as pending_count,
+                    p.updated_at,
+                    (SELECT f_cover.id FROM shots s_cover
+                     JOIN files f_cover ON s_cover.main_file_id = f_cover.id
+                     WHERE s_cover.primary_person_id = p.id
+                     ORDER BY s_cover.timestamp DESC LIMIT 1) as cover_file_id
              FROM people p
              LEFT JOIN faces fa ON fa.person_id = p.id
              LEFT JOIN shots s_primary ON s_primary.primary_person_id = p.id
@@ -48,6 +55,7 @@ pub(super) async fn get_people(UState(state): UState) -> Json<Vec<PersonBrief>> 
     let rows = stmt
         .query_map([], |row| {
             let thumbnail_face_id: Option<String> = row.get(3)?;
+            let cover_file_id: Option<String> = row.get(7)?;
             Ok(PersonBrief {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -55,6 +63,8 @@ pub(super) async fn get_people(UState(state): UState) -> Json<Vec<PersonBrief>> 
                 thumbnail_url: thumbnail_face_id.map(|fid| format!("/api/faces/{}/thumbnail", fid)),
                 shot_count: row.get(4)?,
                 pending_count: row.get(5)?,
+                updated_at: row.get(6)?,
+                cover_shot_thumbnail_url: cover_file_id.map(|fid| format!("/api/files/{}/thumbnail", fid)),
             })
         })
         .unwrap();
@@ -302,6 +312,150 @@ pub(super) async fn merge_people(
     })?;
 
     Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+/// Browse a person: returns person metadata + all shots + all files per shot.
+/// Solves the N+1 problem for the mobile client.
+#[derive(Serialize, ToSchema)]
+pub(super) struct PersonMeta {
+    id: String,
+    name: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(super) struct BrowseFileDetail {
+    id: String,
+    mime_type: Option<String>,
+    is_original: bool,
+    file_size: Option<i64>,
+    thumbnail_url: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(super) struct BrowseShotDetail {
+    id: String,
+    timestamp: Option<String>,
+    review_status: Option<String>,
+    files: Vec<BrowseFileDetail>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(super) struct PersonBrowseResponse {
+    person: PersonMeta,
+    shots: Vec<BrowseShotDetail>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/people/{id}/browse",
+    tag = "people",
+    summary = "Get person browse graph",
+    description = "Returns a complete person browse graph with all shots and their file variants in a single response. Designed for offline-first browsing clients.",
+    params(
+        ("id" = String, Path, description = "Person ID")
+    ),
+    responses(
+        (status = 200, description = "Person browse graph", body = PersonBrowseResponse),
+        (status = 404, description = "Person not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub(super) async fn get_person_browse(
+    Path(id): Path<String>,
+    UState(state): UState,
+) -> Result<Json<PersonBrowseResponse>, StatusCode> {
+    let db = state.db.lock().await;
+
+    // Query 1: Get person info
+    let person = db
+        .query_row(
+            "SELECT id, name FROM people WHERE id = ?",
+            params![id],
+            |row| {
+                Ok(PersonMeta {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                })
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StatusCode::NOT_FOUND,
+            _ => {
+                tracing::error!("Failed to query person {}: {}", id, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+
+    // Query 2: Get all shots with their files in one go
+    let mut stmt = db
+        .prepare(
+            "SELECT s.id, s.timestamp, s.review_status,
+                    f.id, f.mime_type, f.is_original, f.file_size
+             FROM shots s
+             JOIN files f ON f.shot_id = s.id
+             WHERE EXISTS (
+                 SELECT 1 FROM faces fa
+                 JOIN files ff ON fa.file_id = ff.id
+                 WHERE ff.shot_id = s.id AND fa.person_id = ?
+             )
+             ORDER BY s.timestamp DESC, f.is_original DESC, f.path ASC",
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to prepare browse query for person {}: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let rows = stmt
+        .query_map(params![id], |row| {
+            let shot_id: String = row.get(0)?;
+            let timestamp: Option<String> = row.get(1)?;
+            let review_status: Option<String> = row.get(2)?;
+            let file_id: String = row.get(3)?;
+            let mime_type: Option<String> = row.get(4)?;
+            let is_original: bool = row.get(5)?;
+            let file_size: Option<i64> = row.get(6)?;
+            Ok((shot_id, timestamp, review_status, file_id, mime_type, is_original, file_size))
+        })
+        .map_err(|e| {
+            tracing::error!("Failed to execute browse query for person {}: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Group files by shot
+    let mut shots: Vec<BrowseShotDetail> = Vec::new();
+    let mut current_shot_id: Option<String> = None;
+
+    for row in rows {
+        let (shot_id, timestamp, review_status, file_id, mime_type, is_original, file_size) =
+            row.map_err(|e| {
+                tracing::error!("Failed to read browse row: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let file = BrowseFileDetail {
+            thumbnail_url: format!("/api/files/{}/thumbnail", file_id),
+            id: file_id,
+            mime_type,
+            is_original,
+            file_size,
+        };
+
+        if current_shot_id.as_deref() == Some(&shot_id) {
+            // Same shot — append file to the last shot entry
+            shots.last_mut().unwrap().files.push(file);
+        } else {
+            // New shot
+            current_shot_id = Some(shot_id.clone());
+            shots.push(BrowseShotDetail {
+                id: shot_id,
+                timestamp,
+                review_status,
+                files: vec![file],
+            });
+        }
+    }
+
+    Ok(Json(PersonBrowseResponse { person, shots }))
 }
 
 /// Delete a person and all their face records.

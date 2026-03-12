@@ -3,12 +3,12 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     middleware::Next,
     response::{AppendHeaders, IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use openidconnect::{
-    core::{CoreClient, CoreProviderMetadata, CoreResponseType},
+    core::{CoreClient, CoreIdToken, CoreProviderMetadata, CoreResponseType},
     reqwest::async_http_client,
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
@@ -260,7 +260,7 @@ pub(crate) async fn me(
     State(auth): State<AuthState>,
     headers: HeaderMap,
 ) -> Result<Json<SessionClaims>, StatusCode> {
-    let claims = parse_session_cookie(&headers, &auth.jwt_decoding_key)?;
+    let claims = parse_session_token(&headers, &auth.jwt_decoding_key)?;
     Ok(Json(claims))
 }
 
@@ -292,9 +292,77 @@ pub async fn require_auth(
     mut request: axum::extract::Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let claims = parse_session_cookie(&headers, &auth.jwt_decoding_key)?;
+    let claims = parse_session_token(&headers, &auth.jwt_decoding_key)?;
     request.extensions_mut().insert(claims);
     Ok(next.run(request).await)
+}
+
+// ---------------------------------------------------------------------------
+// Token exchange — mobile clients exchange an OIDC ID token for a session JWT
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct TokenExchangeRequest {
+    id_token: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/token",
+    tag = "auth",
+    summary = "Exchange OIDC ID token for session JWT",
+    description = "Mobile clients perform the OIDC Authorization Code + PKCE flow directly with the identity provider, then send the resulting ID token here. Phos validates it against the provider's JWKS and returns a session JWT that can be used in the `Authorization: Bearer` header.",
+    request_body(content = TokenExchangeRequest, description = "OIDC ID token to exchange"),
+    responses(
+        (status = 200, description = "Session JWT token", body = serde_json::Value),
+        (status = 400, description = "Invalid ID token format"),
+        (status = 401, description = "ID token verification failed"),
+    )
+)]
+pub(crate) async fn token_exchange(
+    State(auth): State<AuthState>,
+    Json(payload): Json<TokenExchangeRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Parse the raw ID token string into a CoreIdToken
+    let id_token: CoreIdToken = serde_json::from_value(serde_json::Value::String(
+        payload.id_token,
+    ))
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Verify the token against the OIDC provider's JWKS.
+    // We skip nonce verification because the mobile client handled the nonce
+    // during its own authorization flow.
+    let verifier = auth
+        .oidc_client
+        .id_token_verifier()
+        .set_other_audience_verifier_fn(|_| true);
+    let claims = id_token
+        .claims(&verifier, |_: Option<&Nonce>| Ok(()))
+        .map_err(|e| {
+            tracing::error!("ID token verification failed: {}", e);
+            StatusCode::UNAUTHORIZED
+        })?;
+
+    // Build a Phos session JWT with the same structure as the web flow.
+    let now = chrono::Utc::now().timestamp() as usize;
+    let session = SessionClaims {
+        sub: claims.subject().to_string(),
+        name: claims
+            .name()
+            .and_then(|n| n.get(None))
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+        email: claims.email().map(|e| e.to_string()).unwrap_or_default(),
+        exp: now + auth.jwt_ttl_secs as usize,
+        iat: now,
+    };
+    let token = encode(&Header::default(), &session, &auth.jwt_encoding_key)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "token": token,
+        "expires_in": auth.jwt_ttl_secs
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +375,7 @@ pub fn create_auth_router(auth: AuthState) -> Router {
         .route("/api/auth/callback", get(callback))
         .route("/api/auth/me", get(me))
         .route("/api/auth/logout", get(logout))
+        .route("/api/auth/token", post(token_exchange))
         .with_state(auth)
 }
 
@@ -314,11 +383,22 @@ pub fn create_auth_router(auth: AuthState) -> Router {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn parse_session_cookie(
+fn parse_session_token(
     headers: &HeaderMap,
     key: &DecodingKey,
 ) -> Result<SessionClaims, StatusCode> {
-    let token = get_cookie_value(headers, SESSION_COOKIE).ok_or(StatusCode::UNAUTHORIZED)?;
+    // Try Authorization: Bearer header first, then fall back to session cookie
+    let token = if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
+        let value = auth_header
+            .to_str()
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        value
+            .strip_prefix("Bearer ")
+            .ok_or(StatusCode::UNAUTHORIZED)?
+            .to_string()
+    } else {
+        get_cookie_value(headers, SESSION_COOKIE).ok_or(StatusCode::UNAUTHORIZED)?
+    };
     let data = decode::<SessionClaims>(&token, key, &Validation::new(Algorithm::HS256))
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
     Ok(data.claims)

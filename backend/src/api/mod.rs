@@ -4,6 +4,7 @@ mod files;
 mod people;
 mod shots;
 mod stats;
+mod sync;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -33,6 +34,7 @@ use utoipa::OpenApi;
         crate::auth::callback,
         crate::auth::me,
         crate::auth::logout,
+        crate::auth::token_exchange,
         // Shots
         shots::get_shots,
         shots::get_shot_detail,
@@ -53,6 +55,7 @@ use utoipa::OpenApi;
         people::rename_person,
         people::merge_people,
         people::delete_person,
+        people::get_person_browse,
         // Faces
         faces::get_face_thumbnail,
         faces::reassign_face,
@@ -82,11 +85,14 @@ use utoipa::OpenApi;
         comfyui::comfyui_get_task,
         comfyui::comfyui_retry_task,
         comfyui::comfyui_delete_task,
+        // Sync
+        sync::get_sync,
     ),
     components(
         schemas(
             // Auth
             crate::auth::SessionClaims,
+            crate::auth::TokenExchangeRequest,
             // Shots
             shots::ShotBrief,
             shots::SimilarShotItem,
@@ -109,6 +115,10 @@ use utoipa::OpenApi;
             people::CreatePersonPayload,
             people::RenamePersonPayload,
             people::MergePeoplePayload,
+            people::PersonMeta,
+            people::BrowseFileDetail,
+            people::BrowseShotDetail,
+            people::PersonBrowseResponse,
             // Faces
             faces::FaceSuggestion,
             faces::ReassignFacePayload,
@@ -120,6 +130,12 @@ use utoipa::OpenApi;
             // ComfyUI
             comfyui::ImportWorkflowPayload,
             comfyui::EnhancePayload,
+            // Sync
+            sync::SyncResponse,
+            sync::SyncPerson,
+            sync::SyncShot,
+            sync::SyncFile,
+            sync::SyncQuery,
         )
     ),
     modifiers(&SecurityAddon),
@@ -383,6 +399,7 @@ pub fn create_router(state: AppState) -> Router {
                 .put(people::rename_person)
                 .delete(people::delete_person),
         )
+        .route("/api/people/:id/browse", get(people::get_person_browse))
         .route("/api/people/:id/faces", get(people::get_person_faces))
         // Faces
         .route("/api/faces/:id/thumbnail", get(faces::get_face_thumbnail))
@@ -432,6 +449,8 @@ pub fn create_router(state: AppState) -> Router {
             post(comfyui::comfyui_retry_task),
         )
         .route("/api/version", get(stats::get_version))
+        // Sync
+        .route("/api/sync", get(sync::get_sync))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             resolve_user_db,
