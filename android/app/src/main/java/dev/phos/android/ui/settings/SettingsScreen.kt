@@ -3,7 +3,6 @@ package dev.phos.android.ui.settings
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -15,6 +14,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -53,6 +53,19 @@ fun SettingsScreen(
             ListItem(
                 headlineContent = { Text("Server") },
                 supportingContent = { Text(uiState.serverUrl.ifBlank { "Not configured" }) },
+            )
+
+            HorizontalDivider()
+
+            ListItem(
+                headlineContent = { Text("Sync over Wi-Fi only") },
+                supportingContent = { Text("Only sync metadata when connected to Wi-Fi") },
+                trailingContent = {
+                    Switch(
+                        checked = uiState.wifiOnlySync,
+                        onCheckedChange = viewModel::setWifiOnlySync,
+                    )
+                },
             )
 
             HorizontalDivider()

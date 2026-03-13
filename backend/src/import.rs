@@ -238,7 +238,12 @@ pub fn run_import(
     Ok(())
 }
 
-pub fn run_remote_import(source_str: &str, target_url: &str, threads: usize) -> anyhow::Result<()> {
+pub fn run_remote_import(
+    source_str: &str,
+    target_url: &str,
+    threads: usize,
+    token: Option<&str>,
+) -> anyhow::Result<()> {
     let source = Path::new(source_str);
     if !source.exists() {
         anyhow::bail!("Source directory does not exist: {:?}", source);
@@ -292,10 +297,14 @@ pub fn run_remote_import(source_str: &str, target_url: &str, threads: usize) -> 
             let encoded_filename = urlencoding::encode(&filename);
             let url = format!("{}?filename={}", base_url, encoded_filename);
 
-            match client
+            let mut req = client
                 .put(&url)
-                .header("Content-Type", "application/octet-stream")
-                .send(file_bytes)
+                .header("Content-Type", "application/octet-stream");
+            if let Some(t) = token {
+                req = req.header("Authorization", &format!("Bearer {}", t));
+            }
+
+            match req.send(file_bytes)
             {
                 Ok(_) => {}
                 Err(e) => {
@@ -313,7 +322,11 @@ pub fn run_remote_import(source_str: &str, target_url: &str, threads: usize) -> 
     info!("Triggering post-import finalization on server...");
     let finalize_url = format!("{}/api/import/finalize", target_url.trim_end_matches('/'));
     let client = ureq::Agent::new_with_defaults();
-    match client.post(&finalize_url).send_empty() {
+    let mut req = client.post(&finalize_url);
+    if let Some(t) = token {
+        req = req.header("Authorization", &format!("Bearer {}", t));
+    }
+    match req.send_empty() {
         Ok(_) => {
             println!("Post-import finalization complete (face clustering + reorganization).");
         }

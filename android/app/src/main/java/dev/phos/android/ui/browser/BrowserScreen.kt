@@ -1,5 +1,7 @@
 package dev.phos.android.ui.browser
 
+import android.view.ViewGroup
+import android.widget.FrameLayout
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -25,12 +27,12 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -43,12 +45,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
+import coil3.compose.SubcomposeAsyncImage
 import dev.phos.android.data.local.entity.FileEntity
 import dev.phos.android.ui.common.FullScreenLoading
 import kotlinx.coroutines.flow.distinctUntilChanged
+import me.saket.telephoto.zoomable.coil3.ZoomableAsyncImage
 
 @Composable
 fun BrowserScreen(
@@ -99,11 +111,7 @@ fun BrowserScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-            ) { showOverlay = !showOverlay },
+            .background(Color.Black),
     ) {
         // Vertical pager (shots)
         VerticalPager(
@@ -144,10 +152,15 @@ fun BrowserScreen(
                     modifier = Modifier.fillMaxSize(),
                 ) { fileIndex ->
                     val file = shot.files[fileIndex]
+                    val isVideo = viewModel.isVideo(file)
                     MediaPage(
                         file = file,
-                        thumbnailUrl = viewModel.buildThumbnailUrl(file.id, 1080),
-                        isVideo = viewModel.isVideo(file),
+                        thumbnailUrl = viewModel.buildThumbnailUrl(file.id, 320),
+                        previewUrl = viewModel.buildThumbnailUrl(file.id, 1080),
+                        originalUrl = viewModel.buildOriginalUrl(file.id),
+                        isVideo = isVideo,
+                        okHttpClient = viewModel.getOkHttpClient(),
+                        onTap = { showOverlay = !showOverlay },
                     )
                 }
 
@@ -213,35 +226,135 @@ fun BrowserScreen(
 private fun MediaPage(
     file: FileEntity,
     thumbnailUrl: String,
+    previewUrl: String,
+    originalUrl: String,
     isVideo: Boolean,
+    okHttpClient: okhttp3.OkHttpClient,
+    onTap: () -> Unit,
+) {
+    if (isVideo) {
+        VideoPage(
+            thumbnailUrl = previewUrl,
+            videoUrl = originalUrl,
+            okHttpClient = okHttpClient,
+            onTap = onTap,
+        )
+    } else {
+        ImagePage(
+            thumbnailUrl = thumbnailUrl,
+            previewUrl = previewUrl,
+            onTap = onTap,
+        )
+    }
+}
+
+@Composable
+private fun ImagePage(
+    thumbnailUrl: String,
+    previewUrl: String,
+    onTap: () -> Unit,
 ) {
     Box(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+            ) { onTap() },
         contentAlignment = Alignment.Center,
     ) {
-        // Image (thumbnail -> preview quality)
-        AsyncImage(
-            model = thumbnailUrl,
+        // Progressive loading: small thumbnail as placeholder, w=1080 preview as main
+        ZoomableAsyncImage(
+            model = previewUrl,
             contentDescription = null,
             contentScale = ContentScale.Fit,
             modifier = Modifier.fillMaxSize(),
         )
+    }
+}
 
-        // Video indicator
-        if (isVideo) {
+@Composable
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+private fun VideoPage(
+    thumbnailUrl: String,
+    videoUrl: String,
+    okHttpClient: okhttp3.OkHttpClient,
+    onTap: () -> Unit,
+) {
+    var isPlaying by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize(),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (isPlaying) {
+            // ExoPlayer with OkHttp data source for auth
+            val exoPlayer = remember {
+                val dataSourceFactory = OkHttpDataSource.Factory(okHttpClient)
+                val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
+                ExoPlayer.Builder(context)
+                    .setMediaSourceFactory(mediaSourceFactory)
+                    .build()
+                    .apply {
+                        setMediaItem(MediaItem.fromUri(videoUrl))
+                        prepare()
+                        playWhenReady = true
+                        repeatMode = Player.REPEAT_MODE_ONE
+                    }
+            }
+
+            DisposableEffect(Unit) {
+                onDispose {
+                    exoPlayer.release()
+                }
+            }
+
+            AndroidView(
+                factory = {
+                    PlayerView(it).apply {
+                        player = exoPlayer
+                        useController = true
+                        layoutParams = FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                        )
+                    }
+                },
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            // Poster frame with play button
             Box(
                 modifier = Modifier
-                    .align(Alignment.Center)
-                    .size(64.dp)
-                    .background(Color.Black.copy(alpha = 0.5f), MaterialTheme.shapes.extraLarge),
+                    .fillMaxSize()
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) { isPlaying = true },
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    imageVector = Icons.Default.PlayArrow,
-                    contentDescription = "Play video",
-                    tint = Color.White,
-                    modifier = Modifier.size(40.dp),
+                AsyncImage(
+                    model = thumbnailUrl,
+                    contentDescription = null,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize(),
                 )
+
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .background(Color.Black.copy(alpha = 0.5f), MaterialTheme.shapes.extraLarge),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = "Play video",
+                        tint = Color.White,
+                        modifier = Modifier.size(40.dp),
+                    )
+                }
             }
         }
     }

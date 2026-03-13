@@ -29,6 +29,8 @@ class PeopleViewModel @Inject constructor(
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
+    val authExpired: StateFlow<Boolean> = authRepository.authExpired
+
     init {
         refresh()
     }

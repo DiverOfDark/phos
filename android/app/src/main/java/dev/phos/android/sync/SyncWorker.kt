@@ -31,9 +31,10 @@ class SyncWorker @AssistedInject constructor(
     companion object {
         private const val WORK_NAME = "phos_sync"
 
-        fun enqueue(context: Context) {
+        fun enqueue(context: Context, wifiOnly: Boolean = false) {
+            val networkType = if (wifiOnly) NetworkType.UNMETERED else NetworkType.CONNECTED
             val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .setRequiredNetworkType(networkType)
                 .build()
 
             val request = PeriodicWorkRequestBuilder<SyncWorker>(30, TimeUnit.MINUTES)
@@ -42,7 +43,7 @@ class SyncWorker @AssistedInject constructor(
 
             WorkManager.getInstance(context).enqueueUniquePeriodicWork(
                 WORK_NAME,
-                ExistingPeriodicWorkPolicy.KEEP,
+                ExistingPeriodicWorkPolicy.UPDATE,
                 request,
             )
         }

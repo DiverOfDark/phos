@@ -7,9 +7,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -72,6 +74,26 @@ fun LoginScreen(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Auto-detect OIDC config from server
+            OutlinedButton(
+                onClick = viewModel::fetchAuthConfig,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = uiState.serverUrl.isNotBlank() && !uiState.isFetchingConfig,
+            ) {
+                if (uiState.isFetchingConfig) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Detecting...")
+                } else {
+                    Text("Auto-detect auth config")
+                }
+            }
 
             Spacer(modifier = Modifier.height(16.dp))
 

@@ -31,6 +31,7 @@ clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 rayon = "1.10"
 urlencoding = "2"
+base64 = "0.22"
 openidconnect = "3"
 jsonwebtoken = "9"
 utoipa = { version = "5", features = ["axum_extras"] }

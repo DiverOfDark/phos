@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import coil3.compose.AsyncImage
 import dev.phos.android.data.local.entity.PersonEntity
+import dev.phos.android.ui.common.AuthExpiredBanner
 import dev.phos.android.ui.common.ErrorBanner
 import dev.phos.android.ui.common.ShimmerBox
 
@@ -50,6 +51,7 @@ fun PeopleScreen(
     val people by viewModel.people.collectAsState()
     val isRefreshing by viewModel.isRefreshing.collectAsState()
     val error by viewModel.error.collectAsState()
+    val authExpired by viewModel.authExpired.collectAsState()
 
     Scaffold(
         topBar = {
@@ -68,6 +70,10 @@ fun PeopleScreen(
                 .fillMaxSize()
                 .padding(innerPadding),
         ) {
+            if (authExpired) {
+                AuthExpiredBanner(onReLogin = onSettingsClick)
+            }
+
             error?.let { ErrorBanner(message = it) }
 
             PullToRefreshBox(

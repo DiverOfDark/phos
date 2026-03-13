@@ -24,9 +24,9 @@ class AuthInterceptor @Inject constructor(
 
         val response = chain.proceed(request)
 
-        // Clear token on 401 so the app can re-authenticate
+        // Mark token as expired on 401 but don't clear it — keeps offline browsing working
         if (response.code == 401) {
-            authRepository.get().clearToken()
+            authRepository.get().markTokenExpired()
         }
 
         return response

@@ -8,13 +8,13 @@ import coil3.request.ImageRequest
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.phos.android.data.local.entity.FileEntity
-import dev.phos.android.data.repository.BrowseData
 import dev.phos.android.data.repository.BrowseRepository
 import dev.phos.android.data.repository.ShotWithFiles
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
 import javax.inject.Inject
 
 data class BrowserUiState(
@@ -30,6 +30,7 @@ data class BrowserUiState(
 class BrowserViewModel @Inject constructor(
     savedStateHandle: SavedStateHandle,
     private val browseRepository: BrowseRepository,
+    private val okHttpClient: OkHttpClient,
     @ApplicationContext private val appContext: android.content.Context,
 ) : ViewModel() {
 
@@ -101,6 +102,8 @@ class BrowserViewModel @Inject constructor(
     fun buildOriginalUrl(fileId: String): String {
         return browseRepository.buildOriginalUrl(fileId)
     }
+
+    fun getOkHttpClient(): OkHttpClient = okHttpClient
 
     fun isVideo(file: FileEntity): Boolean {
         return file.mimeType?.startsWith("video/") == true

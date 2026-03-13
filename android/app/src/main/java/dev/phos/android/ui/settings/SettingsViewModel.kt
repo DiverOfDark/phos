@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.phos.android.data.repository.AuthRepository
+import dev.phos.android.sync.SyncWorker
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -17,6 +18,7 @@ data class SettingsUiState(
     val serverUrl: String = "",
     val cacheSize: String = "Calculating...",
     val isClearing: Boolean = false,
+    val wifiOnlySync: Boolean = false,
 )
 
 @HiltViewModel
@@ -31,6 +33,7 @@ class SettingsViewModel @Inject constructor(
     init {
         _uiState.value = SettingsUiState(
             serverUrl = authRepository.getServerUrl() ?: "",
+            wifiOnlySync = authRepository.isWifiOnlySync(),
         )
         calculateCacheSize()
     }
@@ -56,6 +59,13 @@ class SettingsViewModel @Inject constructor(
             }
             _uiState.value = _uiState.value.copy(isClearing = false, cacheSize = "0 B")
         }
+    }
+
+    fun setWifiOnlySync(enabled: Boolean) {
+        authRepository.setWifiOnlySync(enabled)
+        _uiState.value = _uiState.value.copy(wifiOnlySync = enabled)
+        // Re-enqueue sync worker with updated constraints
+        SyncWorker.enqueue(context, wifiOnly = enabled)
     }
 
     fun logout() {

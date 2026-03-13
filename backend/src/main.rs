@@ -1,6 +1,7 @@
 mod ai;
 mod api;
 mod auth;
+mod cli_auth;
 mod comfyui;
 mod db;
 mod import;
@@ -95,7 +96,16 @@ async fn main() {
             let threads = threads.max(1);
             if let Some(ref target_str) = target {
                 if target_str.starts_with("http://") || target_str.starts_with("https://") {
-                    if let Err(e) = import::run_remote_import(&source, target_str, threads) {
+                    let token = match cli_auth::authenticate_if_needed(target_str) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!("Authentication failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(e) =
+                        import::run_remote_import(&source, target_str, threads, token.as_deref())
+                    {
                         eprintln!("Remote import failed: {}", e);
                         std::process::exit(1);
                     }

@@ -5,20 +5,27 @@ import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.fasterxml.jackson.databind.DeserializationFeature
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.phos.android.data.remote.PhosApi
 import dev.phos.android.data.remote.model.TokenExchangeRequest
 import dev.phos.android.data.repository.AuthRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import net.openid.appauth.AuthorizationException
 import net.openid.appauth.AuthorizationRequest
 import net.openid.appauth.AuthorizationResponse
 import net.openid.appauth.AuthorizationService
 import net.openid.appauth.AuthorizationServiceConfiguration
 import net.openid.appauth.ResponseTypeValues
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import javax.inject.Inject
 
 data class LoginUiState(
@@ -26,17 +33,29 @@ data class LoginUiState(
     val oidcIssuer: String = "",
     val oidcClientId: String = "",
     val isLoading: Boolean = false,
+    val isFetchingConfig: Boolean = false,
     val error: String? = null,
     val isLoggedIn: Boolean = false,
+)
+
+private data class AuthConfigDto(
+    val issuer: String? = null,
+    val client_id: String? = null,
+    val scopes: List<String>? = null,
 )
 
 @HiltViewModel
 class LoginViewModel @Inject constructor(
     private val authRepository: AuthRepository,
+    private val okHttpClient: OkHttpClient,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(LoginUiState())
     val uiState: StateFlow<LoginUiState> = _uiState.asStateFlow()
+
+    private val mapper = jacksonObjectMapper().apply {
+        configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+    }
 
     init {
         // Restore saved values
@@ -62,6 +81,41 @@ class LoginViewModel @Inject constructor(
 
     fun updateOidcClientId(clientId: String) {
         _uiState.value = _uiState.value.copy(oidcClientId = clientId)
+    }
+
+    fun fetchAuthConfig() {
+        val serverUrl = _uiState.value.serverUrl.trimEnd('/')
+        if (serverUrl.isBlank()) return
+
+        _uiState.value = _uiState.value.copy(isFetchingConfig = true)
+        viewModelScope.launch {
+            try {
+                val config = withContext(Dispatchers.IO) {
+                    val request = Request.Builder()
+                        .url("$serverUrl/api/auth/config")
+                        .get()
+                        .build()
+                    val response = okHttpClient.newCall(request).execute()
+                    if (response.isSuccessful) {
+                        response.body?.string()?.let { body ->
+                            mapper.readValue<AuthConfigDto>(body)
+                        }
+                    } else null
+                }
+                if (config != null) {
+                    _uiState.value = _uiState.value.copy(
+                        oidcIssuer = config.issuer ?: "",
+                        oidcClientId = config.client_id ?: "",
+                        isFetchingConfig = false,
+                    )
+                } else {
+                    _uiState.value = _uiState.value.copy(isFetchingConfig = false)
+                }
+            } catch (_: Exception) {
+                // Server may not have auth configured (single-user mode) — that's fine
+                _uiState.value = _uiState.value.copy(isFetchingConfig = false)
+            }
+        }
     }
 
     fun startLogin(activity: Activity) {
