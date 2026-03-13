@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/android-client-prd"
+    "version": "master"
   },
   "paths": {
     "/api/auth/callback": {
@@ -1834,6 +1834,12 @@
           },
           "issuer": {
             "type": "string"
+          },
+          "mobile_client_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "scopes": {
             "type": "array",

@@ -48,6 +48,7 @@ pub struct AuthState {
     scopes: Vec<String>,
     issuer_url: String,
     client_id: String,
+    mobile_client_id: Option<String>,
 }
 
 /// Discover the OIDC provider and build the auth state.
@@ -59,6 +60,7 @@ pub async fn init_oidc(
     jwt_secret: &str,
     jwt_ttl_secs: u64,
     scopes: Vec<String>,
+    mobile_client_id: Option<String>,
 ) -> anyhow::Result<AuthState> {
     let provider_metadata = CoreProviderMetadata::discover_async(
         IssuerUrl::new(issuer_url.to_string())?,
@@ -82,6 +84,7 @@ pub async fn init_oidc(
         scopes,
         issuer_url: issuer_url.to_string(),
         client_id: client_id.to_string(),
+        mobile_client_id,
     })
 }
 
@@ -310,6 +313,8 @@ pub async fn require_auth(
 pub(crate) struct AuthConfigResponse {
     issuer: String,
     client_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mobile_client_id: Option<String>,
     scopes: Vec<String>,
 }
 
@@ -330,6 +335,7 @@ pub(crate) async fn auth_config(
     Json(AuthConfigResponse {
         issuer: auth.issuer_url.clone(),
         client_id: auth.client_id.clone(),
+        mobile_client_id: auth.mobile_client_id.clone(),
         scopes: auth.scopes.clone(),
     })
 }

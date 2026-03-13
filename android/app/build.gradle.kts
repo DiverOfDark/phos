@@ -68,15 +68,15 @@ openApiGenerate {
     ))
     globalProperties.set(mapOf(
         "models" to "",
-        "apis" to "",
+        "apis" to "false",
     ))
 }
 
 // Add generated sources to build
-kotlin {
+android {
     sourceSets {
-        main {
-            kotlin.srcDir("${layout.buildDirectory.get().asFile}/generated/openapi/src/main/java")
+        getByName("main") {
+            java.srcDir("${layout.buildDirectory.get().asFile}/generated/openapi/src/main/java")
         }
     }
 }
@@ -114,6 +114,9 @@ dependencies {
     implementation(libs.room.runtime)
     implementation(libs.room.ktx)
     ksp(libs.room.compiler)
+
+    // Generated code annotations
+    compileOnly("javax.annotation:javax.annotation-api:1.3.2")
 
     // Networking
     implementation(libs.okhttp)

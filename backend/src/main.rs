@@ -377,6 +377,8 @@ async fn run_server() {
             .map(String::from)
             .collect();
 
+        let mobile_client_id = std::env::var("PHOS_OIDC_MOBILE_CLIENT_ID").ok();
+
         info!("OIDC authentication enabled (issuer: {})", issuer);
         let auth_state = auth::init_oidc(
             &issuer,
@@ -386,6 +388,7 @@ async fn run_server() {
             &jwt_secret,
             jwt_ttl,
             scopes,
+            mobile_client_id,
         )
         .await
         .expect("Failed to initialize OIDC provider");

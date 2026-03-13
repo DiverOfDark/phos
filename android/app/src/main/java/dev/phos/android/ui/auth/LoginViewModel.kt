@@ -41,6 +41,7 @@ data class LoginUiState(
 private data class AuthConfigDto(
     val issuer: String? = null,
     val client_id: String? = null,
+    val mobile_client_id: String? = null,
     val scopes: List<String>? = null,
 )
 
@@ -105,7 +106,7 @@ class LoginViewModel @Inject constructor(
                 if (config != null) {
                     _uiState.value = _uiState.value.copy(
                         oidcIssuer = config.issuer ?: "",
-                        oidcClientId = config.client_id ?: "",
+                        oidcClientId = config.mobile_client_id ?: config.client_id ?: "",
                         isFetchingConfig = false,
                     )
                 } else {
