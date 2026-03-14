@@ -1,5 +1,7 @@
 package dev.phos.android.ui.auth
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -33,7 +35,21 @@ fun LoginScreen(
     viewModel: LoginViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsState()
+    val authIntent by viewModel.authIntent.collectAsState()
     val context = LocalContext.current
+
+    val authLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        viewModel.handleAuthResult(result.data)
+    }
+
+    LaunchedEffect(authIntent) {
+        authIntent?.let {
+            authLauncher.launch(it)
+            viewModel.clearAuthIntent()
+        }
+    }
 
     LaunchedEffect(uiState.isLoggedIn) {
         if (uiState.isLoggedIn) {
@@ -125,10 +141,7 @@ fun LoginScreen(
             }
 
             Button(
-                onClick = {
-                    val activity = context as? android.app.Activity ?: return@Button
-                    viewModel.startLogin(activity)
-                },
+                onClick = { viewModel.startLogin(context) },
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !uiState.isLoading && uiState.serverUrl.isNotBlank(),
             ) {

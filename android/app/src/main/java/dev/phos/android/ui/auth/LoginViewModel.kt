@@ -1,10 +1,11 @@
 package dev.phos.android.ui.auth
 
-import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import dagger.hilt.android.qualifiers.ApplicationContext
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
@@ -49,10 +50,15 @@ private data class AuthConfigDto(
 class LoginViewModel @Inject constructor(
     private val authRepository: AuthRepository,
     private val okHttpClient: OkHttpClient,
+    private val phosApi: PhosApi,
+    @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(LoginUiState())
     val uiState: StateFlow<LoginUiState> = _uiState.asStateFlow()
+
+    private val _authIntent = MutableStateFlow<Intent?>(null)
+    val authIntent: StateFlow<Intent?> = _authIntent.asStateFlow()
 
     private val mapper = jacksonObjectMapper().apply {
         configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
@@ -119,7 +125,7 @@ class LoginViewModel @Inject constructor(
         }
     }
 
-    fun startLogin(activity: Activity) {
+    fun startLogin(context: Context) {
         val state = _uiState.value
         if (state.serverUrl.isBlank()) {
             _uiState.value = state.copy(error = "Server URL is required")
@@ -169,9 +175,8 @@ class LoginViewModel @Inject constructor(
                         .setScopes("openid", "profile", "email")
                         .build()
 
-                    val authService = AuthorizationService(activity)
-                    val authIntent = authService.getAuthorizationRequestIntent(authRequest)
-                    activity.startActivityForResult(authIntent, RC_AUTH)
+                    val authService = AuthorizationService(context)
+                    _authIntent.value = authService.getAuthorizationRequestIntent(authRequest)
                 }
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
@@ -182,7 +187,11 @@ class LoginViewModel @Inject constructor(
         }
     }
 
-    fun handleAuthResult(data: Intent?, api: PhosApi) {
+    fun clearAuthIntent() {
+        _authIntent.value = null
+    }
+
+    fun handleAuthResult(data: Intent?) {
         val response = data?.let { AuthorizationResponse.fromIntent(it) }
         val exception = data?.let { AuthorizationException.fromIntent(it) }
 
@@ -202,31 +211,40 @@ class LoginViewModel @Inject constructor(
             return
         }
 
-        viewModelScope.launch {
-            try {
-                // Exchange the ID token with the Phos backend
-                val idToken = response.idToken
-                if (idToken != null) {
-                    val request = TokenExchangeRequest().apply { this.idToken = idToken }
-                    val tokenResponse = api.exchangeToken(request)
-                    authRepository.saveToken(tokenResponse.token, tokenResponse.expiresIn)
-                    _uiState.value = _uiState.value.copy(isLoading = false, isLoggedIn = true)
-                } else {
-                    _uiState.value = _uiState.value.copy(
-                        isLoading = false,
-                        error = "No ID token in auth response",
-                    )
-                }
-            } catch (e: Exception) {
+        // Exchange authorization code for tokens via AppAuth
+        val authService = AuthorizationService(appContext)
+        authService.performTokenRequest(response.createTokenExchangeRequest()) { tokenResponse, tokenEx ->
+            if (tokenEx != null || tokenResponse == null) {
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
-                    error = "Token exchange failed: ${e.message}",
+                    error = "Token exchange failed: ${tokenEx?.message}",
                 )
+                return@performTokenRequest
+            }
+
+            val idToken = tokenResponse.idToken
+            if (idToken == null) {
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    error = "No ID token in token response",
+                )
+                return@performTokenRequest
+            }
+
+            // Exchange the ID token with the Phos backend
+            viewModelScope.launch {
+                try {
+                    val request = TokenExchangeRequest().apply { this.idToken = idToken }
+                    val backendResponse = phosApi.exchangeToken(request)
+                    authRepository.saveToken(backendResponse.token, backendResponse.expiresIn)
+                    _uiState.value = _uiState.value.copy(isLoading = false, isLoggedIn = true)
+                } catch (e: Exception) {
+                    _uiState.value = _uiState.value.copy(
+                        isLoading = false,
+                        error = "Backend token exchange failed: ${e.message}",
+                    )
+                }
             }
         }
-    }
-
-    companion object {
-        const val RC_AUTH = 1001
     }
 }
