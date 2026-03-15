@@ -390,7 +390,7 @@ pub(super) async fn get_person_browse(
              FROM shots s
              JOIN files f ON f.shot_id = s.id
              WHERE s.primary_person_id = ?
-             ORDER BY s.timestamp DESC, f.is_original DESC, f.path ASC",
+             ORDER BY s.id, f.is_original DESC, f.path ASC",
         )
         .map_err(|e| {
             tracing::error!("Failed to prepare browse query for person {}: {}", id, e);
@@ -446,6 +446,9 @@ pub(super) async fn get_person_browse(
             });
         }
     }
+
+    // Sort shots by timestamp (newest first) after grouping
+    shots.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
     Ok(Json(PersonBrowseResponse { person, shots }))
 }
