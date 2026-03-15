@@ -143,11 +143,7 @@ pub(super) async fn get_person_shots(
              FROM shots s
              LEFT JOIN files f ON s.main_file_id = f.id
              LEFT JOIN people p ON s.primary_person_id = p.id
-             WHERE EXISTS (
-                 SELECT 1 FROM faces fa
-                 JOIN files ff ON fa.file_id = ff.id
-                 WHERE ff.shot_id = s.id AND fa.person_id = ?
-             )
+             WHERE s.primary_person_id = ?
              ORDER BY s.timestamp DESC",
         )
         .unwrap();
@@ -393,11 +389,7 @@ pub(super) async fn get_person_browse(
                     f.id, f.mime_type, f.is_original, f.file_size
              FROM shots s
              JOIN files f ON f.shot_id = s.id
-             WHERE EXISTS (
-                 SELECT 1 FROM faces fa
-                 JOIN files ff ON fa.file_id = ff.id
-                 WHERE ff.shot_id = s.id AND fa.person_id = ?
-             )
+             WHERE s.primary_person_id = ?
              ORDER BY s.timestamp DESC, f.is_original DESC, f.path ASC",
         )
         .map_err(|e| {

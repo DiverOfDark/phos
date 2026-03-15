@@ -26,10 +26,13 @@ import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -58,6 +61,7 @@ import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
 import dev.phos.android.data.local.entity.FileEntity
 import dev.phos.android.ui.common.FullScreenLoading
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import me.saket.telephoto.zoomable.coil3.ZoomableAsyncImage
 import me.saket.telephoto.zoomable.rememberZoomableImageState
@@ -296,7 +300,7 @@ private fun VideoPage(
     okHttpClient: okhttp3.OkHttpClient,
     onTap: () -> Unit,
 ) {
-    var isPlaying by remember { mutableStateOf(false) }
+    var isStarted by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val zoomableState = rememberZoomableState()
 
@@ -305,7 +309,7 @@ private fun VideoPage(
             .fillMaxSize(),
         contentAlignment = Alignment.Center,
     ) {
-        if (isPlaying) {
+        if (isStarted) {
             // ExoPlayer with OkHttp data source for auth
             val exoPlayer = remember {
                 val dataSourceFactory = OkHttpDataSource.Factory(okHttpClient)
@@ -327,6 +331,25 @@ private fun VideoPage(
                 }
             }
 
+            // Playback state
+            var isPaused by remember { mutableStateOf(false) }
+            var currentPosition by remember { mutableStateOf(0L) }
+            var duration by remember { mutableStateOf(0L) }
+            var showControls by remember { mutableStateOf(true) }
+            var isSeeking by remember { mutableStateOf(false) }
+
+            // Poll playback position
+            LaunchedEffect(exoPlayer) {
+                while (true) {
+                    if (!isSeeking) {
+                        currentPosition = exoPlayer.currentPosition
+                    }
+                    duration = exoPlayer.duration.coerceAtLeast(0L)
+                    delay(200)
+                }
+            }
+
+            // Player view
             AndroidView(
                 factory = {
                     PlayerView(it).apply {
@@ -340,8 +363,80 @@ private fun VideoPage(
                 },
                 modifier = Modifier
                     .fillMaxSize()
-                    .zoomable(zoomableState),
+                    .zoomable(zoomableState)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) {
+                        showControls = !showControls
+                        onTap()
+                    },
             )
+
+            // Controls bar
+            AnimatedVisibility(
+                visible = showControls,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier.align(Alignment.BottomCenter),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.6f)),
+                            )
+                        )
+                        .navigationBarsPadding()
+                        .padding(horizontal = 4.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(onClick = {
+                        isPaused = !isPaused
+                        exoPlayer.playWhenReady = !isPaused
+                    }) {
+                        Icon(
+                            imageVector = if (isPaused) Icons.Default.PlayArrow else Icons.Filled.Pause,
+                            contentDescription = if (isPaused) "Play" else "Pause",
+                            tint = Color.White,
+                        )
+                    }
+
+                    Text(
+                        text = formatDuration(currentPosition),
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+
+                    Slider(
+                        value = currentPosition.toFloat(),
+                        onValueChange = {
+                            isSeeking = true
+                            currentPosition = it.toLong()
+                        },
+                        onValueChangeFinished = {
+                            exoPlayer.seekTo(currentPosition)
+                            isSeeking = false
+                        },
+                        valueRange = 0f..duration.toFloat().coerceAtLeast(1f),
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(horizontal = 4.dp),
+                        colors = SliderDefaults.colors(
+                            thumbColor = Color.White,
+                            activeTrackColor = Color.White,
+                            inactiveTrackColor = Color.White.copy(alpha = 0.3f),
+                        ),
+                    )
+
+                    Text(
+                        text = formatDuration(duration),
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
         } else {
             // Poster frame with play button
             Box(
@@ -350,7 +445,7 @@ private fun VideoPage(
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
-                    ) { isPlaying = true },
+                    ) { isStarted = true },
                 contentAlignment = Alignment.Center,
             ) {
                 AsyncImage(
@@ -376,6 +471,13 @@ private fun VideoPage(
             }
         }
     }
+}
+
+private fun formatDuration(ms: Long): String {
+    val totalSeconds = ms / 1000
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%d:%02d".format(minutes, seconds)
 }
 
 @Composable
