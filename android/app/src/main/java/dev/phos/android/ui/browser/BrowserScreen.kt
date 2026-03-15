@@ -62,6 +62,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import me.saket.telephoto.zoomable.coil3.ZoomableAsyncImage
 import me.saket.telephoto.zoomable.rememberZoomableImageState
 import me.saket.telephoto.zoomable.rememberZoomableState
+import me.saket.telephoto.zoomable.zoomable
 
 @Composable
 fun BrowserScreen(
@@ -297,6 +298,7 @@ private fun VideoPage(
 ) {
     var isPlaying by remember { mutableStateOf(false) }
     val context = LocalContext.current
+    val zoomableState = rememberZoomableState()
 
     Box(
         modifier = Modifier
@@ -329,14 +331,16 @@ private fun VideoPage(
                 factory = {
                     PlayerView(it).apply {
                         player = exoPlayer
-                        useController = true
+                        useController = false
                         layoutParams = FrameLayout.LayoutParams(
                             ViewGroup.LayoutParams.MATCH_PARENT,
                             ViewGroup.LayoutParams.MATCH_PARENT,
                         )
                     }
                 },
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zoomable(zoomableState),
             )
         } else {
             // Poster frame with play button

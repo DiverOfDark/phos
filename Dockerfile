@@ -14,9 +14,7 @@ COPY frontend/ ./
 RUN PHOS_VERSION=${PHOS_VERSION} npm run build
 
 # Stage 2: Build Backend
-FROM rust:latest AS backend-builder
-ARG PHOS_VERSION
-ENV PHOS_VERSION=${PHOS_VERSION}
+FROM rust:1.87 AS backend-builder
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
@@ -41,13 +39,17 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
 COPY backend/build.rs ./
-# Create dummy src/main.rs to build dependencies
+# Build dependencies with dummy source (cached separately from app code)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/backend/target \
     mkdir src && echo "fn main() {}" > src/main.rs && \
     cargo build --release --features "" || true && \
     rm -rf src
+
+# Set PHOS_VERSION after dep build so version changes don't invalidate dep cache
+ARG PHOS_VERSION
+ENV PHOS_VERSION=${PHOS_VERSION}
 
 COPY backend/src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
