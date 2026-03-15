@@ -14,7 +14,7 @@ COPY frontend/ ./
 RUN PHOS_VERSION=${PHOS_VERSION} npm run build
 
 # Stage 2: Build Backend
-FROM rust:1.87 AS backend-builder
+FROM rust:1.93 AS backend-builder
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \

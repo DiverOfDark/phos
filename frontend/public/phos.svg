@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1e1545"/>
+      <stop offset="100%" stop-color="#0c0c1e"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="20%" stop-color="#fff3c4"/>
+      <stop offset="50%" stop-color="#f6ad55" stop-opacity="0.8"/>
+      <stop offset="80%" stop-color="#ed8936" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#dd6b20" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="innerGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#fff9e6" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#fff9e6" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="252" fill="url(#bg)"/>
+
+  <!-- Ambient inner glow -->
+  <circle cx="256" cy="256" r="200" fill="url(#innerGlow)"/>
+
+  <!-- Aperture blades - 6 curved overlapping blades -->
+  <!-- Each blade is a path from outer ring, curving to create the classic iris pattern -->
+  <g fill="#8b7ec8" opacity="0.7">
+    <!-- Blade 1: 0° -->
+    <path d="M256,76
+             A180,180 0 0,1 411,166
+             L310,210
+             A80,80 0 0,0 270,178 Z"/>
+    <!-- Blade 2: 60° -->
+    <path d="M411,166
+             A180,180 0 0,1 411,346
+             L310,302
+             A80,80 0 0,0 330,236 Z"/>
+    <!-- Blade 3: 120° -->
+    <path d="M411,346
+             A180,180 0 0,1 256,436
+             L256,334
+             A80,80 0 0,0 310,302 Z"/>
+    <!-- Blade 4: 180° -->
+    <path d="M256,436
+             A180,180 0 0,1 101,346
+             L202,302
+             A80,80 0 0,0 242,334 Z"/>
+    <!-- Blade 5: 240° -->
+    <path d="M101,346
+             A180,180 0 0,1 101,166
+             L202,210
+             A80,80 0 0,0 182,276 Z"/>
+    <!-- Blade 6: 300° -->
+    <path d="M101,166
+             A180,180 0 0,1 256,76
+             L256,178
+             A80,80 0 0,0 202,210 Z"/>
+  </g>
+
+  <!-- Blade highlights -->
+  <g fill="#a99de0" opacity="0.3">
+    <path d="M256,76
+             A180,180 0 0,1 411,166
+             L310,210
+             A80,80 0 0,0 270,178 Z"/>
+    <path d="M411,346
+             A180,180 0 0,1 256,436
+             L256,334
+             A80,80 0 0,0 310,302 Z"/>
+    <path d="M101,346
+             A180,180 0 0,1 101,166
+             L202,210
+             A80,80 0 0,0 182,276 Z"/>
+  </g>
+
+  <!-- Outer lens ring -->
+  <circle cx="256" cy="256" r="200" fill="none" stroke="#6c5eb5" stroke-width="3" opacity="0.5"/>
+
+  <!-- Central light glow -->
+  <circle cx="256" cy="256" r="90" fill="url(#glow)"/>
+
+  <!-- Bright core -->
+  <circle cx="256" cy="256" r="28" fill="#fffbeb" opacity="0.95"/>
+  <circle cx="256" cy="256" r="12" fill="#ffffff"/>
+
+  <!-- Subtle light rays -->
+  <g stroke="#ffd97a" stroke-width="1.5" opacity="0.2" stroke-linecap="round">
+    <line x1="256" y1="168" x2="256" y2="80"/>
+    <line x1="332" y1="212" x2="408" y2="168"/>
+    <line x1="332" y1="300" x2="408" y2="344"/>
+    <line x1="256" y1="344" x2="256" y2="432"/>
+    <line x1="180" y1="300" x2="104" y2="344"/>
+    <line x1="180" y1="212" x2="104" y2="168"/>
+  </g>
+</svg>

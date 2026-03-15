@@ -287,8 +287,8 @@ onMounted(() => {
       <div class="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
         <div class="flex items-center gap-4 md:gap-8">
           <router-link to="/" class="flex items-center gap-2.5 group">
-            <div class="w-9 h-9 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20 group-hover:scale-105 transition-transform">
-              <span class="text-white font-black text-lg">P</span>
+            <div class="w-9 h-9 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20 group-hover:scale-105 transition-transform overflow-hidden">
+              <img src="/phos.svg" alt="Phos" class="w-9 h-9" />
             </div>
             <span class="text-xl font-bold tracking-tight text-white hidden xs:block">Phos</span>
           </router-link>
