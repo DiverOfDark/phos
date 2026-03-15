@@ -95,6 +95,27 @@ class BrowserViewModel @Inject constructor(
         }
     }
 
+    fun deleteFile(shotIndex: Int, fileIndex: Int) {
+        val shots = _uiState.value.shots
+        if (shotIndex !in shots.indices) return
+        val shot = shots[shotIndex]
+        if (fileIndex !in shot.files.indices) return
+        val file = shot.files[fileIndex]
+        if (file.isOriginal) return
+
+        viewModelScope.launch {
+            try {
+                browseRepository.deleteFile(file.id)
+                val updatedFiles = shot.files.filterIndexed { i, _ -> i != fileIndex }
+                val updatedShots = shots.toMutableList()
+                updatedShots[shotIndex] = shot.copy(files = updatedFiles)
+                _uiState.value = _uiState.value.copy(shots = updatedShots)
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(error = "Failed to delete: ${e.message}")
+            }
+        }
+    }
+
     fun buildThumbnailUrl(fileId: String, width: Int = 1080): String {
         return browseRepository.buildThumbnailUrl(fileId, width)
     }

@@ -5,6 +5,7 @@ import dev.phos.android.data.remote.model.PersonBrowseResponse
 import dev.phos.android.data.remote.model.SyncResponse
 import dev.phos.android.data.remote.model.TokenExchangeRequest
 import retrofit2.http.Body
+import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.POST
 import retrofit2.http.Path
@@ -28,6 +29,9 @@ interface PhosApi {
         @Path("id") id: String,
         @Query("w") width: Int? = null,
     ): okhttp3.ResponseBody
+
+    @DELETE("api/files/{id}")
+    suspend fun deleteFile(@Path("id") id: String): okhttp3.ResponseBody
 
     @POST("api/auth/token")
     suspend fun exchangeToken(@Body request: TokenExchangeRequest): TokenExchangeResponse

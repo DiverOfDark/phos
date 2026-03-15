@@ -122,6 +122,11 @@ class BrowseRepository @Inject constructor(
         )
     }
 
+    suspend fun deleteFile(fileId: String) {
+        api.deleteFile(fileId)
+        fileDao.deleteById(fileId)
+    }
+
     fun buildThumbnailUrl(fileId: String, width: Int = 1080): String {
         val baseUrl = authRepository.getServerUrl()?.trimEnd('/') ?: ""
         return "$baseUrl/api/files/$fileId/thumbnail?w=$width"

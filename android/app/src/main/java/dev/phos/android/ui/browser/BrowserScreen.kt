@@ -26,14 +26,17 @@ import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -100,6 +103,7 @@ fun BrowserScreen(
 
     var showOverlay by remember { mutableStateOf(true) }
     var currentFileIndex by remember { mutableStateOf(uiState.initialFileIndex) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
 
     val verticalPagerState = rememberPagerState(
         initialPage = uiState.initialShotIndex,
@@ -219,10 +223,36 @@ fun BrowserScreen(
                 fileCount = if (uiState.shots.isNotEmpty()) {
                     uiState.shots[verticalPagerState.currentPage].files.size
                 } else 0,
+                isOriginal = if (uiState.shots.isNotEmpty()) {
+                    val shot = uiState.shots[verticalPagerState.currentPage]
+                    currentFileIndex in shot.files.indices && shot.files[currentFileIndex].isOriginal
+                } else true,
                 timestamp = if (uiState.shots.isNotEmpty()) {
                     uiState.shots[verticalPagerState.currentPage].shot.timestamp
                 } else null,
                 onBack = onBack,
+                onDeleteVariant = { showDeleteConfirm = true },
+            )
+        }
+
+        if (showDeleteConfirm) {
+            AlertDialog(
+                onDismissRequest = { showDeleteConfirm = false },
+                title = { Text("Delete variant?") },
+                text = { Text("This will permanently delete this file variant from the server.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showDeleteConfirm = false
+                        viewModel.deleteFile(verticalPagerState.currentPage, currentFileIndex)
+                    }) {
+                        Text("Delete", color = MaterialTheme.colorScheme.error)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showDeleteConfirm = false }) {
+                        Text("Cancel")
+                    }
+                },
             )
         }
     }
@@ -487,8 +517,10 @@ private fun MediaOverlay(
     shotCount: Int,
     fileIndex: Int,
     fileCount: Int,
+    isOriginal: Boolean,
     timestamp: String?,
     onBack: () -> Unit,
+    onDeleteVariant: () -> Unit,
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         // Top gradient + info
@@ -537,6 +569,16 @@ private fun MediaOverlay(
                         color = Color.White.copy(alpha = 0.8f),
                         modifier = Modifier.padding(end = 8.dp),
                     )
+                }
+
+                if (!isOriginal) {
+                    IconButton(onClick = onDeleteVariant) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = "Delete variant",
+                            tint = Color.White.copy(alpha = 0.8f),
+                        )
+                    }
                 }
             }
         }
