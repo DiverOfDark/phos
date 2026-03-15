@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import dev.phos.android.data.local.PhosDatabase
 import dev.phos.android.data.repository.AuthRepository
 import dev.phos.android.sync.SyncWorker
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,12 +19,14 @@ data class SettingsUiState(
     val serverUrl: String = "",
     val cacheSize: String = "Calculating...",
     val isClearing: Boolean = false,
+    val isClearingMetadata: Boolean = false,
     val wifiOnlySync: Boolean = false,
 )
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val authRepository: AuthRepository,
+    private val database: PhosDatabase,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
 
@@ -58,6 +61,14 @@ class SettingsViewModel @Inject constructor(
                 cacheDir.deleteRecursively()
             }
             _uiState.value = _uiState.value.copy(isClearing = false, cacheSize = "0 B")
+        }
+    }
+
+    fun clearMetadataCache() {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isClearingMetadata = true)
+            database.clearAllTables()
+            _uiState.value = _uiState.value.copy(isClearingMetadata = false)
         }
     }
 

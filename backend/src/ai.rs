@@ -366,9 +366,15 @@ impl AiPipeline {
         let det_path = ensure_model("det_10g.onnx")?;
         let rec_path = ensure_model("w600k_r50.onnx")?;
 
-        let face_detector = Session::builder()?.commit_from_file(&det_path)?;
+        let face_detector = Session::builder()?
+            .with_intra_threads(1)?
+            .with_inter_threads(1)?
+            .commit_from_file(&det_path)?;
 
-        let face_recognizer = Session::builder()?.commit_from_file(&rec_path)?;
+        let face_recognizer = Session::builder()?
+            .with_intra_threads(1)?
+            .with_inter_threads(1)?
+            .commit_from_file(&rec_path)?;
 
         Ok(Self {
             face_detector: Some(Mutex::new(face_detector)),

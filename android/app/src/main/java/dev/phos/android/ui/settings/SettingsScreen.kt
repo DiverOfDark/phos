@@ -89,6 +89,24 @@ fun SettingsScreen(
             HorizontalDivider()
 
             ListItem(
+                headlineContent = { Text("Metadata cache") },
+                supportingContent = { Text("Clear locally cached people, shots, and files") },
+                trailingContent = {
+                    if (uiState.isClearingMetadata) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.padding(8.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    }
+                },
+                modifier = Modifier.clickable(enabled = !uiState.isClearingMetadata) {
+                    viewModel.clearMetadataCache()
+                },
+            )
+
+            HorizontalDivider()
+
+            ListItem(
                 headlineContent = {
                     Text(
                         "Sign out",
