@@ -811,25 +811,16 @@ impl Scanner {
                 .map(|frame| compute_dhash(&frame));
 
             if let Some(ai) = &self.ai {
-                if let Ok(keyframes) = extract_video_keyframes(path, 5.0) {
-                    let kf_count = keyframes.len();
-                    // Use into_iter() so each keyframe's DynamicImage is dropped
-                    // after face detection completes, instead of holding ALL
-                    // keyframes in memory simultaneously.
-                    for kf in keyframes {
-                        keyframe_results.push(KeyframeResult {
-                            kf_id: Uuid::new_v4().to_string(),
-                            timestamp_ms: kf.timestamp_ms,
-                            kf_path: format!("memory://keyframe_{}", kf.timestamp_ms),
-                            faces: detect_faces_collect(ai, &kf.image),
-                        });
-                    }
-                    debug!(
-                        "Processed {} keyframes for video {:?}",
-                        kf_count,
-                        path
-                    );
-                }
+                // Stream keyframes one at a time: each DynamicImage is dropped
+                // after face detection, so only one frame is in memory at a time.
+                let _ = for_each_video_keyframe(path, 5.0, |timestamp_ms, image| {
+                    keyframe_results.push(KeyframeResult {
+                        kf_id: Uuid::new_v4().to_string(),
+                        timestamp_ms,
+                        kf_path: format!("memory://keyframe_{}", timestamp_ms),
+                        faces: detect_faces_collect(ai, &image),
+                    });
+                });
             }
             dhash
         } else {
@@ -1201,20 +1192,17 @@ fn get_video_dimensions(path: &Path) -> (Option<i32>, Option<i32>) {
     }
 }
 
-/// A keyframe extracted from a video file.
-struct ExtractedKeyframe {
-    timestamp_ms: i64,
-    image: DynamicImage,
-}
-
-/// Extract keyframes from a video at approximately every `interval_secs` seconds.
-/// Returns a vector of (timestamp_ms, DynamicImage) pairs.
-fn extract_video_keyframes(
+/// Process video keyframes one at a time via a callback, avoiding collecting all
+/// decoded frames in memory simultaneously.  Each `DynamicImage` is dropped as
+/// soon as the callback returns, so only one frame is in memory per call.
+fn for_each_video_keyframe<F>(
     path: &Path,
     interval_secs: f64,
-) -> anyhow::Result<Vec<ExtractedKeyframe>> {
-    let mut keyframes = Vec::new();
-
+    mut on_keyframe: F,
+) -> anyhow::Result<usize>
+where
+    F: FnMut(i64, DynamicImage),
+{
     let mut ictx = ffmpeg::format::input(&path)?;
 
     let stream = ictx
@@ -1251,12 +1239,14 @@ fn extract_video_keyframes(
 
     // Track the last extracted timestamp so we only extract at intervals
     let mut last_extracted_secs: f64 = -interval_secs; // Ensure we extract the first frame
+    let mut count: usize = 0;
 
-    let receive_frames = |decoder: &mut ffmpeg::decoder::Video,
-                          scaler: &mut ffmpeg::software::scaling::Context,
-                          keyframes: &mut Vec<ExtractedKeyframe>,
-                          last_extracted: &mut f64,
-                          time_base: ffmpeg::Rational| {
+    let receive_and_process = |decoder: &mut ffmpeg::decoder::Video,
+                               scaler: &mut ffmpeg::software::scaling::Context,
+                               on_keyframe: &mut F,
+                               last_extracted: &mut f64,
+                               count: &mut usize,
+                               time_base: ffmpeg::Rational| {
         let mut decoded = ffmpeg::frame::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
             // Calculate frame timestamp in seconds
@@ -1295,10 +1285,9 @@ fn extract_video_keyframes(
 
             if let Some(img_buf) = RgbImage::from_raw(w, h, rgb_data) {
                 let dynamic_img = DynamicImage::ImageRgb8(img_buf);
-                keyframes.push(ExtractedKeyframe {
-                    timestamp_ms,
-                    image: dynamic_img,
-                });
+                on_keyframe(timestamp_ms, dynamic_img);
+                // dynamic_img is dropped here — only one frame in memory at a time
+                *count += 1;
             }
         }
     };
@@ -1306,27 +1295,29 @@ fn extract_video_keyframes(
     for (stream, packet) in ictx.packets() {
         if stream.index() == video_stream_index {
             decoder.send_packet(&packet)?;
-            receive_frames(
+            receive_and_process(
                 &mut decoder,
                 &mut scaler,
-                &mut keyframes,
+                &mut on_keyframe,
                 &mut last_extracted_secs,
+                &mut count,
                 time_base,
             );
         }
     }
     decoder.send_eof()?;
-    receive_frames(
+    receive_and_process(
         &mut decoder,
         &mut scaler,
-        &mut keyframes,
+        &mut on_keyframe,
         &mut last_extracted_secs,
+        &mut count,
         time_base,
     );
 
-    debug!("Extracted {} keyframes from {:?}", keyframes.len(), path);
+    debug!("Processed {} keyframes from {:?}", count, path);
 
-    Ok(keyframes)
+    Ok(count)
 }
 
 /// Extract the first frame from a video file and return it as a DynamicImage.
