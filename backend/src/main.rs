@@ -225,12 +225,21 @@ async fn run_server() {
                     return;
                 }
                 let user_db_path = user_dir.join(".phos.db");
-                let user_scanner = scanner_ref.with_db_path(user_db_path.clone());
                 let user_name = user_dir
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
                 info!("Scanning user library: {}", user_name);
+
+                // Run migrations (including path relativization) before scanning,
+                // so the scanner sees relative paths and doesn't treat existing
+                // files as duplicates.
+                if let Err(e) = db::init_db(&user_db_path) {
+                    tracing::error!("DB init failed for user {}: {}", user_name, e);
+                    continue;
+                }
+
+                let user_scanner = scanner_ref.with_db_path(user_db_path.clone());
 
                 if let Err(e) = user_scanner.rehash_files() {
                     tracing::error!("Rehash failed for user {}: {}", user_name, e);

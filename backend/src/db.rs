@@ -338,17 +338,51 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
     // Paths stored as absolute (e.g. /home/user/library/person/001/photo.jpg) become
     // relative to the library root (e.g. person/001/photo.jpg).
     // Idempotent: already-relative paths don't match the LIKE prefix.
+    // Uses OR IGNORE to handle races where the scanner already stored relative paths.
     {
         let library_root = path.as_ref().parent().unwrap_or(Path::new("."));
         let prefix = format!("{}/", library_root.to_string_lossy());
 
+        // Convert absolute paths to relative, skipping any that would conflict
+        // with already-relative entries (e.g. from a scanner run before migration).
         let files_migrated = conn.execute(
-            "UPDATE files SET path = SUBSTR(path, LENGTH(?1) + 1) WHERE path LIKE (?1 || '%')",
+            "UPDATE OR IGNORE files SET path = SUBSTR(path, LENGTH(?1) + 1) WHERE path LIKE (?1 || '%')",
             params![prefix],
         )?;
 
+        // Clean up remaining absolute-path duplicates that couldn't be converted.
+        // These are entries where a relative-path version already exists.
+        let duplicate_ids: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM files WHERE path LIKE (?1 || '%')",
+            )?;
+            let ids: Vec<String> = stmt.query_map(params![prefix], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            ids
+        };
+        if !duplicate_ids.is_empty() {
+            for file_id in &duplicate_ids {
+                conn.execute(
+                    "DELETE FROM face_neighbors WHERE face_id_a IN (SELECT id FROM faces WHERE file_id = ?1) OR face_id_b IN (SELECT id FROM faces WHERE file_id = ?1)",
+                    params![file_id],
+                )?;
+                conn.execute("DELETE FROM faces WHERE file_id = ?", params![file_id])?;
+                conn.execute("DELETE FROM video_keyframes WHERE video_file_id = ?", params![file_id])?;
+                conn.execute("DELETE FROM files WHERE id = ?", params![file_id])?;
+            }
+            conn.execute(
+                "DELETE FROM shots WHERE id NOT IN (SELECT DISTINCT shot_id FROM files)",
+                [],
+            )?;
+            tracing::info!(
+                "Cleaned up {} duplicate absolute-path entries during migration",
+                duplicate_ids.len()
+            );
+        }
+
         let faces_migrated = conn.execute(
-            "UPDATE faces SET thumbnail_path = SUBSTR(thumbnail_path, LENGTH(?1) + 1) WHERE thumbnail_path LIKE (?1 || '%')",
+            "UPDATE OR IGNORE faces SET thumbnail_path = SUBSTR(thumbnail_path, LENGTH(?1) + 1) WHERE thumbnail_path LIKE (?1 || '%')",
             params![prefix],
         )?;
 
