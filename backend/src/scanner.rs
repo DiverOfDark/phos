@@ -789,29 +789,34 @@ impl Scanner {
             None
         };
 
-        // dHash computation
-        let dhash: Option<[u8; 8]> = if mime_type.starts_with("image/") {
-            open_image(path).ok().map(|img| compute_dhash(&img))
-        } else if mime_type.starts_with("video/") {
-            extract_first_video_frame(path)
-                .ok()
-                .map(|frame| compute_dhash(&frame))
-        } else {
-            None
-        };
-
-        // Face detection (collect results without writing)
+        // Load image/video frame once and reuse for both dHash and face detection.
+        // Previously the image was loaded twice (once for dHash, once for faces),
+        // doubling per-thread memory usage.
         let mut image_faces: Vec<FaceResult> = Vec::new();
         let mut keyframe_results: Vec<KeyframeResult> = Vec::new();
 
-        if let Some(ai) = &self.ai {
-            if mime_type.starts_with("image/") {
-                if let Ok(img) = open_image(path) {
-                    image_faces = detect_faces_collect(ai, &img);
-                }
-            } else if mime_type.starts_with("video/") {
+        let dhash: Option<[u8; 8]> = if mime_type.starts_with("image/") {
+            let img = open_image(path).ok();
+            let dhash = img.as_ref().map(|i| compute_dhash(i));
+
+            if let (Some(ai), Some(ref img)) = (&self.ai, &img) {
+                image_faces = detect_faces_collect(ai, img);
+            }
+            // img dropped here — single load for both operations
+            dhash
+        } else if mime_type.starts_with("video/") {
+            // Extract first frame for dHash (lightweight — single frame)
+            let dhash = extract_first_video_frame(path)
+                .ok()
+                .map(|frame| compute_dhash(&frame));
+
+            if let Some(ai) = &self.ai {
                 if let Ok(keyframes) = extract_video_keyframes(path, 5.0) {
-                    for kf in &keyframes {
+                    let kf_count = keyframes.len();
+                    // Use into_iter() so each keyframe's DynamicImage is dropped
+                    // after face detection completes, instead of holding ALL
+                    // keyframes in memory simultaneously.
+                    for kf in keyframes {
                         keyframe_results.push(KeyframeResult {
                             kf_id: Uuid::new_v4().to_string(),
                             timestamp_ms: kf.timestamp_ms,
@@ -821,12 +826,15 @@ impl Scanner {
                     }
                     debug!(
                         "Processed {} keyframes for video {:?}",
-                        keyframes.len(),
+                        kf_count,
                         path
                     );
                 }
             }
-        }
+            dhash
+        } else {
+            None
+        };
 
         // --- Phase 2: dHash shot grouping ---
         // Check the dhash_cache for a match (Hamming distance <= 10).
