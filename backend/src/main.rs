@@ -17,7 +17,8 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::info;
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tracing::{info, Level};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
@@ -413,6 +414,11 @@ async fn run_server() {
             .merge(protected_api)
             .merge(Scalar::with_url("/api/docs", api::ApiDoc::openapi()))
             .fallback_service(serve_static)
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(Level::INFO))
+                    .on_response(DefaultOnResponse::new().level(Level::INFO).include_headers(false)),
+            )
             .layer(CorsLayer::permissive())
     } else {
         info!("OIDC authentication disabled (set PHOS_OIDC_ISSUER to enable)");
@@ -420,6 +426,11 @@ async fn run_server() {
             .merge(api_router)
             .merge(Scalar::with_url("/api/docs", api::ApiDoc::openapi()))
             .fallback_service(serve_static)
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(Level::INFO))
+                    .on_response(DefaultOnResponse::new().level(Level::INFO).include_headers(false)),
+            )
             .layer(CorsLayer::permissive())
     };
 
