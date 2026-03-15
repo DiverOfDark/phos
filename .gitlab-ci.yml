@@ -1,0 +1,23 @@
+stages:
+  - build
+
+build-android:
+  stage: build
+  image: eclipse-temurin:17-jdk
+  variables:
+    ANDROID_HOME: "${CI_PROJECT_DIR}/android-sdk"
+    GRADLE_USER_HOME: "${CI_PROJECT_DIR}/.gradle"
+  cache:
+    key: android-gradle
+    paths:
+      - .gradle/caches/
+      - .gradle/wrapper/
+      - android-sdk/
+  script:
+    - cd android
+    - chmod +x gradlew
+    - ./gradlew assembleRelease --no-daemon
+  artifacts:
+    paths:
+      - android/app/build/outputs/apk/release/*.apk
+    expire_in: 30 days

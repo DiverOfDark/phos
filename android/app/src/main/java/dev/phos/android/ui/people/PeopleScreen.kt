@@ -48,6 +48,7 @@ import dev.phos.android.ui.common.ShimmerBox
 fun PeopleScreen(
     onPersonClick: (String) -> Unit,
     onSettingsClick: () -> Unit,
+    onReLogin: () -> Unit,
     viewModel: PeopleViewModel = hiltViewModel(),
 ) {
     val people by viewModel.people.collectAsState()
@@ -73,7 +74,10 @@ fun PeopleScreen(
                 .padding(innerPadding),
         ) {
             if (authExpired) {
-                AuthExpiredBanner(onReLogin = onSettingsClick)
+                AuthExpiredBanner(onReLogin = {
+                    viewModel.reLogin()
+                    onReLogin()
+                })
             }
 
             error?.let { ErrorBanner(message = it) }

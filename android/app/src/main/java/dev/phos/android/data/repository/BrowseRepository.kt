@@ -8,6 +8,7 @@ import dev.phos.android.data.local.entity.ShotEntity
 import dev.phos.android.data.local.entity.ViewPositionEntity
 import dev.phos.android.data.remote.model.PersonBrowseResponse
 import dev.phos.android.data.remote.PhosApi
+import kotlinx.coroutines.flow.first
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -103,12 +104,7 @@ class BrowseRepository @Inject constructor(
 
     private suspend fun loadLocalBrowseData(personId: String): BrowseData {
         val shots = mutableListOf<ShotWithFiles>()
-        val shotEntities = shotDao.getShotsByPersonId(personId)
-        val collectedShots = mutableListOf<ShotEntity>()
-        shotEntities.collect { list ->
-            collectedShots.addAll(list)
-            return@collect
-        }
+        val collectedShots = shotDao.getShotsByPersonId(personId).first()
         for (shot in collectedShots) {
             val files = fileDao.getFilesByShotIdOnce(shot.id)
             shots.add(ShotWithFiles(shot = shot, files = files))

@@ -56,11 +56,12 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
-import coil3.compose.SubcomposeAsyncImage
 import dev.phos.android.data.local.entity.FileEntity
 import dev.phos.android.ui.common.FullScreenLoading
 import kotlinx.coroutines.flow.distinctUntilChanged
 import me.saket.telephoto.zoomable.coil3.ZoomableAsyncImage
+import me.saket.telephoto.zoomable.rememberZoomableImageState
+import me.saket.telephoto.zoomable.rememberZoomableState
 
 @Composable
 fun BrowserScreen(
@@ -93,6 +94,7 @@ fun BrowserScreen(
     }
 
     var showOverlay by remember { mutableStateOf(true) }
+    var currentFileIndex by remember { mutableStateOf(uiState.initialFileIndex) }
 
     val verticalPagerState = rememberPagerState(
         initialPage = uiState.initialShotIndex,
@@ -104,6 +106,7 @@ fun BrowserScreen(
         snapshotFlow { verticalPagerState.currentPage }
             .distinctUntilChanged()
             .collect { shotIndex ->
+                currentFileIndex = 0
                 viewModel.onShotChanged(shotIndex, 0)
             }
     }
@@ -141,6 +144,7 @@ fun BrowserScreen(
                     snapshotFlow { horizontalPagerState.currentPage }
                         .distinctUntilChanged()
                         .collect { fileIndex ->
+                            currentFileIndex = fileIndex
                             viewModel.onShotChanged(shotIndex, fileIndex)
                         }
                 }
@@ -206,10 +210,7 @@ fun BrowserScreen(
                 personName = uiState.personName,
                 shotIndex = verticalPagerState.currentPage,
                 shotCount = uiState.shots.size,
-                fileIndex = if (uiState.shots.isNotEmpty()) {
-                    val currentShot = uiState.shots[verticalPagerState.currentPage]
-                    0 // Will be updated by horizontal pager
-                } else 0,
+                fileIndex = currentFileIndex,
                 fileCount = if (uiState.shots.isNotEmpty()) {
                     uiState.shots[verticalPagerState.currentPage].files.size
                 } else 0,
@@ -254,6 +255,8 @@ private fun ImagePage(
     previewUrl: String,
     onTap: () -> Unit,
 ) {
+    val zoomableState = rememberZoomableImageState(rememberZoomableState())
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -263,9 +266,20 @@ private fun ImagePage(
             ) { onTap() },
         contentAlignment = Alignment.Center,
     ) {
-        // Progressive loading: small thumbnail as placeholder, w=1080 preview as main
+        // Show low-res thumbnail immediately as placeholder
+        if (!zoomableState.isImageDisplayed) {
+            AsyncImage(
+                model = thumbnailUrl,
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+
+        // Progressive loading: show zoomable high-res preview on top
         ZoomableAsyncImage(
             model = previewUrl,
+            state = zoomableState,
             contentDescription = null,
             contentScale = ContentScale.Fit,
             modifier = Modifier.fillMaxSize(),

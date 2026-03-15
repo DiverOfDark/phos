@@ -62,6 +62,11 @@ fun PhosNavigation() {
                 onSettingsClick = {
                     navController.navigate(Routes.SETTINGS)
                 },
+                onReLogin = {
+                    navController.navigate(Routes.LOGIN) {
+                        popUpTo(0) { inclusive = true }
+                    }
+                },
             )
         }
 

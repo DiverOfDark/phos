@@ -49,6 +49,10 @@ class PeopleViewModel @Inject constructor(
         }
     }
 
+    fun reLogin() {
+        authRepository.clearToken()
+    }
+
     fun buildCoverUrl(person: PersonEntity): String? {
         val thumbnailUrl = person.coverShotThumbnailUrl ?: person.thumbnailUrl ?: return null
         val baseUrl = authRepository.getServerUrl()?.trimEnd('/') ?: return null

@@ -395,6 +395,15 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         }
     }
 
+    // Indexes for join/filter performance (IF NOT EXISTS is idempotent)
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_faces_person_id ON faces(person_id);
+         CREATE INDEX IF NOT EXISTS idx_faces_file_id ON faces(file_id);
+         CREATE INDEX IF NOT EXISTS idx_files_shot_id ON files(shot_id);
+         CREATE INDEX IF NOT EXISTS idx_shots_primary_person_id ON shots(primary_person_id);
+         CREATE INDEX IF NOT EXISTS idx_shots_timestamp ON shots(timestamp);"
+    )?;
+
     Ok(conn)
 }
 
