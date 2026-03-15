@@ -141,6 +141,7 @@ impl Scanner {
     /// Updates the hash if it changed; removes the record if the file is missing from disk.
     pub fn rehash_files(&self) -> anyhow::Result<()> {
         let conn = self.open_db()?;
+        let library_root = self.db_path.parent().unwrap();
 
         let mut stmt = conn.prepare("SELECT id, path, hash FROM files")?;
         let rows: Vec<(String, String, String)> = stmt
@@ -163,7 +164,7 @@ impl Scanner {
         let mut removed = 0u64;
 
         for (file_id, file_path, old_hash) in &rows {
-            let path = Path::new(file_path);
+            let path = db::resolve_path(library_root, file_path);
             pb.set_message(
                 path.file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -187,7 +188,7 @@ impl Scanner {
                 continue;
             }
 
-            match calculate_hash(path) {
+            match calculate_hash(&path) {
                 Ok(new_hash) => {
                     if new_hash != *old_hash {
                         let _ = conn.execute(
@@ -327,13 +328,14 @@ impl Scanner {
     /// If the parent shot has no remaining files, the shot record is also removed.
     /// Orphaned person records (those with no remaining faces) are cleaned up too.
     pub fn remove_file(&self, conn: &Connection, path: &Path) -> anyhow::Result<()> {
-        let path_str = path.to_string_lossy();
+        let library_root = self.db_path.parent().unwrap();
+        let path_str = db::make_relative(library_root, path);
 
         // Look up the file by path
         let (file_id, shot_id): (String, String) = conn
             .query_row(
                 "SELECT id, shot_id FROM files WHERE path = ?",
-                params![path_str.as_ref()],
+                params![path_str],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|_| anyhow::anyhow!("File not found in DB: {:?}", path))?;
@@ -670,12 +672,14 @@ impl Scanner {
         dhash_cache: &std::sync::Mutex<Vec<DHashCacheEntry>>,
     ) -> anyhow::Result<()> {
         // --- Phase 1: CPU-heavy work (no DB writes) ---
+        let library_root = self.db_path.parent().unwrap();
+        let relative_path = db::make_relative(library_root, path);
 
         // Quick path duplicate check — catches concurrent processing of the
         // same file (e.g. upload handler + watcher race).
         {
             let mut stmt = conn.prepare("SELECT id FROM files WHERE path = ?")?;
-            let mut rows = stmt.query(params![path.to_string_lossy().as_ref()])?;
+            let mut rows = stmt.query(params![&relative_path])?;
             if rows.next()?.is_some() {
                 debug!("File already indexed at path {:?}, skipping", path);
                 return Ok(());
@@ -856,7 +860,7 @@ impl Scanner {
 
             conn.execute(
                 "INSERT INTO files (id, shot_id, path, hash, mime_type, file_size, is_original) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![id, actual_shot_id, path.to_string_lossy(), hash, mime_type, file_size, is_original],
+                params![id, actual_shot_id, relative_path, hash, mime_type, file_size, is_original],
             )?;
 
             if is_new_shot {

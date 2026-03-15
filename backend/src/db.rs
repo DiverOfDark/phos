@@ -1,5 +1,5 @@
-use rusqlite::{Connection, Result};
-use std::path::Path;
+use rusqlite::{params, Connection, Result};
+use std::path::{Path, PathBuf};
 
 /// Open a connection with WAL mode and busy timeout enabled.
 /// Use this when worker threads need their own connection.
@@ -8,6 +8,26 @@ pub fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", "60000")?;
     Ok(conn)
+}
+
+/// Convert an absolute filesystem path to a path relative to the library root.
+/// Used when storing paths in the database for portability.
+pub fn make_relative(library_root: &Path, abs_path: &Path) -> String {
+    match abs_path.strip_prefix(library_root) {
+        Ok(rel) => rel.to_string_lossy().to_string(),
+        Err(_) => abs_path.to_string_lossy().to_string(),
+    }
+}
+
+/// Resolve a database path to an absolute filesystem path.
+/// If the path is already absolute (pre-migration data), returns it as-is.
+pub fn resolve_path(library_root: &Path, db_path: &str) -> PathBuf {
+    let p = Path::new(db_path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        library_root.join(p)
+    }
 }
 
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
@@ -312,6 +332,33 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             "ALTER TABLE comfyui_workflows ADD COLUMN description TEXT",
             [],
         )?;
+    }
+
+    // Migration: convert absolute file paths to relative paths.
+    // Paths stored as absolute (e.g. /home/user/library/person/001/photo.jpg) become
+    // relative to the library root (e.g. person/001/photo.jpg).
+    // Idempotent: already-relative paths don't match the LIKE prefix.
+    {
+        let library_root = path.as_ref().parent().unwrap_or(Path::new("."));
+        let prefix = format!("{}/", library_root.to_string_lossy());
+
+        let files_migrated = conn.execute(
+            "UPDATE files SET path = SUBSTR(path, LENGTH(?1) + 1) WHERE path LIKE (?1 || '%')",
+            params![prefix],
+        )?;
+
+        let faces_migrated = conn.execute(
+            "UPDATE faces SET thumbnail_path = SUBSTR(thumbnail_path, LENGTH(?1) + 1) WHERE thumbnail_path LIKE (?1 || '%')",
+            params![prefix],
+        )?;
+
+        if files_migrated > 0 || faces_migrated > 0 {
+            tracing::info!(
+                "Migrated paths to relative: {} files, {} face thumbnails",
+                files_migrated,
+                faces_migrated
+            );
+        }
     }
 
     Ok(conn)

@@ -28,7 +28,8 @@ struct StoredFileRecord {
 }
 
 /// Load all files with visual_embedding (dHash) from the DB.
-fn load_dhash_cache(conn: &Connection) -> Vec<StoredFileRecord> {
+/// Resolves DB paths to absolute using the library root.
+fn load_dhash_cache(conn: &Connection, library_root: &Path) -> Vec<StoredFileRecord> {
     let mut stmt = match conn
         .prepare("SELECT path, visual_embedding FROM files WHERE visual_embedding IS NOT NULL")
     {
@@ -57,7 +58,10 @@ fn load_dhash_cache(conn: &Connection) -> Vec<StoredFileRecord> {
         if blob.len() == 8 {
             let mut dhash = [0u8; 8];
             dhash.copy_from_slice(&blob);
-            records.push(StoredFileRecord { path, dhash });
+            let resolved = db::resolve_path(library_root, &path)
+                .to_string_lossy()
+                .to_string();
+            records.push(StoredFileRecord { path: resolved, dhash });
         }
     }
     records
@@ -170,7 +174,7 @@ pub fn run_import(
     };
 
     // Load dHash cache (starts empty, grows as we import)
-    let dhash_cache = Mutex::new(load_dhash_cache(&conn));
+    let dhash_cache = Mutex::new(load_dhash_cache(&conn, target));
 
     info!("Using {} import threads", threads);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -752,9 +756,9 @@ pub fn rename_person_folder(
     }
 
     // Batch-update files.path: replace old folder_name prefix with new one
-    // Find all files that belong to shots assigned to this person
-    let old_prefix = format!("{}/", old_dir.to_string_lossy());
-    let new_prefix = format!("{}/", new_dir.to_string_lossy());
+    // DB paths are relative to library root, so prefixes are just folder names
+    let old_prefix = format!("{}/", old_folder_name);
+    let new_prefix = format!("{}/", new_folder_name);
 
     let mut stmt = conn.prepare(
         "SELECT f.id, f.path FROM files f
@@ -909,7 +913,7 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
         let target_dir = library.join(&person_folder).join(&folder_num_str);
 
         for file_row in files {
-            let current_path = PathBuf::from(&file_row.path);
+            let current_path = db::resolve_path(library, &file_row.path);
             pb.set_message(
                 current_path
                     .file_name()
@@ -1043,10 +1047,11 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                     fs::remove_file(&current_path)?;
                 }
 
-                // Update DB path
+                // Update DB path (store relative to library root)
+                let relative_target = db::make_relative(library, &target_path);
                 conn.execute(
                     "UPDATE files SET path = ? WHERE id = ?",
-                    params![target_path.to_string_lossy().as_ref(), file_row.file_id],
+                    params![relative_target, file_row.file_id],
                 )?;
 
                 Ok(())

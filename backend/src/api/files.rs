@@ -192,12 +192,12 @@ pub(super) async fn get_file(
         .map_err(|_| StatusCode::NOT_FOUND)?
     };
 
-    let path = std::path::Path::new(&file_path);
+    let path = crate::db::resolve_path(&state.library_root, &file_path);
     if !path.exists() {
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let bytes = tokio::fs::read(path)
+    let bytes = tokio::fs::read(&path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -272,7 +272,7 @@ pub(super) async fn get_file_thumbnail(
         (path, mime, db_path)
     };
 
-    let source_path = std::path::Path::new(&file_path);
+    let source_path = crate::db::resolve_path(&state.library_root, &file_path);
     if !source_path.exists() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -308,15 +308,15 @@ pub(super) async fn get_file_thumbnail(
     let mime = mime_type.unwrap_or_default();
     let is_video = mime.starts_with("video/");
 
-    let source_path_owned = file_path.clone();
+    let source_path_owned = source_path.clone();
     let thumb_path_clone = thumb_path.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let img = if is_video {
-            crate::scanner::extract_first_video_frame(std::path::Path::new(&source_path_owned))
+            crate::scanner::extract_first_video_frame(&source_path_owned)
                 .map_err(|e| format!("Failed to extract video frame: {}", e))?
         } else {
-            crate::scanner::open_image(std::path::Path::new(&source_path_owned))
+            crate::scanner::open_image(&source_path_owned)
                 .map_err(|e| format!("Failed to open image: {}", e))?
         };
 
@@ -497,8 +497,9 @@ pub(super) async fn delete_file(
         })?;
 
     // Delete physical file from disk (best-effort)
-    if let Err(e) = std::fs::remove_file(&file_path) {
-        tracing::warn!("Failed to delete file from disk {:?}: {}", file_path, e);
+    let resolved_path = crate::db::resolve_path(&state.library_root, &file_path);
+    if let Err(e) = std::fs::remove_file(&resolved_path) {
+        tracing::warn!("Failed to delete file from disk {:?}: {}", resolved_path, e);
     }
 
     // Delete cached thumbnail and clean up empty directories (best-effort)

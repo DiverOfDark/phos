@@ -284,7 +284,7 @@ pub fn prepare_workflow(
 /// Get the source image bytes (PNG-encoded) for a shot.
 /// For images: reads the original file.
 /// For videos: extracts the first frame.
-fn get_source_image(conn: &Connection, shot_id: &str) -> anyhow::Result<(Vec<u8>, String)> {
+fn get_source_image(conn: &Connection, shot_id: &str, library_root: &Path) -> anyhow::Result<(Vec<u8>, String)> {
     // Find the original file for this shot
     let (file_path, mime_type): (String, String) = conn
         .query_row(
@@ -296,15 +296,15 @@ fn get_source_image(conn: &Connection, shot_id: &str) -> anyhow::Result<(Vec<u8>
         )
         .map_err(|_| anyhow::anyhow!("No original file found for shot {}", shot_id))?;
 
-    let path = Path::new(&file_path);
+    let path = db::resolve_path(library_root, &file_path);
     if !path.exists() {
         anyhow::bail!("Source file does not exist: {}", file_path);
     }
 
     let img: DynamicImage = if mime_type.starts_with("video/") {
-        scanner::extract_first_video_frame(path)?
+        scanner::extract_first_video_frame(&path)?
     } else {
-        scanner::open_image(path)?
+        scanner::open_image(&path)?
     };
 
     // Encode to PNG bytes
@@ -329,6 +329,7 @@ pub fn spawn_enhancement_worker(
     shutdown: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
+        let library_root = db_path.parent().unwrap().to_path_buf();
         let conn = match db::open_connection(&db_path) {
             Ok(c) => c,
             Err(e) => {
@@ -355,8 +356,8 @@ pub fn spawn_enhancement_worker(
                 break;
             }
 
-            process_pending_tasks(&conn, &client);
-            poll_active_tasks(&conn, &client, timeout_secs);
+            process_pending_tasks(&conn, &client, &library_root);
+            poll_active_tasks(&conn, &client, timeout_secs, &library_root);
             check_retries(&conn);
             cleanup_completed_tasks(&conn);
 
@@ -384,7 +385,7 @@ fn recover_interrupted_tasks(conn: &Connection) {
 }
 
 /// Pick up pending tasks and start processing them.
-fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient) {
+fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient, library_root: &Path) {
     let tasks: Vec<(String, String, String, String)> = {
         let mut stmt = match conn.prepare(
             "SELECT t.id, t.shot_id, t.workflow_id, w.workflow_json
@@ -425,7 +426,7 @@ fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient) {
         );
 
         // 1. Get source image
-        let (image_data, upload_name) = match get_source_image(conn, &shot_id) {
+        let (image_data, upload_name) = match get_source_image(conn, &shot_id, library_root) {
             Ok(v) => v,
             Err(e) => {
                 mark_failed(
@@ -495,7 +496,7 @@ fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient) {
 }
 
 /// Poll tasks that are queued/processing against ComfyUI history.
-fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u64) {
+fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u64, library_root: &Path) {
     let tasks: Vec<(String, String, String, String)> = {
         let mut stmt = match conn.prepare(
             "SELECT t.id, t.shot_id, t.comfyui_prompt_id, t.started_at
@@ -611,7 +612,7 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
 
                         if let Some(filename) = filename {
                             match download_and_save_output(
-                                conn, client, &task_id, &shot_id, filename, subfolder, out_type,
+                                conn, client, &task_id, &shot_id, filename, subfolder, out_type, library_root,
                             ) {
                                 Ok(_) => {
                                     downloaded = true;
@@ -642,7 +643,7 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
 
                         if let Some(filename) = filename {
                             match download_and_save_output(
-                                conn, client, &task_id, &shot_id, filename, subfolder, out_type,
+                                conn, client, &task_id, &shot_id, filename, subfolder, out_type, library_root,
                             ) {
                                 Ok(_) => {
                                     downloaded = true;
@@ -686,11 +687,12 @@ fn download_and_save_output(
     filename: &str,
     subfolder: &str,
     output_type: &str,
+    library_root: &Path,
 ) -> anyhow::Result<()> {
     let data = client.download_output(filename, subfolder, output_type)?;
 
     // Get the original file path to determine where to save
-    let original_path: String = conn
+    let original_path_str: String = conn
         .query_row(
             "SELECT path FROM files WHERE shot_id = ?1 AND is_original = 1 LIMIT 1",
             params![shot_id],
@@ -698,7 +700,7 @@ fn download_and_save_output(
         )
         .map_err(|_| anyhow::anyhow!("No original file found for shot {}", shot_id))?;
 
-    let original = Path::new(&original_path);
+    let original = db::resolve_path(library_root, &original_path_str);
     let parent = original
         .parent()
         .ok_or_else(|| anyhow::anyhow!("No parent directory"))?;
@@ -738,7 +740,7 @@ fn download_and_save_output(
 
     let file_id = Uuid::new_v4().to_string();
     let file_size = data.len() as i64;
-    let path_str = output_path.to_string_lossy().to_string();
+    let path_str = db::make_relative(library_root, &output_path);
 
     conn.execute(
         "INSERT INTO files (id, shot_id, path, hash, mime_type, file_size, is_original)

@@ -334,7 +334,7 @@ pub(super) async fn get_face_thumbnail(
         (result.0, result.1, result.2, result.3, result.4, db_path)
     };
 
-    let source_path = std::path::Path::new(&file_path);
+    let source_path = crate::db::resolve_path(&state.library_root, &file_path);
     if !source_path.exists() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -360,11 +360,11 @@ pub(super) async fn get_face_thumbnail(
     }
 
     // Generate face thumbnail
-    let file_path_owned = file_path.clone();
+    let source_path_owned = source_path.clone();
     let thumb_path_clone = thumb_path.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let img = crate::scanner::open_image(std::path::Path::new(&file_path_owned))
+        let img = crate::scanner::open_image(&source_path_owned)
             .map_err(|e| format!("Failed to open image: {}", e))?;
 
         let (img_w, img_h) = img.dimensions();
@@ -478,12 +478,12 @@ pub(super) async fn add_manual_face(
         payload.box_y2,
     );
     let scanner = state.scanner.clone();
-    let file_path_owned = file_path.clone();
+    let resolved_path = crate::db::resolve_path(&state.library_root, &file_path);
 
     // Compute embedding on a blocking thread
     let (face_id, embedding_blob) =
         tokio::task::spawn_blocking(move || -> Result<(String, Vec<u8>), String> {
-            let img = crate::scanner::open_image(std::path::Path::new(&file_path_owned))
+            let img = crate::scanner::open_image(&resolved_path)
                 .map_err(|e| format!("Failed to open image: {}", e))?;
 
             let embedding = if let Some(ai) = scanner.ai() {

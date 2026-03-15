@@ -468,8 +468,9 @@ pub(super) async fn delete_shot(
 
     // Delete physical files from disk (best-effort)
     for (_, path) in &files {
-        if let Err(e) = std::fs::remove_file(path) {
-            tracing::warn!("Failed to delete file from disk {:?}: {}", path, e);
+        let resolved = crate::db::resolve_path(&state.library_root, path);
+        if let Err(e) = std::fs::remove_file(&resolved) {
+            tracing::warn!("Failed to delete file from disk {:?}: {}", resolved, e);
         }
     }
 
