@@ -15,7 +15,7 @@ RUN PHOS_VERSION=${PHOS_VERSION} npm run build
 
 # Stage 2: Build Backend
 FROM rust:1.93 AS backend-builder
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install --no-install-recommends -y \
     pkg-config \
     libssl-dev \
     libclang-dev \
@@ -60,7 +60,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Stage 3: Final Image
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install --no-install-recommends -y \
     libssl3 \
     libsqlite3-0 \
     ffmpeg \
