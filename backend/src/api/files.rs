@@ -463,15 +463,6 @@ pub(super) async fn delete_file(
         })
         .unwrap_or_default();
 
-    // Delete face_neighbors
-    db.execute(
-        "DELETE FROM face_neighbors WHERE face_id_a IN (SELECT id FROM faces WHERE file_id = ?) OR face_id_b IN (SELECT id FROM faces WHERE file_id = ?)",
-        params![id, id],
-    ).map_err(|e| {
-        tracing::error!("Failed to delete face_neighbors: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
     // Delete faces
     db.execute("DELETE FROM faces WHERE file_id = ?", params![id])
         .map_err(|e| {

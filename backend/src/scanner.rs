@@ -1,4 +1,4 @@
-use crate::ai::{cosine_similarity, AiPipeline, MAX_FACE_DISTANCE, MIN_FACES_FOR_CORE};
+use crate::ai::{cosine_similarity, AiPipeline, MAX_FACE_DISTANCE};
 use crate::db;
 use exif::{In, Tag};
 use ffmpeg_next as ffmpeg;
@@ -173,10 +173,6 @@ impl Scanner {
 
             if !path.exists() {
                 // File missing from disk — remove from DB
-                let _ = conn.execute(
-                    "DELETE FROM face_neighbors WHERE face_id_a IN (SELECT id FROM faces WHERE file_id = ?) OR face_id_b IN (SELECT id FROM faces WHERE file_id = ?)",
-                    params![file_id, file_id],
-                );
                 let _ = conn.execute("DELETE FROM faces WHERE file_id = ?", params![file_id]);
                 let _ = conn.execute(
                     "DELETE FROM video_keyframes WHERE video_file_id = ?",
@@ -396,222 +392,211 @@ impl Scanner {
         Ok(())
     }
 
-    /// Cluster all unassigned faces using a core-point nearest-neighbor approach.
+    /// Cluster unassigned faces using centroid-based assignment.
     ///
-    /// Pass 1: For each unassigned face, find neighbors within `MAX_FACE_DISTANCE`.
-    ///   - "Core" faces (≥ `MIN_FACES_FOR_CORE` neighbors) are assigned to the
-    ///     closest neighbor's person, or a new person is created.
-    ///   - Non-core faces are deferred.
-    ///     Pass 2: Deferred faces are re-checked — some may now have assigned neighbors.
+    /// Each face is compared against existing person representative embeddings (centroids).
+    /// If it matches within `MAX_FACE_DISTANCE`, it's assigned to that person and the
+    /// centroid is updated as a running average. Otherwise a new person is created.
+    /// This is O(n × k) where k = number of people, instead of the previous O(n²) pairwise approach.
     pub fn cluster_faces(&self, conn: &Connection) -> anyhow::Result<()> {
-        // Load all face embeddings
-        let mut stmt =
-            conn.prepare("SELECT id, embedding, person_id FROM faces WHERE embedding IS NOT NULL")?;
-        let rows: Vec<(String, Vec<f32>, Option<String>)> = stmt
+        // Load unassigned faces with embeddings
+        let mut stmt = conn.prepare(
+            "SELECT id, embedding FROM faces WHERE embedding IS NOT NULL AND person_id IS NULL",
+        )?;
+        let unassigned: Vec<(String, Vec<f32>)> = stmt
             .query_map([], |row| {
                 let id: String = row.get(0)?;
                 let blob: Vec<u8> = row.get(1)?;
-                let person_id: Option<String> = row.get(2)?;
-                Ok((id, blob, person_id))
+                Ok((id, blob))
             })?
             .filter_map(|r| r.ok())
-            .filter_map(|(id, blob, person_id)| {
+            .filter_map(|(id, blob)| {
                 bincode::deserialize::<Vec<f32>>(&blob)
                     .ok()
                     .filter(|e| !e.is_empty())
-                    .map(|embedding| (id, embedding, person_id))
+                    .map(|embedding| (id, embedding))
             })
             .collect();
 
-        if rows.is_empty() {
+        if unassigned.is_empty() {
+            let total: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM faces WHERE embedding IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            info!("All {} faces already assigned, nothing to cluster", total);
             return Ok(());
         }
 
-        // Build index: face_id -> (embedding, person_id)
-        let face_ids: Vec<String> = rows.iter().map(|(id, _, _)| id.clone()).collect();
-        let embeddings: Vec<Vec<f32>> = rows.iter().map(|(_, e, _)| e.clone()).collect();
-        let mut assignments: Vec<Option<String>> = rows.iter().map(|(_, _, p)| p.clone()).collect();
+        info!("Clustering: {} unassigned faces", unassigned.len());
 
-        let n = face_ids.len();
-        let unassigned_count = assignments.iter().filter(|a| a.is_none()).count();
+        // Load existing people centroids: (person_id, embedding_sum, face_count)
+        // We track the unnormalized sum so we can update it incrementally.
+        // cosine_similarity normalizes internally, so comparisons still work correctly.
+        let mut centroids: Vec<(String, Vec<f32>, usize)> = {
+            let mut pstmt = conn.prepare(
+                "SELECT p.id, p.representative_embedding, \
+                 (SELECT COUNT(*) FROM faces f WHERE f.person_id = p.id) \
+                 FROM people p WHERE p.representative_embedding IS NOT NULL",
+            )?;
+            let rows: Vec<(String, Vec<u8>, usize)> = pstmt
+                .query_map([], |row| {
+                    let pid: String = row.get(0)?;
+                    let blob: Vec<u8> = row.get(1)?;
+                    let count: usize = row.get(2)?;
+                    Ok((pid, blob, count))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows.into_iter()
+                .filter_map(|(pid, blob, count)| {
+                    bincode::deserialize::<Vec<f32>>(&blob)
+                        .ok()
+                        .filter(|e| !e.is_empty())
+                        .map(|e| {
+                            // Convert normalized centroid back to sum for running average
+                            let sum: Vec<f32> =
+                                e.iter().map(|v| v * count as f32).collect();
+                            (pid, sum, count)
+                        })
+                })
+                .collect()
+        };
 
-        if unassigned_count == 0 {
-            info!("All {} faces already assigned, nothing to cluster", n);
-            return Ok(());
-        }
-
-        info!(
-            "Clustering: {} total faces, {} unassigned",
-            n, unassigned_count
-        );
-
-        // Build face_id -> index lookup
-        let id_to_idx: HashMap<&str, usize> = face_ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.as_str(), i))
-            .collect();
-
-        // Load cached neighbors from DB
-        let mut neighbors: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
-        let mut cached_faces: HashSet<String> = HashSet::new();
-
+        // Also ensure people without representative_embedding get one computed
+        // from their existing faces (handles old data from before this migration)
         {
-            let mut load_stmt =
-                conn.prepare("SELECT face_id_a, face_id_b, distance FROM face_neighbors")?;
-            let cached_rows: Vec<(String, String, f32)> = load_stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            let orphan_pids: Vec<String> = conn
+                .prepare(
+                    "SELECT id FROM people WHERE representative_embedding IS NULL \
+                     AND EXISTS (SELECT 1 FROM faces WHERE person_id = people.id AND embedding IS NOT NULL)",
+                )?
+                .query_map([], |row| row.get(0))?
                 .filter_map(|r| r.ok())
                 .collect();
 
-            for (a, b, dist) in &cached_rows {
-                if let (Some(&i), Some(&j)) = (id_to_idx.get(a.as_str()), id_to_idx.get(b.as_str()))
-                {
-                    neighbors[i].push((j, *dist));
-                    cached_faces.insert(a.clone());
+            for pid in orphan_pids {
+                let face_embs: Vec<Vec<f32>> = conn
+                    .prepare("SELECT embedding FROM faces WHERE person_id = ? AND embedding IS NOT NULL")?
+                    .query_map(params![&pid], |row| {
+                        let blob: Vec<u8> = row.get(0)?;
+                        Ok(blob)
+                    })?
+                    .filter_map(|r| r.ok())
+                    .filter_map(|blob| {
+                        bincode::deserialize::<Vec<f32>>(&blob)
+                            .ok()
+                            .filter(|e| !e.is_empty())
+                    })
+                    .collect();
+
+                if face_embs.is_empty() {
+                    continue;
                 }
-                // Note: the reverse (b->a) is stored as its own row
+
+                let dim = face_embs[0].len();
+                let mut sum = vec![0.0f32; dim];
+                for emb in &face_embs {
+                    for (i, v) in emb.iter().enumerate() {
+                        sum[i] += v;
+                    }
+                }
+                let count = face_embs.len();
+
+                // Save normalized centroid to DB
+                let mean: Vec<f32> = sum.iter().map(|v| v / count as f32).collect();
+                let norm: f32 = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    let normalized: Vec<f32> = mean.iter().map(|v| v / norm).collect();
+                    let blob = bincode::serialize(&normalized)?;
+                    conn.execute(
+                        "UPDATE people SET representative_embedding = ? WHERE id = ?",
+                        params![blob, &pid],
+                    )?;
+                }
+
+                centroids.push((pid, sum, count));
             }
         }
 
-        // Find faces that need distance computation (not yet in cache)
-        let new_face_indices: Vec<usize> = (0..n)
-            .filter(|i| !cached_faces.contains(&face_ids[*i]))
-            .collect();
-
-        let new_count = new_face_indices.len();
-        let cached_count = n - new_count;
-
-        if new_count == 0 {
-            info!("All {} face distances loaded from cache", n);
-        } else {
-            info!(
-                "Computing distances for {} new faces ({} cached)",
-                new_count, cached_count
-            );
-        }
-
-        let pb = ProgressBar::new(new_count as u64);
+        let pb = ProgressBar::new(unassigned.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
                 .unwrap()
                 .progress_chars("=>-"),
         );
-        pb.set_message("Computing distances");
+        pb.set_message("Assigning faces to people");
 
-        // Compute distances for new faces against ALL faces, and store in cache
-        // Also compute distances between cached faces and new faces (reverse direction)
-        {
-            let mut insert_stmt = conn.prepare(
-                "INSERT OR IGNORE INTO face_neighbors (face_id_a, face_id_b, distance) VALUES (?, ?, ?)"
-            )?;
+        let mut update_stmt = conn.prepare("UPDATE faces SET person_id = ? WHERE id = ?")?;
+        let mut affected_people: HashSet<String> = HashSet::new();
+        let mut assigned_count = 0usize;
 
-            for &i in &new_face_indices {
-                let mut nbrs = Vec::new();
-                for j in 0..n {
-                    if i == j {
-                        continue;
-                    }
-                    if embeddings[i].len() != embeddings[j].len() {
-                        continue;
-                    }
-                    let sim = cosine_similarity(&embeddings[i], &embeddings[j]);
-                    let dist = 1.0 - sim;
-                    if dist <= MAX_FACE_DISTANCE {
-                        nbrs.push((j, dist));
-                        // Cache both directions
-                        insert_stmt.execute(params![face_ids[i], face_ids[j], dist])?;
-                        insert_stmt.execute(params![face_ids[j], face_ids[i], dist])?;
-                        // Also add reverse direction to in-memory neighbor list
-                        neighbors[j].push((i, dist));
+        for (face_id, embedding) in &unassigned {
+            // Find best matching person centroid
+            let mut best: Option<(usize, f32)> = None;
+            for (idx, (_, centroid_sum, _)) in centroids.iter().enumerate() {
+                if centroid_sum.len() != embedding.len() {
+                    continue;
+                }
+                // cosine_similarity normalizes internally, so using the sum works
+                let dist = 1.0 - cosine_similarity(embedding, centroid_sum);
+                if dist <= MAX_FACE_DISTANCE {
+                    if let Some((_, best_dist)) = best {
+                        if dist < best_dist {
+                            best = Some((idx, dist));
+                        }
+                    } else {
+                        best = Some((idx, dist));
                     }
                 }
-                neighbors[i] = nbrs;
-                pb.inc(1);
-            }
-        }
-
-        // Sort all neighbor lists by distance
-        for nbrs in &mut neighbors {
-            nbrs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        }
-
-        // Prune cached entries for faces that no longer exist in the DB
-        conn.execute(
-            "DELETE FROM face_neighbors WHERE face_id_a NOT IN (SELECT id FROM faces) \
-             OR face_id_b NOT IN (SELECT id FROM faces)",
-            [],
-        )?;
-
-        pb.set_message("Assigning clusters");
-        pb.set_length(n as u64);
-        pb.set_position(0);
-
-        let mut deferred: Vec<usize> = Vec::new();
-
-        // Pass 1: Process core faces
-        for i in 0..n {
-            if assignments[i].is_some() {
-                pb.inc(1);
-                continue;
             }
 
-            let nbrs = &neighbors[i];
-            if nbrs.len() >= MIN_FACES_FOR_CORE {
-                // Core face: look for an assigned neighbor
-                let assigned_neighbor = nbrs.iter().find(|(j, _)| assignments[*j].is_some());
-
-                let person_id = if let Some((j, _)) = assigned_neighbor {
-                    assignments[*j].clone().unwrap()
-                } else {
-                    // Create a new person
-                    let pid = Uuid::new_v4().to_string();
-                    conn.execute(
-                        "INSERT INTO people (id, thumbnail_face_id) VALUES (?, ?)",
-                        params![pid, face_ids[i]],
-                    )?;
-                    pid
-                };
-
-                assignments[i] = Some(person_id.clone());
-
-                // Also assign unassigned neighbors that are core or close
-                for &(j, _) in nbrs {
-                    if assignments[j].is_none() {
-                        assignments[j] = Some(person_id.clone());
-                    }
+            let person_id = if let Some((idx, _)) = best {
+                // Assign to existing person and update running centroid
+                let (ref pid, ref mut sum, ref mut count) = centroids[idx];
+                for (i, v) in embedding.iter().enumerate() {
+                    sum[i] += v;
                 }
+                *count += 1;
+                pid.clone()
             } else {
-                deferred.push(i);
-            }
+                // No match — create a new person
+                let pid = Uuid::new_v4().to_string();
+                let emb_blob = bincode::serialize(embedding)?;
+                conn.execute(
+                    "INSERT INTO people (id, thumbnail_face_id, representative_embedding) VALUES (?, ?, ?)",
+                    params![&pid, face_id, emb_blob],
+                )?;
+                centroids.push((pid.clone(), embedding.clone(), 1));
+                pid
+            };
+
+            update_stmt.execute(params![&person_id, face_id])?;
+            affected_people.insert(person_id);
+            assigned_count += 1;
             pb.inc(1);
-        }
-
-        // Pass 2: Process deferred (non-core) faces
-        for &i in &deferred {
-            if assignments[i].is_some() {
-                continue; // May have been assigned in pass 1 as a neighbor
-            }
-
-            // Find closest assigned neighbor
-            let closest = neighbors[i].iter().find(|(j, _)| assignments[*j].is_some());
-
-            if let Some((j, _)) = closest {
-                assignments[i] = assignments[*j].clone();
-            }
-            // Otherwise leave unassigned (isolated face)
         }
 
         pb.finish_and_clear();
 
-        // Write assignments back to DB
-        let mut update_stmt = conn.prepare("UPDATE faces SET person_id = ? WHERE id = ?")?;
-        let mut assigned_count = 0;
-        for i in 0..n {
-            if let Some(ref person_id) = assignments[i] {
-                update_stmt.execute(params![person_id, face_ids[i]])?;
-                assigned_count += 1;
+        // Recompute and save representative embeddings for all affected people
+        for (pid, sum, count) in &centroids {
+            if !affected_people.contains(pid) {
+                continue;
+            }
+            if *count == 0 {
+                continue;
+            }
+            let mean: Vec<f32> = sum.iter().map(|v| v / *count as f32).collect();
+            let norm: f32 = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                let normalized: Vec<f32> = mean.iter().map(|v| v / norm).collect();
+                let blob = bincode::serialize(&normalized)?;
+                conn.execute(
+                    "UPDATE people SET representative_embedding = ? WHERE id = ?",
+                    params![blob, pid],
+                )?;
             }
         }
 
@@ -656,10 +641,8 @@ impl Scanner {
         let person_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM people", [], |row| row.get(0))?;
         info!(
-            "Clustering complete: {} faces assigned to {} persons ({} unassigned)",
-            assigned_count,
-            person_count,
-            n - assigned_count
+            "Clustering complete: {} faces assigned to {} persons",
+            assigned_count, person_count
         );
 
         Ok(())

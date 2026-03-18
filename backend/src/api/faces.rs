@@ -251,16 +251,6 @@ pub(super) async fn delete_face(
         .ok()
         .flatten();
 
-    // Delete face_neighbors entries where this face appears
-    db.execute(
-        "DELETE FROM face_neighbors WHERE face_id_a = ? OR face_id_b = ?",
-        params![id, id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to delete face_neighbors for face {}: {}", id, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
     // Delete the face record
     let deleted = db
         .execute("DELETE FROM faces WHERE id = ?", params![id])

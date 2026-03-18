@@ -968,7 +968,6 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                     })
                     .unwrap_or_default();
 
-                let _ = conn.execute("DELETE FROM face_neighbors WHERE face_id_a IN (SELECT id FROM faces WHERE file_id = ?) OR face_id_b IN (SELECT id FROM faces WHERE file_id = ?)", params![file_row.file_id, file_row.file_id]);
                 let _ = conn.execute(
                     "DELETE FROM faces WHERE file_id = ?",
                     params![file_row.file_id],

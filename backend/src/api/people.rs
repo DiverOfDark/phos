@@ -454,7 +454,7 @@ pub(super) async fn get_person_browse(
 }
 
 /// Delete a person and all their face records.
-/// Removes all faces belonging to this person, cleans up face_neighbors,
+/// Removes all faces belonging to this person,
 /// recalculates primary_person_id for affected shots, and deletes the person.
 #[utoipa::path(
     delete,
@@ -513,17 +513,6 @@ pub(super) async fn delete_person(
         })?
         .filter_map(|r| r.ok())
         .collect();
-
-    // Delete face_neighbors for all faces of this person
-    db.execute(
-        "DELETE FROM face_neighbors WHERE face_id_a IN (SELECT id FROM faces WHERE person_id = ?)
-         OR face_id_b IN (SELECT id FROM faces WHERE person_id = ?)",
-        params![id, id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to delete face_neighbors for person {}: {}", id, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
 
     // Delete all face records for this person
     db.execute("DELETE FROM faces WHERE person_id = ?", params![id])

@@ -142,16 +142,8 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         [],
     )?;
 
-    // Cached pairwise face distances for clustering
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS face_neighbors (
-            face_id_a TEXT NOT NULL,
-            face_id_b TEXT NOT NULL,
-            distance REAL NOT NULL,
-            PRIMARY KEY (face_id_a, face_id_b)
-        )",
-        [],
-    )?;
+    // Drop legacy O(n²) pairwise distance cache — clustering now uses person centroids
+    conn.execute("DROP TABLE IF EXISTS face_neighbors", [])?;
 
     // ComfyUI workflow templates
     conn.execute(
@@ -363,10 +355,6 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         };
         if !duplicate_ids.is_empty() {
             for file_id in &duplicate_ids {
-                conn.execute(
-                    "DELETE FROM face_neighbors WHERE face_id_a IN (SELECT id FROM faces WHERE file_id = ?1) OR face_id_b IN (SELECT id FROM faces WHERE file_id = ?1)",
-                    params![file_id],
-                )?;
                 conn.execute("DELETE FROM faces WHERE file_id = ?", params![file_id])?;
                 conn.execute("DELETE FROM video_keyframes WHERE video_file_id = ?", params![file_id])?;
                 conn.execute("DELETE FROM files WHERE id = ?", params![file_id])?;

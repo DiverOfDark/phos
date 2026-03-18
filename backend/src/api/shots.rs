@@ -415,17 +415,6 @@ pub(super) async fn delete_shot(
 
     let file_ids: Vec<&str> = files.iter().map(|(id, _)| id.as_str()).collect();
 
-    // Delete face_neighbors referencing faces of these files
-    for fid in &file_ids {
-        db.execute(
-            "DELETE FROM face_neighbors WHERE face_id_a IN (SELECT id FROM faces WHERE file_id = ?) OR face_id_b IN (SELECT id FROM faces WHERE file_id = ?)",
-            params![fid, fid],
-        ).map_err(|e| {
-            tracing::error!("Failed to delete face_neighbors: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    }
-
     // Delete faces
     for fid in &file_ids {
         db.execute("DELETE FROM faces WHERE file_id = ?", params![fid])

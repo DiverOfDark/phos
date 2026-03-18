@@ -12,9 +12,6 @@ use std::sync::Mutex;
 /// Max cosine distance for a face match (= 1.0 - cosine_similarity).
 pub const MAX_FACE_DISTANCE: f32 = 0.6;
 
-/// Minimum neighbors within distance for a face to be considered a "core" point.
-pub const MIN_FACES_FOR_CORE: usize = 3;
-
 /// ArcFace canonical reference landmarks for a 112x112 aligned face.
 /// Order: left eye, right eye, nose tip, left mouth corner, right mouth corner.
 const ARCFACE_REF_LANDMARKS: [(f32, f32); 5] = [
