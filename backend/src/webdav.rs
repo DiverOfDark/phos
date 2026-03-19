@@ -142,7 +142,8 @@ impl DavFileSystem for PhosFs {
 /// Validate Basic Auth credentials against the database.
 /// Returns Ok(()) on success, or an HTTP error response on failure.
 fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<Body>> {
-    let conn = db::open_connection(db_path).map_err(|_| {
+    let conn = db::open_connection(db_path).map_err(|e| {
+        tracing::error!("WebDAV: failed to open database at {:?}: {}", db_path, e);
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::from("Database error"))
@@ -157,6 +158,7 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
     let auth_header = match auth_header {
         Some(h) => h,
         None => {
+            tracing::debug!("WebDAV: no Authorization header, requesting credentials");
             return Err(Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .header(header::WWW_AUTHENTICATE, "Basic realm=\"phos\"")
@@ -170,6 +172,11 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
 
     // If no credentials configured, WebDAV is not enabled
     if stored_username.is_none() || stored_password_hash.is_none() {
+        tracing::warn!(
+            "WebDAV: credentials not configured (username={}, password={}), set them in Settings",
+            stored_username.is_some(),
+            stored_password_hash.is_some()
+        );
         return Err(Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(Body::from(
@@ -179,6 +186,7 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
     }
 
     if !auth_header.starts_with("Basic ") {
+        tracing::warn!("WebDAV: non-Basic auth scheme received");
         return Err(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(header::WWW_AUTHENTICATE, "Basic realm=\"phos\"")
@@ -189,6 +197,7 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(&auth_header[6..])
         .map_err(|_| {
+            tracing::warn!("WebDAV: failed to decode base64 credentials");
             Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .header(header::WWW_AUTHENTICATE, "Basic realm=\"phos\"")
@@ -197,6 +206,7 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
         })?;
 
     let decoded_str = String::from_utf8(decoded).map_err(|_| {
+        tracing::warn!("WebDAV: credentials are not valid UTF-8");
         Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(header::WWW_AUTHENTICATE, "Basic realm=\"phos\"")
@@ -205,6 +215,7 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
     })?;
 
     let (username, password) = decoded_str.split_once(':').ok_or_else(|| {
+        tracing::warn!("WebDAV: malformed credentials (no colon separator)");
         Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(header::WWW_AUTHENTICATE, "Basic realm=\"phos\"")
@@ -217,6 +228,7 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
     let input_hash = format!("{:x}", Sha256::digest(password.as_bytes()));
 
     if username != expected_username || input_hash != expected_hash {
+        tracing::warn!("WebDAV: authentication failed for user {:?}", username);
         return Err(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(header::WWW_AUTHENTICATE, "Basic realm=\"phos\"")
@@ -224,6 +236,7 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
             .unwrap());
     }
 
+    tracing::debug!("WebDAV: authenticated user {:?}", username);
     Ok(())
 }
 
