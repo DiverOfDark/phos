@@ -426,10 +426,10 @@ impl AiPipeline {
 
     fn load_caption_models() -> Result<(Session, Session, Session, Session, Tokenizer)> {
         tracing::info!("Downloading Florence-2-large-ft captioning models...");
-        let vision_encoder_path = ensure_caption_model("onnx/vision_encoder.onnx")?;
-        let embed_tokens_path = ensure_caption_model("onnx/embed_tokens.onnx")?;
-        let encoder_path = ensure_caption_model("onnx/encoder_model.onnx")?;
-        let decoder_path = ensure_caption_model("onnx/decoder_model.onnx")?;
+        let vision_encoder_path = ensure_caption_model("onnx/vision_encoder_q4.onnx")?;
+        let embed_tokens_path = ensure_caption_model("onnx/embed_tokens_q4.onnx")?;
+        let encoder_path = ensure_caption_model("onnx/encoder_model_q4.onnx")?;
+        let decoder_path = ensure_caption_model("onnx/decoder_model_q4.onnx")?;
         let tokenizer_path = ensure_caption_model("tokenizer.json")?;
 
         let build = |path: &std::path::Path| -> Result<Session> {
