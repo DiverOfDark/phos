@@ -37,6 +37,11 @@ import {
   LogOut,
   Wand2,
   Layers,
+  Globe,
+  Trash2,
+  Eye,
+  EyeOff,
+  Copy,
 } from 'lucide-vue-next'
 
 // --- Version ---
@@ -274,9 +279,89 @@ function saveLibraryPath() {
   setTimeout(() => { settingsSaved.value = false }, 2000)
 }
 
+// --- WebDAV Settings ---
+const webdavEnabled = ref(false)
+const webdavUsername = ref('')
+const webdavPassword = ref('')
+const webdavSaving = ref(false)
+const webdavMessage = ref('')
+const webdavError = ref('')
+const webdavShowPassword = ref(false)
+const webdavUrlCopied = ref(false)
+
+const webdavUrl = computed(() => {
+  return `${window.location.protocol}//${window.location.host}/webdav/`
+})
+
+async function fetchWebdavSettings() {
+  try {
+    const res = await fetch('/api/settings/webdav')
+    if (!res.ok) return
+    const data = await res.json()
+    webdavEnabled.value = data.enabled
+    webdavUsername.value = data.username || ''
+  } catch {
+    // ignore
+  }
+}
+
+async function saveWebdavSettings() {
+  if (!webdavUsername.value.trim() || !webdavPassword.value.trim()) {
+    webdavError.value = 'Username and password are required.'
+    return
+  }
+
+  webdavSaving.value = true
+  webdavMessage.value = ''
+  webdavError.value = ''
+
+  try {
+    const res = await fetch('/api/settings/webdav', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: webdavUsername.value.trim(),
+        password: webdavPassword.value.trim(),
+      })
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    webdavMessage.value = 'WebDAV credentials saved!'
+    webdavPassword.value = ''
+    await fetchWebdavSettings()
+    setTimeout(() => { webdavMessage.value = '' }, 3000)
+  } catch (e) {
+    webdavError.value = e.message || 'Failed to save credentials.'
+  } finally {
+    webdavSaving.value = false
+  }
+}
+
+async function disableWebdav() {
+  webdavMessage.value = ''
+  webdavError.value = ''
+  try {
+    const res = await fetch('/api/settings/webdav', { method: 'DELETE' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    webdavEnabled.value = false
+    webdavUsername.value = ''
+    webdavPassword.value = ''
+    webdavMessage.value = 'WebDAV disabled.'
+    setTimeout(() => { webdavMessage.value = '' }, 3000)
+  } catch (e) {
+    webdavError.value = e.message || 'Failed to disable WebDAV.'
+  }
+}
+
+function copyWebdavUrl() {
+  navigator.clipboard.writeText(webdavUrl.value)
+  webdavUrlCopied.value = true
+  setTimeout(() => { webdavUrlCopied.value = false }, 2000)
+}
+
 // --- Init ---
 onMounted(() => {
   fetchPendingCount()
+  fetchWebdavSettings()
 })
 </script>
 
@@ -436,6 +521,103 @@ onMounted(() => {
                       <div class="w-10 h-5 bg-indigo-600 rounded-full relative">
                          <div class="absolute right-1 top-1 w-3 h-3 bg-white rounded-full"></div>
                       </div>
+                    </div>
+                  </div>
+
+                  <!-- WebDAV Access -->
+                  <div class="space-y-3 pt-6 border-t border-white/5">
+                    <div class="flex items-center gap-2">
+                      <Globe class="w-4 h-4 text-zinc-400" />
+                      <Label class="text-sm font-medium">WebDAV Access</Label>
+                      <span
+                        v-if="webdavEnabled"
+                        class="ml-auto px-2 py-0.5 bg-emerald-500/15 text-emerald-400 rounded text-[10px] font-bold"
+                      >ENABLED</span>
+                      <span
+                        v-else
+                        class="ml-auto px-2 py-0.5 bg-zinc-700/50 text-zinc-500 rounded text-[10px] font-bold"
+                      >DISABLED</span>
+                    </div>
+                    <p class="text-xs text-zinc-500">
+                      Mount your library as a read-only network drive via WebDAV.
+                    </p>
+
+                    <div class="space-y-2">
+                      <Label class="text-xs text-zinc-400">Username</Label>
+                      <Input
+                        v-model="webdavUsername"
+                        placeholder="webdav"
+                        class="h-8 text-sm"
+                      />
+                    </div>
+                    <div class="space-y-2">
+                      <Label class="text-xs text-zinc-400">Password</Label>
+                      <div class="flex gap-2">
+                        <div class="relative flex-1">
+                          <Input
+                            v-model="webdavPassword"
+                            :type="webdavShowPassword ? 'text' : 'password'"
+                            :placeholder="webdavEnabled ? '(unchanged)' : 'Set a password'"
+                            class="h-8 text-sm pr-9"
+                          />
+                          <button
+                            type="button"
+                            class="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300"
+                            @click="webdavShowPassword = !webdavShowPassword"
+                          >
+                            <EyeOff v-if="webdavShowPassword" class="w-3.5 h-3.5" />
+                            <Eye v-else class="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="flex gap-2 pt-1">
+                      <Button
+                        size="sm"
+                        class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs"
+                        :disabled="webdavSaving"
+                        @click="saveWebdavSettings"
+                      >
+                        <RefreshCw v-if="webdavSaving" class="w-3 h-3 mr-1 animate-spin" />
+                        {{ webdavEnabled ? 'Update' : 'Enable' }}
+                      </Button>
+                      <Button
+                        v-if="webdavEnabled"
+                        size="sm"
+                        variant="outline"
+                        class="text-xs border-red-500/30 text-red-400 hover:bg-red-500/10"
+                        @click="disableWebdav"
+                      >
+                        <Trash2 class="w-3 h-3 mr-1" />
+                        Disable
+                      </Button>
+                    </div>
+
+                    <!-- Connection URL -->
+                    <div v-if="webdavEnabled" class="p-3 rounded-xl bg-zinc-900/50 border border-white/5 space-y-1">
+                      <p class="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Connection URL</p>
+                      <div class="flex items-center gap-2">
+                        <code class="text-xs text-indigo-400 flex-1 truncate">{{ webdavUrl }}</code>
+                        <button
+                          class="text-zinc-500 hover:text-white transition-colors shrink-0"
+                          @click="copyWebdavUrl"
+                          :title="webdavUrlCopied ? 'Copied!' : 'Copy URL'"
+                        >
+                          <Check v-if="webdavUrlCopied" class="w-3.5 h-3.5 text-emerald-500" />
+                          <Copy v-else class="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <!-- Feedback -->
+                    <div v-if="webdavMessage" class="flex items-start gap-2 p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
+                      <Check class="w-3.5 h-3.5 text-emerald-500 mt-0.5 shrink-0" />
+                      <p class="text-xs text-emerald-400">{{ webdavMessage }}</p>
+                    </div>
+                    <div v-if="webdavError" class="flex items-start gap-2 p-2 rounded-lg bg-red-500/10 border border-red-500/20">
+                      <AlertCircle class="w-3.5 h-3.5 text-red-500 mt-0.5 shrink-0" />
+                      <p class="text-xs text-red-400">{{ webdavError }}</p>
                     </div>
                   </div>
               </div>

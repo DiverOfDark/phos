@@ -10,6 +10,7 @@ Phos is a self-hosted AI-powered media manager that automatically indexes your p
 - **ComfyUI Integration** — Optional image enhancement via ComfyUI workflows
 - **Multi-User Mode** — OIDC/SSO authentication with per-user isolated libraries
 - **Web UI** — Modern Vue 3 gallery with people browser, import dialog, and settings
+- **WebDAV Server** — Read-only network drive access to your library; mount from any file manager, Nextcloud, or rclone
 - **CLI Tools** — `import` (local/remote) and `reorganize` subcommands
 
 ## Quick Start with Docker
@@ -71,13 +72,19 @@ Setting `PHOS_OIDC_ISSUER` enables multi-user mode — each authenticated user g
 | `PHOS_JWT_SECRET` | *(auto-generated)* | Secret for signing session JWTs. Auto-generated and persisted to `.phos_jwt_secret` if not set |
 | `PHOS_JWT_TTL` | `3600` | Session JWT lifetime in seconds |
 
+### WebDAV
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PHOS_WEBDAV_PORT` | *(unset)* | Serve WebDAV on a separate port at `/` (e.g. `4918`). Useful for clients that have trouble with path-prefixed WebDAV |
+
 ### ComfyUI Integration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PHOS_COMFYUI_URL` | *(unset)* | ComfyUI server URL (e.g. `http://localhost:8188`). Enables background image enhancement |
 
-### Docker Compose with SSO and ComfyUI
+### Docker Compose with SSO, ComfyUI, and WebDAV
 
 ```yaml
 services:
@@ -85,12 +92,14 @@ services:
     image: ghcr.io/diverofdark/phos:latest
     ports:
       - "33000:33000"
+      - "4918:4918"          # Optional dedicated WebDAV port
     volumes:
       - ./data/models:/app/models
       - ./data/library:/app/library
     environment:
       - RUST_LOG=info
       - PHOS_LIBRARY_PATH=/app/library
+      - PHOS_WEBDAV_PORT=4918
       - PHOS_OIDC_ISSUER=https://auth.example.com/realms/phos
       - PHOS_OIDC_CLIENT_ID=phos
       - PHOS_OIDC_CLIENT_SECRET=your-client-secret
@@ -129,6 +138,28 @@ npm test             # Run vitest
 ```
 
 Set `PHOS_DUMMY_AI=1` to skip AI model download during development.
+
+## WebDAV Access
+
+Phos includes a built-in read-only WebDAV server so you can mount your library as a network drive from any file manager (Finder, Explorer, Nautilus), Nextcloud, rclone, Cyberduck, etc.
+
+1. Open **Settings** in the web UI and scroll to **WebDAV Access**
+2. Set a username and password, then click **Enable**
+3. Mount the displayed URL in your file manager or WebDAV client
+
+The WebDAV endpoint is always available at `/webdav/` on the main port. Internal metadata files (`.phos.db`, thumbnails, etc.) are automatically hidden, and all write operations are rejected.
+
+For clients that require WebDAV at the root path (e.g. older Windows Explorer), set `PHOS_WEBDAV_PORT` to serve WebDAV on a dedicated port at `/`.
+
+### Example: mount with rclone
+
+```bash
+rclone mount :webdav: ~/phos-library \
+  --webdav-url http://localhost:33000/webdav/ \
+  --webdav-user myuser \
+  --webdav-pass mypass \
+  --read-only
+```
 
 ## Architecture
 

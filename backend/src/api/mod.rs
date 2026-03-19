@@ -2,6 +2,7 @@ mod comfyui;
 mod faces;
 mod files;
 mod people;
+pub mod settings;
 mod shots;
 mod stats;
 mod sync;
@@ -89,6 +90,10 @@ use utoipa::OpenApi;
         comfyui::comfyui_delete_task,
         // Sync
         sync::get_sync,
+        // Settings
+        settings::get_webdav_settings,
+        settings::set_webdav_settings,
+        settings::delete_webdav_settings,
     ),
     components(
         schemas(
@@ -139,6 +144,9 @@ use utoipa::OpenApi;
             sync::SyncShot,
             sync::SyncFile,
             sync::SyncQuery,
+            // Settings
+            settings::WebDavSettings,
+            settings::WebDavCredentials,
         )
     ),
     modifiers(&SecurityAddon),
@@ -454,6 +462,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/version", get(stats::get_version))
         // Sync
         .route("/api/sync", get(sync::get_sync))
+        // Settings
+        .route(
+            "/api/settings/webdav",
+            get(settings::get_webdav_settings)
+                .put(settings::set_webdav_settings)
+                .delete(settings::delete_webdav_settings),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             resolve_user_db,

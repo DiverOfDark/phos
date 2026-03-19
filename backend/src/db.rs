@@ -192,6 +192,15 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         [],
     )?;
 
+    // Key-value settings (e.g. WebDAV credentials)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    )?;
+
     // Add representative_embedding column to people if it doesn't exist (migration)
     // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we check via pragma
     let people_columns: Vec<String> = conn
@@ -396,6 +405,32 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
     )?;
 
     Ok(conn)
+}
+
+/// Get a setting value by key.
+pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?",
+        params![key],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Set a setting value (insert or update).
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// Delete a setting by key.
+pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM settings WHERE key = ?", params![key])?;
+    Ok(())
 }
 
 /// Migrate from the old `photos` table schema to the new `shots` table schema.

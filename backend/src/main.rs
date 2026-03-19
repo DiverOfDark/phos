@@ -7,6 +7,7 @@ mod db;
 mod import;
 mod scanner;
 mod watcher;
+mod webdav;
 
 use axum::Router;
 use clap::{Parser, Subcommand};
@@ -366,6 +367,10 @@ async fn run_server() {
     let index_path = format!("{}/index.html", static_dir);
     let serve_static = ServeDir::new(&static_dir).not_found_service(ServeFile::new(index_path));
 
+    // WebDAV service — always available at /webdav/, returns 401/503 until
+    // credentials are configured via the settings API.
+    let webdav_service = webdav::WebDavService::new(root_path, &db_path);
+
     let port = std::env::var("PHOS_PORT")
         .unwrap_or_else(|_| "33000".to_string())
         .parse::<u16>()
@@ -424,6 +429,7 @@ async fn run_server() {
         Router::new()
             .merge(auth_router)
             .merge(protected_api)
+            .nest_service("/webdav", webdav_service.clone())
             .merge(Scalar::with_url("/api/docs", api::ApiDoc::openapi()))
             .fallback_service(serve_static)
             .layer(
@@ -436,6 +442,7 @@ async fn run_server() {
         info!("OIDC authentication disabled (set PHOS_OIDC_ISSUER to enable)");
         Router::new()
             .merge(api_router)
+            .nest_service("/webdav", webdav_service.clone())
             .merge(Scalar::with_url("/api/docs", api::ApiDoc::openapi()))
             .fallback_service(serve_static)
             .layer(
@@ -445,6 +452,22 @@ async fn run_server() {
             )
             .layer(CorsLayer::permissive())
     };
+
+    // Optional: serve WebDAV on a separate port at `/` (for clients that
+    // have trouble with path-prefixed WebDAV, e.g. older Finder/Explorer).
+    if let Ok(webdav_port_str) = std::env::var("PHOS_WEBDAV_PORT") {
+        if let Ok(webdav_port) = webdav_port_str.parse::<u16>() {
+            let webdav_app = Router::new().fallback_service(webdav_service);
+            let webdav_addr = SocketAddr::from(([0, 0, 0, 0], webdav_port));
+            info!("WebDAV also listening on {}", webdav_addr);
+            let webdav_listener = tokio::net::TcpListener::bind(webdav_addr)
+                .await
+                .expect("Failed to bind WebDAV port");
+            tokio::spawn(async move {
+                axum::serve(webdav_listener, webdav_app).await.unwrap();
+            });
+        }
+    }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("listening on {}", addr);
