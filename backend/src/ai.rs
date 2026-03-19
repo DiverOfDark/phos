@@ -383,15 +383,23 @@ impl AiPipeline {
         let det_path = ensure_model("det_10g.onnx")?;
         let rec_path = ensure_model("w600k_r50.onnx")?;
 
-        let face_detector = Session::builder()?
-            .with_intra_threads(1)?
-            .with_inter_threads(1)?
-            .commit_from_file(&det_path)?;
+        let face_detector = Session::builder()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_intra_threads(1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_inter_threads(1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .commit_from_file(&det_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let face_recognizer = Session::builder()?
-            .with_intra_threads(1)?
-            .with_inter_threads(1)?
-            .commit_from_file(&rec_path)?;
+        let face_recognizer = Session::builder()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_intra_threads(1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_inter_threads(1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .commit_from_file(&rec_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // Load Florence-2 captioning models (graceful fallback — face detection still works if this fails)
         let (caption_vision_encoder, caption_embed_tokens, caption_text_encoder, caption_decoder, caption_tokenizer) =
@@ -433,10 +441,14 @@ impl AiPipeline {
         let tokenizer_path = ensure_caption_model("tokenizer.json")?;
 
         let build = |path: &std::path::Path| -> Result<Session> {
-            Ok(Session::builder()?
-                .with_intra_threads(1)?
-                .with_inter_threads(1)?
-                .commit_from_file(path)?)
+            Session::builder()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .with_intra_threads(1)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .with_inter_threads(1)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .commit_from_file(path)
+                .map_err(|e| anyhow::anyhow!("{e}"))
         };
 
         let vision_encoder = build(&vision_encoder_path)?;
