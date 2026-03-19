@@ -39,6 +39,7 @@ import {
   AlertCircle,
   RotateCcw,
   Play,
+  MessageSquare,
 } from 'lucide-vue-next'
 
 const route = useRoute()
@@ -227,6 +228,14 @@ const metadata = computed(() => {
       label: 'Folder',
       value: String(shot.value.folder_number).padStart(3, '0'),
       icon: 'folder',
+    })
+  }
+
+  if (shot.value.description) {
+    items.push({
+      label: 'Description',
+      value: shot.value.description,
+      icon: 'caption',
     })
   }
 
@@ -1148,6 +1157,7 @@ watch(() => route.params.id, () => {
                 <MapPin v-else-if="item.icon === 'map'" class="w-3.5 h-3.5 text-zinc-500" />
                 <Maximize2 v-else-if="item.icon === 'size'" class="w-3.5 h-3.5 text-zinc-500" />
                 <FileImage v-else-if="item.icon === 'files'" class="w-3.5 h-3.5 text-zinc-500" />
+                <MessageSquare v-else-if="item.icon === 'caption'" class="w-3.5 h-3.5 text-zinc-500" />
                 <HardDrive v-else class="w-3.5 h-3.5 text-zinc-500" />
               </div>
               <div class="min-w-0">

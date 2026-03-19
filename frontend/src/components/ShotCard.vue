@@ -37,6 +37,7 @@ const statusLabel = computed(() => {
     <img
       v-if="shot.thumbnail_url"
       :src="shot.thumbnail_url"
+      :title="shot.description || ''"
       class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
       loading="lazy"
     />
