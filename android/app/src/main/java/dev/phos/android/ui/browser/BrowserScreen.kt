@@ -68,6 +68,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import me.saket.telephoto.zoomable.coil3.ZoomableAsyncImage
 import me.saket.telephoto.zoomable.rememberZoomableImageState
+import me.saket.telephoto.zoomable.ZoomSpec
 import me.saket.telephoto.zoomable.rememberZoomableState
 import me.saket.telephoto.zoomable.zoomable
 
@@ -290,7 +291,9 @@ private fun ImagePage(
     previewUrl: String,
     onTap: () -> Unit,
 ) {
-    val zoomableState = rememberZoomableImageState(rememberZoomableState())
+    val zoomableState = rememberZoomableImageState(
+        rememberZoomableState(zoomSpec = ZoomSpec(maxZoomFactor = 4f))
+    )
 
     Box(
         modifier = Modifier
@@ -332,7 +335,7 @@ private fun VideoPage(
 ) {
     var isStarted by remember { mutableStateOf(false) }
     val context = LocalContext.current
-    val zoomableState = rememberZoomableState()
+    val zoomableState = rememberZoomableState(zoomSpec = ZoomSpec(maxZoomFactor = 4f))
 
     Box(
         modifier = Modifier
