@@ -404,6 +404,9 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
          CREATE INDEX IF NOT EXISTS idx_shots_timestamp ON shots(timestamp);"
     )?;
 
+    // Clean up people who lost all their shots (e.g. after shot merges)
+    cleanup_orphaned_people(&conn)?;
+
     Ok(conn)
 }
 
@@ -430,6 +433,39 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
 /// Delete a setting by key.
 pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
     conn.execute("DELETE FROM settings WHERE key = ?", params![key])?;
+    Ok(())
+}
+
+/// Delete people who have no shots assigned to them and no faces referencing them.
+/// This can happen when shots are merged and a person loses all their shots.
+pub fn cleanup_orphaned_people(conn: &Connection) -> Result<()> {
+    // First, unassign faces for people who have no shots
+    let unassigned = conn.execute(
+        "UPDATE faces SET person_id = NULL
+         WHERE person_id IS NOT NULL
+           AND person_id NOT IN (
+               SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL
+           )",
+        [],
+    )?;
+    if unassigned > 0 {
+        tracing::info!("Unassigned {} faces from people with no shots", unassigned);
+    }
+
+    // Then delete people with no shots and no faces
+    let deleted = conn.execute(
+        "DELETE FROM people
+         WHERE id NOT IN (
+             SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL
+         )
+         AND id NOT IN (
+             SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL
+         )",
+        [],
+    )?;
+    if deleted > 0 {
+        tracing::info!("Cleaned up {} orphaned people", deleted);
+    }
     Ok(())
 }
 

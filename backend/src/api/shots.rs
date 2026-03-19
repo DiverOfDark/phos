@@ -1093,6 +1093,11 @@ pub(super) async fn merge_shots(
         })?;
     }
 
+    // Clean up people who lost all their shots after this merge
+    if let Err(e) = crate::db::cleanup_orphaned_people(&db) {
+        tracing::error!("Failed to cleanup orphaned people after merge: {}", e);
+    }
+
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
