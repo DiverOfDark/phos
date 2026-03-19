@@ -149,19 +149,6 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
             .unwrap()
     })?;
 
-    let stored_username = db::get_setting(&conn, "webdav_username");
-    let stored_password_hash = db::get_setting(&conn, "webdav_password");
-
-    // If no credentials configured, WebDAV is not enabled
-    if stored_username.is_none() || stored_password_hash.is_none() {
-        return Err(Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Body::from(
-                "WebDAV not configured. Set credentials in Settings.",
-            ))
-            .unwrap());
-    }
-
     let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -177,6 +164,19 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
                 .unwrap());
         }
     };
+
+    let stored_username = db::get_setting(&conn, "webdav_username");
+    let stored_password_hash = db::get_setting(&conn, "webdav_password");
+
+    // If no credentials configured, WebDAV is not enabled
+    if stored_username.is_none() || stored_password_hash.is_none() {
+        return Err(Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from(
+                "WebDAV not configured. Set credentials in Settings.",
+            ))
+            .unwrap());
+    }
 
     if !auth_header.starts_with("Basic ") {
         return Err(Response::builder()
