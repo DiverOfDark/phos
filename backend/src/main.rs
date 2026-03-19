@@ -369,7 +369,7 @@ async fn run_server() {
 
     // WebDAV service — always available at /webdav/, returns 401/503 until
     // credentials are configured via the settings API.
-    let webdav_service = webdav::WebDavService::new(root_path, multi_user);
+    let webdav_service = webdav::WebDavService::new(root_path, multi_user, "/webdav");
 
     let port = std::env::var("PHOS_PORT")
         .unwrap_or_else(|_| "33000".to_string())
@@ -457,7 +457,9 @@ async fn run_server() {
     // have trouble with path-prefixed WebDAV, e.g. older Finder/Explorer).
     if let Ok(webdav_port_str) = std::env::var("PHOS_WEBDAV_PORT") {
         if let Ok(webdav_port) = webdav_port_str.parse::<u16>() {
-            let webdav_app = Router::new().fallback_service(webdav_service);
+            // Standalone WebDAV: no prefix stripping needed since it's served at root.
+            let webdav_standalone = webdav::WebDavService::new(root_path, multi_user, "");
+            let webdav_app = Router::new().fallback_service(webdav_standalone);
             let webdav_addr = SocketAddr::from(([0, 0, 0, 0], webdav_port));
             info!("WebDAV also listening on {}", webdav_addr);
             let webdav_listener = tokio::net::TcpListener::bind(webdav_addr)

@@ -283,12 +283,17 @@ fn check_basic_auth(
 }
 
 /// Build a DavHandler for the given library root.
-fn build_dav_handler(library_root: &Path) -> DavHandler {
+/// When `prefix` is non-empty, configure `strip_prefix` so that response hrefs
+/// include the mount prefix (e.g. `/webdav/photo.jpg` instead of `/photo.jpg`).
+fn build_dav_handler(library_root: &Path, prefix: &str) -> DavHandler {
     let fs = PhosFs::new(library_root);
-    DavHandler::builder()
+    let mut builder = DavHandler::builder()
         .filesystem(Box::new(fs))
-        .locksystem(FakeLs::new())
-        .build_handler()
+        .locksystem(FakeLs::new());
+    if !prefix.is_empty() {
+        builder = builder.strip_prefix(prefix);
+    }
+    builder.build_handler()
 }
 
 /// Tower service that wraps DavHandler with Basic Auth.
@@ -299,15 +304,18 @@ pub struct WebDavService {
     single_user_handler: DavHandler,
     library_root: PathBuf,
     multi_user: bool,
+    /// URL prefix that axum strips (e.g. "/webdav"). Empty when served at root.
+    prefix: String,
 }
 
 impl WebDavService {
-    pub fn new(library_root: &Path, multi_user: bool) -> Self {
-        let single_user_handler = build_dav_handler(library_root);
+    pub fn new(library_root: &Path, multi_user: bool, prefix: &str) -> Self {
+        let single_user_handler = build_dav_handler(library_root, prefix);
         WebDavService {
             single_user_handler,
             library_root: library_root.to_path_buf(),
             multi_user,
+            prefix: prefix.to_string(),
         }
     }
 }
@@ -325,6 +333,7 @@ impl tower_service::Service<Request<Body>> for WebDavService {
         let single_user_handler = self.single_user_handler.clone();
         let library_root = self.library_root.clone();
         let multi_user = self.multi_user;
+        let prefix = self.prefix.clone();
 
         Box::pin(async move {
             let auth = match check_basic_auth(&req, &library_root, multi_user) {
@@ -335,9 +344,28 @@ impl tower_service::Service<Request<Body>> for WebDavService {
             // In multi-user mode, build a handler for this user's library.
             // In single-user mode, reuse the pre-built handler.
             let handler = if multi_user {
-                build_dav_handler(&auth.library_root)
+                build_dav_handler(&auth.library_root, &prefix)
             } else {
                 single_user_handler
+            };
+
+            // axum's nest_service strips the mount prefix (e.g. "/webdav") from
+            // the request URI, but dav-server needs the full URI to generate
+            // correct hrefs in PROPFIND responses. Reconstruct it here.
+            let req = if !prefix.is_empty() {
+                let (mut parts, body) = req.into_parts();
+                let path = parts.uri.path();
+                let new_pq = if let Some(q) = parts.uri.query() {
+                    format!("{prefix}{path}?{q}")
+                } else {
+                    format!("{prefix}{path}")
+                };
+                let mut uri_parts = parts.uri.into_parts();
+                uri_parts.path_and_query = Some(new_pq.parse().unwrap());
+                parts.uri = axum::http::Uri::from_parts(uri_parts).unwrap();
+                Request::from_parts(parts, body)
+            } else {
+                req
             };
 
             let resp = handler.handle(req).await;
