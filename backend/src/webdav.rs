@@ -17,6 +17,9 @@ use sha2::{Digest, Sha256};
 
 use crate::db;
 
+/// Fixed username used in single-user mode (no OIDC).
+const SINGLE_USER_WEBDAV_USERNAME: &str = "phos";
+
 /// Check if a filename should be hidden from WebDAV clients.
 /// Hides Phos internal files (.phos.db, .phos_thumbnails/, .phos.db-wal, etc.)
 /// and the duplicates staging folder.
@@ -139,17 +142,18 @@ impl DavFileSystem for PhosFs {
     }
 }
 
-/// Validate Basic Auth credentials against the database.
-/// Returns Ok(()) on success, or an HTTP error response on failure.
-fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<Body>> {
-    let conn = db::open_connection(db_path).map_err(|e| {
-        tracing::error!("WebDAV: failed to open database at {:?}: {}", db_path, e);
-        Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from("Database error"))
-            .unwrap()
-    })?;
+/// Result of successful Basic Auth: the resolved library root for the user.
+struct AuthResult {
+    library_root: PathBuf,
+}
 
+/// Extract and validate Basic Auth credentials. Returns the library root for the authenticated user.
+fn check_basic_auth(
+    req: &Request<Body>,
+    library_root: &Path,
+    multi_user: bool,
+) -> Result<AuthResult, Response<Body>> {
+    // --- Extract Authorization header ---
     let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -166,24 +170,6 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
                 .unwrap());
         }
     };
-
-    let stored_username = db::get_setting(&conn, "webdav_username");
-    let stored_password_hash = db::get_setting(&conn, "webdav_password");
-
-    // If no credentials configured, WebDAV is not enabled
-    if stored_username.is_none() || stored_password_hash.is_none() {
-        tracing::warn!(
-            "WebDAV: credentials not configured (username={}, password={}), set them in Settings",
-            stored_username.is_some(),
-            stored_password_hash.is_some()
-        );
-        return Err(Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Body::from(
-                "WebDAV not configured. Set credentials in Settings.",
-            ))
-            .unwrap());
-    }
 
     if !auth_header.starts_with("Basic ") {
         tracing::warn!("WebDAV: non-Basic auth scheme received");
@@ -223,12 +209,66 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
             .unwrap()
     })?;
 
-    let expected_username = stored_username.unwrap();
+    // --- Resolve the DB and library path for this user ---
+    let user_library = if multi_user {
+        // In multi-user mode, the username IS the OIDC sub, and each user's
+        // library is at <root>/<sub>/
+        let user_dir = library_root.join(username);
+        if !user_dir.is_dir() {
+            tracing::warn!("WebDAV: no library directory for user {:?}", username);
+            return Err(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(header::WWW_AUTHENTICATE, "Basic realm=\"phos\"")
+                .body(Body::from("Invalid credentials"))
+                .unwrap());
+        }
+        user_dir
+    } else {
+        // Single-user: username must be the fixed value
+        if username != SINGLE_USER_WEBDAV_USERNAME {
+            tracing::warn!(
+                "WebDAV: wrong username {:?} (expected {:?})",
+                username,
+                SINGLE_USER_WEBDAV_USERNAME
+            );
+            return Err(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(header::WWW_AUTHENTICATE, "Basic realm=\"phos\"")
+                .body(Body::from("Invalid credentials"))
+                .unwrap());
+        }
+        library_root.to_path_buf()
+    };
+
+    let db_path = user_library.join(".phos.db");
+    let conn = db::open_connection(&db_path).map_err(|e| {
+        tracing::error!("WebDAV: failed to open database at {:?}: {}", db_path, e);
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("Database error"))
+            .unwrap()
+    })?;
+
+    let stored_password_hash = db::get_setting(&conn, "webdav_password");
+
+    if stored_password_hash.is_none() {
+        tracing::warn!(
+            "WebDAV: no password configured for user {:?}",
+            username
+        );
+        return Err(Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from(
+                "WebDAV not configured. Set a password in Settings.",
+            ))
+            .unwrap());
+    }
+
     let expected_hash = stored_password_hash.unwrap();
     let input_hash = format!("{:x}", Sha256::digest(password.as_bytes()));
 
-    if username != expected_username || input_hash != expected_hash {
-        tracing::warn!("WebDAV: authentication failed for user {:?}", username);
+    if input_hash != expected_hash {
+        tracing::warn!("WebDAV: wrong password for user {:?}", username);
         return Err(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(header::WWW_AUTHENTICATE, "Basic realm=\"phos\"")
@@ -237,28 +277,37 @@ fn check_basic_auth(req: &Request<Body>, db_path: &Path) -> Result<(), Response<
     }
 
     tracing::debug!("WebDAV: authenticated user {:?}", username);
-    Ok(())
+    Ok(AuthResult {
+        library_root: user_library,
+    })
+}
+
+/// Build a DavHandler for the given library root.
+fn build_dav_handler(library_root: &Path) -> DavHandler {
+    let fs = PhosFs::new(library_root);
+    DavHandler::builder()
+        .filesystem(Box::new(fs))
+        .locksystem(FakeLs::new())
+        .build_handler()
 }
 
 /// Tower service that wraps DavHandler with Basic Auth.
 /// Used with axum's `nest_service` to handle all WebDAV methods (including PROPFIND, etc.).
 #[derive(Clone)]
 pub struct WebDavService {
-    handler: DavHandler,
-    db_path: PathBuf,
+    /// Pre-built handler for single-user mode (avoids rebuilding per request).
+    single_user_handler: DavHandler,
+    library_root: PathBuf,
+    multi_user: bool,
 }
 
 impl WebDavService {
-    pub fn new(library_root: &Path, db_path: &Path) -> Self {
-        let fs = PhosFs::new(library_root);
-        let handler = DavHandler::builder()
-            .filesystem(Box::new(fs))
-            .locksystem(FakeLs::new())
-            .build_handler();
-
+    pub fn new(library_root: &Path, multi_user: bool) -> Self {
+        let single_user_handler = build_dav_handler(library_root);
         WebDavService {
-            handler,
-            db_path: db_path.to_path_buf(),
+            single_user_handler,
+            library_root: library_root.to_path_buf(),
+            multi_user,
         }
     }
 }
@@ -273,13 +322,23 @@ impl tower_service::Service<Request<Body>> for WebDavService {
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let handler = self.handler.clone();
-        let db_path = self.db_path.clone();
+        let single_user_handler = self.single_user_handler.clone();
+        let library_root = self.library_root.clone();
+        let multi_user = self.multi_user;
 
         Box::pin(async move {
-            if let Err(resp) = check_basic_auth(&req, &db_path) {
-                return Ok(resp);
-            }
+            let auth = match check_basic_auth(&req, &library_root, multi_user) {
+                Ok(a) => a,
+                Err(resp) => return Ok(resp),
+            };
+
+            // In multi-user mode, build a handler for this user's library.
+            // In single-user mode, reuse the pre-built handler.
+            let handler = if multi_user {
+                build_dav_handler(&auth.library_root)
+            } else {
+                single_user_handler
+            };
 
             let resp = handler.handle(req).await;
             let (parts, dav_body) = resp.into_parts();

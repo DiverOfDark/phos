@@ -369,7 +369,7 @@ async fn run_server() {
 
     // WebDAV service — always available at /webdav/, returns 401/503 until
     // credentials are configured via the settings API.
-    let webdav_service = webdav::WebDavService::new(root_path, &db_path);
+    let webdav_service = webdav::WebDavService::new(root_path, multi_user);
 
     let port = std::env::var("PHOS_PORT")
         .unwrap_or_else(|_| "33000".to_string())

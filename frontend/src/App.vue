@@ -306,8 +306,8 @@ async function fetchWebdavSettings() {
 }
 
 async function saveWebdavSettings() {
-  if (!webdavUsername.value.trim() || !webdavPassword.value.trim()) {
-    webdavError.value = 'Username and password are required.'
+  if (!webdavPassword.value.trim()) {
+    webdavError.value = 'Password is required.'
     return
   }
 
@@ -320,17 +320,16 @@ async function saveWebdavSettings() {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        username: webdavUsername.value.trim(),
         password: webdavPassword.value.trim(),
       })
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    webdavMessage.value = 'WebDAV credentials saved!'
+    webdavMessage.value = 'WebDAV password saved!'
     webdavPassword.value = ''
     await fetchWebdavSettings()
     setTimeout(() => { webdavMessage.value = '' }, 3000)
   } catch (e) {
-    webdavError.value = e.message || 'Failed to save credentials.'
+    webdavError.value = e.message || 'Failed to save password.'
   } finally {
     webdavSaving.value = false
   }
@@ -343,7 +342,6 @@ async function disableWebdav() {
     const res = await fetch('/api/settings/webdav', { method: 'DELETE' })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     webdavEnabled.value = false
-    webdavUsername.value = ''
     webdavPassword.value = ''
     webdavMessage.value = 'WebDAV disabled.'
     setTimeout(() => { webdavMessage.value = '' }, 3000)
@@ -544,11 +542,9 @@ onMounted(() => {
 
                     <div class="space-y-2">
                       <Label class="text-xs text-zinc-400">Username</Label>
-                      <Input
-                        v-model="webdavUsername"
-                        placeholder="webdav"
-                        class="h-8 text-sm"
-                      />
+                      <div class="h-8 px-3 flex items-center text-sm text-zinc-300 bg-zinc-800/50 border border-white/10 rounded-md font-mono">
+                        {{ webdavUsername }}
+                      </div>
                     </div>
                     <div class="space-y-2">
                       <Label class="text-xs text-zinc-400">Password</Label>
