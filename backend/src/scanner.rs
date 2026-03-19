@@ -221,18 +221,8 @@ impl Scanner {
             info!("Removed {} orphaned shots", orphaned_shots);
         }
 
-        // Clean up orphaned people (no faces remaining)
-        let _ = conn.execute(
-            "UPDATE shots SET primary_person_id = NULL WHERE primary_person_id IN (SELECT p.id FROM people p WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id))",
-            [],
-        );
-        let orphaned_people = conn.execute(
-            "DELETE FROM people WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = people.id)",
-            [],
-        )?;
-        if orphaned_people > 0 {
-            info!("Removed {} orphaned people", orphaned_people);
-        }
+        // Clean up orphaned people (no faces remaining, or faces but no shots)
+        crate::db::cleanup_orphaned_people(&conn)?;
 
         Ok(())
     }
@@ -311,6 +301,9 @@ impl Scanner {
 
         // Compact folder numbers to remove gaps from reassignments
         compact_folder_numbers(&conn)?;
+
+        // Clean up people with no shots (unassigns their faces, then deletes)
+        crate::db::cleanup_orphaned_people(&conn)?;
 
         // Clean up empty directories left behind by duplicate moves or deletions
         crate::import::cleanup_empty_dirs(root)?;
