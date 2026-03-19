@@ -36,3 +36,4 @@ openidconnect = "3"
 jsonwebtoken = "9"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-scalar = { version = "0.2", features = ["axum"] }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

@@ -139,7 +139,8 @@ pub(super) async fn get_person_shots(
         .prepare(
             "SELECT DISTINCT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number,
                     f.id AS main_file_id, p.name AS person_name,
-                    (SELECT COUNT(*) FROM files WHERE shot_id = s.id) AS file_count
+                    (SELECT COUNT(*) FROM files WHERE shot_id = s.id) AS file_count,
+                    s.description
              FROM shots s
              LEFT JOIN files f ON s.main_file_id = f.id
              LEFT JOIN people p ON s.primary_person_id = p.id
@@ -162,6 +163,7 @@ pub(super) async fn get_person_shots(
                     .unwrap_or_default(),
                 primary_person_name: row.get(6)?,
                 file_count: row.get(7)?,
+                description: row.get(8)?,
             })
         })
         .unwrap();

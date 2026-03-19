@@ -242,6 +242,9 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
                 [],
             )?;
         }
+        if !shots_columns.contains(&"description".to_string()) {
+            conn.execute("ALTER TABLE shots ADD COLUMN description TEXT", [])?;
+        }
     }
 
     // Add updated_at column to people if it doesn't exist

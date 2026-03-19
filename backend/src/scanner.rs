@@ -906,6 +906,80 @@ impl Scanner {
             }
         }
     }
+
+    /// Generate captions for all shots that don't have one yet.
+    /// Runs sequentially — ONNX sessions are behind Mutex so parallelism wouldn't help.
+    pub fn caption_shots(&self, root: &Path) -> anyhow::Result<()> {
+        let ai = match &self.ai {
+            Some(ai) => ai,
+            None => return Ok(()),
+        };
+
+        if !ai.has_captioning() {
+            info!("Captioning models not available, skipping caption generation");
+            return Ok(());
+        }
+
+        let conn = self.open_db()?;
+        let library_root = self.db_path.parent().unwrap_or(root);
+
+        // Find shots without descriptions, joined with their main file path
+        let mut stmt = conn.prepare(
+            "SELECT s.id, f.path FROM shots s
+             JOIN files f ON s.main_file_id = f.id
+             WHERE s.description IS NULL"
+        )?;
+        let shots: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if shots.is_empty() {
+            info!("All shots already have captions");
+            return Ok(());
+        }
+
+        info!("Generating captions for {} shots", shots.len());
+
+        let pb = ProgressBar::new(shots.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} captioning")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        let mut update_stmt = conn.prepare(
+            "UPDATE shots SET description = ? WHERE id = ?"
+        )?;
+
+        for (shot_id, file_path) in &shots {
+            let abs_path = db::resolve_path(library_root, file_path);
+            info!("Captioning shot {} ({:?})", shot_id, abs_path);
+            let result = (|| -> anyhow::Result<String> {
+                let img = open_image(&abs_path)?;
+                ai.generate_caption(&img)
+            })();
+
+            match result {
+                Ok(ref caption) => {
+                    info!("Captioned shot {}: {:?}", shot_id, caption);
+                    if let Err(e) = update_stmt.execute(rusqlite::params![caption, shot_id]) {
+                        error!("Failed to save caption for shot {}: {}", shot_id, e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to generate caption for shot {} ({:?}): {}", shot_id, abs_path, e);
+                }
+            }
+
+            pb.inc(1);
+        }
+
+        pb.finish_with_message("Captioning complete");
+        info!("Caption generation finished");
+        Ok(())
+    }
 }
 
 /// Assign `primary_person_id` for each shot based on the largest face with a person_id.

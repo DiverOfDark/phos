@@ -83,6 +83,7 @@ pub(super) async fn upload_file_raw(
     // Index the file immediately (blocking -- runs face detection etc.)
     let scanner = state.scanner.clone();
     let target_path_owned = target_path.to_path_buf();
+    let upload_library_root = state.library_root.clone();
     tokio::task::spawn_blocking(move || {
         let conn = match scanner.open_db() {
             Ok(c) => c,
@@ -98,6 +99,11 @@ pub(super) async fn upload_file_raw(
                 target_path_owned,
                 e
             );
+            return;
+        }
+        // Caption the newly added shot
+        if let Err(e) = scanner.caption_shots(&upload_library_root) {
+            tracing::error!("Failed to caption uploaded file: {}", e);
         }
     })
     .await
@@ -139,7 +145,13 @@ pub(super) async fn finalize_import(
                 .map_err(|e| format!("Face clustering failed: {}", e))?;
         }
 
-        // 2. Reorganize files to match clustering
+        // 2. Caption any uncaptioned shots
+        tracing::info!("Finalize: captioning shots...");
+        scanner
+            .caption_shots(&library_root)
+            .map_err(|e| format!("Captioning failed: {}", e))?;
+
+        // 3. Reorganize files to match clustering
         tracing::info!("Finalize: reorganizing files...");
         crate::import::run_reorganize(&library_root, false)
             .map_err(|e| format!("Reorganize failed: {}", e))?;

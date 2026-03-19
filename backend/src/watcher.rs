@@ -1,9 +1,8 @@
-use crate::ai::AiPipeline;
 use crate::scanner::{is_media_file, Scanner};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -32,8 +31,7 @@ const DEBOUNCE_DURATION: Duration = Duration::from_secs(2);
 /// stops watching.
 pub fn start_watcher(
     library_path: PathBuf,
-    db_path: PathBuf,
-    ai: Option<AiPipeline>,
+    scanner: Arc<Scanner>,
 ) -> anyhow::Result<RecommendedWatcher> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
@@ -49,11 +47,12 @@ pub fn start_watcher(
     watcher.watch(&library_path, RecursiveMode::Recursive)?;
     info!("File watcher started on {:?}", library_path);
 
+    let watcher_library_path = library_path.clone();
     // Spawn the debounce + processing thread.
     std::thread::Builder::new()
         .name("phos-file-watcher".into())
         .spawn(move || {
-            run_watcher_loop(rx, &db_path, ai.as_ref());
+            run_watcher_loop(rx, &scanner, &watcher_library_path);
         })?;
 
     Ok(watcher)
@@ -66,8 +65,8 @@ pub fn start_watcher(
 /// processes all accumulated events in one batch.
 fn run_watcher_loop(
     rx: mpsc::Receiver<notify::Result<Event>>,
-    db_path: &Path,
-    ai: Option<&AiPipeline>,
+    scanner: &Scanner,
+    library_path: &Path,
 ) {
     // Maps each path to the action that should be taken and the instant of the
     // last event for that path.
@@ -91,7 +90,7 @@ fn run_watcher_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     // Flush remaining events before exiting.
                     if !pending.is_empty() {
-                        flush_pending(&mut pending, db_path, ai);
+                        flush_pending(&mut pending, scanner, library_path);
                     }
                     info!("File watcher channel closed, shutting down watcher loop");
                     return;
@@ -112,11 +111,11 @@ fn run_watcher_loop(
                 .values()
                 .any(|(_, ts)| ts.elapsed() >= DEBOUNCE_DURATION);
             if should_flush {
-                flush_pending(&mut pending, db_path, ai);
+                flush_pending(&mut pending, scanner, library_path);
             }
         } else {
             // Timeout fired -- flush all pending events.
-            flush_pending(&mut pending, db_path, ai);
+            flush_pending(&mut pending, scanner, library_path);
         }
     }
 }
@@ -152,16 +151,14 @@ fn collect_event(pending: &mut HashMap<PathBuf, (FileAction, Instant)>, event: &
 /// Process all pending file actions and clear the map.
 fn flush_pending(
     pending: &mut HashMap<PathBuf, (FileAction, Instant)>,
-    db_path: &Path,
-    ai: Option<&AiPipeline>,
+    scanner: &Scanner,
+    library_path: &Path,
 ) {
     if pending.is_empty() {
         return;
     }
 
     info!("Processing {} debounced file watcher events", pending.len());
-
-    let scanner = Scanner::new(db_path.to_path_buf(), None);
 
     let conn = match scanner.open_db() {
         Ok(c) => c,
@@ -183,6 +180,8 @@ fn flush_pending(
         .map(|(path, (action, _))| (path, action))
         .collect();
 
+    let mut had_upserts = false;
+
     for (path, action) in actions {
         match action {
             FileAction::Upsert => {
@@ -192,9 +191,10 @@ fn flush_pending(
                     debug!("Watcher: path {:?} no longer exists, skipping", path);
                     continue;
                 }
-                let _ = ai;
                 if let Err(e) = scanner.process_file(&conn, &path, &dhash_cache) {
                     error!("Watcher: failed to process {:?}: {}", path, e);
+                } else {
+                    had_upserts = true;
                 }
             }
             FileAction::Remove => {
@@ -202,6 +202,13 @@ fn flush_pending(
                     warn!("Watcher: failed to remove {:?}: {}", path, e);
                 }
             }
+        }
+    }
+
+    // Caption any newly added shots that don't have descriptions yet
+    if had_upserts {
+        if let Err(e) = scanner.caption_shots(library_path) {
+            error!("Watcher: captioning failed: {}", e);
         }
     }
 }
@@ -289,7 +296,8 @@ mod tests {
         );
         // Use a non-existent DB path -- flush should handle the error gracefully
         // and still clear the map.
-        flush_pending(&mut pending, Path::new("/tmp/nonexistent_test.db"), None);
+        let scanner = Scanner::new(PathBuf::from("/tmp/nonexistent_test.db"), None);
+        flush_pending(&mut pending, &scanner, Path::new("/tmp"));
         assert!(pending.is_empty());
     }
 }

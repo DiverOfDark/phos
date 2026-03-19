@@ -8,6 +8,7 @@ use ort::value::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use tokenizers::Tokenizer;
 
 /// Max cosine distance for a face match (= 1.0 - cosine_similarity).
 pub const MAX_FACE_DISTANCE: f32 = 0.6;
@@ -48,6 +49,11 @@ pub struct AiPipeline {
     face_detector: Option<Mutex<Session>>,
     face_recognizer: Option<Mutex<Session>>,
     logged_outputs: AtomicBool,
+    caption_vision_encoder: Option<Mutex<Session>>,
+    caption_embed_tokens: Option<Mutex<Session>>,
+    caption_text_encoder: Option<Mutex<Session>>,
+    caption_decoder: Option<Mutex<Session>>,
+    caption_tokenizer: Option<Tokenizer>,
 }
 
 #[allow(dead_code)]
@@ -67,6 +73,15 @@ fn ensure_model(filename: &str) -> Result<PathBuf> {
     let path = repo
         .get(&format!("models/buffalo_l/{}", filename))
         .with_context(|| format!("Failed to download model '{}'", filename))?;
+    Ok(path)
+}
+
+fn ensure_caption_model(filename: &str) -> Result<PathBuf> {
+    let api = Api::new().context("Failed to initialize Hugging Face API")?;
+    let repo = api.model("onnx-community/Florence-2-large-ft".to_string());
+    let path = repo
+        .get(filename)
+        .with_context(|| format!("Failed to download captioning model '{}'", filename))?;
     Ok(path)
 }
 
@@ -357,6 +372,11 @@ impl AiPipeline {
                 face_detector: None,
                 face_recognizer: None,
                 logged_outputs: AtomicBool::new(false),
+                caption_vision_encoder: None,
+                caption_embed_tokens: None,
+                caption_text_encoder: None,
+                caption_decoder: None,
+                caption_tokenizer: None,
             });
         }
 
@@ -373,11 +393,220 @@ impl AiPipeline {
             .with_inter_threads(1)?
             .commit_from_file(&rec_path)?;
 
+        // Load Florence-2 captioning models (graceful fallback — face detection still works if this fails)
+        let (caption_vision_encoder, caption_embed_tokens, caption_text_encoder, caption_decoder, caption_tokenizer) =
+            match Self::load_caption_models() {
+                Ok((ve, et, te, dec, tok)) => {
+                    tracing::info!("Florence-2 captioning models loaded successfully");
+                    (
+                        Some(Mutex::new(ve)),
+                        Some(Mutex::new(et)),
+                        Some(Mutex::new(te)),
+                        Some(Mutex::new(dec)),
+                        Some(tok),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load captioning models, captioning disabled: {}", e);
+                    (None, None, None, None, None)
+                }
+            };
+
         Ok(Self {
             face_detector: Some(Mutex::new(face_detector)),
             face_recognizer: Some(Mutex::new(face_recognizer)),
             logged_outputs: AtomicBool::new(false),
+            caption_vision_encoder,
+            caption_embed_tokens,
+            caption_text_encoder,
+            caption_decoder,
+            caption_tokenizer,
         })
+    }
+
+    fn load_caption_models() -> Result<(Session, Session, Session, Session, Tokenizer)> {
+        tracing::info!("Downloading Florence-2-large-ft captioning models...");
+        let vision_encoder_path = ensure_caption_model("onnx/vision_encoder.onnx")?;
+        let embed_tokens_path = ensure_caption_model("onnx/embed_tokens.onnx")?;
+        let encoder_path = ensure_caption_model("onnx/encoder_model.onnx")?;
+        let decoder_path = ensure_caption_model("onnx/decoder_model.onnx")?;
+        let tokenizer_path = ensure_caption_model("tokenizer.json")?;
+
+        let build = |path: &std::path::Path| -> Result<Session> {
+            Ok(Session::builder()?
+                .with_intra_threads(1)?
+                .with_inter_threads(1)?
+                .commit_from_file(path)?)
+        };
+
+        let vision_encoder = build(&vision_encoder_path)?;
+        let embed_tokens = build(&embed_tokens_path)?;
+        let encoder = build(&encoder_path)?;
+        let decoder = build(&decoder_path)?;
+
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+
+        Ok((vision_encoder, embed_tokens, encoder, decoder, tokenizer))
+    }
+
+    pub fn has_captioning(&self) -> bool {
+        self.caption_vision_encoder.is_some()
+    }
+
+    pub fn generate_caption(&self, img: &DynamicImage) -> Result<String> {
+        if std::env::var("PHOS_DUMMY_AI")
+            .ok()
+            .is_some_and(|v| v == "1")
+        {
+            return Ok("A placeholder caption for this image".to_string());
+        }
+
+        let (ve_mutex, et_mutex, te_mutex, dec_mutex, tokenizer) = match (
+            &self.caption_vision_encoder,
+            &self.caption_embed_tokens,
+            &self.caption_text_encoder,
+            &self.caption_decoder,
+            &self.caption_tokenizer,
+        ) {
+            (Some(ve), Some(et), Some(te), Some(d), Some(t)) => (ve, et, te, d, t),
+            _ => return Err(anyhow::anyhow!("Captioning models not loaded")),
+        };
+
+        // --- Step 1: Image preprocessing (768x768, ImageNet normalization) ---
+        let resized = img.resize_exact(768, 768, image::imageops::FilterType::CatmullRom);
+        let rgb = resized.to_rgb8();
+
+        let mean = [0.485f32, 0.456, 0.406];
+        let std_dev = [0.229f32, 0.224, 0.225];
+
+        let mut pixel_values = Array4::<f32>::zeros((1, 3, 768, 768));
+        for (x, y, pixel) in rgb.enumerate_pixels() {
+            for c in 0..3 {
+                pixel_values[[0, c, y as usize, x as usize]] =
+                    (pixel[c] as f32 / 255.0 - mean[c]) / std_dev[c];
+            }
+        }
+
+        // --- Step 2: Vision encoder → image features [1, 577, 1024] ---
+        let pixel_input = Value::from_array((vec![1, 3, 768, 768], pixel_values.into_raw_vec()))?;
+        let image_features = {
+            let mut session = ve_mutex.lock().map_err(|_| anyhow::anyhow!("Vision encoder mutex poisoned"))?;
+            let outputs = session.run(inputs!["pixel_values" => pixel_input])?;
+            let tensor = outputs[0].try_extract_tensor::<f32>()?;
+            let shape: Vec<i64> = tensor.0.to_vec();
+            let data: Vec<f32> = tensor.1.to_vec();
+            (shape, data)
+        };
+        let img_seq_len = image_features.0[1] as usize; // 577
+        let d_model = image_features.0[2] as usize; // 1024
+
+        // --- Step 3: Tokenize text prompt ---
+        let prompt = "Describe with a paragraph what is shown in the image.";
+        let encoding = tokenizer
+            .encode(prompt, true)
+            .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {}", e))?;
+        let prompt_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        let text_len = prompt_ids.len();
+
+        // --- Step 4: Embed text tokens → text_embeds [1, N, 1024] ---
+        let text_embeds = {
+            let input_ids = Value::from_array((vec![1, text_len], prompt_ids))?;
+            let mut session = et_mutex.lock().map_err(|_| anyhow::anyhow!("Embed tokens mutex poisoned"))?;
+            let outputs = session.run(inputs!["input_ids" => input_ids])?;
+            let tensor = outputs[0].try_extract_tensor::<f32>()?;
+            tensor.1.to_vec()
+        };
+
+        // --- Step 5: Concatenate image_features + text_embeds → [1, 577+N, 1024] ---
+        let combined_len = img_seq_len + text_len;
+        let mut combined_embeds: Vec<f32> = Vec::with_capacity(combined_len * d_model);
+        combined_embeds.extend_from_slice(&image_features.1);
+        combined_embeds.extend_from_slice(&text_embeds);
+        let attention_mask: Vec<i64> = vec![1i64; combined_len];
+
+        // --- Step 6: Text encoder → encoder_hidden_states [1, 577+N, 1024] ---
+        let encoder_hidden = {
+            let inputs_embeds = Value::from_array((vec![1, combined_len, d_model], combined_embeds))?;
+            let attn_mask = Value::from_array((vec![1, combined_len], attention_mask.clone()))?;
+            let mut session = te_mutex.lock().map_err(|_| anyhow::anyhow!("Text encoder mutex poisoned"))?;
+            let outputs = session.run(inputs!["inputs_embeds" => inputs_embeds, "attention_mask" => attn_mask])?;
+            let tensor = outputs[0].try_extract_tensor::<f32>()?;
+            tensor.1.to_vec()
+        };
+
+        // --- Step 7: Greedy decoder loop ---
+        let decoder_start_token_id: i64 = 2; // </s> — BART-style decoder start
+        let eos_token_id: i64 = 2;
+        let max_new_tokens: usize = 150;
+        let mut generated_ids: Vec<i64> = vec![decoder_start_token_id];
+
+        let mut dec_session = dec_mutex.lock().map_err(|_| anyhow::anyhow!("Decoder mutex poisoned"))?;
+
+        for _ in 0..max_new_tokens {
+            let seq_len = generated_ids.len();
+
+            // Embed all generated tokens so far
+            let decoder_embeds = {
+                let ids = Value::from_array((vec![1, seq_len], generated_ids.clone()))?;
+                let mut et_session = et_mutex.lock().map_err(|_| anyhow::anyhow!("Embed tokens mutex poisoned"))?;
+                let outputs = et_session.run(inputs!["input_ids" => ids])?;
+                let tensor = outputs[0].try_extract_tensor::<f32>()?;
+                let data: Vec<f32> = tensor.1.to_vec();
+                Value::from_array((vec![1, seq_len, d_model], data))?
+            };
+
+            let enc_hidden = Value::from_array((vec![1, combined_len, d_model], encoder_hidden.clone()))?;
+            let enc_attn_mask = Value::from_array((vec![1, combined_len], attention_mask.clone()))?;
+
+            let outputs = dec_session.run(
+                inputs![
+                    "inputs_embeds" => decoder_embeds,
+                    "encoder_hidden_states" => enc_hidden,
+                    "encoder_attention_mask" => enc_attn_mask
+                ]
+            )?;
+
+            let logits_val = outputs.get("logits")
+                .ok_or_else(|| anyhow::anyhow!("Decoder output missing 'logits' tensor"))?;
+            let logits_tensor = logits_val.try_extract_tensor::<f32>()?;
+            let logits_shape = logits_tensor.0;
+            let logits_data = logits_tensor.1;
+
+            let vocab_size = *logits_shape.last().unwrap() as usize;
+            let last_token_offset = (seq_len - 1) * vocab_size;
+            let last_logits = &logits_data[last_token_offset..last_token_offset + vocab_size];
+
+            // Greedy: argmax
+            let next_token = last_logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx as i64)
+                .unwrap_or(eos_token_id);
+
+            if next_token == eos_token_id && generated_ids.len() > 1 {
+                break;
+            }
+
+            generated_ids.push(next_token);
+        }
+
+        drop(dec_session);
+
+        // --- Step 8: Decode token IDs to text (skip start token) ---
+        let token_ids: Vec<u32> = generated_ids
+            .iter()
+            .skip(1)
+            .filter(|&&id| id != eos_token_id)
+            .map(|&id| id as u32)
+            .collect();
+
+        let text = tokenizer
+            .decode(&token_ids, true)
+            .map_err(|e| anyhow::anyhow!("Failed to decode tokens: {}", e))?;
+
+        Ok(text.trim().to_string())
     }
 
     pub fn detect_faces(&self, img: &DynamicImage) -> Result<Vec<FaceDetection>> {

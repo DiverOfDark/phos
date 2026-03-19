@@ -183,10 +183,17 @@ pub(super) async fn trigger_scan(
         db.query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
     };
 
-    if let Ok(db_path) = db_path_result {
+    if let Ok(_db_path) = db_path_result {
+        let scanner = state.scanner.clone();
+        let scan_path = payload.path.clone();
         tokio::task::spawn_blocking(move || {
-            let scanner = crate::scanner::Scanner::new(std::path::PathBuf::from(db_path), None);
-            let _ = scanner.scan(std::path::Path::new(&payload.path));
+            let path = std::path::Path::new(&scan_path);
+            if let Err(e) = scanner.scan(path) {
+                tracing::error!("Triggered scan failed: {}", e);
+            }
+            if let Err(e) = scanner.caption_shots(path) {
+                tracing::error!("Triggered captioning failed: {}", e);
+            }
         });
     }
 

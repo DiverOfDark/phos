@@ -19,6 +19,7 @@ pub(crate) struct ShotBrief {
     pub primary_person_name: Option<String>,
     pub review_status: Option<String>,
     pub folder_number: Option<i64>,
+    pub description: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -68,7 +69,8 @@ pub(super) async fn get_shots(
     let mut sql = String::from(
         "SELECT DISTINCT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number,
                 f.id AS main_file_id, p.name AS person_name,
-                (SELECT COUNT(*) FROM files WHERE shot_id = s.id) AS file_count
+                (SELECT COUNT(*) FROM files WHERE shot_id = s.id) AS file_count,
+                s.description
          FROM shots s
          LEFT JOIN files f ON s.main_file_id = f.id
          LEFT JOIN people p ON s.primary_person_id = p.id",
@@ -91,12 +93,14 @@ pub(super) async fn get_shots(
     }
 
     if let Some(ref q) = params.q {
-        // Search in file paths associated with the shot via a subquery
+        // Search in file paths and shot descriptions
         conditions.push(
-            "EXISTS (SELECT 1 FROM files fq WHERE fq.shot_id = s.id AND fq.path LIKE ?)"
+            "(EXISTS (SELECT 1 FROM files fq WHERE fq.shot_id = s.id AND fq.path LIKE ?) OR s.description LIKE ?)"
                 .to_string(),
         );
-        bind_values.push(format!("%{}%", q));
+        let pattern = format!("%{}%", q);
+        bind_values.push(pattern.clone());
+        bind_values.push(pattern);
     }
 
     if let Some(ref from) = params.from {
@@ -142,6 +146,7 @@ pub(super) async fn get_shots(
                 .unwrap_or_default(),
             primary_person_name: row.get(6)?,
             file_count: row.get(7)?,
+            description: row.get(8)?,
         })
     }) {
         Ok(r) => r,
@@ -165,6 +170,7 @@ pub(super) struct ShotDetailResponse {
     folder_number: Option<i64>,
     width: Option<i64>,
     height: Option<i64>,
+    description: Option<String>,
     files: Vec<FileDetail>,
     faces: Vec<FaceDetail>,
     also_contains: Vec<AlsoContainsPerson>,
@@ -225,7 +231,7 @@ pub(super) async fn get_shot_detail(
     // Get shot metadata
     let shot_row = db
         .query_row(
-            "SELECT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number, p.name, s.width, s.height
+            "SELECT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number, p.name, s.width, s.height, s.description
              FROM shots s
              LEFT JOIN people p ON s.primary_person_id = p.id
              WHERE s.id = ?",
@@ -240,6 +246,7 @@ pub(super) async fn get_shot_detail(
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )
@@ -363,6 +370,7 @@ pub(super) async fn get_shot_detail(
         folder_number: shot_row.4,
         width: shot_row.6,
         height: shot_row.7,
+        description: shot_row.8,
         files,
         faces,
         also_contains,

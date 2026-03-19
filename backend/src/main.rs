@@ -248,6 +248,12 @@ async fn run_server() {
                 if let Err(e) = user_scanner.scan(user_dir) {
                     tracing::error!("Scan failed for user {}: {}", user_name, e);
                 }
+                if *lock.lock().unwrap() {
+                    return;
+                }
+                if let Err(e) = user_scanner.caption_shots(user_dir) {
+                    tracing::error!("Captioning failed for user {}: {}", user_name, e);
+                }
                 if let Err(e) = import::run_reorganize(user_dir, false) {
                     tracing::error!("Reorganize failed for user {}: {}", user_name, e);
                 }
@@ -271,7 +277,6 @@ async fn run_server() {
         // Single-user mode: scan the root library as before
         let scan_path = root_path.to_path_buf();
         let watcher_library_path = root_path.to_path_buf();
-        let watcher_db_path = db_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
             let (lock, cvar) = &*bg_shutdown;
             if *lock.lock().unwrap() {
@@ -291,6 +296,13 @@ async fn run_server() {
             if *lock.lock().unwrap() {
                 return;
             }
+            if let Err(e) = scanner.caption_shots(&scan_path) {
+                tracing::error!("Captioning failed: {}", e);
+            }
+
+            if *lock.lock().unwrap() {
+                return;
+            }
             // Reorganize files on disk to match clustering results.
             if let Err(e) = import::run_reorganize(&scan_path, false) {
                 tracing::error!("Post-scan reorganize failed: {}", e);
@@ -300,7 +312,7 @@ async fn run_server() {
                 return;
             }
             // Initial scan complete -- start watching for incremental changes.
-            match watcher::start_watcher(watcher_library_path, watcher_db_path, None) {
+            match watcher::start_watcher(watcher_library_path, scanner.clone()) {
                 Ok(watcher_handle) => {
                     info!("File watcher active after initial scan");
                     // Periodically re-run reorganize (every 30 minutes) until shutdown.
