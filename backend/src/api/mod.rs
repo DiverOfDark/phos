@@ -190,7 +190,6 @@ pub struct AppState {
 /// router-level state in single-user mode.
 pub struct UState(pub AppState);
 
-#[axum::async_trait]
 impl axum::extract::FromRequestParts<AppState> for UState {
     type Rejection = std::convert::Infallible;
 

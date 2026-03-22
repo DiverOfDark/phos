@@ -436,7 +436,7 @@ impl Scanner {
                 .query_map([], |row| {
                     let pid: String = row.get(0)?;
                     let blob: Vec<u8> = row.get(1)?;
-                    let count: usize = row.get(2)?;
+                    let count: usize = row.get::<_, u32>(2)? as usize;
                     Ok((pid, blob, count))
                 })?
                 .filter_map(|r| r.ok())
