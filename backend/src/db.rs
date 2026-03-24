@@ -407,6 +407,10 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
     // Clean up people who lost all their shots (e.g. after shot merges)
     cleanup_orphaned_people(&conn)?;
 
+    // Reclaim unused space
+    tracing::info!("Running VACUUM on database");
+    conn.execute_batch("VACUUM;")?;
+
     Ok(conn)
 }
 

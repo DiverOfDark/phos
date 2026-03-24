@@ -1132,9 +1132,8 @@ defineExpose({ loadData: fetchShots })
             Mark Unsorted
           </Button>
 
-          <!-- Delete (unsorted view only) -->
+          <!-- Delete -->
           <Button
-            v-if="statusFilter === 'unsorted'"
             variant="outline"
             class="border-red-500/30 text-red-400 hover:text-red-300 hover:bg-red-500/10 gap-2"
             :disabled="deleting"

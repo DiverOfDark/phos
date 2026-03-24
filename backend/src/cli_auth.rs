@@ -29,8 +29,11 @@ pub fn authenticate_if_needed(server_url: &str) -> anyhow::Result<Option<String>
     let issuer = config["issuer"]
         .as_str()
         .ok_or_else(|| anyhow!("Missing issuer in auth config"))?;
-    let client_id = config["client_id"]
+    // Prefer mobile_client_id (public client, no secret needed for PKCE)
+    // over the web client_id (confidential, requires a secret).
+    let client_id = config["mobile_client_id"]
         .as_str()
+        .or_else(|| config["client_id"].as_str())
         .ok_or_else(|| anyhow!("Missing client_id in auth config"))?;
     let scopes: Vec<&str> = config["scopes"]
         .as_array()
@@ -65,9 +68,8 @@ pub fn authenticate_if_needed(server_url: &str) -> anyhow::Result<Option<String>
     let state = generate_random_string();
 
     // Start local listener for the OIDC callback
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    let redirect_uri = format!("http://localhost:{}/callback", port);
+    let listener = TcpListener::bind("127.0.0.1:3000")?;
+    let redirect_uri = "http://localhost:3000/callback".to_string();
 
     // Build authorization URL
     let auth_url = format!(
@@ -94,8 +96,14 @@ pub fn authenticate_if_needed(server_url: &str) -> anyhow::Result<Option<String>
         anyhow::bail!("CSRF state mismatch — possible attack or stale login attempt");
     }
 
-    // Exchange authorization code for tokens at the OIDC provider
-    let mut token_resp = client
+    // Exchange authorization code for tokens at the OIDC provider.
+    // Use a separate agent that doesn't treat HTTP errors as Rust errors,
+    // so we can read the response body on failure for diagnostics.
+    let token_client = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let mut token_resp = token_client
         .post(token_endpoint)
         .send_form([
             ("grant_type", "authorization_code"),
@@ -105,6 +113,13 @@ pub fn authenticate_if_needed(server_url: &str) -> anyhow::Result<Option<String>
             ("code_verifier", code_verifier.as_str()),
         ])
         .context("Token exchange with OIDC provider failed")?;
+
+    if token_resp.status() != 200 {
+        let status = token_resp.status();
+        let body = token_resp.body_mut().read_to_string().unwrap_or_default();
+        eprintln!("Token exchange failed with HTTP {}: {}", status, body);
+        anyhow::bail!("Token exchange failed (HTTP {})", status);
+    }
 
     let token_json: serde_json::Value = token_resp
         .body_mut()
