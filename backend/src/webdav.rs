@@ -22,9 +22,8 @@ const SINGLE_USER_WEBDAV_USERNAME: &str = "phos";
 
 /// Check if a filename should be hidden from WebDAV clients.
 /// Hides Phos internal files (.phos.db, .phos_thumbnails/, .phos.db-wal, etc.)
-/// and the duplicates staging folder.
 fn is_hidden_name(name: &str) -> bool {
-    name.starts_with(".phos") || name == ".duplicates"
+    name.starts_with(".phos")
 }
 
 /// Check if any component of a DavPath refers to a hidden internal path.
@@ -387,8 +386,6 @@ mod tests {
         assert!(is_hidden_name(".phos.db-shm"));
         assert!(is_hidden_name(".phos_thumbnails"));
         assert!(is_hidden_name(".phos_jwt_secret"));
-        assert!(is_hidden_name(".duplicates"));
-
         assert!(!is_hidden_name("photo.jpg"));
         assert!(!is_hidden_name("John"));
         assert!(!is_hidden_name("001"));
