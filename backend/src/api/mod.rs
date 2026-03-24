@@ -381,7 +381,7 @@ pub fn create_router(state: AppState) -> Router {
         // Shot CRUD
         .route("/api/shots", get(shots::get_shots))
         .route(
-            "/api/shots/:id",
+            "/api/shots/{id}",
             get(shots::get_shot_detail)
                 .put(shots::update_shot)
                 .delete(shots::delete_shot),
@@ -393,8 +393,8 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/shots/merge", post(shots::merge_shots))
         .route("/api/shots/merge/ignore", post(shots::ignore_merge))
-        .route("/api/shots/:id/similar", get(shots::get_similar_shots))
-        .route("/api/shots/:id/split", post(shots::split_shot))
+        .route("/api/shots/{id}/similar", get(shots::get_similar_shots))
+        .route("/api/shots/{id}/split", post(shots::split_shot))
         .route("/api/shots/batch/confirm", post(shots::batch_confirm))
         .route("/api/shots/batch/reassign", post(shots::batch_reassign))
         // People
@@ -404,29 +404,29 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/people/merge", post(people::merge_people))
         .route(
-            "/api/people/:id",
+            "/api/people/{id}",
             get(people::get_person_shots)
                 .put(people::rename_person)
                 .delete(people::delete_person),
         )
-        .route("/api/people/:id/browse", get(people::get_person_browse))
-        .route("/api/people/:id/faces", get(people::get_person_faces))
+        .route("/api/people/{id}/browse", get(people::get_person_browse))
+        .route("/api/people/{id}/faces", get(people::get_person_faces))
         // Faces
-        .route("/api/faces/:id/thumbnail", get(faces::get_face_thumbnail))
-        .route("/api/faces/:id/person", put(faces::reassign_face))
+        .route("/api/faces/{id}/thumbnail", get(faces::get_face_thumbnail))
+        .route("/api/faces/{id}/person", put(faces::reassign_face))
         .route(
-            "/api/faces/:id/suggestions",
+            "/api/faces/{id}/suggestions",
             get(faces::get_face_suggestions),
         )
-        .route("/api/faces/:id", delete(faces::delete_face))
+        .route("/api/faces/{id}", delete(faces::delete_face))
         // Files
         .route(
-            "/api/files/:id",
+            "/api/files/{id}",
             get(files::get_file).delete(files::delete_file),
         )
-        .route("/api/files/:id/thumbnail", get(files::get_file_thumbnail))
-        .route("/api/files/:id/set-original", put(files::set_file_original))
-        .route("/api/files/:id/faces", post(faces::add_manual_face))
+        .route("/api/files/{id}/thumbnail", get(files::get_file_thumbnail))
+        .route("/api/files/{id}/set-original", put(files::set_file_original))
+        .route("/api/files/{id}/faces", post(faces::add_manual_face))
         // Stats + organize
         .route("/api/stats", get(stats::get_stats))
         .route("/api/organize/stats", get(stats::get_organize_stats))
@@ -445,17 +445,17 @@ pub fn create_router(state: AppState) -> Router {
             get(comfyui::comfyui_list_workflows).post(comfyui::comfyui_import_workflow),
         )
         .route(
-            "/api/comfyui/workflows/:id",
+            "/api/comfyui/workflows/{id}",
             delete(comfyui::comfyui_delete_workflow),
         )
         .route("/api/comfyui/enhance", post(comfyui::comfyui_enhance))
         .route("/api/comfyui/tasks", get(comfyui::comfyui_list_tasks))
         .route(
-            "/api/comfyui/tasks/:id",
+            "/api/comfyui/tasks/{id}",
             get(comfyui::comfyui_get_task).delete(comfyui::comfyui_delete_task),
         )
         .route(
-            "/api/comfyui/tasks/:id/retry",
+            "/api/comfyui/tasks/{id}/retry",
             post(comfyui::comfyui_retry_task),
         )
         .route("/api/version", get(stats::get_version))
