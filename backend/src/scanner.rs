@@ -929,6 +929,11 @@ impl Scanner {
 
         pb.finish_with_message("Captioning complete");
         info!("Caption generation finished");
+
+        // Unload caption models to free ~750MB of memory now that the batch is done.
+        // They'll be lazily reloaded if needed again.
+        ai.unload_caption_models();
+
         Ok(())
     }
 }

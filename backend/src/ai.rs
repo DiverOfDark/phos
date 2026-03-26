@@ -45,15 +45,20 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a * norm_b)
 }
 
+struct CaptionModels {
+    vision_encoder: Mutex<Session>,
+    embed_tokens: Mutex<Session>,
+    text_encoder: Mutex<Session>,
+    decoder: Mutex<Session>,
+    tokenizer: Tokenizer,
+}
+
 pub struct AiPipeline {
     face_detector: Option<Mutex<Session>>,
     face_recognizer: Option<Mutex<Session>>,
     logged_outputs: AtomicBool,
-    caption_vision_encoder: Option<Mutex<Session>>,
-    caption_embed_tokens: Option<Mutex<Session>>,
-    caption_text_encoder: Option<Mutex<Session>>,
-    caption_decoder: Option<Mutex<Session>>,
-    caption_tokenizer: Option<Tokenizer>,
+    caption_models: Mutex<Option<CaptionModels>>,
+    caption_load_attempted: AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -372,11 +377,8 @@ impl AiPipeline {
                 face_detector: None,
                 face_recognizer: None,
                 logged_outputs: AtomicBool::new(false),
-                caption_vision_encoder: None,
-                caption_embed_tokens: None,
-                caption_text_encoder: None,
-                caption_decoder: None,
-                caption_tokenizer: None,
+                caption_models: Mutex::new(None),
+                caption_load_attempted: AtomicBool::new(false),
             });
         }
 
@@ -389,6 +391,8 @@ impl AiPipeline {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_inter_threads(1)
             .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_memory_pattern(false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
             .commit_from_file(&det_path)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -398,37 +402,19 @@ impl AiPipeline {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_inter_threads(1)
             .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_memory_pattern(false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
             .commit_from_file(&rec_path)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // Load Florence-2 captioning models (graceful fallback — face detection still works if this fails)
-        let (caption_vision_encoder, caption_embed_tokens, caption_text_encoder, caption_decoder, caption_tokenizer) =
-            match Self::load_caption_models() {
-                Ok((ve, et, te, dec, tok)) => {
-                    tracing::info!("Florence-2 captioning models loaded successfully");
-                    (
-                        Some(Mutex::new(ve)),
-                        Some(Mutex::new(et)),
-                        Some(Mutex::new(te)),
-                        Some(Mutex::new(dec)),
-                        Some(tok),
-                    )
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load captioning models, captioning disabled: {}", e);
-                    (None, None, None, None, None)
-                }
-            };
+        // Caption models are loaded lazily on first use to save ~750MB of idle memory
 
         Ok(Self {
             face_detector: Some(Mutex::new(face_detector)),
             face_recognizer: Some(Mutex::new(face_recognizer)),
             logged_outputs: AtomicBool::new(false),
-            caption_vision_encoder,
-            caption_embed_tokens,
-            caption_text_encoder,
-            caption_decoder,
-            caption_tokenizer,
+            caption_models: Mutex::new(None),
+            caption_load_attempted: AtomicBool::new(false),
         })
     }
 
@@ -447,6 +433,8 @@ impl AiPipeline {
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .with_inter_threads(1)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
+                .with_memory_pattern(false)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
                 .commit_from_file(path)
                 .map_err(|e| anyhow::anyhow!("{e}"))
         };
@@ -462,8 +450,60 @@ impl AiPipeline {
         Ok((vision_encoder, embed_tokens, encoder, decoder, tokenizer))
     }
 
+    /// Ensure caption models are loaded (lazy initialization).
+    /// Returns true if models are available after this call.
+    fn ensure_caption_models(&self) -> bool {
+        if std::env::var("PHOS_DUMMY_AI")
+            .ok()
+            .is_some_and(|v| v == "1")
+        {
+            return true;
+        }
+        // Fast path: already loaded
+        {
+            let guard = self.caption_models.lock().unwrap();
+            if guard.is_some() {
+                return true;
+            }
+        }
+        // Already tried and failed
+        if self.caption_load_attempted.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.caption_load_attempted.store(true, Ordering::Relaxed);
+        match Self::load_caption_models() {
+            Ok((ve, et, te, dec, tok)) => {
+                tracing::info!("Florence-2 captioning models loaded (lazy)");
+                let mut guard = self.caption_models.lock().unwrap();
+                *guard = Some(CaptionModels {
+                    vision_encoder: Mutex::new(ve),
+                    embed_tokens: Mutex::new(et),
+                    text_encoder: Mutex::new(te),
+                    decoder: Mutex::new(dec),
+                    tokenizer: tok,
+                });
+                true
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load captioning models: {}", e);
+                false
+            }
+        }
+    }
+
     pub fn has_captioning(&self) -> bool {
-        self.caption_vision_encoder.is_some()
+        self.ensure_caption_models()
+    }
+
+    /// Unload captioning models to free memory (~750MB).
+    /// They will be reloaded lazily if needed again.
+    pub fn unload_caption_models(&self) {
+        let mut guard = self.caption_models.lock().unwrap();
+        if guard.is_some() {
+            *guard = None;
+            self.caption_load_attempted.store(false, Ordering::Relaxed);
+            tracing::info!("Caption models unloaded to free memory");
+        }
     }
 
     pub fn generate_caption(&self, img: &DynamicImage) -> Result<String> {
@@ -474,16 +514,14 @@ impl AiPipeline {
             return Ok("A placeholder caption for this image".to_string());
         }
 
-        let (ve_mutex, et_mutex, te_mutex, dec_mutex, tokenizer) = match (
-            &self.caption_vision_encoder,
-            &self.caption_embed_tokens,
-            &self.caption_text_encoder,
-            &self.caption_decoder,
-            &self.caption_tokenizer,
-        ) {
-            (Some(ve), Some(et), Some(te), Some(d), Some(t)) => (ve, et, te, d, t),
-            _ => return Err(anyhow::anyhow!("Captioning models not loaded")),
-        };
+        if !self.ensure_caption_models() {
+            return Err(anyhow::anyhow!("Captioning models not available"));
+        }
+
+        let models_guard = self.caption_models.lock().unwrap();
+        let models = models_guard.as_ref().unwrap();
+        let (ve_mutex, et_mutex, te_mutex, dec_mutex, tokenizer) =
+            (&models.vision_encoder, &models.embed_tokens, &models.text_encoder, &models.decoder, &models.tokenizer);
 
         // --- Step 1: Image preprocessing (768x768, ImageNet normalization) ---
         let resized = img.resize_exact(768, 768, image::imageops::FilterType::CatmullRom);
@@ -536,13 +574,13 @@ impl AiPipeline {
         combined_embeds.extend_from_slice(&image_features.1);
         combined_embeds.extend_from_slice(&text_embeds);
         let attention_mask: Vec<i64> = vec![1i64; combined_len];
+        let enc_attn_mask_value = Value::from_array((vec![1, combined_len], attention_mask))?;
 
         // --- Step 6: Text encoder → encoder_hidden_states [1, 577+N, 1024] ---
         let encoder_hidden = {
             let inputs_embeds = Value::from_array((vec![1, combined_len, d_model], combined_embeds))?;
-            let attn_mask = Value::from_array((vec![1, combined_len], attention_mask.clone()))?;
             let mut session = te_mutex.lock().map_err(|_| anyhow::anyhow!("Text encoder mutex poisoned"))?;
-            let outputs = session.run(inputs!["inputs_embeds" => inputs_embeds, "attention_mask" => attn_mask])?;
+            let outputs = session.run(inputs!["inputs_embeds" => inputs_embeds, "attention_mask" => &enc_attn_mask_value])?;
             let tensor = outputs[0].try_extract_tensor::<f32>()?;
             tensor.1.to_vec()
         };
@@ -554,6 +592,10 @@ impl AiPipeline {
         let mut generated_ids: Vec<i64> = vec![decoder_start_token_id];
 
         let mut dec_session = dec_mutex.lock().map_err(|_| anyhow::anyhow!("Decoder mutex poisoned"))?;
+
+        // Pre-create encoder hidden state Value once —
+        // pass by reference in the loop to avoid cloning ~2.4MB per iteration.
+        let enc_hidden_value = Value::from_array((vec![1, combined_len, d_model], encoder_hidden))?;
 
         for _ in 0..max_new_tokens {
             let seq_len = generated_ids.len();
@@ -568,14 +610,11 @@ impl AiPipeline {
                 Value::from_array((vec![1, seq_len, d_model], data))?
             };
 
-            let enc_hidden = Value::from_array((vec![1, combined_len, d_model], encoder_hidden.clone()))?;
-            let enc_attn_mask = Value::from_array((vec![1, combined_len], attention_mask.clone()))?;
-
             let outputs = dec_session.run(
                 inputs![
                     "inputs_embeds" => decoder_embeds,
-                    "encoder_hidden_states" => enc_hidden,
-                    "encoder_attention_mask" => enc_attn_mask
+                    "encoder_hidden_states" => &enc_hidden_value,
+                    "encoder_attention_mask" => &enc_attn_mask_value
                 ]
             )?;
 
