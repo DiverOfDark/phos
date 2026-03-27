@@ -22,6 +22,8 @@ import {
   FileJson,
   ChevronDown,
   ChevronUp,
+  Pencil,
+  Save,
 } from 'lucide-vue-next'
 
 // --- Connection health ---
@@ -139,6 +141,124 @@ async function importWorkflow() {
 
 // --- JSON viewer toggle ---
 const showRawJson = ref(false)
+
+// ===== PRESETS =====
+const presets = ref([])
+const loadingPresets = ref(false)
+const showAddPreset = ref(false)
+const newPresetName = ref('')
+const editingPresetId = ref(null)
+const editingPresetName = ref('')
+
+async function fetchPresets(workflowId) {
+  if (!workflowId) {
+    presets.value = []
+    return
+  }
+  loadingPresets.value = true
+  try {
+    const res = await fetch(`/api/comfyui/workflows/${workflowId}/presets`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    presets.value = await res.json()
+  } catch (e) {
+    console.error('Failed to fetch presets', e)
+    presets.value = []
+  } finally {
+    loadingPresets.value = false
+  }
+}
+
+async function createPreset() {
+  if (!newPresetName.value.trim() || !selectedWorkflowId.value) return
+  // Build text_overrides from workflow's current default inputs
+  const overrides = {}
+  const inputs = selectedWorkflow.value?.inputs || []
+  for (const input of inputs) {
+    if (input.node_type !== 'LoadImage') {
+      overrides[input.node_id] = typeof input.current_value === 'string' ? input.current_value : ''
+    }
+  }
+  try {
+    const res = await fetch(`/api/comfyui/workflows/${selectedWorkflowId.value}/presets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: newPresetName.value.trim(),
+        text_overrides: overrides,
+      }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    newPresetName.value = ''
+    showAddPreset.value = false
+    await fetchPresets(selectedWorkflowId.value)
+  } catch (e) {
+    console.error('Failed to create preset', e)
+  }
+}
+
+function startEditPreset(preset) {
+  editingPresetId.value = preset.id
+  editingPresetName.value = preset.name
+}
+
+async function savePresetName(preset) {
+  if (!editingPresetName.value.trim()) return
+  try {
+    const res = await fetch(`/api/comfyui/workflows/${selectedWorkflowId.value}/presets/${preset.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: editingPresetName.value.trim(),
+        text_overrides: preset.text_overrides,
+        sort_order: preset.sort_order,
+      }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    editingPresetId.value = null
+    await fetchPresets(selectedWorkflowId.value)
+  } catch (e) {
+    console.error('Failed to update preset', e)
+  }
+}
+
+async function updatePresetOverrides(preset, nodeId, value) {
+  const updated = { ...preset.text_overrides, [nodeId]: value }
+  try {
+    const res = await fetch(`/api/comfyui/workflows/${selectedWorkflowId.value}/presets/${preset.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: preset.name,
+        text_overrides: updated,
+        sort_order: preset.sort_order,
+      }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    await fetchPresets(selectedWorkflowId.value)
+  } catch (e) {
+    console.error('Failed to update preset overrides', e)
+  }
+}
+
+async function deletePreset(presetId) {
+  if (!confirm('Delete this preset?')) return
+  try {
+    const res = await fetch(`/api/comfyui/workflows/${selectedWorkflowId.value}/presets/${presetId}`, {
+      method: 'DELETE',
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    await fetchPresets(selectedWorkflowId.value)
+  } catch (e) {
+    console.error('Failed to delete preset', e)
+  }
+}
+
+// Fetch presets when selected workflow changes
+watch(selectedWorkflowId, (id) => {
+  if (id && !showImportForm.value) {
+    fetchPresets(id)
+  }
+})
 
 // ===== QUEUE TAB =====
 const tasks = ref([])
@@ -434,10 +554,21 @@ onUnmounted(() => {
 
             <!-- Workflow detail -->
             <div v-else-if="selectedWorkflow" class="rounded-xl bg-zinc-800/30 border border-white/5 p-6 space-y-5">
-              <div>
-                <h3 class="text-lg font-semibold text-white">{{ selectedWorkflow.name }}</h3>
-                <p v-if="selectedWorkflow.description" class="text-sm text-zinc-400 mt-1">{{ selectedWorkflow.description }}</p>
-                <p class="text-xs text-zinc-500 mt-2">Created {{ formatDate(selectedWorkflow.created_at) }}</p>
+              <div class="flex items-start justify-between gap-4">
+                <div>
+                  <h3 class="text-lg font-semibold text-white">{{ selectedWorkflow.name }}</h3>
+                  <p v-if="selectedWorkflow.description" class="text-sm text-zinc-400 mt-1">{{ selectedWorkflow.description }}</p>
+                  <p class="text-xs text-zinc-500 mt-2">Created {{ formatDate(selectedWorkflow.created_at) }}</p>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  class="gap-1.5 text-zinc-500 hover:text-red-400 hover:bg-red-500/10 shrink-0"
+                  @click="deleteWorkflow(selectedWorkflow.id)"
+                >
+                  <Trash2 class="w-3.5 h-3.5" />
+                  Delete
+                </Button>
               </div>
 
               <!-- Detected Inputs -->
@@ -472,6 +603,112 @@ onUnmounted(() => {
                     {{ output.node_type || 'output' }}
                   </span>
                 </div>
+              </div>
+
+              <!-- Presets -->
+              <div class="space-y-3">
+                <div class="flex items-center justify-between">
+                  <h4 class="text-sm font-medium text-zinc-300">Prompt Presets</h4>
+                  <Button
+                    v-if="!showAddPreset"
+                    variant="ghost"
+                    size="sm"
+                    class="gap-1.5 text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10"
+                    @click="showAddPreset = true; newPresetName = ''"
+                  >
+                    <Plus class="w-3.5 h-3.5" />
+                    Add
+                  </Button>
+                </div>
+
+                <!-- Add preset form -->
+                <div v-if="showAddPreset" class="flex items-center gap-2">
+                  <Input
+                    v-model="newPresetName"
+                    placeholder="Preset name..."
+                    class="bg-zinc-900/50 border-white/10 flex-1"
+                    @keyup.enter="createPreset"
+                  />
+                  <Button
+                    size="sm"
+                    class="bg-indigo-600 hover:bg-indigo-500 text-white gap-1"
+                    :disabled="!newPresetName.trim()"
+                    @click="createPreset"
+                  >
+                    <Check class="w-3.5 h-3.5" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    class="text-zinc-500 hover:text-white"
+                    @click="showAddPreset = false"
+                  >
+                    <X class="w-3.5 h-3.5" />
+                  </Button>
+                </div>
+
+                <!-- Preset list -->
+                <div v-if="loadingPresets" class="flex items-center justify-center py-4">
+                  <RefreshCw class="w-4 h-4 text-indigo-400 animate-spin" />
+                </div>
+                <div v-else-if="presets.length" class="space-y-2">
+                  <div
+                    v-for="preset in presets"
+                    :key="preset.id"
+                    class="rounded-lg bg-zinc-900/50 border border-white/5 p-3 space-y-2"
+                  >
+                    <!-- Preset header -->
+                    <div class="flex items-center justify-between gap-2">
+                      <div v-if="editingPresetId === preset.id" class="flex items-center gap-2 flex-1">
+                        <Input
+                          v-model="editingPresetName"
+                          class="bg-zinc-800/50 border-white/10 text-sm h-7 flex-1"
+                          @keyup.enter="savePresetName(preset)"
+                        />
+                        <button class="text-emerald-400 hover:text-emerald-300" @click="savePresetName(preset)">
+                          <Save class="w-3.5 h-3.5" />
+                        </button>
+                        <button class="text-zinc-500 hover:text-white" @click="editingPresetId = null">
+                          <X class="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                      <span v-else class="text-sm font-medium text-amber-300">{{ preset.name }}</span>
+                      <div v-if="editingPresetId !== preset.id" class="flex items-center gap-1 shrink-0">
+                        <button
+                          class="p-1 rounded text-zinc-600 hover:text-zinc-300 hover:bg-white/5 transition-colors"
+                          @click="startEditPreset(preset)"
+                        >
+                          <Pencil class="w-3 h-3" />
+                        </button>
+                        <button
+                          class="p-1 rounded text-zinc-600 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                          @click="deletePreset(preset.id)"
+                        >
+                          <Trash2 class="w-3 h-3" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <!-- Preset text overrides (editable) -->
+                    <div
+                      v-for="input in (selectedWorkflow.inputs || []).filter(i => i.node_type !== 'LoadImage')"
+                      :key="input.node_id"
+                      class="space-y-1"
+                    >
+                      <label class="text-[10px] font-medium text-zinc-500">
+                        {{ input.field_name }} ({{ input.node_type }})
+                      </label>
+                      <textarea
+                        :value="preset.text_overrides[input.node_id] || ''"
+                        rows="2"
+                        class="flex w-full rounded-md border border-white/5 bg-zinc-800/30 px-2 py-1.5 text-xs text-zinc-300 placeholder:text-zinc-600 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/40 resize-y"
+                        :placeholder="typeof input.current_value === 'string' ? input.current_value : ''"
+                        @change="updatePresetOverrides(preset, input.node_id, $event.target.value)"
+                      />
+                    </div>
+                  </div>
+                </div>
+                <p v-else class="text-xs text-zinc-600">No presets yet. Add one to save prompt text for quick reuse.</p>
               </div>
 
               <!-- Raw JSON viewer -->

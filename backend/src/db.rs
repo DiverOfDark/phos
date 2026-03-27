@@ -181,6 +181,20 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         [],
     )?;
 
+    // Workflow prompt presets (saved text override collections per workflow)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS workflow_presets (
+            id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            text_overrides TEXT NOT NULL DEFAULT '{}',
+            sort_order INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(workflow_id) REFERENCES comfyui_workflows(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     // Ignored merges (for Variations Queue)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS ignored_merges (
@@ -288,6 +302,20 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
         .query_map([], |row| row.get::<_, String>(1))?
         .filter_map(|r| r.ok())
         .collect();
+
+    if !files_columns.contains(&"source_workflow_id".to_string()) {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN source_workflow_id TEXT",
+            [],
+        )?;
+    }
+
+    if !files_columns.contains(&"source_text_overrides".to_string()) {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN source_text_overrides TEXT",
+            [],
+        )?;
+    }
 
     if !files_columns.contains(&"updated_at".to_string()) {
         conn.execute(

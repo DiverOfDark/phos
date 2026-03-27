@@ -386,9 +386,9 @@ fn recover_interrupted_tasks(conn: &Connection) {
 
 /// Pick up pending tasks and start processing them.
 fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient, library_root: &Path) {
-    let tasks: Vec<(String, String, String, String)> = {
+    let tasks: Vec<(String, String, String, String, String)> = {
         let mut stmt = match conn.prepare(
-            "SELECT t.id, t.shot_id, t.workflow_id, w.workflow_json
+            "SELECT t.id, t.shot_id, t.workflow_id, w.workflow_json, COALESCE(t.text_overrides, '{}')
              FROM enhancement_tasks t
              JOIN comfyui_workflows w ON t.workflow_id = w.id
              WHERE t.status = 'pending'
@@ -407,6 +407,7 @@ fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient, library_root
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         }) {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
@@ -418,7 +419,7 @@ fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient, library_root
         result
     };
 
-    for (task_id, shot_id, _workflow_id, workflow_json_str) in tasks {
+    for (task_id, shot_id, _workflow_id, workflow_json_str, text_overrides_str) in tasks {
         // Set uploading
         let _ = conn.execute(
             "UPDATE enhancement_tasks SET status = 'uploading', started_at = CURRENT_TIMESTAMP WHERE id = ?1",
@@ -462,15 +463,6 @@ fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient, library_root
             }
         };
 
-        // Load text overrides from the task
-        let text_overrides_str: String = conn
-            .query_row(
-                "SELECT COALESCE(text_overrides, '{}') FROM enhancement_tasks WHERE id = ?1",
-                params![task_id],
-                |row| row.get(0),
-            )
-            .unwrap_or_else(|_| "{}".to_string());
-
         let text_overrides: std::collections::HashMap<String, String> =
             serde_json::from_str(&text_overrides_str).unwrap_or_default();
 
@@ -497,9 +489,9 @@ fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient, library_root
 
 /// Poll tasks that are queued/processing against ComfyUI history.
 fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u64, library_root: &Path) {
-    let tasks: Vec<(String, String, String, String)> = {
+    let tasks: Vec<(String, String, String, String, String, String)> = {
         let mut stmt = match conn.prepare(
-            "SELECT t.id, t.shot_id, t.comfyui_prompt_id, t.started_at
+            "SELECT t.id, t.shot_id, t.comfyui_prompt_id, t.started_at, t.workflow_id, COALESCE(t.text_overrides, '{}')
              FROM enhancement_tasks t
              WHERE t.status IN ('queued', 'processing')
              AND t.comfyui_prompt_id IS NOT NULL",
@@ -516,6 +508,8 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         }) {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
@@ -527,7 +521,7 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
         result
     };
 
-    for (task_id, shot_id, prompt_id, started_at) in tasks {
+    for (task_id, shot_id, prompt_id, started_at, workflow_id, text_overrides_str) in tasks {
         // Check timeout
         if let Ok(started) = chrono::NaiveDateTime::parse_from_str(&started_at, "%Y-%m-%d %H:%M:%S")
         {
@@ -612,7 +606,7 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
 
                         if let Some(filename) = filename {
                             match download_and_save_output(
-                                conn, client, &task_id, &shot_id, filename, subfolder, out_type, library_root,
+                                conn, client, &task_id, &shot_id, filename, subfolder, out_type, library_root, &workflow_id, &text_overrides_str,
                             ) {
                                 Ok(_) => {
                                     downloaded = true;
@@ -643,7 +637,7 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
 
                         if let Some(filename) = filename {
                             match download_and_save_output(
-                                conn, client, &task_id, &shot_id, filename, subfolder, out_type, library_root,
+                                conn, client, &task_id, &shot_id, filename, subfolder, out_type, library_root, &workflow_id, &text_overrides_str,
                             ) {
                                 Ok(_) => {
                                     downloaded = true;
@@ -688,6 +682,8 @@ fn download_and_save_output(
     subfolder: &str,
     output_type: &str,
     library_root: &Path,
+    workflow_id: &str,
+    text_overrides_json: &str,
 ) -> anyhow::Result<()> {
     let data = client.download_output(filename, subfolder, output_type)?;
 
@@ -743,9 +739,9 @@ fn download_and_save_output(
     let path_str = db::make_relative(library_root, &output_path);
 
     conn.execute(
-        "INSERT INTO files (id, shot_id, path, hash, mime_type, file_size, is_original)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-        params![file_id, shot_id, path_str, hash, mime_type, file_size],
+        "INSERT INTO files (id, shot_id, path, hash, mime_type, file_size, is_original, source_workflow_id, source_text_overrides)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+        params![file_id, shot_id, path_str, hash, mime_type, file_size, workflow_id, text_overrides_json],
     )?;
 
     // Store the output file ID on the task

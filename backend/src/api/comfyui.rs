@@ -503,6 +503,284 @@ pub(super) async fn comfyui_retry_task(
     Ok(Json(serde_json::json!({"status": "pending"})))
 }
 
+// ===== Shot Generations =====
+
+/// GET /api/comfyui/generations/:shot_id — get generation history for a shot
+#[utoipa::path(
+    get,
+    path = "/api/comfyui/generations/{shot_id}",
+    tag = "comfyui",
+    summary = "Get shot generation history",
+    description = "Returns the workflow and text overrides used to generate each non-original file for a shot.",
+    params(("shot_id" = String, Path, description = "Shot ID")),
+    responses(
+        (status = 200, description = "List of generations"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
+pub(super) async fn comfyui_shot_generations(
+    Path(shot_id): Path<String>,
+    UState(state): UState,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let _ = require_comfyui(&state)?;
+    let db = state.db.lock().await;
+
+    let mut stmt = db
+        .prepare(
+            "SELECT f.id, f.source_workflow_id, f.source_text_overrides
+             FROM files f
+             WHERE f.shot_id = ?1 AND f.source_workflow_id IS NOT NULL
+             ORDER BY f.created_at DESC",
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to query generations: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let generations: Vec<serde_json::Value> = stmt
+        .query_map(params![shot_id], |row| {
+            let overrides_str: Option<String> = row.get(2)?;
+            let overrides: serde_json::Value = overrides_str
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::json!({}));
+            Ok(serde_json::json!({
+                "file_id": row.get::<_, String>(0)?,
+                "workflow_id": row.get::<_, String>(1)?,
+                "text_overrides": overrides,
+            }))
+        })
+        .map_err(|e| {
+            tracing::error!("Failed to query generations: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(Json(generations))
+}
+
+// ===== Workflow Presets =====
+
+/// GET /api/comfyui/workflows/:id/presets
+#[derive(Deserialize, ToSchema)]
+pub(super) struct PresetPayload {
+    name: String,
+    #[serde(default)]
+    text_overrides: std::collections::HashMap<String, String>,
+    sort_order: Option<i64>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/comfyui/workflows/{id}/presets",
+    tag = "comfyui",
+    summary = "List workflow presets",
+    description = "List all prompt presets for a specific workflow.",
+    params(("id" = String, Path, description = "Workflow ID")),
+    responses(
+        (status = 200, description = "List of presets"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
+pub(super) async fn comfyui_list_presets(
+    Path(workflow_id): Path<String>,
+    UState(state): UState,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let _ = require_comfyui(&state)?;
+    let db = state.db.lock().await;
+
+    let mut stmt = db
+        .prepare(
+            "SELECT id, name, text_overrides, sort_order, created_at
+             FROM workflow_presets
+             WHERE workflow_id = ?1
+             ORDER BY sort_order ASC, created_at ASC",
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to list presets: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let presets: Vec<serde_json::Value> = stmt
+        .query_map(params![workflow_id], |row| {
+            let overrides_str: String = row.get(2)?;
+            let overrides: serde_json::Value =
+                serde_json::from_str(&overrides_str).unwrap_or(serde_json::json!({}));
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "text_overrides": overrides,
+                "sort_order": row.get::<_, i64>(3)?,
+                "created_at": row.get::<_, String>(4)?,
+            }))
+        })
+        .map_err(|e| {
+            tracing::error!("Failed to query presets: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(Json(presets))
+}
+
+/// POST /api/comfyui/workflows/:id/presets
+#[utoipa::path(
+    post,
+    path = "/api/comfyui/workflows/{id}/presets",
+    tag = "comfyui",
+    summary = "Create workflow preset",
+    description = "Create a new prompt preset for a workflow with saved text overrides.",
+    params(("id" = String, Path, description = "Workflow ID")),
+    request_body = PresetPayload,
+    responses(
+        (status = 200, description = "Preset created"),
+        (status = 404, description = "Workflow not found"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
+pub(super) async fn comfyui_create_preset(
+    Path(workflow_id): Path<String>,
+    UState(state): UState,
+    Json(payload): Json<PresetPayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _ = require_comfyui(&state)?;
+    let db = state.db.lock().await;
+
+    // Verify workflow exists
+    let wf_exists: bool = db
+        .query_row(
+            "SELECT COUNT(*) FROM comfyui_workflows WHERE id = ?1",
+            params![workflow_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+
+    if !wf_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let overrides_json =
+        serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
+    let sort_order = payload.sort_order.unwrap_or(0);
+
+    db.execute(
+        "INSERT INTO workflow_presets (id, workflow_id, name, text_overrides, sort_order) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, workflow_id, payload.name, overrides_json, sort_order],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to insert preset: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "name": payload.name,
+        "text_overrides": payload.text_overrides,
+        "sort_order": sort_order,
+    })))
+}
+
+/// PUT /api/comfyui/workflows/:workflow_id/presets/:preset_id
+#[utoipa::path(
+    put,
+    path = "/api/comfyui/workflows/{workflow_id}/presets/{preset_id}",
+    tag = "comfyui",
+    summary = "Update workflow preset",
+    description = "Update an existing prompt preset's name, text overrides, or sort order.",
+    params(
+        ("workflow_id" = String, Path, description = "Workflow ID"),
+        ("preset_id" = String, Path, description = "Preset ID"),
+    ),
+    request_body = PresetPayload,
+    responses(
+        (status = 200, description = "Preset updated"),
+        (status = 404, description = "Preset not found"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
+pub(super) async fn comfyui_update_preset(
+    Path((workflow_id, preset_id)): Path<(String, String)>,
+    UState(state): UState,
+    Json(payload): Json<PresetPayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _ = require_comfyui(&state)?;
+    let db = state.db.lock().await;
+
+    let overrides_json =
+        serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
+    let sort_order = payload.sort_order.unwrap_or(0);
+
+    let updated = db
+        .execute(
+            "UPDATE workflow_presets SET name = ?1, text_overrides = ?2, sort_order = ?3 WHERE id = ?4 AND workflow_id = ?5",
+            params![payload.name, overrides_json, sort_order, preset_id, workflow_id],
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to update preset: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if updated == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Json(serde_json::json!({
+        "id": preset_id,
+        "name": payload.name,
+        "text_overrides": payload.text_overrides,
+        "sort_order": sort_order,
+    })))
+}
+
+/// DELETE /api/comfyui/workflows/:workflow_id/presets/:preset_id
+#[utoipa::path(
+    delete,
+    path = "/api/comfyui/workflows/{workflow_id}/presets/{preset_id}",
+    tag = "comfyui",
+    summary = "Delete workflow preset",
+    description = "Delete a prompt preset from a workflow.",
+    params(
+        ("workflow_id" = String, Path, description = "Workflow ID"),
+        ("preset_id" = String, Path, description = "Preset ID"),
+    ),
+    responses(
+        (status = 200, description = "Preset deleted"),
+        (status = 404, description = "Preset not found"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
+pub(super) async fn comfyui_delete_preset(
+    Path((workflow_id, preset_id)): Path<(String, String)>,
+    UState(state): UState,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _ = require_comfyui(&state)?;
+    let db = state.db.lock().await;
+
+    let deleted = db
+        .execute(
+            "DELETE FROM workflow_presets WHERE id = ?1 AND workflow_id = ?2",
+            params![preset_id, workflow_id],
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to delete preset: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if deleted == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
 /// DELETE /api/comfyui/tasks/:id — remove a failed or completed task
 #[utoipa::path(
     delete,

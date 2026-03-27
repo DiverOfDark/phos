@@ -9,13 +9,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import {
   Wand2,
   RefreshCw,
   Check,
   AlertCircle,
-  ChevronDown,
+  Copy,
 } from 'lucide-vue-next'
 
 const props = defineProps({
@@ -39,6 +38,13 @@ const selectedWorkflow = computed(() =>
   workflows.value.find(w => w.id === selectedWorkflowId.value) || null
 )
 
+// --- Presets ---
+const presets = ref([])
+const selectedPresetId = ref(null)
+
+// --- Generations (existing variations for this shot) ---
+const generations = ref([])
+
 // --- Text overrides ---
 const textOverrides = ref({})
 
@@ -46,9 +52,6 @@ const textOverrides = ref({})
 const submitting = ref(false)
 const submitError = ref('')
 const submitSuccess = ref(false)
-
-// --- Dropdown open ---
-const showDropdown = ref(false)
 
 async function fetchWorkflows() {
   loadingWorkflows.value = true
@@ -66,10 +69,68 @@ async function fetchWorkflows() {
   }
 }
 
+async function fetchPresets(workflowId) {
+  try {
+    const res = await fetch(`/api/comfyui/workflows/${workflowId}/presets`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    presets.value = await res.json()
+  } catch (e) {
+    console.error('Failed to fetch presets', e)
+    presets.value = []
+  }
+}
+
+async function fetchGenerations(shotId) {
+  try {
+    const res = await fetch(`/api/comfyui/generations/${shotId}`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    generations.value = await res.json()
+  } catch (e) {
+    console.error('Failed to fetch generations', e)
+    generations.value = []
+  }
+}
+
+// Check if a workflow has any existing generation for this shot
+function workflowHasGeneration(workflowId) {
+  return generations.value.some(g => g.workflow_id === workflowId)
+}
+
+// Check if a preset's overrides match any existing generation for the selected workflow
+function presetHasGeneration(preset) {
+  return generations.value.some(g => {
+    if (g.workflow_id !== selectedWorkflowId.value) return false
+    return overridesMatch(g.text_overrides, preset.text_overrides)
+  })
+}
+
+// Check if current text overrides match any existing generation
+const currentMatchesGeneration = computed(() => {
+  if (!selectedWorkflowId.value) return false
+  return generations.value.some(g => {
+    if (g.workflow_id !== selectedWorkflowId.value) return false
+    return overridesMatch(g.text_overrides, textOverrides.value)
+  })
+})
+
+function overridesMatch(a, b) {
+  const keysA = Object.keys(a || {})
+  const keysB = Object.keys(b || {})
+  const allKeys = new Set([...keysA, ...keysB])
+  for (const key of allKeys) {
+    const valA = (a || {})[key] || ''
+    const valB = (b || {})[key] || ''
+    if (valA !== valB) return false
+  }
+  return true
+}
+
 // Initialize text overrides when workflow changes
 watch(selectedWorkflow, (wf) => {
   if (!wf) {
     textOverrides.value = {}
+    presets.value = []
+    selectedPresetId.value = null
     return
   }
   const overrides = {}
@@ -80,20 +141,46 @@ watch(selectedWorkflow, (wf) => {
     }
   }
   textOverrides.value = overrides
+  selectedPresetId.value = null
+  fetchPresets(wf.id)
 })
 
-// Fetch workflows when dialog opens
+// Fetch workflows and generations when dialog opens
 watch(dialogOpen, (val) => {
   if (val) {
     submitError.value = ''
     submitSuccess.value = false
     fetchWorkflows()
+    if (props.shotId) {
+      fetchGenerations(props.shotId)
+    }
   }
 })
 
 function selectWorkflow(id) {
   selectedWorkflowId.value = id
-  showDropdown.value = false
+}
+
+function selectPreset(preset) {
+  if (selectedPresetId.value === preset.id) {
+    // Deselect — restore workflow defaults
+    selectedPresetId.value = null
+    const overrides = {}
+    const inputs = selectedWorkflow.value?.inputs || []
+    for (const input of inputs) {
+      if (input.node_type !== 'LoadImage') {
+        overrides[input.node_id] = typeof input.current_value === 'string' ? input.current_value : ''
+      }
+    }
+    textOverrides.value = overrides
+    return
+  }
+  selectedPresetId.value = preset.id
+  const overrides = { ...textOverrides.value }
+  for (const [key, value] of Object.entries(preset.text_overrides)) {
+    overrides[key] = value
+  }
+  textOverrides.value = overrides
 }
 
 const textInputs = computed(() => {
@@ -157,45 +244,31 @@ async function enhance() {
       </DialogHeader>
 
       <div class="mt-4 space-y-4">
-        <!-- Workflow selector -->
+        <!-- Workflow selector (chips) -->
         <div class="space-y-2">
           <Label>Workflow</Label>
-          <div class="relative">
+          <div v-if="loadingWorkflows" class="text-sm text-zinc-500">Loading workflows...</div>
+          <div v-else-if="workflows.length" class="flex flex-wrap gap-2">
             <button
-              class="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-zinc-800/50 border border-white/10 text-sm text-left hover:border-white/20 transition-colors"
-              @click="showDropdown = !showDropdown"
+              v-for="wf in workflows"
+              :key="wf.id"
+              class="relative px-3 py-1.5 rounded-lg text-sm font-medium border transition-all"
+              :class="selectedWorkflowId === wf.id
+                ? 'bg-indigo-600/20 text-indigo-300 border-indigo-500/30'
+                : 'bg-zinc-800/50 text-zinc-400 border-white/10 hover:border-white/20 hover:text-zinc-200'"
+              @click="selectWorkflow(wf.id)"
             >
-              <span v-if="loadingWorkflows" class="text-zinc-500">Loading workflows...</span>
-              <span v-else-if="selectedWorkflow" class="text-zinc-200 truncate">{{ selectedWorkflow.name }}</span>
-              <span v-else class="text-zinc-500">Select a workflow...</span>
-              <ChevronDown class="w-4 h-4 text-zinc-500 shrink-0 ml-2" />
+              {{ wf.name }}
+              <span
+                v-if="workflowHasGeneration(wf.id)"
+                class="ml-1.5 inline-flex items-center"
+                title="This shot already has variations from this workflow"
+              >
+                <Copy class="w-3 h-3 text-emerald-400" />
+              </span>
             </button>
-
-            <div
-              v-if="showDropdown && workflows.length"
-              class="absolute top-full left-0 right-0 mt-1 z-50 bg-zinc-900 border border-white/10 rounded-xl shadow-2xl overflow-hidden"
-            >
-              <ScrollArea class="max-h-48">
-                <div class="p-1">
-                  <button
-                    v-for="wf in workflows"
-                    :key="wf.id"
-                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left transition-colors"
-                    :class="selectedWorkflowId === wf.id
-                      ? 'bg-indigo-600/20 text-indigo-300'
-                      : 'text-zinc-300 hover:bg-white/5 hover:text-white'"
-                    @click="selectWorkflow(wf.id)"
-                  >
-                    <div class="min-w-0 flex-1">
-                      <p class="text-sm font-medium truncate">{{ wf.name }}</p>
-                      <p v-if="wf.description" class="text-xs text-zinc-500 truncate">{{ wf.description }}</p>
-                    </div>
-                    <Check v-if="selectedWorkflowId === wf.id" class="w-4 h-4 text-indigo-400 shrink-0" />
-                  </button>
-                </div>
-              </ScrollArea>
-            </div>
           </div>
+          <div v-else class="text-sm text-zinc-500">No workflows available</div>
         </div>
 
         <!-- Output type indicator -->
@@ -204,6 +277,34 @@ async function enhance() {
           <span class="px-2 py-0.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-xs font-medium text-indigo-400">
             {{ outputType }}
           </span>
+        </div>
+
+        <!-- Preset chips -->
+        <div v-if="presets.length && selectedWorkflow" class="space-y-2">
+          <Label class="text-zinc-400">Presets</Label>
+          <div class="flex flex-wrap gap-2">
+            <button
+              v-for="preset in presets"
+              :key="preset.id"
+              class="relative px-3 py-1.5 rounded-lg text-sm font-medium border transition-all"
+              :class="[
+                selectedPresetId === preset.id
+                  ? 'bg-amber-600/20 text-amber-300 border-amber-500/30'
+                  : 'bg-zinc-800/50 text-zinc-400 border-white/10 hover:border-white/20 hover:text-zinc-200',
+                presetHasGeneration(preset) ? 'ring-1 ring-emerald-500/30' : '',
+              ]"
+              @click="selectPreset(preset)"
+            >
+              {{ preset.name }}
+              <span
+                v-if="presetHasGeneration(preset)"
+                class="ml-1.5 inline-flex items-center"
+                title="Already generated with this preset"
+              >
+                <Check class="w-3 h-3 text-emerald-400" />
+              </span>
+            </button>
+          </div>
         </div>
 
         <!-- Text input overrides -->
@@ -218,8 +319,15 @@ async function enhance() {
               rows="2"
               class="flex w-full rounded-lg border border-white/10 bg-zinc-800/50 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 focus-visible:ring-offset-0 resize-y"
               :placeholder="typeof input.current_value === 'string' ? input.current_value : 'Enter value...'"
+              @input="selectedPresetId = null"
             />
           </div>
+        </div>
+
+        <!-- Already generated warning -->
+        <div v-if="currentMatchesGeneration" class="flex items-start gap-2 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20">
+          <Copy class="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
+          <p class="text-sm text-amber-300">This shot already has a variation with this workflow and prompts.</p>
         </div>
 
         <!-- No workflows message -->

@@ -88,6 +88,11 @@ use utoipa::OpenApi;
         comfyui::comfyui_get_task,
         comfyui::comfyui_retry_task,
         comfyui::comfyui_delete_task,
+        comfyui::comfyui_shot_generations,
+        comfyui::comfyui_list_presets,
+        comfyui::comfyui_create_preset,
+        comfyui::comfyui_update_preset,
+        comfyui::comfyui_delete_preset,
         // Sync
         sync::get_sync,
         // Settings
@@ -138,6 +143,7 @@ use utoipa::OpenApi;
             // ComfyUI
             comfyui::ImportWorkflowPayload,
             comfyui::EnhancePayload,
+            comfyui::PresetPayload,
             // Sync
             sync::SyncResponse,
             sync::SyncPerson,
@@ -447,6 +453,18 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/comfyui/workflows/{id}",
             delete(comfyui::comfyui_delete_workflow),
+        )
+        .route(
+            "/api/comfyui/workflows/{id}/presets",
+            get(comfyui::comfyui_list_presets).post(comfyui::comfyui_create_preset),
+        )
+        .route(
+            "/api/comfyui/workflows/{workflow_id}/presets/{preset_id}",
+            put(comfyui::comfyui_update_preset).delete(comfyui::comfyui_delete_preset),
+        )
+        .route(
+            "/api/comfyui/generations/{shot_id}",
+            get(comfyui::comfyui_shot_generations),
         )
         .route("/api/comfyui/enhance", post(comfyui::comfyui_enhance))
         .route("/api/comfyui/tasks", get(comfyui::comfyui_list_tasks))
