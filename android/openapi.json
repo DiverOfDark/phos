@@ -221,6 +221,38 @@
         }
       }
     },
+    "/api/comfyui/generations/{shot_id}": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Get shot generation history",
+        "description": "Returns the workflow and text overrides used to generate each non-original file for a shot.",
+        "operationId": "comfyui_shot_generations",
+        "parameters": [
+          {
+            "name": "shot_id",
+            "in": "path",
+            "description": "Shot ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of generations"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
     "/api/comfyui/health": {
       "get": {
         "tags": [
@@ -463,6 +495,177 @@
           },
           "404": {
             "description": "Workflow not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/workflows/{id}/presets": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "List workflow presets",
+        "description": "List all prompt presets for a specific workflow.",
+        "operationId": "comfyui_list_presets",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Workflow ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of presets"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Create workflow preset",
+        "description": "Create a new prompt preset for a workflow with saved text overrides.",
+        "operationId": "comfyui_create_preset",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Workflow ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PresetPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Preset created"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/workflows/{workflow_id}/presets/{preset_id}": {
+      "put": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Update workflow preset",
+        "description": "Update an existing prompt preset's name, text overrides, or sort order.",
+        "operationId": "comfyui_update_preset",
+        "parameters": [
+          {
+            "name": "workflow_id",
+            "in": "path",
+            "description": "Workflow ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "preset_id",
+            "in": "path",
+            "description": "Preset ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PresetPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Preset updated"
+          },
+          "404": {
+            "description": "Preset not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Delete workflow preset",
+        "description": "Delete a prompt preset from a workflow.",
+        "operationId": "comfyui_delete_preset",
+        "parameters": [
+          {
+            "name": "workflow_id",
+            "in": "path",
+            "description": "Workflow ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "preset_id",
+            "in": "path",
+            "description": "Preset ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Preset deleted"
+          },
+          "404": {
+            "description": "Preset not found"
           },
           "500": {
             "description": "Internal server error"
@@ -1231,6 +1434,58 @@
           },
           "500": {
             "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/settings/webdav": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "operationId": "get_webdav_settings",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebDavSettings"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Settings"
+        ],
+        "operationId": "set_webdav_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebDavCredentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Credentials saved"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Settings"
+        ],
+        "operationId": "delete_webdav_settings",
+        "responses": {
+          "200": {
+            "description": "WebDAV disabled"
           }
         }
       }
@@ -2333,6 +2588,34 @@
           }
         }
       },
+      "PresetPayload": {
+        "type": "object",
+        "description": "GET /api/comfyui/workflows/:id/presets",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "sort_order": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "text_overrides": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "ReassignFacePayload": {
         "type": "object",
         "description": "Reassign a face to a different person",
@@ -2406,6 +2689,12 @@
           "file_count"
         ],
         "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "file_count": {
             "type": "integer",
             "format": "int64"
@@ -2463,6 +2752,12 @@
             "items": {
               "$ref": "#/components/schemas/AlsoContainsPerson"
             }
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "faces": {
             "type": "array",
@@ -2877,6 +3172,33 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "WebDavCredentials": {
+        "type": "object",
+        "required": [
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string"
+          }
+        }
+      },
+      "WebDavSettings": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "username"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "username": {
+            "type": "string",
+            "description": "The WebDAV username (OIDC sub in multi-user mode, \"phos\" in single-user)."
           }
         }
       }
