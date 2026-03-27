@@ -9,9 +9,9 @@ use axum::{
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use openidconnect::{
     core::{CoreClient, CoreIdToken, CoreProviderMetadata, CoreResponseType},
-    reqwest::async_http_client,
-    AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
+    AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
+    EndpointMaybeSet, EndpointNotSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, Scope, TokenResponse,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -38,10 +38,21 @@ struct OidcStateClaims {
     exp: usize,
 }
 
+/// OIDC client type after provider metadata discovery + explicit endpoint setup.
+type DiscoveredClient = CoreClient<
+    openidconnect::EndpointSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointMaybeSet,
+    EndpointMaybeSet,
+>;
+
 /// Shared state for auth route handlers and the auth middleware.
 #[derive(Clone)]
 pub struct AuthState {
-    oidc_client: CoreClient,
+    oidc_client: DiscoveredClient,
+    http_client: openidconnect::reqwest::Client,
     jwt_encoding_key: EncodingKey,
     jwt_decoding_key: DecodingKey,
     jwt_ttl_secs: u64,
@@ -62,22 +73,31 @@ pub async fn init_oidc(
     scopes: Vec<String>,
     mobile_client_id: Option<String>,
 ) -> anyhow::Result<AuthState> {
+    let http_client = openidconnect::reqwest::ClientBuilder::new()
+        .redirect(openidconnect::reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
+
     let provider_metadata = CoreProviderMetadata::discover_async(
         IssuerUrl::new(issuer_url.to_string())?,
-        async_http_client,
+        &http_client,
     )
     .await
     .map_err(|e| anyhow::anyhow!("OIDC discovery failed: {}", e))?;
+
+    let auth_uri = provider_metadata.authorization_endpoint().clone();
 
     let client = CoreClient::from_provider_metadata(
         provider_metadata,
         ClientId::new(client_id.to_string()),
         Some(ClientSecret::new(client_secret.to_string())),
     )
+    .set_auth_uri(auth_uri)
     .set_redirect_uri(RedirectUrl::new(redirect_uri.to_string())?);
 
     Ok(AuthState {
         oidc_client: client,
+        http_client,
         jwt_encoding_key: EncodingKey::from_secret(jwt_secret.as_bytes()),
         jwt_decoding_key: DecodingKey::from_secret(jwt_secret.as_bytes()),
         jwt_ttl_secs,
@@ -202,8 +222,12 @@ pub(crate) async fn callback(
     let token_response = auth
         .oidc_client
         .exchange_code(AuthorizationCode::new(code))
+        .map_err(|e| {
+            tracing::error!("Failed to build token request: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .set_pkce_verifier(PkceCodeVerifier::new(state_claims.pkce_verifier))
-        .request_async(async_http_client)
+        .request_async(&auth.http_client)
         .await
         .map_err(|e| {
             tracing::error!("Token exchange failed: {}", e);

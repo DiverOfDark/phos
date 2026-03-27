@@ -577,8 +577,9 @@ fn find_or_create_person_for_import(
         })?
         .filter_map(|r| r.ok())
         .filter_map(|(pid, blob)| {
-            bincode::deserialize::<Vec<f32>>(&blob)
+            bincode::serde::decode_from_slice::<Vec<f32>, _>(&blob, bincode::config::legacy())
                 .ok()
+                .map(|(v, _)| v)
                 .filter(|e| e.len() == embedding.len())
                 .map(|e| (pid, e))
         })
@@ -602,7 +603,7 @@ fn find_or_create_person_for_import(
         Ok(person_id)
     } else {
         let person_id = Uuid::new_v4().to_string();
-        let embedding_blob = bincode::serialize(embedding)?;
+        let embedding_blob = bincode::serde::encode_to_vec(embedding, bincode::config::legacy())?;
         conn.execute(
             "INSERT INTO people (id, representative_embedding) VALUES (?, ?)",
             params![person_id, embedding_blob],
