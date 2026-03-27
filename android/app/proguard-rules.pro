@@ -13,6 +13,11 @@
     *;
 }
 
+# GitHub API models (Jackson deserialization)
+-keepclassmembers class dev.phos.android.data.update.** {
+    *;
+}
+
 # Room
 -keep class * extends androidx.room.RoomDatabase
 -dontwarn androidx.room.paging.**

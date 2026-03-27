@@ -7,11 +7,15 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.phos.android.data.local.PhosDatabase
 import dev.phos.android.data.repository.AuthRepository
+import dev.phos.android.data.update.UpdateRepository
+import dev.phos.android.data.update.UpdateState
 import dev.phos.android.sync.SyncWorker
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 
@@ -21,12 +25,15 @@ data class SettingsUiState(
     val isClearing: Boolean = false,
     val isClearingMetadata: Boolean = false,
     val wifiOnlySync: Boolean = false,
+    val updateState: UpdateState = UpdateState.Idle,
+    val currentVersion: String = "",
 )
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val authRepository: AuthRepository,
     private val database: PhosDatabase,
+    private val updateRepository: UpdateRepository,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
 
@@ -37,8 +44,10 @@ class SettingsViewModel @Inject constructor(
         _uiState.value = SettingsUiState(
             serverUrl = authRepository.getServerUrl() ?: "",
             wifiOnlySync = authRepository.isWifiOnlySync(),
+            currentVersion = updateRepository.getCurrentVersion(),
         )
         calculateCacheSize()
+        checkForUpdate()
     }
 
     private fun calculateCacheSize() {
@@ -67,7 +76,9 @@ class SettingsViewModel @Inject constructor(
     fun clearMetadataCache() {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isClearingMetadata = true)
-            database.clearAllTables()
+            withContext(Dispatchers.IO) {
+                database.clearAllTables()
+            }
             _uiState.value = _uiState.value.copy(isClearingMetadata = false)
         }
     }
@@ -77,6 +88,47 @@ class SettingsViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(wifiOnlySync = enabled)
         // Re-enqueue sync worker with updated constraints
         SyncWorker.enqueue(context, wifiOnly = enabled)
+    }
+
+    fun checkForUpdate() {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(updateState = UpdateState.Checking)
+            val state = withContext(Dispatchers.IO) {
+                updateRepository.checkForUpdate()
+            }
+            _uiState.value = _uiState.value.copy(updateState = state)
+        }
+    }
+
+    fun downloadUpdate() {
+        val current = _uiState.value.updateState
+        if (current !is UpdateState.Available) return
+
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(updateState = UpdateState.Downloading(0f))
+            try {
+                val apkFile = withContext(Dispatchers.IO) {
+                    updateRepository.downloadApk(current.downloadUrl) { progress ->
+                        _uiState.value = _uiState.value.copy(
+                            updateState = UpdateState.Downloading(progress)
+                        )
+                    }
+                }
+                _uiState.value = _uiState.value.copy(
+                    updateState = UpdateState.ReadyToInstall(apkFile)
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    updateState = UpdateState.Error(e.message ?: "Download failed")
+                )
+            }
+        }
+    }
+
+    fun installUpdate() {
+        val current = _uiState.value.updateState
+        if (current !is UpdateState.ReadyToInstall) return
+        updateRepository.installApk(context, current.apkFile)
     }
 
     fun logout() {

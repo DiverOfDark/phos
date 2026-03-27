@@ -9,6 +9,7 @@ import coil3.disk.DiskCache
 import coil3.memory.MemoryCache
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import dagger.hilt.android.HiltAndroidApp
+import dev.phos.android.sync.UpdateCheckWorker
 import okhttp3.OkHttpClient
 import okio.Path.Companion.toOkioPath
 import javax.inject.Inject
@@ -23,6 +24,12 @@ class PhosApplication : Application(), Configuration.Provider, SingletonImageLoa
         get() = Configuration.Builder()
             .setWorkerFactory(workerFactory)
             .build()
+
+    override fun onCreate() {
+        super.onCreate()
+        UpdateCheckWorker.createNotificationChannel(this)
+        UpdateCheckWorker.enqueue(this)
+    }
 
     override fun newImageLoader(context: android.content.Context): ImageLoader {
         return ImageLoader.Builder(context)
