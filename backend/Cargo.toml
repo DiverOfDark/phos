@@ -32,7 +32,7 @@ indicatif = "0.18"
 rayon = "1.10"
 urlencoding = "2"
 base64 = "0.22"
-openidconnect = "3"
+openidconnect = "4"
 jsonwebtoken = "10"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
