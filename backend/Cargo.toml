@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 tempfile = "3.27"
-bincode = { version = "2", features = ["serde"] }
+bincode = { version = "3", features = ["serde"] }
 axum = { version = "0.8.8", features = ["macros", "multipart"] }
 ureq = { version = "3.0", features = ["json"] }
 tokio = { version = "1.50", features = ["full"] }
