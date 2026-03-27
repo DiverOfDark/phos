@@ -175,7 +175,7 @@ async function createPreset() {
   const inputs = selectedWorkflow.value?.inputs || []
   for (const input of inputs) {
     if (input.node_type !== 'LoadImage') {
-      overrides[input.node_id] = typeof input.current_value === 'string' ? input.current_value : ''
+      overrides[`${input.node_id}.${input.field_name}`] = typeof input.current_value === 'string' ? input.current_value : ''
     }
   }
   try {
@@ -692,18 +692,18 @@ onUnmounted(() => {
                     <!-- Preset text overrides (editable) -->
                     <div
                       v-for="input in (selectedWorkflow.inputs || []).filter(i => i.node_type !== 'LoadImage')"
-                      :key="input.node_id"
+                      :key="`${input.node_id}.${input.field_name}`"
                       class="space-y-1"
                     >
                       <label class="text-[10px] font-medium text-zinc-500">
                         {{ input.field_name }} ({{ input.node_type }})
                       </label>
                       <textarea
-                        :value="preset.text_overrides[input.node_id] || ''"
+                        :value="preset.text_overrides[`${input.node_id}.${input.field_name}`] || ''"
                         rows="2"
                         class="flex w-full rounded-md border border-white/5 bg-zinc-800/30 px-2 py-1.5 text-xs text-zinc-300 placeholder:text-zinc-600 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/40 resize-y"
                         :placeholder="typeof input.current_value === 'string' ? input.current_value : ''"
-                        @change="updatePresetOverrides(preset, input.node_id, $event.target.value)"
+                        @change="updatePresetOverrides(preset, `${input.node_id}.${input.field_name}`, $event.target.value)"
                       />
                     </div>
                   </div>

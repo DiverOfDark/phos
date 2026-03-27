@@ -137,7 +137,7 @@ watch(selectedWorkflow, (wf) => {
   const inputs = wf.inputs || []
   for (const input of inputs) {
     if (input.node_type !== 'LoadImage') {
-      overrides[input.node_id] = typeof input.current_value === 'string' ? input.current_value : ''
+      overrides[`${input.node_id}.${input.field_name}`] = typeof input.current_value === 'string' ? input.current_value : ''
     }
   }
   textOverrides.value = overrides
@@ -169,7 +169,7 @@ function selectPreset(preset) {
     const inputs = selectedWorkflow.value?.inputs || []
     for (const input of inputs) {
       if (input.node_type !== 'LoadImage') {
-        overrides[input.node_id] = typeof input.current_value === 'string' ? input.current_value : ''
+        overrides[`${input.node_id}.${input.field_name}`] = typeof input.current_value === 'string' ? input.current_value : ''
       }
     }
     textOverrides.value = overrides
@@ -310,12 +310,12 @@ async function enhance() {
         <!-- Text input overrides -->
         <div v-if="textInputs.length" class="space-y-3">
           <Label class="text-zinc-400">Input Overrides</Label>
-          <div v-for="input in textInputs" :key="input.node_id" class="space-y-1.5">
+          <div v-for="input in textInputs" :key="`${input.node_id}.${input.field_name}`" class="space-y-1.5">
             <label class="text-xs font-medium text-zinc-400">
               {{ input.field_name }} <span class="text-zinc-600">({{ input.node_type }}, node {{ input.node_id }})</span>
             </label>
             <textarea
-              v-model="textOverrides[input.node_id]"
+              v-model="textOverrides[`${input.node_id}.${input.field_name}`]"
               rows="2"
               class="flex w-full rounded-lg border border-white/10 bg-zinc-800/50 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 focus-visible:ring-offset-0 resize-y"
               :placeholder="typeof input.current_value === 'string' ? input.current_value : 'Enter value...'"
