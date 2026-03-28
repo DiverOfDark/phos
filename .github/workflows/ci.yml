@@ -38,23 +38,19 @@ jobs:
             echo "version=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Decode keystore
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > /tmp/release.keystore
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-
       - name: Build Android APKs
         run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > /tmp/release.keystore
           cd android
           chmod +x gradlew
+          KEYSTORE_FILE='/tmp/release.keystore'
           VERSION_ARGS=""
           if [ -n "${{ steps.version.outputs.version }}" ]; then
             VERSION_ARGS="-PversionName=${{ steps.version.outputs.version }}"
           fi
           ./gradlew assembleDebug assembleRelease --no-daemon $VERSION_ARGS
         env:
-          KEYSTORE_FILE: ${{ startsWith(github.ref, 'refs/tags/v') && '/tmp/release.keystore' || '' }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
