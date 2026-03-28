@@ -60,54 +60,14 @@ jobs:
           cp android/app/build/outputs/apk/release/app-release.apk android/app/build/outputs/apk/release/phos-release.apk
 
       - name: Upload release APK artifact
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v7
         with:
           name: release-apk
           path: android/app/build/outputs/apk/release/phos-release.apk
           retention-days: 30
 
-      - name: Upload debug APK artifact
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: debug-apk
-          path: android/app/build/outputs/apk/debug/*.apk
-          retention-days: 30
-
-  backend-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev libavutil-dev libavformat-dev libavcodec-dev libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev nasm
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo registry and build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            backend/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('backend/Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
-
-      - name: Backend Tests
-        run: |
-          cd backend
-          cargo test
-
   docker:
-    needs: [backend-test]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
     permissions:
       contents: read
       packages: write

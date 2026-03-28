@@ -29,8 +29,8 @@ COPY backend/Cargo.toml backend/Cargo.lock backend/build.rs ./
 COPY backend/src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
-# Stage 2c: Build (deps cached as layer, then compile source)
-FROM chef AS backend-builder
+# Stage 2c: Build deps + run tests
+FROM chef AS backend-test
 COPY --from=planner /app/backend/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
@@ -38,6 +38,10 @@ ARG PHOS_VERSION
 ENV PHOS_VERSION=${PHOS_VERSION}
 COPY backend/Cargo.toml backend/Cargo.lock backend/build.rs ./
 COPY backend/src ./src
+RUN cargo test --release --lib
+
+# Stage 2d: Build release binary (reuses compilation from test stage)
+FROM backend-test AS backend-builder
 RUN cargo build --release && \
     cp target/release/phos-backend /usr/local/bin/phos-backend
 
