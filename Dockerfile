@@ -13,49 +13,32 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY frontend/ ./
 RUN PHOS_VERSION=${PHOS_VERSION} npm run build
 
-# Stage 2: Build Backend
-FROM rust:1.94 AS backend-builder
+# Stage 2a: Chef base (install cargo-chef + system deps)
+FROM rust:1.94 AS chef
 RUN apt-get update && apt-get install --no-install-recommends -y \
-    pkg-config \
-    libssl-dev \
-    libclang-dev \
-    clang \
-    cmake \
-    libsqlite3-dev \
-    ffmpeg \
-    libavcodec-dev \
-    libavformat-dev \
-    libavutil-dev \
-    libswscale-dev \
-    libswresample-dev \
-    libavdevice-dev \
-    libavfilter-dev \
-    wget \
-    unzip \
-    nasm \
-    yasm \
+    pkg-config libssl-dev libclang-dev clang cmake libsqlite3-dev \
+    ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+    libswresample-dev libavdevice-dev libavfilter-dev wget unzip nasm yasm \
     && rm -rf /var/lib/apt/lists/*
-
+RUN cargo install cargo-chef --locked
 WORKDIR /app/backend
-COPY backend/Cargo.toml backend/Cargo.lock ./
-COPY backend/build.rs ./
-# Build dependencies with dummy source (cached separately from app code)
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/backend/target \
-    mkdir src && echo "fn main() {}" > src/main.rs && \
-    cargo build --release --features "" || true && \
-    rm -rf src
 
-# Set PHOS_VERSION after dep build so version changes don't invalidate dep cache
+# Stage 2b: Generate dependency recipe
+FROM chef AS planner
+COPY backend/Cargo.toml backend/Cargo.lock backend/build.rs ./
+COPY backend/src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Stage 2c: Build (deps cached as layer, then compile source)
+FROM chef AS backend-builder
+COPY --from=planner /app/backend/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
 ARG PHOS_VERSION
 ENV PHOS_VERSION=${PHOS_VERSION}
-
+COPY backend/Cargo.toml backend/Cargo.lock backend/build.rs ./
 COPY backend/src ./src
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/backend/target \
-    touch src/main.rs && cargo build --release && \
+RUN cargo build --release && \
     cp target/release/phos-backend /usr/local/bin/phos-backend
 
 # Stage 3: Final Image
