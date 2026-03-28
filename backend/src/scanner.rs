@@ -178,6 +178,10 @@ impl Scanner {
                     "DELETE FROM video_keyframes WHERE video_file_id = ?",
                     params![file_id],
                 );
+                let _ = conn.execute(
+                    "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?",
+                    params![file_id],
+                );
                 let _ = conn.execute("DELETE FROM files WHERE id = ?", params![file_id]);
                 removed += 1;
                 pb.inc(1);
@@ -348,6 +352,12 @@ impl Scanner {
             params![file_id],
         )?;
         debug!("Deleted video keyframes for file {}", file_id);
+
+        // Clear enhancement_tasks referencing this file
+        conn.execute(
+            "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?",
+            params![file_id],
+        )?;
 
         // Delete the file record
         conn.execute("DELETE FROM files WHERE id = ?", params![file_id])?;

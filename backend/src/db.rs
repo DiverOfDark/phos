@@ -397,6 +397,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             for file_id in &duplicate_ids {
                 conn.execute("DELETE FROM faces WHERE file_id = ?", params![file_id])?;
                 conn.execute("DELETE FROM video_keyframes WHERE video_file_id = ?", params![file_id])?;
+                conn.execute("UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?", params![file_id])?;
                 conn.execute("DELETE FROM files WHERE id = ?", params![file_id])?;
             }
             conn.execute(

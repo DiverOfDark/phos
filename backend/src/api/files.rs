@@ -491,6 +491,16 @@ pub(super) async fn delete_file(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Clear enhancement_tasks referencing this file
+    db.execute(
+        "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?",
+        params![id],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to clear enhancement_tasks: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     // Delete the file record
     db.execute("DELETE FROM files WHERE id = ?", params![id])
         .map_err(|e| {

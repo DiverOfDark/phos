@@ -444,6 +444,28 @@ pub(super) async fn delete_shot(
         })?;
     }
 
+    // Clear enhancement_tasks referencing these files
+    for fid in &file_ids {
+        db.execute(
+            "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?",
+            params![fid],
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to clear enhancement_tasks: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    // Delete enhancement_tasks for this shot
+    db.execute(
+        "DELETE FROM enhancement_tasks WHERE shot_id = ?",
+        params![id],
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to delete enhancement_tasks: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     // Delete files from DB
     db.execute("DELETE FROM files WHERE shot_id = ?", params![id])
         .map_err(|e| {

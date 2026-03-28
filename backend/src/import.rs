@@ -977,6 +977,10 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                     "DELETE FROM video_keyframes WHERE video_file_id = ?",
                     params![file_row.file_id],
                 );
+                let _ = conn.execute(
+                    "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?",
+                    params![file_row.file_id],
+                );
                 let _ = conn.execute("DELETE FROM files WHERE id = ?", params![file_row.file_id]);
 
                 // Delete shot if no files remain
