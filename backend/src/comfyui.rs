@@ -83,15 +83,41 @@ impl ComfyUiClient {
         let url = format!("{}/prompt", self.base_url);
 
         let bytes = serde_json::to_vec(&payload)?;
-        let mut resp = ureq::post(&url)
+        let mut resp = match ureq::post(&url)
             .header("Content-Type", "application/json")
             .send(bytes.as_slice())
-            .map_err(|e| anyhow::anyhow!("Queue prompt failed: {}", e))?;
+        {
+            Ok(resp) => resp,
+            Err(ureq::Error::StatusCode(status)) => {
+                // ComfyUI returns 400 with JSON body for validation errors (bad prompts, missing nodes, etc.)
+                anyhow::bail!("Queue prompt rejected by ComfyUI (HTTP {})", status);
+            }
+            Err(e) => {
+                anyhow::bail!("Queue prompt failed: {}", e);
+            }
+        };
 
         let json: Value = resp.body_mut().read_json()?;
+
+        // Check for error field in response (ComfyUI may return 200 with error details)
+        if let Some(error) = json.get("error") {
+            let error_msg = error
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown prompt validation error");
+            let node_errors = json.get("node_errors")
+                .map(|v| serde_json::to_string(v).unwrap_or_default())
+                .unwrap_or_default();
+            if node_errors.is_empty() {
+                anyhow::bail!("ComfyUI prompt error: {}", error_msg);
+            } else {
+                anyhow::bail!("ComfyUI prompt error: {}. Node errors: {}", error_msg, node_errors);
+            }
+        }
+
         let prompt_id = json["prompt_id"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("No 'prompt_id' in queue response"))?;
+            .ok_or_else(|| anyhow::anyhow!("No 'prompt_id' in queue response: {}", json))?;
         Ok(prompt_id.to_string())
     }
 
@@ -568,25 +594,65 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
 
         // Check for execution error
         if let Some(status) = history.get("status") {
-            if let Some(true) = status.get("completed").and_then(|v| v.as_bool()) {
-                // Completed — no error
-            } else if status.get("messages").is_some() {
-                // Check for error messages
+            let completed = status.get("completed").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !completed {
+                // Look for explicit error messages
+                let mut found_error = false;
                 if let Some(msgs) = status.get("messages").and_then(|v| v.as_array()) {
                     for msg in msgs {
                         if let Some(arr) = msg.as_array() {
                             if arr.first().and_then(|v| v.as_str()) == Some("execution_error") {
-                                let err_detail = arr
-                                    .get(1)
+                                let err_data = arr.get(1);
+                                let exception_msg = err_data
                                     .and_then(|v| v.get("exception_message"))
                                     .and_then(|v| v.as_str())
-                                    .unwrap_or("Unknown execution error");
-                                mark_failed(conn, &task_id, err_detail, false);
-                                continue;
+                                    .unwrap_or("Unknown error");
+                                let node_type = err_data
+                                    .and_then(|v| v.get("node_type"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let node_id = err_data
+                                    .and_then(|v| v.get("node_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let traceback = err_data
+                                    .and_then(|v| v.get("traceback"))
+                                    .and_then(|v| v.as_array())
+                                    .map(|tb| tb.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(""))
+                                    .unwrap_or_default();
+
+                                let err_detail = format!(
+                                    "ComfyUI execution error in node {} ({}): {}",
+                                    node_id, node_type, exception_msg
+                                );
+                                if !traceback.is_empty() {
+                                    error!("Task {} traceback:\n{}", task_id, traceback);
+                                }
+                                mark_failed(conn, &task_id, &err_detail, false);
+                                found_error = true;
+                                break;
                             }
                         }
                     }
                 }
+                if found_error {
+                    continue;
+                }
+
+                // Check if status_str indicates a non-success state
+                let status_str = status.get("status_str").and_then(|v| v.as_str()).unwrap_or("");
+                if status_str == "error" {
+                    let err_msg = format!(
+                        "ComfyUI prompt failed with status '{}'. Status details: {}",
+                        status_str,
+                        serde_json::to_string(status).unwrap_or_else(|_| "N/A".to_string())
+                    );
+                    mark_failed(conn, &task_id, &err_msg, false);
+                    continue;
+                }
+
+                // Not completed and no error — still running
+                continue;
             }
         }
 
@@ -677,10 +743,21 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
             );
             info!("Task {} completed successfully", task_id);
         } else {
+            // Log the full outputs for debugging
+            let outputs_debug = history.get("outputs")
+                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "N/A".to_string()))
+                .unwrap_or_else(|| "null".to_string());
+            let status_debug = history.get("status")
+                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "N/A".to_string()))
+                .unwrap_or_else(|| "null".to_string());
+            error!(
+                "Task {} produced no downloadable outputs. Status: {}, Outputs: {}",
+                task_id, status_debug, outputs_debug
+            );
             mark_failed(
                 conn,
                 &task_id,
-                "No output images found in ComfyUI response",
+                "No output images found in ComfyUI response (workflow completed but produced no downloadable files)",
                 false,
             );
         }
