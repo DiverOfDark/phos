@@ -40,7 +40,6 @@ jobs:
 
       - name: Build Android APKs
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > /tmp/release.keystore
           cd android
           chmod +x gradlew
           VERSION_ARGS=""
@@ -49,10 +48,7 @@ jobs:
           fi
           ./gradlew assembleDebug assembleRelease --no-daemon $VERSION_ARGS
         env:
-          KEYSTORE_FILE: /tmp/release.keystore
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
       - name: Rename release APK for upload
         if: startsWith(github.ref, 'refs/tags/v')

@@ -23,12 +23,12 @@ android {
 
     signingConfigs {
         create("release") {
-            val keystorePath = System.getenv("KEYSTORE_FILE")
-            if (keystorePath != null) {
-                storeFile = file(keystorePath)
-                storePassword = System.getenv("KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("KEY_ALIAS")
-                keyPassword = System.getenv("KEY_PASSWORD")
+            val password = System.getenv("KEYSTORE_PASSWORD")
+            if (password != null) {
+                storeFile = rootProject.file("phos-release.keystore")
+                storePassword = password
+                keyAlias = "phos"
+                keyPassword = password
             }
         }
     }
@@ -41,8 +41,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            val keystorePath = System.getenv("KEYSTORE_FILE")
-            if (keystorePath != null) {
+            if (System.getenv("KEYSTORE_PASSWORD") != null) {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
