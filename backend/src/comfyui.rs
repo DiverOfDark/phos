@@ -2,6 +2,7 @@ use crate::db;
 use crate::scanner;
 use image::DynamicImage;
 use rusqlite::{params, Connection};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -268,6 +269,20 @@ pub fn prepare_workflow(
                             if val.is_string() {
                                 *val = Value::String(override_val.clone());
                             }
+                        }
+                    }
+                }
+            }
+
+            // Randomize seed fields so each run produces different results,
+            // mirroring ComfyUI's frontend behavior for "random" seeds.
+            if let Some(inputs) = node.get_mut("inputs") {
+                if let Some(obj) = inputs.as_object_mut() {
+                    for (field, val) in obj.iter_mut() {
+                        if (field == "seed" || field == "noise_seed") && val.is_number() {
+                            // ComfyUI seeds are integers up to 2^53-1 (JS safe integer max)
+                            let new_seed = rand::rng().random_range(0u64..=(1u64 << 53) - 1);
+                            *val = Value::Number(serde_json::Number::from(new_seed));
                         }
                     }
                 }
