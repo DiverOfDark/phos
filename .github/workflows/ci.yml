@@ -29,11 +29,24 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
+      - name: Compute version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build Android APKs
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleDebug assembleRelease --no-daemon
+          VERSION_ARGS=""
+          if [ -n "${{ steps.version.outputs.version }}" ]; then
+            VERSION_ARGS="-PversionName=${{ steps.version.outputs.version }}"
+          fi
+          ./gradlew assembleDebug assembleRelease --no-daemon $VERSION_ARGS
 
       - name: Rename debug APK for release upload
         if: startsWith(github.ref, 'refs/tags/v')
