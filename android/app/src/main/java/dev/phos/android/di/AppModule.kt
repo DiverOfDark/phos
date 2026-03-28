@@ -16,8 +16,8 @@ import dev.phos.android.data.local.dao.PersonDao
 import dev.phos.android.data.local.dao.ShotDao
 import dev.phos.android.data.local.dao.SyncStateDao
 import dev.phos.android.data.remote.AuthInterceptor
+import dev.phos.android.data.remote.BaseUrlInterceptor
 import dev.phos.android.data.remote.PhosApi
-import dev.phos.android.data.repository.AuthRepository
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
@@ -37,8 +37,12 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideOkHttpClient(authInterceptor: AuthInterceptor): OkHttpClient {
+    fun provideOkHttpClient(
+        baseUrlInterceptor: BaseUrlInterceptor,
+        authInterceptor: AuthInterceptor,
+    ): OkHttpClient {
         return OkHttpClient.Builder()
+            .addInterceptor(baseUrlInterceptor)
             .addInterceptor(authInterceptor)
             .addInterceptor(HttpLoggingInterceptor().apply {
                 level = HttpLoggingInterceptor.Level.BASIC
@@ -53,12 +57,9 @@ object AppModule {
     fun provideRetrofit(
         okHttpClient: OkHttpClient,
         objectMapper: ObjectMapper,
-        authRepository: AuthRepository,
     ): Retrofit {
-        val baseUrl = authRepository.getServerUrl() ?: "http://localhost:33000/"
-        val sanitizedUrl = if (baseUrl.endsWith("/")) baseUrl else "$baseUrl/"
         return Retrofit.Builder()
-            .baseUrl(sanitizedUrl)
+            .baseUrl(BaseUrlInterceptor.PLACEHOLDER_BASE_URL)
             .client(okHttpClient)
             .addConverterFactory(JacksonConverterFactory.create(objectMapper))
             .build()
