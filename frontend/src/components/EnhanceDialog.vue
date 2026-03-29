@@ -20,6 +20,7 @@ import {
 const props = defineProps({
   open: Boolean,
   shotId: [String, Number],
+  fileId: String,
 })
 
 const emit = defineEmits(['update:open', 'taskCreated'])
@@ -209,6 +210,7 @@ async function enhance() {
         shot_id: props.shotId,
         workflow_id: selectedWorkflowId.value,
         text_overrides: textOverrides.value,
+        ...(props.fileId ? { source_file_id: props.fileId } : {}),
       }),
     })
     if (!res.ok) {

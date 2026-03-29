@@ -168,6 +168,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             status TEXT NOT NULL DEFAULT 'pending',
             comfyui_prompt_id TEXT,
             text_overrides TEXT DEFAULT '{}',
+            source_file_id TEXT,
             output_file_id TEXT,
             error_message TEXT,
             retry_count INTEGER DEFAULT 0,
@@ -176,6 +177,7 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             completed_at DATETIME,
             FOREIGN KEY(shot_id) REFERENCES shots(id),
             FOREIGN KEY(workflow_id) REFERENCES comfyui_workflows(id),
+            FOREIGN KEY(source_file_id) REFERENCES files(id),
             FOREIGN KEY(output_file_id) REFERENCES files(id)
         )",
         [],
@@ -364,6 +366,21 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
             "ALTER TABLE comfyui_workflows ADD COLUMN description TEXT",
             [],
         )?;
+    }
+
+    // Add source_file_id column to enhancement_tasks if it doesn't exist
+    {
+        let et_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(enhancement_tasks)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if !et_columns.is_empty() && !et_columns.contains(&"source_file_id".to_string()) {
+            conn.execute(
+                "ALTER TABLE enhancement_tasks ADD COLUMN source_file_id TEXT REFERENCES files(id)",
+                [],
+            )?;
+        }
     }
 
     // Migration: convert absolute file paths to relative paths.

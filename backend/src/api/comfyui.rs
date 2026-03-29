@@ -230,6 +230,8 @@ pub(super) async fn comfyui_delete_workflow(
 pub(super) struct EnhancePayload {
     shot_id: String,
     workflow_id: String,
+    /// Optional: specific file to use as source. If omitted, the original file is used.
+    source_file_id: Option<String>,
     #[serde(default)]
     text_overrides: std::collections::HashMap<String, String>,
 }
@@ -288,8 +290,8 @@ pub(super) async fn comfyui_enhance(
         serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
 
     db.execute(
-        "INSERT INTO enhancement_tasks (id, shot_id, workflow_id, text_overrides) VALUES (?1, ?2, ?3, ?4)",
-        params![task_id, payload.shot_id, payload.workflow_id, text_overrides_json],
+        "INSERT INTO enhancement_tasks (id, shot_id, workflow_id, text_overrides, source_file_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![task_id, payload.shot_id, payload.workflow_id, text_overrides_json, payload.source_file_id],
     )
     .map_err(|e| {
         tracing::error!("Failed to insert enhancement task: {}", e);

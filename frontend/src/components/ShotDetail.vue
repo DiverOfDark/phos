@@ -1379,6 +1379,7 @@ watch(() => route.params.id, () => {
     <EnhanceDialog
       v-model:open="showEnhanceDialog"
       :shot-id="shotId"
+      :file-id="selectedFile?.id"
       @task-created="onTaskCreated"
     />
   </div>

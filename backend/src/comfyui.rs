@@ -311,19 +311,29 @@ pub fn prepare_workflow(
 // ---------------------------------------------------------------------------
 
 /// Get the source image bytes (PNG-encoded) for a shot.
-/// For images: reads the original file.
+/// If `source_file_id` is provided, uses that specific file; otherwise falls back to the original.
+/// For images: reads the file directly.
 /// For videos: extracts the first frame.
-fn get_source_image(conn: &Connection, shot_id: &str, library_root: &Path) -> anyhow::Result<(Vec<u8>, String)> {
-    // Find the original file for this shot
-    let (file_path, mime_type): (String, String) = conn
-        .query_row(
+fn get_source_image(conn: &Connection, shot_id: &str, source_file_id: Option<&str>, library_root: &Path) -> anyhow::Result<(Vec<u8>, String)> {
+    // If a specific source file is requested, use it; otherwise fall back to the original
+    let (file_path, mime_type): (String, String) = if let Some(file_id) = source_file_id {
+        conn.query_row(
+            "SELECT f.path, COALESCE(f.mime_type, '') FROM files f
+             WHERE f.id = ?1 AND f.shot_id = ?2 LIMIT 1",
+            params![file_id, shot_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| anyhow::anyhow!("Source file {} not found for shot {}", file_id, shot_id))?
+    } else {
+        conn.query_row(
             "SELECT f.path, COALESCE(f.mime_type, '') FROM files f
              WHERE f.shot_id = ?1 AND f.is_original = 1
              ORDER BY f.created_at ASC LIMIT 1",
             params![shot_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(|_| anyhow::anyhow!("No original file found for shot {}", shot_id))?;
+        .map_err(|_| anyhow::anyhow!("No original file found for shot {}", shot_id))?
+    };
 
     let path = db::resolve_path(library_root, &file_path);
     if !path.exists() {
@@ -415,9 +425,9 @@ fn recover_interrupted_tasks(conn: &Connection) {
 
 /// Pick up pending tasks and start processing them.
 fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient, library_root: &Path) {
-    let tasks: Vec<(String, String, String, String, String)> = {
+    let tasks: Vec<(String, String, String, String, String, Option<String>)> = {
         let mut stmt = match conn.prepare(
-            "SELECT t.id, t.shot_id, t.workflow_id, w.workflow_json, COALESCE(t.text_overrides, '{}')
+            "SELECT t.id, t.shot_id, t.workflow_id, w.workflow_json, COALESCE(t.text_overrides, '{}'), t.source_file_id
              FROM enhancement_tasks t
              JOIN comfyui_workflows w ON t.workflow_id = w.id
              WHERE t.status = 'pending'
@@ -437,6 +447,7 @@ fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient, library_root
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         }) {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
@@ -448,15 +459,15 @@ fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient, library_root
         result
     };
 
-    for (task_id, shot_id, _workflow_id, workflow_json_str, text_overrides_str) in tasks {
+    for (task_id, shot_id, _workflow_id, workflow_json_str, text_overrides_str, source_file_id) in tasks {
         // Set uploading
         let _ = conn.execute(
             "UPDATE enhancement_tasks SET status = 'uploading', started_at = CURRENT_TIMESTAMP WHERE id = ?1",
             params![task_id],
         );
 
-        // 1. Get source image
-        let (image_data, upload_name) = match get_source_image(conn, &shot_id, library_root) {
+        // 1. Get source image (use specific file if provided, otherwise original)
+        let (image_data, upload_name) = match get_source_image(conn, &shot_id, source_file_id.as_deref(), library_root) {
             Ok(v) => v,
             Err(e) => {
                 mark_failed(
