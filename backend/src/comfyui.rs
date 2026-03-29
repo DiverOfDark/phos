@@ -2,15 +2,12 @@ use crate::db;
 use crate::scanner;
 use image::DynamicImage;
 use rusqlite::{params, Connection};
-use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
-use tracing_subscriber::fmt::time;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -735,6 +732,21 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
             }
         }
 
+        if !downloaded {
+            // Check if a previous attempt already saved an output file for this task
+            let has_existing_output: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM enhancement_tasks WHERE id = ?1 AND output_file_id IS NOT NULL",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if has_existing_output {
+                downloaded = true;
+                info!("Task {} has output from a previous attempt, marking as completed", task_id);
+            }
+        }
+
         if downloaded {
             let _ = conn.execute(
                 "UPDATE enhancement_tasks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?1",
@@ -802,17 +814,12 @@ fn download_and_save_output(
         .and_then(|s| s.to_str())
         .unwrap_or("png");
 
-    let task_short = &task_id[..8.min(task_id.len())];
-    let output_filename = format!("{}_enhanced_{}.{}", stem, task_short, ext);
-    let output_path = parent.join(&output_filename);
-
-    std::fs::write(&output_path, &data)?;
-    info!("Saved enhanced output to {:?}", output_path);
-
-    // Compute hash
+    // Compute hash before writing to disk so we can check for duplicates
     let mut hasher = Sha256::new();
     hasher.update(&data);
     let hash = format!("{:x}", hasher.finalize());
+
+    let file_size = data.len() as i64;
 
     // Guess mime type from extension
     let mime_type = match ext {
@@ -825,20 +832,63 @@ fn download_and_save_output(
         _ => "application/octet-stream",
     };
 
-    let file_id = Uuid::new_v4().to_string();
-    let file_size = data.len() as i64;
-    let path_str = db::make_relative(library_root, &output_path);
+    let task_short = &task_id[..8.min(task_id.len())];
+    let base_output_filename = format!("{}_enhanced_{}.{}", stem, task_short, ext);
+    let base_output_path = parent.join(&base_output_filename);
+    let base_path_str = db::make_relative(library_root, &base_output_path);
 
-    conn.execute(
-        "INSERT INTO files (id, shot_id, path, hash, mime_type, file_size, is_original, source_workflow_id, source_text_overrides)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
-        params![file_id, shot_id, path_str, hash, mime_type, file_size, workflow_id, text_overrides_json],
-    )?;
+    // Check if a file with the expected path already exists in the DB (from a previous attempt)
+    let existing: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, hash FROM files WHERE path = ?1",
+            params![base_path_str],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let actual_file_id: String = match existing {
+        Some((existing_id, existing_hash)) if existing_hash == hash => {
+            // Same content already saved — nothing to do
+            info!("Task {} output already exists with same hash, skipping write", task_id);
+            existing_id
+        }
+        Some(_) => {
+            // Path is taken but content differs — save as a new variant with a unique suffix
+            let unique = &Uuid::new_v4().to_string()[..8];
+            let variant_filename = format!("{}_enhanced_{}_{}.{}", stem, task_short, unique, ext);
+            let variant_path = parent.join(&variant_filename);
+
+            std::fs::write(&variant_path, &data)?;
+            info!("Saved enhanced output (new variant) to {:?}", variant_path);
+
+            let variant_path_str = db::make_relative(library_root, &variant_path);
+            let file_id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO files (id, shot_id, path, hash, mime_type, file_size, is_original, source_workflow_id, source_text_overrides)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+                params![file_id, shot_id, variant_path_str, hash, mime_type, file_size, workflow_id, text_overrides_json],
+            )?;
+            file_id
+        }
+        None => {
+            // No existing file — normal save
+            std::fs::write(&base_output_path, &data)?;
+            info!("Saved enhanced output to {:?}", base_output_path);
+
+            let file_id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO files (id, shot_id, path, hash, mime_type, file_size, is_original, source_workflow_id, source_text_overrides)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+                params![file_id, shot_id, base_path_str, hash, mime_type, file_size, workflow_id, text_overrides_json],
+            )?;
+            file_id
+        }
+    };
 
     // Store the output file ID on the task
     conn.execute(
         "UPDATE enhancement_tasks SET output_file_id = ?2 WHERE id = ?1",
-        params![task_id, file_id],
+        params![task_id, actual_file_id],
     )?;
 
     Ok(())
