@@ -3,11 +3,12 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use rusqlite::params;
+use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::UState;
+use crate::schema::{enhancement_tasks, faces, files, ignored_merges, people, shots, video_keyframes};
 
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ShotBrief {
@@ -64,8 +65,12 @@ pub(super) async fn get_shots(
     UState(state): UState,
     Query(params): Query<ShotsQuery>,
 ) -> Json<Vec<ShotBrief>> {
-    let db = state.db.lock().await;
+    let mut conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(_) => return Json(Vec::new()),
+    };
 
+    // Build dynamic SQL query
     let mut sql = String::from(
         "SELECT DISTINCT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number,
                 f.id AS main_file_id, p.name AS person_name,
@@ -79,38 +84,39 @@ pub(super) async fn get_shots(
     let mut bind_values: Vec<String> = Vec::new();
 
     if let Some(ref person_id) = params.person_id {
-        conditions.push("s.primary_person_id = ?".to_string());
         bind_values.push(person_id.clone());
+        conditions.push(format!("s.primary_person_id = ?{}", bind_values.len()));
     }
 
     if let Some(ref status) = params.status {
         if status == "unsorted" {
             conditions.push("s.primary_person_id IS NULL".to_string());
         } else {
-            conditions.push("s.review_status = ?".to_string());
             bind_values.push(status.clone());
+            conditions.push(format!("s.review_status = ?{}", bind_values.len()));
         }
     }
 
     if let Some(ref q) = params.q {
-        // Search in file paths and shot descriptions
-        conditions.push(
-            "(EXISTS (SELECT 1 FROM files fq WHERE fq.shot_id = s.id AND fq.path LIKE ?) OR s.description LIKE ?)"
-                .to_string(),
-        );
         let pattern = format!("%{}%", q);
         bind_values.push(pattern.clone());
+        let idx1 = bind_values.len();
         bind_values.push(pattern);
+        let idx2 = bind_values.len();
+        conditions.push(format!(
+            "(EXISTS (SELECT 1 FROM files fq WHERE fq.shot_id = s.id AND fq.path LIKE ?{}) OR s.description LIKE ?{})",
+            idx1, idx2
+        ));
     }
 
     if let Some(ref from) = params.from {
-        conditions.push("s.timestamp >= ?".to_string());
         bind_values.push(from.clone());
+        conditions.push(format!("s.timestamp >= ?{}", bind_values.len()));
     }
 
     if let Some(ref to) = params.to {
-        conditions.push("s.timestamp <= ?".to_string());
         bind_values.push(to.clone());
+        conditions.push(format!("s.timestamp <= ?{}", bind_values.len()));
     }
 
     if !conditions.is_empty() {
@@ -120,43 +126,101 @@ pub(super) async fn get_shots(
 
     sql.push_str(" ORDER BY s.timestamp DESC");
 
-    let mut stmt = match db.prepare(&sql) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("Failed to prepare shots query: {}", e);
-            return Json(Vec::new());
-        }
+    #[derive(diesel::QueryableByName)]
+    struct ShotRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        id: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        timestamp: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        primary_person_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        review_status: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+        folder_number: Option<i32>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        main_file_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        person_name: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        file_count: i64,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        description: Option<String>,
+    }
+
+    // Build the sql_query and bind parameters dynamically
+    let query = diesel::sql_query(&sql);
+
+    // We need to bind each parameter. Since diesel::sql_query().bind() returns a
+    // different type each time, we need to handle this with a macro-like approach.
+    // Instead, we'll use the boxed approach with raw SQL parameter embedding.
+    // Actually, diesel::sql_query uses positional params (?1, ?2, etc.) for SQLite.
+    // We need to bind them in order.
+
+    // Unfortunately, diesel's sql_query chaining changes the type with each bind,
+    // making dynamic binding difficult. We'll handle up to the maximum number of
+    // parameters we can have (max 5: person_id, status, q_pattern1, q_pattern2, from, to = 6 max).
+    let rows: Result<Vec<ShotRow>, _> = match bind_values.len() {
+        0 => query.load::<ShotRow>(&mut conn),
+        1 => query
+            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
+            .load::<ShotRow>(&mut conn),
+        2 => query
+            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
+            .load::<ShotRow>(&mut conn),
+        3 => query
+            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
+            .load::<ShotRow>(&mut conn),
+        4 => query
+            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[3])
+            .load::<ShotRow>(&mut conn),
+        5 => query
+            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[3])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[4])
+            .load::<ShotRow>(&mut conn),
+        _ => query
+            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[3])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[4])
+            .bind::<diesel::sql_types::Text, _>(&bind_values[5])
+            .load::<ShotRow>(&mut conn),
     };
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = bind_values
-        .iter()
-        .map(|v| v as &dyn rusqlite::types::ToSql)
-        .collect();
-
-    let rows = match stmt.query_map(param_refs.as_slice(), |row| {
-        let main_file_id: Option<String> = row.get(5)?;
-        Ok(ShotBrief {
-            id: row.get(0)?,
-            timestamp: row.get(1)?,
-            primary_person_id: row.get(2)?,
-            review_status: row.get(3)?,
-            folder_number: row.get(4)?,
-            thumbnail_url: main_file_id
-                .map(|fid| format!("/api/files/{}/thumbnail", fid))
-                .unwrap_or_default(),
-            primary_person_name: row.get(6)?,
-            file_count: row.get(7)?,
-            description: row.get(8)?,
-        })
-    }) {
-        Ok(r) => r,
+    let shots = match rows {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| ShotBrief {
+                id: row.id,
+                thumbnail_url: row
+                    .main_file_id
+                    .map(|fid| format!("/api/files/{}/thumbnail", fid))
+                    .unwrap_or_default(),
+                timestamp: row.timestamp,
+                file_count: row.file_count,
+                primary_person_id: row.primary_person_id,
+                primary_person_name: row.person_name,
+                review_status: row.review_status,
+                folder_number: row.folder_number.map(|v| v as i64),
+                description: row.description,
+            })
+            .collect(),
         Err(e) => {
             tracing::error!("Failed to query shots: {}", e);
-            return Json(Vec::new());
+            Vec::new()
         }
     };
 
-    let shots: Vec<_> = rows.filter_map(|r| r.ok()).collect();
     Json(shots)
 }
 
@@ -226,109 +290,128 @@ pub(super) async fn get_shot_detail(
     Path(id): Path<String>,
     UState(state): UState,
 ) -> Result<Json<ShotDetailResponse>, StatusCode> {
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Get shot metadata
-    let shot_row = db
-        .query_row(
-            "SELECT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number, p.name, s.width, s.height, s.description
-             FROM shots s
-             LEFT JOIN people p ON s.primary_person_id = p.id
-             WHERE s.id = ?",
-            params![id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                ))
-            },
-        )
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    // Get shot metadata with person name via sql_query (LEFT JOIN)
+    #[derive(diesel::QueryableByName)]
+    struct ShotMetaRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        id: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        timestamp: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        primary_person_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        review_status: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+        folder_number: Option<i32>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        person_name: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+        width: Option<i32>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+        height: Option<i32>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        description: Option<String>,
+    }
+
+    let shot_row: ShotMetaRow = diesel::sql_query(
+        "SELECT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number, p.name AS person_name, s.width, s.height, s.description
+         FROM shots s
+         LEFT JOIN people p ON s.primary_person_id = p.id
+         WHERE s.id = ?1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&id)
+    .get_result::<ShotMetaRow>(&mut conn)
+    .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let shot_width = shot_row.width.map(|v| v as i64);
+    let shot_height = shot_row.height.map(|v| v as i64);
 
     // Get files for this shot
-    let mut stmt = db
-        .prepare("SELECT id, path, mime_type, is_original, file_size FROM files WHERE shot_id = ? ORDER BY is_original DESC, path ASC")
-        .map_err(|e| {
-            tracing::error!("Failed to prepare files query: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    let shot_width = shot_row.6;
-    let shot_height = shot_row.7;
-    let mut files: Vec<FileDetail> = stmt
-        .query_map(params![id], |row| {
-            let file_id: String = row.get(0)?;
-            Ok(FileDetail {
-                thumbnail_url: format!("/api/files/{}/thumbnail", file_id),
-                id: file_id,
-                path: row.get(1)?,
-                mime_type: row.get(2)?,
-                is_original: row.get::<_, bool>(3).unwrap_or(false),
-                file_size: row.get(4)?,
-                width: None,
-                height: None,
-                duration_ms: None,
-            })
-        })
+    let file_rows: Vec<(String, String, Option<String>, Option<bool>, Option<i32>)> = files::table
+        .filter(files::shot_id.eq(&id))
+        .select((files::id, files::path, files::mime_type, files::is_original, files::file_size))
+        .order((files::is_original.desc(), files::path.asc()))
+        .load(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to query files: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .filter_map(|r| r.ok())
+        })?;
+
+    let detail_files: Vec<FileDetail> = file_rows
+        .into_iter()
+        .map(|(file_id, path, mime_type, is_original, file_size)| FileDetail {
+            thumbnail_url: format!("/api/files/{}/thumbnail", file_id),
+            id: file_id,
+            path,
+            mime_type,
+            is_original: is_original.unwrap_or(false),
+            file_size: file_size.map(|v| v as i64),
+            width: shot_width,
+            height: shot_height,
+            duration_ms: None,
+        })
         .collect();
 
-    // Set width/height from shot metadata
-    for file in &mut files {
-        file.width = shot_width;
-        file.height = shot_height;
-    }
+    // We already set width/height from shot metadata above in the map
 
     // Get faces for files in this shot, with person names
-    let mut stmt = db
-        .prepare(
-            "SELECT fa.id, fa.file_id, fa.person_id, p.name, fa.box_x1, fa.box_y1, fa.box_x2, fa.box_y2
-             FROM faces fa
-             JOIN files f ON fa.file_id = f.id
-             LEFT JOIN people p ON fa.person_id = p.id
-             WHERE f.shot_id = ?",
-        )
-        .map_err(|e| {
-            tracing::error!("Failed to prepare faces query: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    let faces: Vec<FaceDetail> = stmt
-        .query_map(params![id], |row| {
-            Ok(FaceDetail {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                person_id: row.get(2)?,
-                person_name: row.get(3)?,
-                box_x1: row.get(4)?,
-                box_y1: row.get(5)?,
-                box_x2: row.get(6)?,
-                box_y2: row.get(7)?,
-            })
+    #[derive(diesel::QueryableByName)]
+    struct FaceRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        id: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        file_id: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        person_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        person_name: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Float>)]
+        box_x1: Option<f32>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Float>)]
+        box_y1: Option<f32>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Float>)]
+        box_x2: Option<f32>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Float>)]
+        box_y2: Option<f32>,
+    }
+
+    let face_rows: Vec<FaceRow> = diesel::sql_query(
+        "SELECT fa.id, fa.file_id, fa.person_id, p.name AS person_name, fa.box_x1, fa.box_y1, fa.box_x2, fa.box_y2
+         FROM faces fa
+         JOIN files f ON fa.file_id = f.id
+         LEFT JOIN people p ON fa.person_id = p.id
+         WHERE f.shot_id = ?1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&id)
+    .load::<FaceRow>(&mut conn)
+    .map_err(|e| {
+        tracing::error!("Failed to query faces: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let detail_faces: Vec<FaceDetail> = face_rows
+        .into_iter()
+        .map(|row| FaceDetail {
+            id: row.id,
+            file_id: row.file_id,
+            person_id: row.person_id,
+            person_name: row.person_name,
+            box_x1: row.box_x1.unwrap_or(0.0),
+            box_y1: row.box_y1.unwrap_or(0.0),
+            box_x2: row.box_x2.unwrap_or(0.0),
+            box_y2: row.box_y2.unwrap_or(0.0),
         })
-        .map_err(|e| {
-            tracing::error!("Failed to query faces: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .filter_map(|r| r.ok())
         .collect();
 
     // Compute also_contains: people who have faces in this shot OTHER than the primary person
     let mut also_contains: Vec<AlsoContainsPerson> = Vec::new();
     let mut seen_person_ids = std::collections::HashSet::new();
-    for face in &faces {
+    for face in &detail_faces {
         if let Some(ref pid) = face.person_id {
             // Skip the primary person and duplicates
-            if Some(pid.as_str()) != shot_row.2.as_deref() && seen_person_ids.insert(pid.clone()) {
+            if Some(pid.as_str()) != shot_row.primary_person_id.as_deref() && seen_person_ids.insert(pid.clone()) {
                 also_contains.push(AlsoContainsPerson {
                     id: pid.clone(),
                     name: face.person_name.clone(),
@@ -338,41 +421,49 @@ pub(super) async fn get_shot_detail(
     }
 
     // Previous shot (newer timestamp, or same timestamp with id > current for stable ordering)
-    let prev_shot_id: Option<String> = db
-        .query_row(
-            "SELECT id FROM shots
-             WHERE (timestamp > ?1 OR (timestamp = ?1 AND id > ?2) OR (timestamp IS NULL AND ?1 IS NOT NULL))
-             ORDER BY timestamp ASC, id ASC
-             LIMIT 1",
-            params![shot_row.1, id],
-            |row| row.get(0),
-        )
-        .ok();
+    #[derive(diesel::QueryableByName)]
+    struct NavRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        id: String,
+    }
+
+    let prev_shot_id: Option<String> = diesel::sql_query(
+        "SELECT id FROM shots
+         WHERE (timestamp > ?1 OR (timestamp = ?1 AND id > ?2) OR (timestamp IS NULL AND ?1 IS NOT NULL))
+         ORDER BY timestamp ASC, id ASC
+         LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&shot_row.timestamp)
+    .bind::<diesel::sql_types::Text, _>(&id)
+    .get_result::<NavRow>(&mut conn)
+    .ok()
+    .map(|r| r.id);
 
     // Next shot (older timestamp, or same timestamp with id < current for stable ordering)
-    let next_shot_id: Option<String> = db
-        .query_row(
-            "SELECT id FROM shots
-             WHERE (timestamp < ?1 OR (timestamp = ?1 AND id < ?2) OR (?1 IS NULL AND timestamp IS NOT NULL))
-             ORDER BY timestamp DESC, id DESC
-             LIMIT 1",
-            params![shot_row.1, id],
-            |row| row.get(0),
-        )
-        .ok();
+    let next_shot_id: Option<String> = diesel::sql_query(
+        "SELECT id FROM shots
+         WHERE (timestamp < ?1 OR (timestamp = ?1 AND id < ?2) OR (?1 IS NULL AND timestamp IS NOT NULL))
+         ORDER BY timestamp DESC, id DESC
+         LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&shot_row.timestamp)
+    .bind::<diesel::sql_types::Text, _>(&id)
+    .get_result::<NavRow>(&mut conn)
+    .ok()
+    .map(|r| r.id);
 
     Ok(Json(ShotDetailResponse {
-        id: shot_row.0,
-        timestamp: shot_row.1,
-        primary_person_id: shot_row.2,
-        primary_person_name: shot_row.5,
-        review_status: shot_row.3,
-        folder_number: shot_row.4,
-        width: shot_row.6,
-        height: shot_row.7,
-        description: shot_row.8,
-        files,
-        faces,
+        id: shot_row.id,
+        timestamp: shot_row.timestamp,
+        primary_person_id: shot_row.primary_person_id,
+        primary_person_name: shot_row.person_name,
+        review_status: shot_row.review_status,
+        folder_number: shot_row.folder_number.map(|v| v as i64),
+        width: shot_width,
+        height: shot_height,
+        description: shot_row.description,
+        files: detail_files,
+        faces: detail_faces,
         also_contains,
         prev_shot_id,
         next_shot_id,
@@ -396,86 +487,68 @@ pub(super) async fn delete_shot(
     Path(id): Path<String>,
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Collect file paths and IDs to clean up
-    let mut stmt = db
-        .prepare("SELECT id, path FROM files WHERE shot_id = ?")
-        .map_err(|e| {
-            tracing::error!("Failed to prepare file query for delete: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let files: Vec<(String, String)> = stmt
-        .query_map(params![id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+    let file_rows: Vec<(String, String)> = files::table
+        .filter(files::shot_id.eq(&id))
+        .select((files::id, files::path))
+        .load(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to query files for delete: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+        })?;
 
-    if files.is_empty() {
+    if file_rows.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let file_ids: Vec<&str> = files.iter().map(|(id, _)| id.as_str()).collect();
+    let file_ids: Vec<&str> = file_rows.iter().map(|(id, _)| id.as_str()).collect();
 
-    // Delete faces
-    for fid in &file_ids {
-        db.execute("DELETE FROM faces WHERE file_id = ?", params![fid])
-            .map_err(|e| {
-                tracing::error!("Failed to delete faces: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
+    // Delete faces for all files in this shot
+    diesel::delete(faces::table.filter(faces::file_id.eq_any(&file_ids)))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to delete faces: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Delete video_keyframes
-    for fid in &file_ids {
-        db.execute(
-            "DELETE FROM video_keyframes WHERE video_file_id = ?",
-            params![fid],
-        )
+    diesel::delete(video_keyframes::table.filter(video_keyframes::video_file_id.eq_any(&file_ids)))
+        .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to delete video_keyframes: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    }
 
     // Clear enhancement_tasks referencing these files
-    for fid in &file_ids {
-        db.execute(
-            "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?",
-            params![fid],
-        )
+    diesel::update(enhancement_tasks::table.filter(enhancement_tasks::output_file_id.eq_any(&file_ids)))
+        .set(enhancement_tasks::output_file_id.eq(None::<String>))
+        .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to clear enhancement_tasks: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    }
 
     // Delete enhancement_tasks for this shot
-    db.execute(
-        "DELETE FROM enhancement_tasks WHERE shot_id = ?",
-        params![id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to delete enhancement_tasks: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    diesel::delete(enhancement_tasks::table.filter(enhancement_tasks::shot_id.eq(&id)))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to delete enhancement_tasks: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Delete files from DB
-    db.execute("DELETE FROM files WHERE shot_id = ?", params![id])
+    diesel::delete(files::table.filter(files::shot_id.eq(&id)))
+        .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to delete files: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     // Delete the shot record
-    let deleted = db
-        .execute("DELETE FROM shots WHERE id = ?", params![id])
+    let deleted = diesel::delete(shots::table.filter(shots::id.eq(&id)))
+        .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to delete shot: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -486,7 +559,7 @@ pub(super) async fn delete_shot(
     }
 
     // Delete physical files from disk (best-effort)
-    for (_, path) in &files {
+    for (_, path) in &file_rows {
         let resolved = crate::db::resolve_path(&state.library_root, path);
         if let Err(e) = std::fs::remove_file(&resolved) {
             tracing::warn!("Failed to delete file from disk {:?}: {}", resolved, e);
@@ -494,19 +567,11 @@ pub(super) async fn delete_shot(
     }
 
     // Clean up cached thumbnails and empty directories (best-effort)
-    let db_path: String = db
-        .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
-        .unwrap_or_default();
-    if !db_path.is_empty() {
-        let db_dir = std::path::Path::new(&db_path)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let thumb_dir = db_dir.join(".phos_thumbnails");
-        for (fid, _) in &files {
-            let _ = std::fs::remove_file(thumb_dir.join(format!("{}.jpg", fid)));
-        }
-        let _ = crate::import::cleanup_empty_dirs(db_dir);
+    let thumb_dir = state.library_root.join(".phos_thumbnails");
+    for (fid, _) in &file_rows {
+        let _ = std::fs::remove_file(thumb_dir.join(format!("{}.jpg", fid)));
     }
+    let _ = crate::import::cleanup_empty_dirs(&state.library_root);
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
@@ -539,15 +604,13 @@ pub(super) async fn update_shot(
     UState(state): UState,
     Json(payload): Json<UpdateShotPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Verify the shot exists
-    let exists: bool = db
-        .query_row(
-            "SELECT COUNT(*) FROM shots WHERE id = ?",
-            params![id],
-            |row| row.get::<_, i64>(0),
-        )
+    let exists: bool = shots::table
+        .filter(shots::id.eq(&id))
+        .count()
+        .get_result::<i64>(&mut conn)
         .map(|c| c > 0)
         .unwrap_or(false);
 
@@ -558,30 +621,30 @@ pub(super) async fn update_shot(
     if let Some(ref person_id) = payload.primary_person_id {
         if person_id.is_empty() {
             // Set to unsorted (NULL primary_person_id)
-            let max_folder: i64 = db
-                .query_row(
-                    "SELECT COALESCE(MAX(folder_number), 0) FROM shots WHERE primary_person_id IS NULL",
-                    [],
-                    |row| row.get(0),
-                )
+            let max_folder: i64 = shots::table
+                .filter(shots::primary_person_id.is_null())
+                .select(diesel::dsl::max(shots::folder_number))
+                .first::<Option<i32>>(&mut conn)
+                .unwrap_or(None)
+                .map(|v| v as i64)
                 .unwrap_or(0);
 
-            db.execute(
-                "UPDATE shots SET primary_person_id = NULL, folder_number = ? WHERE id = ?",
-                params![max_folder + 1, id],
-            )
-            .map_err(|e| {
-                tracing::error!("Failed to update shot to unsorted: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            diesel::update(shots::table.filter(shots::id.eq(&id)))
+                .set((
+                    shots::primary_person_id.eq(None::<String>),
+                    shots::folder_number.eq((max_folder + 1) as i32),
+                ))
+                .execute(&mut conn)
+                .map_err(|e| {
+                    tracing::error!("Failed to update shot to unsorted: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
         } else {
             // Verify person exists
-            let person_exists: bool = db
-                .query_row(
-                    "SELECT COUNT(*) FROM people WHERE id = ?",
-                    params![person_id],
-                    |row| row.get::<_, i64>(0),
-                )
+            let person_exists: bool = people::table
+                .filter(people::id.eq(person_id))
+                .count()
+                .get_result::<i64>(&mut conn)
                 .map(|c| c > 0)
                 .unwrap_or(false);
 
@@ -590,22 +653,24 @@ pub(super) async fn update_shot(
             }
 
             // Assign new folder_number for this person (MAX+1)
-            let max_folder: i64 = db
-                .query_row(
-                    "SELECT COALESCE(MAX(folder_number), 0) FROM shots WHERE primary_person_id = ?",
-                    params![person_id],
-                    |row| row.get(0),
-                )
+            let max_folder: i64 = shots::table
+                .filter(shots::primary_person_id.eq(person_id))
+                .select(diesel::dsl::max(shots::folder_number))
+                .first::<Option<i32>>(&mut conn)
+                .unwrap_or(None)
+                .map(|v| v as i64)
                 .unwrap_or(0);
 
-            db.execute(
-                "UPDATE shots SET primary_person_id = ?, folder_number = ? WHERE id = ?",
-                params![person_id, max_folder + 1, id],
-            )
-            .map_err(|e| {
-                tracing::error!("Failed to update shot primary_person_id: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            diesel::update(shots::table.filter(shots::id.eq(&id)))
+                .set((
+                    shots::primary_person_id.eq(person_id),
+                    shots::folder_number.eq((max_folder + 1) as i32),
+                ))
+                .execute(&mut conn)
+                .map_err(|e| {
+                    tracing::error!("Failed to update shot primary_person_id: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
         }
     }
 
@@ -613,14 +678,13 @@ pub(super) async fn update_shot(
         if status != "pending" && status != "confirmed" {
             return Err(StatusCode::BAD_REQUEST);
         }
-        db.execute(
-            "UPDATE shots SET review_status = ? WHERE id = ?",
-            params![status, id],
-        )
-        .map_err(|e| {
-            tracing::error!("Failed to update shot review_status: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        diesel::update(shots::table.filter(shots::id.eq(&id)))
+            .set(shots::review_status.eq(status))
+            .execute(&mut conn)
+            .map_err(|e| {
+                tracing::error!("Failed to update shot review_status: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
     }
 
     Ok(Json(serde_json::json!({"status": "ok"})))
@@ -657,15 +721,13 @@ pub(super) async fn split_shot(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Verify the source shot exists
-    let exists: bool = db
-        .query_row(
-            "SELECT COUNT(*) FROM shots WHERE id = ?",
-            params![id],
-            |row| row.get::<_, i64>(0),
-        )
+    let exists: bool = shots::table
+        .filter(shots::id.eq(&id))
+        .count()
+        .get_result::<i64>(&mut conn)
         .map(|c| c > 0)
         .unwrap_or(false);
 
@@ -675,12 +737,11 @@ pub(super) async fn split_shot(
 
     // Verify all file_ids belong to this shot
     for fid in &payload.file_ids {
-        let belongs: bool = db
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE id = ? AND shot_id = ?",
-                params![fid, id],
-                |row| row.get::<_, i64>(0),
-            )
+        let belongs: bool = files::table
+            .filter(files::id.eq(fid))
+            .filter(files::shot_id.eq(&id))
+            .count()
+            .get_result::<i64>(&mut conn)
             .map(|c| c > 0)
             .unwrap_or(false);
 
@@ -690,12 +751,10 @@ pub(super) async fn split_shot(
     }
 
     // Verify we're not splitting ALL files (must leave at least one in the source shot)
-    let total_files: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM files WHERE shot_id = ?",
-            params![id],
-            |row| row.get(0),
-        )
+    let total_files: i64 = files::table
+        .filter(files::shot_id.eq(&id))
+        .count()
+        .get_result::<i64>(&mut conn)
         .unwrap_or(0);
 
     if payload.file_ids.len() as i64 >= total_files {
@@ -703,27 +762,16 @@ pub(super) async fn split_shot(
     }
 
     // Get the source shot's metadata
-    #[allow(clippy::type_complexity)]
     let (timestamp, width, height, latitude, longitude): (
         Option<String>,
-        Option<i64>,
-        Option<i64>,
-        Option<f64>,
-        Option<f64>,
-    ) = db
-        .query_row(
-            "SELECT timestamp, width, height, latitude, longitude FROM shots WHERE id = ?",
-            params![id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
+        Option<i32>,
+        Option<i32>,
+        Option<f32>,
+        Option<f32>,
+    ) = shots::table
+        .filter(shots::id.eq(&id))
+        .select((shots::timestamp, shots::width, shots::height, shots::latitude, shots::longitude))
+        .first(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to get source shot metadata: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -732,120 +780,142 @@ pub(super) async fn split_shot(
     // Create new shot
     let new_shot_id = uuid::Uuid::new_v4().to_string();
 
-    db.execute(
-        "INSERT INTO shots (id, timestamp, width, height, latitude, longitude, review_status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-        params![new_shot_id, timestamp, width, height, latitude, longitude],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to create new shot for split: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // Move the specified files to the new shot
-    for fid in &payload.file_ids {
-        db.execute(
-            "UPDATE files SET shot_id = ? WHERE id = ?",
-            params![new_shot_id, fid],
-        )
+    diesel::insert_into(shots::table)
+        .values((
+            shots::id.eq(&new_shot_id),
+            shots::timestamp.eq(&timestamp),
+            shots::width.eq(width),
+            shots::height.eq(height),
+            shots::latitude.eq(latitude),
+            shots::longitude.eq(longitude),
+            shots::review_status.eq("pending"),
+        ))
+        .execute(&mut conn)
         .map_err(|e| {
-            tracing::error!("Failed to move file to new shot: {}", e);
+            tracing::error!("Failed to create new shot for split: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    }
+
+    // Move the specified files to the new shot
+    diesel::update(files::table.filter(files::id.eq_any(&payload.file_ids)))
+        .set(files::shot_id.eq(&new_shot_id))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to move files to new shot: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Ensure the new shot has at least one is_original file
-    let new_has_original: bool = db
-        .query_row(
-            "SELECT COUNT(*) FROM files WHERE shot_id = ? AND is_original = 1",
-            params![new_shot_id],
-            |row| row.get::<_, i64>(0),
-        )
+    let new_has_original: bool = files::table
+        .filter(files::shot_id.eq(&new_shot_id))
+        .filter(files::is_original.eq(true))
+        .count()
+        .get_result::<i64>(&mut conn)
         .map(|c| c > 0)
         .unwrap_or(false);
 
     if !new_has_original {
-        let _ = db.execute(
-            "UPDATE files SET is_original = 1 WHERE id = (SELECT id FROM files WHERE shot_id = ? LIMIT 1)",
-            params![new_shot_id],
-        );
+        // Get the first file in the new shot and mark it as original
+        if let Ok(first_file_id) = files::table
+            .filter(files::shot_id.eq(&new_shot_id))
+            .select(files::id)
+            .first::<String>(&mut conn)
+        {
+            let _ = diesel::update(files::table.filter(files::id.eq(&first_file_id)))
+                .set(files::is_original.eq(true))
+                .execute(&mut conn);
+        }
     }
 
     // Set the new shot's main_file_id to its original file
-    if let Ok(new_main_file) = db.query_row::<String, _, _>(
-        "SELECT id FROM files WHERE shot_id = ? AND is_original = 1 LIMIT 1",
-        params![new_shot_id],
-        |row| row.get(0),
-    ) {
-        let _ = db.execute(
-            "UPDATE shots SET main_file_id = ? WHERE id = ?",
-            params![new_main_file, new_shot_id],
-        );
+    if let Ok(new_main_file) = files::table
+        .filter(files::shot_id.eq(&new_shot_id))
+        .filter(files::is_original.eq(true))
+        .select(files::id)
+        .first::<String>(&mut conn)
+    {
+        let _ = diesel::update(shots::table.filter(shots::id.eq(&new_shot_id)))
+            .set(shots::main_file_id.eq(&new_main_file))
+            .execute(&mut conn);
     }
 
     // Ensure the source shot still has an original
-    let source_has_original: bool = db
-        .query_row(
-            "SELECT COUNT(*) FROM files WHERE shot_id = ? AND is_original = 1",
-            params![id],
-            |row| row.get::<_, i64>(0),
-        )
+    let source_has_original: bool = files::table
+        .filter(files::shot_id.eq(&id))
+        .filter(files::is_original.eq(true))
+        .count()
+        .get_result::<i64>(&mut conn)
         .map(|c| c > 0)
         .unwrap_or(false);
 
     if !source_has_original {
-        let _ = db.execute(
-            "UPDATE files SET is_original = 1 WHERE id = (SELECT id FROM files WHERE shot_id = ? LIMIT 1)",
-            params![id],
-        );
+        if let Ok(first_file_id) = files::table
+            .filter(files::shot_id.eq(&id))
+            .select(files::id)
+            .first::<String>(&mut conn)
+        {
+            let _ = diesel::update(files::table.filter(files::id.eq(&first_file_id)))
+                .set(files::is_original.eq(true))
+                .execute(&mut conn);
+        }
     }
 
     // Update the source shot's main_file_id
-    if let Ok(source_main_file) = db.query_row::<String, _, _>(
-        "SELECT id FROM files WHERE shot_id = ? AND is_original = 1 LIMIT 1",
-        params![id],
-        |row| row.get(0),
-    ) {
-        let _ = db.execute(
-            "UPDATE shots SET main_file_id = ? WHERE id = ?",
-            params![source_main_file, id],
-        );
+    if let Ok(source_main_file) = files::table
+        .filter(files::shot_id.eq(&id))
+        .filter(files::is_original.eq(true))
+        .select(files::id)
+        .first::<String>(&mut conn)
+    {
+        let _ = diesel::update(shots::table.filter(shots::id.eq(&id)))
+            .set(shots::main_file_id.eq(&source_main_file))
+            .execute(&mut conn);
     }
 
     // Determine primary person for the new shot based on its faces
     // (face with the largest bounding box area that has a person_id)
-    let new_primary_person: Option<String> = db
-        .query_row(
-            "SELECT fa.person_id
-             FROM faces fa
-             JOIN files f ON fa.file_id = f.id
-             WHERE f.shot_id = ? AND fa.person_id IS NOT NULL
-             ORDER BY (fa.box_x2 - fa.box_x1) * (fa.box_y2 - fa.box_y1) DESC
-             LIMIT 1",
-            params![new_shot_id],
-            |row| row.get(0),
-        )
-        .ok();
+    #[derive(diesel::QueryableByName)]
+    struct PersonIdRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        person_id: Option<String>,
+    }
+
+    let new_primary_person: Option<String> = diesel::sql_query(
+        "SELECT fa.person_id
+         FROM faces fa
+         JOIN files f ON fa.file_id = f.id
+         WHERE f.shot_id = ?1 AND fa.person_id IS NOT NULL
+         ORDER BY (fa.box_x2 - fa.box_x1) * (fa.box_y2 - fa.box_y1) DESC
+         LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&new_shot_id)
+    .get_result::<PersonIdRow>(&mut conn)
+    .ok()
+    .and_then(|r| r.person_id);
 
     if let Some(ref ppid) = new_primary_person {
-        let max_folder: i64 = db
-            .query_row(
-                "SELECT COALESCE(MAX(folder_number), 0) FROM shots WHERE primary_person_id = ?",
-                params![ppid],
-                |row| row.get(0),
-            )
+        let max_folder: i64 = shots::table
+            .filter(shots::primary_person_id.eq(ppid))
+            .select(diesel::dsl::max(shots::folder_number))
+            .first::<Option<i32>>(&mut conn)
+            .unwrap_or(None)
+            .map(|v| v as i64)
             .unwrap_or(0);
 
-        let _ = db.execute(
-            "UPDATE shots SET primary_person_id = ?, folder_number = ? WHERE id = ?",
-            params![ppid, max_folder + 1, new_shot_id],
-        );
+        let _ = diesel::update(shots::table.filter(shots::id.eq(&new_shot_id)))
+            .set((
+                shots::primary_person_id.eq(ppid),
+                shots::folder_number.eq((max_folder + 1) as i32),
+            ))
+            .execute(&mut conn);
     }
 
     // Set both shots to pending
-    let _ = db.execute(
-        "UPDATE shots SET review_status = 'pending' WHERE id = ? OR id = ?",
-        params![id, new_shot_id],
-    );
+    let _ = diesel::update(
+        shots::table.filter(shots::id.eq(&id).or(shots::id.eq(&new_shot_id))),
+    )
+    .set(shots::review_status.eq("pending"))
+    .execute(&mut conn);
 
     Ok(Json(
         serde_json::json!({"status": "ok", "new_shot_id": new_shot_id}),
@@ -870,15 +940,13 @@ pub(super) async fn get_similar_shots(
     UState(state): UState,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<SimilarShotsGrouped>>, StatusCode> {
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Get current shot's primary_person_id and main_file_id
-    let (main_file_id, primary_person_id): (Option<String>, Option<String>) = db
-        .query_row(
-            "SELECT main_file_id, primary_person_id FROM shots WHERE id = ?",
-            params![id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    let (main_file_id, primary_person_id): (Option<String>, Option<String>) = shots::table
+        .filter(shots::id.eq(&id))
+        .select((shots::main_file_id, shots::primary_person_id))
+        .first(&mut conn)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
     let main_file_id = match main_file_id {
@@ -887,15 +955,15 @@ pub(super) async fn get_similar_shots(
     };
 
     // Load the main file's dHash
-    let current_dhash: Option<Vec<u8>> = db
-        .query_row(
-            "SELECT visual_embedding FROM files WHERE id = ? AND visual_embedding IS NOT NULL",
-            params![main_file_id],
-            |row| row.get(0),
-        )
-        .ok();
+    let current_dhash_blob: Option<Vec<u8>> = files::table
+        .filter(files::id.eq(&main_file_id))
+        .filter(files::visual_embedding.is_not_null())
+        .select(files::visual_embedding)
+        .first::<Option<Vec<u8>>>(&mut conn)
+        .ok()
+        .flatten();
 
-    let current_dhash = match current_dhash {
+    let current_dhash = match current_dhash_blob {
         Some(blob) if blob.len() == 8 => {
             let mut arr = [0u8; 8];
             arr.copy_from_slice(&blob);
@@ -910,43 +978,46 @@ pub(super) async fn get_similar_shots(
     // Add primary person
     if primary_person_id.is_some() {
         let primary_name: Option<String> = primary_person_id.as_ref().and_then(|pid| {
-            db.query_row(
-                "SELECT name FROM people WHERE id = ?",
-                params![pid],
-                |row| row.get(0),
-            )
-            .ok()
+            people::table
+                .filter(people::id.eq(pid))
+                .select(people::name)
+                .first::<Option<String>>(&mut conn)
+                .ok()
+                .flatten()
         });
         person_ids.push((primary_person_id.clone(), primary_name));
     }
 
     // Add secondary people from faces on this shot's files
     {
-        let mut stmt = db
-            .prepare(
-                "SELECT DISTINCT fa.person_id, p.name
-                 FROM faces fa
-                 JOIN files fi ON fi.id = fa.file_id
-                 JOIN people p ON p.id = fa.person_id
-                 WHERE fi.shot_id = ?1
-                   AND fa.person_id IS NOT NULL
-                   AND (?2 IS NULL OR fa.person_id != ?2)",
-            )
-            .map_err(|e| {
-                tracing::error!("Failed to prepare faces query: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-        let secondary: Vec<(Option<String>, Option<String>)> = stmt
-            .query_map(params![id, primary_person_id], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .map_err(|e| {
-                tracing::error!("Failed to query faces: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        person_ids.extend(secondary);
+        #[derive(diesel::QueryableByName)]
+        struct SecondaryPersonRow {
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            person_id: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            name: Option<String>,
+        }
+
+        let secondary: Vec<SecondaryPersonRow> = diesel::sql_query(
+            "SELECT DISTINCT fa.person_id, p.name
+             FROM faces fa
+             JOIN files fi ON fi.id = fa.file_id
+             JOIN people p ON p.id = fa.person_id
+             WHERE fi.shot_id = ?1
+               AND fa.person_id IS NOT NULL
+               AND (?2 IS NULL OR fa.person_id != ?2)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&primary_person_id)
+        .load::<SecondaryPersonRow>(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to query faces: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        for row in secondary {
+            person_ids.push((row.person_id, row.name));
+        }
     }
 
     // If no people at all, query shots with NULL primary_person_id
@@ -957,70 +1028,64 @@ pub(super) async fn get_similar_shots(
     // For each person, find similar shots
     let mut groups: Vec<SimilarShotsGrouped> = Vec::new();
 
-    for (person_id, person_name) in &person_ids {
-        let mut stmt = db
-            .prepare(
-                "SELECT s.id, s.main_file_id, s.review_status, p.name,
-                        (SELECT COUNT(*) FROM files WHERE shot_id = s.id) as file_count,
-                        f.visual_embedding
-                 FROM shots s
-                 LEFT JOIN people p ON s.primary_person_id = p.id
-                 JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
-                 WHERE s.id != ?1
-                   AND (s.primary_person_id = ?2 OR (?2 IS NULL AND s.primary_person_id IS NULL))",
-            )
-            .map_err(|e| {
-                tracing::error!("Failed to prepare similar shots query: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+    #[derive(diesel::QueryableByName)]
+    struct CandidateRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        id: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        main_file_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        review_status: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        person_name: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        file_count: i64,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+        visual_embedding: Option<Vec<u8>>,
+    }
 
-        #[allow(clippy::type_complexity)]
-        let candidates: Vec<(
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-            Vec<u8>,
-        )> = stmt
-            .query_map(params![id, person_id], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            })
-            .map_err(|e| {
-                tracing::error!("Failed to query similar shots: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+    for (person_id, person_name) in &person_ids {
+        let candidates: Vec<CandidateRow> = diesel::sql_query(
+            "SELECT s.id, s.main_file_id, s.review_status, p.name AS person_name,
+                    (SELECT COUNT(*) FROM files WHERE shot_id = s.id) as file_count,
+                    f.visual_embedding
+             FROM shots s
+             LEFT JOIN people p ON s.primary_person_id = p.id
+             JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
+             WHERE s.id != ?1
+               AND (s.primary_person_id = ?2 OR (?2 IS NULL AND s.primary_person_id IS NULL))",
+        )
+        .bind::<diesel::sql_types::Text, _>(&id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(person_id)
+        .load::<CandidateRow>(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to query similar shots: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         let mut results: Vec<SimilarShotItem> = candidates
             .into_iter()
-            .filter_map(
-                |(shot_id, main_fid, review_status, pname, file_count, blob)| {
-                    if blob.len() != 8 {
-                        return None;
-                    }
-                    let mut candidate_dhash = [0u8; 8];
-                    candidate_dhash.copy_from_slice(&blob);
-                    let distance =
-                        crate::scanner::hamming_distance(&current_dhash, &candidate_dhash);
-                    Some(SimilarShotItem {
-                        id: shot_id,
-                        thumbnail_url: format!("/api/files/{}/thumbnail", main_fid),
-                        file_count,
-                        primary_person_name: pname,
-                        review_status,
-                        distance,
-                    })
-                },
-            )
+            .filter_map(|row| {
+                let blob = row.visual_embedding?;
+                if blob.len() != 8 {
+                    return None;
+                }
+                let mut candidate_dhash = [0u8; 8];
+                candidate_dhash.copy_from_slice(&blob);
+                let distance =
+                    crate::scanner::hamming_distance(&current_dhash, &candidate_dhash);
+                Some(SimilarShotItem {
+                    id: row.id,
+                    thumbnail_url: format!(
+                        "/api/files/{}/thumbnail",
+                        row.main_file_id.unwrap_or_default()
+                    ),
+                    file_count: row.file_count,
+                    primary_person_name: row.person_name,
+                    review_status: row.review_status,
+                    distance,
+                })
+            })
             .collect();
 
         results.sort_by_key(|r| r.distance);
@@ -1067,16 +1132,14 @@ pub(super) async fn merge_shots(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Verify both shots exist
     for sid in [&payload.source_id, &payload.target_id] {
-        let exists: bool = db
-            .query_row(
-                "SELECT COUNT(*) FROM shots WHERE id = ?",
-                params![sid],
-                |row| row.get::<_, i64>(0),
-            )
+        let exists: bool = shots::table
+            .filter(shots::id.eq(sid))
+            .count()
+            .get_result::<i64>(&mut conn)
             .map(|c| c > 0)
             .unwrap_or(false);
 
@@ -1087,17 +1150,20 @@ pub(super) async fn merge_shots(
 
     // Move all files from source to target
     // Set is_original = false on moved files (target keeps its original)
-    db.execute(
-        "UPDATE files SET shot_id = ?, is_original = 0 WHERE shot_id = ?",
-        params![payload.target_id, payload.source_id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to move files during shot merge: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    diesel::update(files::table.filter(files::shot_id.eq(&payload.source_id)))
+        .set((
+            files::shot_id.eq(&payload.target_id),
+            files::is_original.eq(false),
+        ))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to move files during shot merge: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Delete the source shot
-    db.execute("DELETE FROM shots WHERE id = ?", params![payload.source_id])
+    diesel::delete(shots::table.filter(shots::id.eq(&payload.source_id)))
+        .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to delete source shot during merge: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -1105,22 +1171,58 @@ pub(super) async fn merge_shots(
 
     // If person_id is provided, update the target shot's primary person
     if let Some(ref person_id) = payload.person_id {
-        db.execute(
-            "UPDATE shots SET primary_person_id = ?, folder_number = NULL WHERE id = ?",
-            params![person_id, payload.target_id],
-        )
-        .map_err(|e| {
-            tracing::error!("Failed to update primary_person_id during merge: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        diesel::update(shots::table.filter(shots::id.eq(&payload.target_id)))
+            .set((
+                shots::primary_person_id.eq(person_id),
+                shots::folder_number.eq(None::<i32>),
+            ))
+            .execute(&mut conn)
+            .map_err(|e| {
+                tracing::error!("Failed to update primary_person_id during merge: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
     }
 
     // Clean up people who lost all their shots after this merge
-    if let Err(e) = crate::db::cleanup_orphaned_people(&db) {
+    // Use Diesel sql_query since the original cleanup_orphaned_people uses rusqlite
+    if let Err(e) = cleanup_orphaned_people_diesel(&mut conn) {
         tracing::error!("Failed to cleanup orphaned people after merge: {}", e);
     }
 
     Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+/// Diesel-based equivalent of `crate::db::cleanup_orphaned_people`.
+fn cleanup_orphaned_people_diesel(conn: &mut diesel::SqliteConnection) -> Result<(), diesel::result::Error> {
+    // Unassign faces for people who have no shots
+    let unassigned = diesel::sql_query(
+        "UPDATE faces SET person_id = NULL
+         WHERE person_id IS NOT NULL
+           AND person_id NOT IN (
+               SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL
+           )",
+    )
+    .execute(conn)?;
+    if unassigned > 0 {
+        tracing::info!("Unassigned {} faces from people with no shots", unassigned);
+    }
+
+    // Delete people with no shots and no faces
+    let deleted = diesel::sql_query(
+        "DELETE FROM people
+         WHERE id NOT IN (
+             SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL
+         )
+         AND id NOT IN (
+             SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL
+         )",
+    )
+    .execute(conn)?;
+    if deleted > 0 {
+        tracing::info!("Cleaned up {} orphaned people", deleted);
+    }
+
+    Ok(())
 }
 
 /// POST /api/shots/batch/confirm - batch set review_status = 'confirmed'
@@ -1150,15 +1252,13 @@ pub(super) async fn batch_confirm(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let mut updated_count = 0usize;
     for sid in &payload.shot_ids {
-        let updated = db
-            .execute(
-                "UPDATE shots SET review_status = 'confirmed' WHERE id = ?",
-                params![sid],
-            )
+        let updated = diesel::update(shots::table.filter(shots::id.eq(sid)))
+            .set(shots::review_status.eq("confirmed"))
+            .execute(&mut conn)
             .map_err(|e| {
                 tracing::error!("Failed to confirm shot {}: {}", sid, e);
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -1199,18 +1299,16 @@ pub(super) async fn batch_reassign(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Verify person exists (unless empty = unsorted)
     let person_id_value: Option<&str> = if payload.person_id.is_empty() {
         None
     } else {
-        let exists: bool = db
-            .query_row(
-                "SELECT COUNT(*) FROM people WHERE id = ?",
-                params![payload.person_id],
-                |row| row.get::<_, i64>(0),
-            )
+        let exists: bool = people::table
+            .filter(people::id.eq(&payload.person_id))
+            .count()
+            .get_result::<i64>(&mut conn)
             .map(|c| c > 0)
             .unwrap_or(false);
 
@@ -1224,31 +1322,37 @@ pub(super) async fn batch_reassign(
     for sid in &payload.shot_ids {
         // Assign new folder_number for this person/unsorted namespace
         let max_folder: i64 = match person_id_value {
-            Some(pid) => db
-                .query_row(
-                    "SELECT COALESCE(MAX(folder_number), 0) FROM shots WHERE primary_person_id = ?",
-                    params![pid],
-                    |row| row.get(0),
-                )
+            Some(pid) => shots::table
+                .filter(shots::primary_person_id.eq(pid))
+                .select(diesel::dsl::max(shots::folder_number))
+                .first::<Option<i32>>(&mut conn)
+                .unwrap_or(None)
+                .map(|v| v as i64)
                 .unwrap_or(0),
-            None => db
-                .query_row(
-                    "SELECT COALESCE(MAX(folder_number), 0) FROM shots WHERE primary_person_id IS NULL",
-                    [],
-                    |row| row.get(0),
-                )
+            None => shots::table
+                .filter(shots::primary_person_id.is_null())
+                .select(diesel::dsl::max(shots::folder_number))
+                .first::<Option<i32>>(&mut conn)
+                .unwrap_or(None)
+                .map(|v| v as i64)
                 .unwrap_or(0),
         };
 
         let updated = match person_id_value {
-            Some(pid) => db.execute(
-                "UPDATE shots SET primary_person_id = ?, folder_number = ?, review_status = 'confirmed' WHERE id = ?",
-                params![pid, max_folder + 1, sid],
-            ),
-            None => db.execute(
-                "UPDATE shots SET primary_person_id = NULL, folder_number = ?, review_status = 'confirmed' WHERE id = ?",
-                params![max_folder + 1, sid],
-            ),
+            Some(pid) => diesel::update(shots::table.filter(shots::id.eq(sid)))
+                .set((
+                    shots::primary_person_id.eq(pid),
+                    shots::folder_number.eq((max_folder + 1) as i32),
+                    shots::review_status.eq("confirmed"),
+                ))
+                .execute(&mut conn),
+            None => diesel::update(shots::table.filter(shots::id.eq(sid)))
+                .set((
+                    shots::primary_person_id.eq(None::<String>),
+                    shots::folder_number.eq((max_folder + 1) as i32),
+                    shots::review_status.eq("confirmed"),
+                ))
+                .execute(&mut conn),
         }
         .map_err(|e| {
             tracing::error!("Failed to reassign shot {}: {}", sid, e);
@@ -1285,20 +1389,24 @@ pub(super) async fn ignore_merge(
     UState(state): UState,
     Json(payload): Json<IgnoreMergePayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let (s1, s2) = if payload.shot_id_1 < payload.shot_id_2 {
         (&payload.shot_id_1, &payload.shot_id_2)
     } else {
         (&payload.shot_id_2, &payload.shot_id_1)
     };
-    db.execute(
-        "INSERT OR IGNORE INTO ignored_merges (shot_id_1, shot_id_2) VALUES (?, ?)",
-        params![s1, s2],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to insert ignored_merge: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+
+    diesel::insert_or_ignore_into(ignored_merges::table)
+        .values((
+            ignored_merges::shot_id_1.eq(s1),
+            ignored_merges::shot_id_2.eq(s2),
+        ))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to insert ignored_merge: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -1338,19 +1446,35 @@ pub(super) async fn get_similar_shot_groups(
     UState(state): UState,
     Query(query): Query<SimilarGroupsQuery>,
 ) -> Result<Json<SimilarGroupsResponse>, StatusCode> {
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mut stmt = db
-        .prepare(
-            "SELECT s.id, s.main_file_id, s.review_status, p.name,
+    #[derive(diesel::QueryableByName)]
+    struct ShotDataRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        id: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        main_file_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        review_status: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        person_name: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        file_count: i64,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+        visual_embedding: Option<Vec<u8>>,
+    }
+
+    let all_shots: Vec<ShotDataRow> = diesel::sql_query(
+        "SELECT s.id, s.main_file_id, s.review_status, p.name AS person_name,
                 (SELECT COUNT(*) FROM files WHERE shot_id = s.id) as file_count,
                 f.visual_embedding
          FROM shots s
          LEFT JOIN people p ON s.primary_person_id = p.id
          JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
          ORDER BY s.timestamp DESC",
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    )
+    .load::<ShotDataRow>(&mut conn)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     struct ShotData {
         id: String,
@@ -1361,37 +1485,33 @@ pub(super) async fn get_similar_shot_groups(
         dhash: [u8; 8],
     }
 
-    let candidates: Vec<ShotData> = stmt
-        .query_map([], |row| {
-            let blob: Vec<u8> = row.get(5)?;
-            let mut dhash = [0u8; 8];
-            if blob.len() == 8 {
-                dhash.copy_from_slice(&blob);
+    let candidates: Vec<ShotData> = all_shots
+        .into_iter()
+        .filter_map(|row| {
+            let blob = row.visual_embedding?;
+            if blob.len() != 8 {
+                return None;
             }
-            Ok(ShotData {
-                id: row.get(0)?,
-                main_fid: row.get(1)?,
-                review_status: row.get(2)?,
-                person_name: row.get(3)?,
-                file_count: row.get(4)?,
+            let mut dhash = [0u8; 8];
+            dhash.copy_from_slice(&blob);
+            Some(ShotData {
+                id: row.id,
+                main_fid: row.main_file_id.unwrap_or_default(),
+                review_status: row.review_status,
+                person_name: row.person_name,
+                file_count: row.file_count,
                 dhash,
             })
         })
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .filter_map(|r| r.ok())
         .collect();
 
     let mut ignored = std::collections::HashSet::new();
-    if let Ok(mut ignore_stmt) = db.prepare("SELECT shot_id_1, shot_id_2 FROM ignored_merges") {
-        if let Ok(rows) = ignore_stmt.query_map([], |row| {
-            let s1: String = row.get(0)?;
-            let s2: String = row.get(1)?;
-            Ok((s1, s2))
-        }) {
-            for pair in rows.flatten() {
-                ignored.insert(pair);
-            }
-        }
+    let ignored_rows: Vec<(String, String)> = ignored_merges::table
+        .select((ignored_merges::shot_id_1, ignored_merges::shot_id_2))
+        .load(&mut conn)
+        .unwrap_or_default();
+    for pair in ignored_rows {
+        ignored.insert(pair);
     }
 
     let mut groups: Vec<SimilarShotGroup> = Vec::new();
