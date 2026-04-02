@@ -15,6 +15,7 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
+use crate::db::DbPool;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -183,11 +184,13 @@ impl utoipa::Modify for SecurityAddon {
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
+    pub pool: DbPool,
     pub scanner: Arc<crate::scanner::Scanner>,
     pub comfyui_url: Option<String>,
     pub library_root: PathBuf,
     pub multi_user: bool,
     pub user_dbs: Arc<RwLock<HashMap<String, Arc<Mutex<Connection>>>>>,
+    pub user_pools: Arc<RwLock<HashMap<String, DbPool>>>,
     pub shutdown_flag: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
@@ -233,13 +236,16 @@ pub async fn resolve_user_db(
             let user_library = state.library_root.join(user_sub);
             let user_scanner =
                 Arc::new(state.scanner.with_db_path(user_library.join(".phos.db")));
+            let user_pool = get_or_create_user_pool(&state, user_sub).await.unwrap_or_else(|_| state.pool.clone());
             AppState {
                 db,
+                pool: user_pool,
                 scanner: user_scanner,
                 comfyui_url: state.comfyui_url.clone(),
                 library_root: user_library,
                 multi_user: state.multi_user,
                 user_dbs: state.user_dbs.clone(),
+                user_pools: state.user_pools.clone(),
                 shutdown_flag: state.shutdown_flag.clone(),
             }
         } else {
@@ -293,6 +299,36 @@ async fn get_or_create_user_db(
         );
     }
     Ok(shared)
+}
+
+async fn get_or_create_user_pool(
+    state: &AppState,
+    user_sub: &str,
+) -> Result<DbPool, StatusCode> {
+    // Fast path: read lock
+    {
+        let pools = state.user_pools.read().await;
+        if let Some(pool) = pools.get(user_sub) {
+            return Ok(pool.clone());
+        }
+    }
+    // Slow path: write lock
+    let mut pools = state.user_pools.write().await;
+    if let Some(pool) = pools.get(user_sub) {
+        return Ok(pool.clone());
+    }
+    let user_dir = state.library_root.join(user_sub);
+    let db_path = user_dir.join(".phos.db");
+    let pool = crate::db::establish_pool(&db_path).map_err(|e| {
+        tracing::error!("Failed to create pool for user {}: {}", user_sub, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    crate::db::run_migrations(&pool).map_err(|e| {
+        tracing::error!("Failed to run migrations for user {}: {}", user_sub, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    pools.insert(user_sub.to_string(), pool.clone());
+    Ok(pool)
 }
 
 /// Recalculate `shots.primary_person_id` for a given shot.

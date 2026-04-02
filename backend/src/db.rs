@@ -1,5 +1,46 @@
+use diesel::prelude::*;
+use diesel::r2d2::{self, ConnectionManager, CustomizeConnection, Pool};
+use diesel::sqlite::SqliteConnection;
+use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
 use rusqlite::{params, Connection, Result};
 use std::path::{Path, PathBuf};
+
+pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+pub type DbPool = Pool<ConnectionManager<SqliteConnection>>;
+
+#[derive(Debug)]
+struct SqlitePragmaCustomizer;
+
+impl CustomizeConnection<SqliteConnection, r2d2::Error> for SqlitePragmaCustomizer {
+    fn on_acquire(&self, conn: &mut SqliteConnection) -> std::result::Result<(), r2d2::Error> {
+        diesel::sql_query("PRAGMA journal_mode = WAL")
+            .execute(conn)
+            .map_err(|e| r2d2::Error::QueryError(e))?;
+        diesel::sql_query("PRAGMA busy_timeout = 5000")
+            .execute(conn)
+            .map_err(|e| r2d2::Error::QueryError(e))?;
+        Ok(())
+    }
+}
+
+/// Create a Diesel r2d2 connection pool for the given database path.
+/// Configures WAL mode and busy_timeout on each connection.
+pub fn establish_pool<P: AsRef<Path>>(path: P) -> std::result::Result<DbPool, r2d2::PoolError> {
+    let database_url = path.as_ref().to_string_lossy().to_string();
+    let manager = ConnectionManager::<SqliteConnection>::new(database_url);
+    Pool::builder()
+        .max_size(4)
+        .connection_customizer(Box::new(SqlitePragmaCustomizer))
+        .build(manager)
+}
+
+/// Run pending Diesel migrations on a pooled connection.
+pub fn run_migrations(pool: &DbPool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = pool.get().map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    conn.run_pending_migrations(MIGRATIONS)
+        .map(|_| ())
+}
 
 /// Open a connection with WAL mode and busy timeout enabled.
 /// Use this when worker threads need their own connection.

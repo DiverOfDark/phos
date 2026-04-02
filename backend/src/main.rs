@@ -182,17 +182,22 @@ async fn run_server() {
     let user_dbs: Arc<RwLock<HashMap<String, Arc<Mutex<rusqlite::Connection>>>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
+    let pool = db::establish_pool(&db_path).expect("Failed to create connection pool");
+    db::run_migrations(&pool).expect("Failed to run Diesel migrations");
+
     // Shutdown coordination: a condvar that the blocking background task
     // can wait on, and the signal handler sets.
     let shutdown_flag = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
 
     let state = api::AppState {
         db: shared_conn.clone(),
+        pool,
         scanner: scanner.clone(),
         comfyui_url: comfyui_url.clone(),
         library_root: root_path.to_path_buf(),
         multi_user,
         user_dbs: user_dbs.clone(),
+        user_pools: Arc::new(RwLock::new(HashMap::new())),
         shutdown_flag: shutdown_flag.clone(),
     };
 
