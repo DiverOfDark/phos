@@ -1,15 +1,6 @@
 use rusqlite::{params, Connection, Result};
 use std::path::{Path, PathBuf};
 
-/// Check if a blob uses the legacy bincode format (8-byte u64 LE length prefix + f32 data).
-fn is_legacy_embedding_blob(blob: &[u8]) -> bool {
-    if blob.len() < 12 {
-        return false;
-    }
-    let prefix = u64::from_le_bytes(blob[..8].try_into().unwrap()) as usize;
-    prefix > 0 && prefix * 4 + 8 == blob.len()
-}
-
 /// Open a connection with WAL mode and busy timeout enabled.
 /// Use this when worker threads need their own connection.
 pub fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection> {
@@ -461,88 +452,6 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
 
     // Clean up people who lost all their shots (e.g. after shot merges)
     cleanup_orphaned_people(&conn)?;
-
-    // Migrate bincode-legacy embedding blobs to raw f32 format.
-    // Old format: 8-byte u64 LE length prefix + N*4 bytes of LE f32.
-    // New format: N*4 bytes of raw LE f32 (no prefix).
-    {
-        let already_migrated: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM settings WHERE key = 'embedding_format_migrated'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            > 0;
-
-        if !already_migrated {
-            let mut migrated_count = 0u64;
-
-            // Migrate faces.embedding
-            {
-                let mut stmt = conn.prepare(
-                    "SELECT id, embedding FROM faces WHERE embedding IS NOT NULL",
-                )?;
-                let rows: Vec<(String, Vec<u8>)> = stmt
-                    .query_map([], |row| {
-                        let id: String = row.get(0)?;
-                        let blob: Vec<u8> = row.get(1)?;
-                        Ok((id, blob))
-                    })?
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                for (id, blob) in &rows {
-                    if is_legacy_embedding_blob(blob) {
-                        let new_blob = &blob[8..];
-                        conn.execute(
-                            "UPDATE faces SET embedding = ? WHERE id = ?",
-                            params![new_blob, id],
-                        )?;
-                        migrated_count += 1;
-                    }
-                }
-            }
-
-            // Migrate people.representative_embedding
-            {
-                let mut stmt = conn.prepare(
-                    "SELECT id, representative_embedding FROM people WHERE representative_embedding IS NOT NULL",
-                )?;
-                let rows: Vec<(String, Vec<u8>)> = stmt
-                    .query_map([], |row| {
-                        let id: String = row.get(0)?;
-                        let blob: Vec<u8> = row.get(1)?;
-                        Ok((id, blob))
-                    })?
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                for (id, blob) in &rows {
-                    if is_legacy_embedding_blob(blob) {
-                        let new_blob = &blob[8..];
-                        conn.execute(
-                            "UPDATE people SET representative_embedding = ? WHERE id = ?",
-                            params![new_blob, id],
-                        )?;
-                        migrated_count += 1;
-                    }
-                }
-            }
-
-            conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('embedding_format_migrated', '1')",
-                [],
-            )?;
-
-            if migrated_count > 0 {
-                tracing::info!(
-                    "Migrated {} embedding blobs from bincode-legacy to raw f32 format",
-                    migrated_count
-                );
-            }
-        }
-    }
 
     // Reclaim unused space
     tracing::info!("Running VACUUM on database");
