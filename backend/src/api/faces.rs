@@ -4,25 +4,30 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use diesel::prelude::*;
 use image::GenericImageView;
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use utoipa::ToSchema;
 
 use super::UState;
+use crate::models::NewFace;
+use crate::schema::{faces, files, people};
 
 /// Find the shot_id for a given face
-fn get_shot_id_for_face(db: &rusqlite::Connection, face_id: &str) -> Result<String, StatusCode> {
-    db.query_row(
-        "SELECT f.shot_id FROM faces fa JOIN files f ON fa.file_id = f.id WHERE fa.id = ?",
-        params![face_id],
-        |row| row.get(0),
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to find shot for face {}: {}", face_id, e);
-        StatusCode::NOT_FOUND
-    })
+fn get_shot_id_for_face(
+    conn: &mut diesel::SqliteConnection,
+    face_id: &str,
+) -> Result<String, StatusCode> {
+    faces::table
+        .inner_join(files::table.on(faces::file_id.eq(files::id)))
+        .filter(faces::id.eq(face_id))
+        .select(files::shot_id)
+        .first::<String>(conn)
+        .map_err(|e| {
+            tracing::error!("Failed to find shot for face {}: {}", face_id, e);
+            StatusCode::NOT_FOUND
+        })
 }
 
 /// Get suggested persons for a face based on embedding similarity.
@@ -59,16 +64,19 @@ pub(super) async fn get_face_suggestions(
 ) -> Result<Json<Vec<FaceSuggestion>>, StatusCode> {
     use crate::ai::cosine_similarity;
 
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Load the target face's embedding
-    let target_blob: Vec<u8> = db
-        .query_row(
-            "SELECT embedding FROM faces WHERE id = ?",
-            params![id],
-            |row| row.get(0),
-        )
+    let target_blob: Option<Vec<u8>> = faces::table
+        .filter(faces::id.eq(&id))
+        .select(faces::embedding)
+        .first::<Option<Vec<u8>>>(&mut conn)
         .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let target_blob = target_blob.ok_or(StatusCode::NOT_FOUND)?;
 
     let target_embedding: Vec<f32> =
         crate::embedding::decode_embedding(&target_blob).ok_or_else(|| {
@@ -81,32 +89,25 @@ pub(super) async fn get_face_suggestions(
     }
 
     // Load one representative face embedding per person (the thumbnail face)
-    let mut stmt = db
-        .prepare(
-            "SELECT p.id, p.name, p.thumbnail_face_id, f.embedding
-             FROM people p
-             JOIN faces f ON f.id = p.thumbnail_face_id
-             WHERE f.embedding IS NOT NULL",
-        )
-        .map_err(|e| {
-            tracing::error!("Failed to prepare person embeddings query: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let mut suggestions: Vec<FaceSuggestion> = stmt
-        .query_map([], |row| {
-            let person_id: String = row.get(0)?;
-            let person_name: Option<String> = row.get(1)?;
-            let thumbnail_face_id: Option<String> = row.get(2)?;
-            let blob: Vec<u8> = row.get(3)?;
-            Ok((person_id, person_name, thumbnail_face_id, blob))
-        })
+    let rows: Vec<(String, Option<String>, Option<String>, Option<Vec<u8>>)> = people::table
+        .inner_join(faces::table.on(faces::id.nullable().eq(people::thumbnail_face_id)))
+        .filter(faces::embedding.is_not_null())
+        .select((
+            people::id,
+            people::name,
+            people::thumbnail_face_id,
+            faces::embedding,
+        ))
+        .load::<(String, Option<String>, Option<String>, Option<Vec<u8>>)>(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to query person embeddings: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .filter_map(|r| r.ok())
+        })?;
+
+    let mut suggestions: Vec<FaceSuggestion> = rows
+        .into_iter()
         .filter_map(|(person_id, person_name, thumbnail_face_id, blob)| {
+            let blob = blob?;
             let embedding: Vec<f32> = crate::embedding::decode_embedding(&blob)?;
             if embedding.len() != target_embedding.len() || embedding.is_empty() {
                 return None;
@@ -116,7 +117,8 @@ pub(super) async fn get_face_suggestions(
             Some(FaceSuggestion {
                 person_id,
                 person_name,
-                thumbnail_url: thumbnail_face_id.map(|fid| format!("/api/faces/{}/thumbnail", fid)),
+                thumbnail_url: thumbnail_face_id
+                    .map(|fid| format!("/api/faces/{}/thumbnail", fid)),
                 distance,
             })
         })
@@ -159,38 +161,34 @@ pub(super) async fn reassign_face(
     UState(state): UState,
     Json(payload): Json<ReassignFacePayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Verify the target person exists
-    let person_exists: bool = db
-        .query_row(
-            "SELECT COUNT(*) FROM people WHERE id = ?",
-            params![payload.person_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|c| c > 0)
-        .unwrap_or(false);
+    let person_exists: i64 = people::table
+        .filter(people::id.eq(&payload.person_id))
+        .count()
+        .get_result(&mut conn)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    if !person_exists {
+    if person_exists == 0 {
         return Err(StatusCode::NOT_FOUND);
     }
 
     // Find the shot_id and old person_id for this face before updating
-    let shot_id = get_shot_id_for_face(&db, &id)?;
-    let old_person_id: Option<String> = db
-        .query_row(
-            "SELECT person_id FROM faces WHERE id = ?",
-            params![id],
-            |row| row.get(0),
-        )
+    let shot_id = get_shot_id_for_face(&mut conn, &id)?;
+    let old_person_id: Option<String> = faces::table
+        .filter(faces::id.eq(&id))
+        .select(faces::person_id)
+        .first::<Option<String>>(&mut conn)
         .ok()
         .flatten();
 
-    let updated = db
-        .execute(
-            "UPDATE faces SET person_id = ? WHERE id = ?",
-            params![payload.person_id, id],
-        )
+    let updated = diesel::update(faces::table.filter(faces::id.eq(&id)))
+        .set(faces::person_id.eq(&payload.person_id))
+        .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to reassign face: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -201,17 +199,25 @@ pub(super) async fn reassign_face(
     }
 
     // Set thumbnail_face_id if the person doesn't have one yet
-    let _ = db.execute(
-        "UPDATE people SET thumbnail_face_id = ? WHERE id = ? AND thumbnail_face_id IS NULL",
-        params![id, payload.person_id],
-    );
+    let _ = diesel::update(
+        people::table
+            .filter(people::id.eq(&payload.person_id))
+            .filter(people::thumbnail_face_id.is_null()),
+    )
+    .set(people::thumbnail_face_id.eq(&id))
+    .execute(&mut conn);
 
     // Recalculate shot's primary_person_id (unless confirmed)
-    super::recalculate_primary_person(&db, &shot_id)?;
+    // This helper still uses rusqlite
+    {
+        let db = state.db.lock().await;
+        super::recalculate_primary_person(&db, &shot_id)?;
+    }
 
     // If the old person has no remaining faces, delete them
     if let Some(pid) = &old_person_id {
         if pid != &payload.person_id {
+            let db = state.db.lock().await;
             super::cleanup_orphaned_person(&db, pid)?;
         }
     }
@@ -239,22 +245,23 @@ pub(super) async fn delete_face(
     Path(id): Path<String>,
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Find the shot_id and person_id for this face before deleting
-    let shot_id = get_shot_id_for_face(&db, &id)?;
-    let old_person_id: Option<String> = db
-        .query_row(
-            "SELECT person_id FROM faces WHERE id = ?",
-            params![id],
-            |row| row.get(0),
-        )
+    let shot_id = get_shot_id_for_face(&mut conn, &id)?;
+    let old_person_id: Option<String> = faces::table
+        .filter(faces::id.eq(&id))
+        .select(faces::person_id)
+        .first::<Option<String>>(&mut conn)
         .ok()
         .flatten();
 
     // Delete the face record
-    let deleted = db
-        .execute("DELETE FROM faces WHERE id = ?", params![id])
+    let deleted = diesel::delete(faces::table.filter(faces::id.eq(&id)))
+        .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to delete face {}: {}", id, e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -265,10 +272,15 @@ pub(super) async fn delete_face(
     }
 
     // Recalculate shot's primary_person_id from remaining faces
-    super::recalculate_primary_person(&db, &shot_id)?;
+    // This helper still uses rusqlite
+    {
+        let db = state.db.lock().await;
+        super::recalculate_primary_person(&db, &shot_id)?;
+    }
 
     // If the person has no remaining faces, delete them
     if let Some(pid) = &old_person_id {
+        let db = state.db.lock().await;
         super::cleanup_orphaned_person(&db, pid)?;
     }
 
@@ -295,46 +307,38 @@ pub(super) async fn get_face_thumbnail(
     Path(id): Path<String>,
     UState(state): UState,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let (file_path, box_x1, box_y1, box_x2, box_y2, db_path) = {
-        let db = state.db.lock().await;
-        let mut stmt = db
-            .prepare(
-                "SELECT fi.path, fa.box_x1, fa.box_y1, fa.box_x2, fa.box_y2
-                 FROM faces fa
-                 JOIN files fi ON fa.file_id = fi.id
-                 WHERE fa.id = ?",
-            )
+    let (file_path, box_x1, box_y1, box_x2, box_y2) = {
+        let mut conn = state
+            .pool
+            .get()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        let result = stmt
-            .query_row(params![id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, f32>(1)?,
-                    row.get::<_, f32>(2)?,
-                    row.get::<_, f32>(3)?,
-                    row.get::<_, f32>(4)?,
-                ))
-            })
-            .map_err(|_| StatusCode::NOT_FOUND)?;
-
-        let db_path: String = db
-            .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        (result.0, result.1, result.2, result.3, result.4, db_path)
+        faces::table
+            .inner_join(files::table.on(faces::file_id.eq(files::id)))
+            .filter(faces::id.eq(&id))
+            .select((
+                files::path,
+                faces::box_x1,
+                faces::box_y1,
+                faces::box_x2,
+                faces::box_y2,
+            ))
+            .first::<(String, Option<f32>, Option<f32>, Option<f32>, Option<f32>)>(&mut conn)
+            .map_err(|_| StatusCode::NOT_FOUND)?
     };
+
+    let box_x1 = box_x1.unwrap_or(0.0);
+    let box_y1 = box_y1.unwrap_or(0.0);
+    let box_x2 = box_x2.unwrap_or(0.0);
+    let box_y2 = box_y2.unwrap_or(0.0);
 
     let source_path = crate::db::resolve_path(&state.library_root, &file_path);
     if !source_path.exists() {
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Cache directory
-    let db_dir = std::path::Path::new(&db_path)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let thumb_dir = db_dir.join(".phos_thumbnails").join("faces");
+    // Cache directory — use library_root (parent of .phos.db)
+    let thumb_dir = state.library_root.join(".phos_thumbnails").join("faces");
 
     tokio::fs::create_dir_all(&thumb_dir)
         .await
@@ -453,13 +457,16 @@ pub(super) async fn add_manual_face(
 
     // Look up the file path and shot_id
     let (file_path, shot_id) = {
-        let db = state.db.lock().await;
-        db.query_row(
-            "SELECT path, shot_id FROM files WHERE id = ?",
-            params![file_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .map_err(|_| StatusCode::NOT_FOUND)?
+        let mut conn = state
+            .pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        files::table
+            .filter(files::id.eq(&file_id))
+            .select((files::path, files::shot_id))
+            .first::<(String, String)>(&mut conn)
+            .map_err(|_| StatusCode::NOT_FOUND)?
     };
 
     let bbox = (
@@ -504,18 +511,34 @@ pub(super) async fn add_manual_face(
         })?;
 
     // Insert the face and recalculate primary person
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    db.execute(
-        "INSERT INTO faces (id, file_id, person_id, box_x1, box_y1, box_x2, box_y2, embedding, score) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 1.0)",
-        params![face_id, file_id, payload.box_x1, payload.box_y1, payload.box_x2, payload.box_y2, embedding_blob],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to insert manual face: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    diesel::insert_into(faces::table)
+        .values(NewFace {
+            id: &face_id,
+            file_id: &file_id,
+            person_id: None,
+            box_x1: Some(payload.box_x1),
+            box_y1: Some(payload.box_y1),
+            box_x2: Some(payload.box_x2),
+            box_y2: Some(payload.box_y2),
+            embedding: Some(&embedding_blob),
+            score: Some(1.0),
+        })
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to insert manual face: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    super::recalculate_primary_person(&db, &shot_id)?;
+    // This helper still uses rusqlite
+    {
+        let db = state.db.lock().await;
+        super::recalculate_primary_person(&db, &shot_id)?;
+    }
 
     Ok(Json(serde_json::json!({"id": face_id})))
 }

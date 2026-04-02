@@ -4,13 +4,14 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use diesel::prelude::*;
 use image::GenericImageView;
-use rusqlite::params;
 use serde::Deserialize;
 use std::io::Cursor;
 use utoipa::IntoParams;
 
 use super::UState;
+use crate::schema::{enhancement_tasks, faces, files, shots, video_keyframes};
 
 /// Simple raw-body upload: PUT /api/import/upload?filename=foo.jpg
 /// Body is the raw file bytes. No multipart overhead.
@@ -190,17 +191,12 @@ pub(super) async fn get_file(
     UState(state): UState,
 ) -> Result<impl IntoResponse, StatusCode> {
     let (file_path, mime_type) = {
-        let db = state.db.lock().await;
-        let mut stmt = db
-            .prepare("SELECT path, mime_type FROM files WHERE id = ?")
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        stmt.query_row(params![id], |row| {
-            let path: String = row.get(0)?;
-            let mime: Option<String> = row.get(1)?;
-            Ok((path, mime))
-        })
-        .map_err(|_| StatusCode::NOT_FOUND)?
+        let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        files::table
+            .filter(files::id.eq(&id))
+            .select((files::path, files::mime_type))
+            .first::<(String, Option<String>)>(&mut conn)
+            .map_err(|_| StatusCode::NOT_FOUND)?
     };
 
     let path = crate::db::resolve_path(&state.library_root, &file_path);
@@ -262,25 +258,13 @@ pub(super) async fn get_file_thumbnail(
     Query(query): Query<ThumbnailQuery>,
     UState(state): UState,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let (file_path, mime_type, db_path) = {
-        let db = state.db.lock().await;
-        let mut stmt = db
-            .prepare("SELECT path, mime_type FROM files WHERE id = ?")
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        let (path, mime) = stmt
-            .query_row(params![id], |row| {
-                let p: String = row.get(0)?;
-                let m: Option<String> = row.get(1)?;
-                Ok((p, m))
-            })
-            .map_err(|_| StatusCode::NOT_FOUND)?;
-
-        let db_path: String = db
-            .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        (path, mime, db_path)
+    let (file_path, mime_type) = {
+        let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        files::table
+            .filter(files::id.eq(&id))
+            .select((files::path, files::mime_type))
+            .first::<(String, Option<String>)>(&mut conn)
+            .map_err(|_| StatusCode::NOT_FOUND)?
     };
 
     let source_path = crate::db::resolve_path(&state.library_root, &file_path);
@@ -288,11 +272,8 @@ pub(super) async fn get_file_thumbnail(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Determine thumbnail cache directory (next to the DB file)
-    let db_dir = std::path::Path::new(&db_path)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let thumb_dir = db_dir.join(".phos_thumbnails");
+    // Determine thumbnail cache directory (next to the DB file in library_root)
+    let thumb_dir = state.library_root.join(".phos_thumbnails");
 
     // Create thumb dir if it doesn't exist
     tokio::fs::create_dir_all(&thumb_dir)
@@ -388,43 +369,41 @@ pub(super) async fn set_file_original(
     Path(id): Path<String>,
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Get the shot_id for this file
-    let shot_id: String = db
-        .query_row(
-            "SELECT shot_id FROM files WHERE id = ?",
-            params![id],
-            |row| row.get(0),
-        )
+    let shot_id: String = files::table
+        .filter(files::id.eq(&id))
+        .select(files::shot_id)
+        .first::<String>(&mut conn)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
     // Set all files in this shot to is_original = false
-    db.execute(
-        "UPDATE files SET is_original = 0 WHERE shot_id = ?",
-        params![shot_id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to clear is_original on shot files: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    diesel::update(files::table.filter(files::shot_id.eq(&shot_id)))
+        .set(files::is_original.eq(false))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to clear is_original on shot files: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Set this file as original
-    db.execute("UPDATE files SET is_original = 1 WHERE id = ?", params![id])
+    diesel::update(files::table.filter(files::id.eq(&id)))
+        .set(files::is_original.eq(true))
+        .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to set is_original on file: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     // Update shots.main_file_id
-    db.execute(
-        "UPDATE shots SET main_file_id = ? WHERE id = ?",
-        params![id, shot_id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to update shots.main_file_id: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    diesel::update(shots::table.filter(shots::id.eq(&shot_id)))
+        .set(shots::main_file_id.eq(&id))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to update shots.main_file_id: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
@@ -449,60 +428,60 @@ pub(super) async fn delete_file(
     Path(id): Path<String>,
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Get file info
-    let (shot_id, file_path, is_original): (String, String, bool) = db
-        .query_row(
-            "SELECT shot_id, path, is_original FROM files WHERE id = ?",
-            params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+    let (shot_id, file_path, is_original): (String, String, Option<bool>) = files::table
+        .filter(files::id.eq(&id))
+        .select((files::shot_id, files::path, files::is_original))
+        .first::<(String, String, Option<bool>)>(&mut conn)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
     // Don't allow deleting the original file
-    if is_original {
+    if is_original.unwrap_or(false) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Collect person_ids that might become orphaned
-    let affected_person_ids: Vec<String> = db
-        .prepare("SELECT DISTINCT person_id FROM faces WHERE file_id = ? AND person_id IS NOT NULL")
-        .and_then(|mut s| {
-            s.query_map(params![id], |row| row.get(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    let affected_person_ids: Vec<String> = faces::table
+        .filter(faces::file_id.eq(&id))
+        .filter(faces::person_id.is_not_null())
+        .select(faces::person_id)
+        .distinct()
+        .load::<Option<String>>(&mut conn)
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect();
 
     // Delete faces
-    db.execute("DELETE FROM faces WHERE file_id = ?", params![id])
+    diesel::delete(faces::table.filter(faces::file_id.eq(&id)))
+        .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to delete faces: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     // Delete video keyframes
-    db.execute(
-        "DELETE FROM video_keyframes WHERE video_file_id = ?",
-        params![id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to delete video_keyframes: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    diesel::delete(video_keyframes::table.filter(video_keyframes::video_file_id.eq(&id)))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to delete video_keyframes: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Clear enhancement_tasks referencing this file
-    db.execute(
-        "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?",
-        params![id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to clear enhancement_tasks: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    diesel::update(enhancement_tasks::table.filter(enhancement_tasks::output_file_id.eq(&id)))
+        .set(enhancement_tasks::output_file_id.eq(None::<String>))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to clear enhancement_tasks: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Delete the file record
-    db.execute("DELETE FROM files WHERE id = ?", params![id])
+    diesel::delete(files::table.filter(files::id.eq(&id)))
+        .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to delete file: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -515,18 +494,12 @@ pub(super) async fn delete_file(
     }
 
     // Delete cached thumbnail and clean up empty directories (best-effort)
-    let db_path: String = db
-        .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
-        .unwrap_or_default();
-    if !db_path.is_empty() {
-        let db_dir = std::path::Path::new(&db_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let _ = std::fs::remove_file(db_dir.join(".phos_thumbnails").join(format!("{}.jpg", id)));
-        let _ = crate::import::cleanup_empty_dirs(db_dir);
-    }
+    let thumb_dir = state.library_root.join(".phos_thumbnails");
+    let _ = std::fs::remove_file(thumb_dir.join(format!("{}.jpg", id)));
+    let _ = crate::import::cleanup_empty_dirs(&state.library_root);
 
-    // Recalculate primary person for the shot
+    // Recalculate primary person for the shot (still uses rusqlite connection)
+    let db = state.db.lock().await;
     let _ = super::recalculate_primary_person(&db, &shot_id);
 
     // Clean up orphaned people
