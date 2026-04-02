@@ -1,0 +1,13 @@
+DROP TRIGGER IF EXISTS files_updated_at;
+DROP TRIGGER IF EXISTS shots_updated_at;
+DROP TRIGGER IF EXISTS people_updated_at;
+DROP TABLE IF EXISTS settings;
+DROP TABLE IF EXISTS ignored_merges;
+DROP TABLE IF EXISTS workflow_presets;
+DROP TABLE IF EXISTS enhancement_tasks;
+DROP TABLE IF EXISTS comfyui_workflows;
+DROP TABLE IF EXISTS video_keyframes;
+DROP TABLE IF EXISTS faces;
+DROP TABLE IF EXISTS files;
+DROP TABLE IF EXISTS shots;
+DROP TABLE IF EXISTS people;

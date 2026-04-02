@@ -4,6 +4,8 @@ pub mod auth;
 pub mod comfyui;
 pub mod db;
 pub mod embedding;
+pub mod models;
+pub mod schema;
 pub mod import;
 pub mod scanner;
 pub mod watcher;

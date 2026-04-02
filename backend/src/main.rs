@@ -10,7 +10,9 @@ mod comfyui;
 mod db;
 mod embedding;
 mod import;
+mod models;
 mod scanner;
+mod schema;
 mod watcher;
 mod webdav;
 
