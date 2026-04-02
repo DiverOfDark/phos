@@ -3,9 +3,12 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use rusqlite::params;
+use diesel::prelude::*;
 use serde::Deserialize;
 use utoipa::ToSchema;
+
+use crate::models::{NewComfyuiWorkflow, NewEnhancementTask, NewWorkflowPreset};
+use crate::schema::{comfyui_workflows, enhancement_tasks, files, shots, workflow_presets};
 
 use super::{AppState, UState};
 
@@ -70,47 +73,39 @@ pub(super) async fn comfyui_list_workflows(
     UState(state): UState,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mut stmt = db
-        .prepare(
-            "SELECT id, name, description, inputs_json, outputs_json, created_at FROM comfyui_workflows ORDER BY created_at DESC",
-        )
+    let rows: Vec<crate::models::ComfyuiWorkflow> = comfyui_workflows::table
+        .order(comfyui_workflows::created_at.desc())
+        .load(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to list workflows: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let workflows: Vec<serde_json::Value> = stmt
-        .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            let description: Option<String> = row.get(2)?;
-            let inputs_str: Option<String> = row.get(3)?;
-            let outputs_str: Option<String> = row.get(4)?;
-            let created_at: String = row.get(5)?;
-
-            let inputs: serde_json::Value = inputs_str
+    let workflows: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|wf| {
+            let inputs: serde_json::Value = wf
+                .inputs_json
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(serde_json::Value::Array(vec![]));
-            let outputs: serde_json::Value = outputs_str
+            let outputs: serde_json::Value = wf
+                .outputs_json
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(serde_json::Value::Array(vec![]));
-
-            Ok(serde_json::json!({
-                "id": id,
-                "name": name,
-                "description": description,
+            serde_json::json!({
+                "id": wf.id,
+                "name": wf.name,
+                "description": wf.description,
                 "inputs": inputs,
                 "outputs": outputs,
-                "created_at": created_at,
-            }))
+                "created_at": wf.created_at,
+            })
         })
-        .map_err(|e| {
-            tracing::error!("Failed to query workflows: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .filter_map(|r| r.ok())
         .collect();
 
     Ok(Json(workflows))
@@ -170,15 +165,25 @@ pub(super) async fn comfyui_import_workflow(
     let outputs_json =
         serde_json::to_string(&outputs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let db = state.db.lock().await;
-    db.execute(
-        "INSERT INTO comfyui_workflows (id, name, description, workflow_json, inputs_json, outputs_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, payload.name, payload.description, workflow_json, inputs_json, outputs_json],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to insert workflow: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    diesel::insert_into(comfyui_workflows::table)
+        .values(NewComfyuiWorkflow {
+            id: &id,
+            name: &payload.name,
+            description: payload.description.as_deref(),
+            workflow_json: &workflow_json,
+            inputs_json: Some(&inputs_json),
+            outputs_json: Some(&outputs_json),
+        })
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to insert workflow: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(serde_json::json!({
         "id": id,
@@ -209,10 +214,13 @@ pub(super) async fn comfyui_delete_workflow(
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let deleted = db
-        .execute("DELETE FROM comfyui_workflows WHERE id = ?1", params![id])
+    let deleted = diesel::delete(comfyui_workflows::table.filter(comfyui_workflows::id.eq(&id)))
+        .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to delete workflow: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -255,15 +263,16 @@ pub(super) async fn comfyui_enhance(
     Json(payload): Json<EnhancePayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Verify shot exists
-    let shot_exists: bool = db
-        .query_row(
-            "SELECT COUNT(*) FROM shots WHERE id = ?1",
-            params![payload.shot_id],
-            |row| row.get::<_, i64>(0),
-        )
+    let shot_exists: bool = shots::table
+        .filter(shots::id.eq(&payload.shot_id))
+        .count()
+        .get_result::<i64>(&mut conn)
         .map(|c| c > 0)
         .unwrap_or(false);
 
@@ -272,12 +281,10 @@ pub(super) async fn comfyui_enhance(
     }
 
     // Verify workflow exists
-    let wf_exists: bool = db
-        .query_row(
-            "SELECT COUNT(*) FROM comfyui_workflows WHERE id = ?1",
-            params![payload.workflow_id],
-            |row| row.get::<_, i64>(0),
-        )
+    let wf_exists: bool = comfyui_workflows::table
+        .filter(comfyui_workflows::id.eq(&payload.workflow_id))
+        .count()
+        .get_result::<i64>(&mut conn)
         .map(|c| c > 0)
         .unwrap_or(false);
 
@@ -289,14 +296,19 @@ pub(super) async fn comfyui_enhance(
     let text_overrides_json =
         serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
 
-    db.execute(
-        "INSERT INTO enhancement_tasks (id, shot_id, workflow_id, text_overrides, source_file_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![task_id, payload.shot_id, payload.workflow_id, text_overrides_json, payload.source_file_id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to insert enhancement task: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    diesel::insert_into(enhancement_tasks::table)
+        .values(NewEnhancementTask {
+            id: &task_id,
+            shot_id: &payload.shot_id,
+            workflow_id: &payload.workflow_id,
+            text_overrides: Some(&text_overrides_json),
+            source_file_id: payload.source_file_id.as_deref(),
+        })
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to insert enhancement task: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(serde_json::json!({
         "id": task_id,
@@ -328,93 +340,110 @@ pub(super) async fn comfyui_list_tasks(
     Query(query): Query<TasksQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let tasks: Vec<serde_json::Value> = if let Some(shot_id) = &query.shot_id {
-        query_tasks(&db, Some(shot_id))?
+        query_tasks(&mut conn, Some(shot_id))?
     } else {
-        query_tasks(&db, None)?
+        query_tasks(&mut conn, None)?
     };
 
     Ok(Json(tasks))
 }
 
-fn task_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
-    let shot_id: String = row.get(1)?;
-    let main_file_id: Option<String> = row.get(11)?;
-    let thumbnail_url = main_file_id.map(|fid| format!("/api/files/{}/thumbnail", fid));
-    Ok(serde_json::json!({
-        "id": row.get::<_, String>(0)?,
-        "shot_id": shot_id,
-        "workflow_id": row.get::<_, String>(2)?,
-        "workflow_name": row.get::<_, String>(3)?,
-        "status": row.get::<_, String>(4)?,
-        "error_message": row.get::<_, Option<String>>(5)?,
-        "retry_count": row.get::<_, i64>(6)?,
-        "output_file_id": row.get::<_, Option<String>>(7)?,
-        "created_at": row.get::<_, String>(8)?,
-        "started_at": row.get::<_, Option<String>>(9)?,
-        "completed_at": row.get::<_, Option<String>>(10)?,
+/// Row returned from the task JOIN query.
+#[derive(QueryableByName)]
+struct TaskRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    shot_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    status: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    error_message: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    retry_count: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    output_file_id: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    created_at: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    started_at: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    completed_at: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    main_file_id: Option<String>,
+}
+
+fn task_row_to_json(row: TaskRow) -> serde_json::Value {
+    let thumbnail_url = row
+        .main_file_id
+        .map(|fid| format!("/api/files/{}/thumbnail", fid));
+    serde_json::json!({
+        "id": row.id,
+        "shot_id": row.shot_id,
+        "workflow_id": row.workflow_id,
+        "workflow_name": row.workflow_name,
+        "status": row.status,
+        "error_message": row.error_message,
+        "retry_count": row.retry_count.unwrap_or(0),
+        "output_file_id": row.output_file_id,
+        "created_at": row.created_at,
+        "started_at": row.started_at,
+        "completed_at": row.completed_at,
         "thumbnail_url": thumbnail_url,
-    }))
+    })
 }
 
 fn query_tasks(
-    db: &rusqlite::Connection,
+    conn: &mut diesel::SqliteConnection,
     shot_id: Option<&String>,
 ) -> Result<Vec<serde_json::Value>, StatusCode> {
     if let Some(shot_id) = shot_id {
-        let mut stmt = db
-            .prepare(
-                "SELECT t.id, t.shot_id, t.workflow_id, w.name, t.status, t.error_message,
-                        t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
-                        s.main_file_id
-                 FROM enhancement_tasks t
-                 JOIN comfyui_workflows w ON t.workflow_id = w.id
-                 LEFT JOIN shots s ON t.shot_id = s.id
-                 WHERE t.shot_id = ?1
-                 ORDER BY t.created_at DESC",
-            )
-            .map_err(|e| {
-                tracing::error!("Failed to prepare tasks query: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let rows: Vec<TaskRow> = diesel::sql_query(
+            "SELECT t.id, t.shot_id, t.workflow_id, w.name AS workflow_name, t.status, t.error_message,
+                    t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
+                    s.main_file_id
+             FROM enhancement_tasks t
+             JOIN comfyui_workflows w ON t.workflow_id = w.id
+             LEFT JOIN shots s ON t.shot_id = s.id
+             WHERE t.shot_id = ?1
+             ORDER BY t.created_at DESC",
+        )
+        .bind::<diesel::sql_types::Text, _>(shot_id)
+        .load(conn)
+        .map_err(|e| {
+            tracing::error!("Failed to query tasks: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-        let rows: Vec<serde_json::Value> = stmt
-            .query_map(params![shot_id], task_row_to_json)
-            .map_err(|e| {
-                tracing::error!("Failed to query tasks: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(rows)
+        Ok(rows.into_iter().map(task_row_to_json).collect())
     } else {
-        let mut stmt = db
-            .prepare(
-                "SELECT t.id, t.shot_id, t.workflow_id, w.name, t.status, t.error_message,
-                        t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
-                        s.main_file_id
-                 FROM enhancement_tasks t
-                 JOIN comfyui_workflows w ON t.workflow_id = w.id
-                 LEFT JOIN shots s ON t.shot_id = s.id
-                 ORDER BY t.created_at DESC
-                 LIMIT 100",
-            )
-            .map_err(|e| {
-                tracing::error!("Failed to prepare tasks query: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let rows: Vec<TaskRow> = diesel::sql_query(
+            "SELECT t.id, t.shot_id, t.workflow_id, w.name AS workflow_name, t.status, t.error_message,
+                    t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
+                    s.main_file_id
+             FROM enhancement_tasks t
+             JOIN comfyui_workflows w ON t.workflow_id = w.id
+             LEFT JOIN shots s ON t.shot_id = s.id
+             ORDER BY t.created_at DESC
+             LIMIT 100",
+        )
+        .load(conn)
+        .map_err(|e| {
+            tracing::error!("Failed to query tasks: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-        let rows: Vec<serde_json::Value> = stmt
-            .query_map([], task_row_to_json)
-            .map_err(|e| {
-                tracing::error!("Failed to query tasks: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(rows)
+        Ok(rows.into_iter().map(task_row_to_json).collect())
     }
 }
 
@@ -438,23 +467,25 @@ pub(super) async fn comfyui_get_task(
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let task = db
-        .query_row(
-            "SELECT t.id, t.shot_id, t.workflow_id, w.name, t.status, t.error_message,
-                    t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
-                    s.main_file_id
-             FROM enhancement_tasks t
-             JOIN comfyui_workflows w ON t.workflow_id = w.id
-             LEFT JOIN shots s ON t.shot_id = s.id
-             WHERE t.id = ?1",
-            params![id],
-            task_row_to_json,
-        )
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let row: TaskRow = diesel::sql_query(
+        "SELECT t.id, t.shot_id, t.workflow_id, w.name AS workflow_name, t.status, t.error_message,
+                t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
+                s.main_file_id
+         FROM enhancement_tasks t
+         JOIN comfyui_workflows w ON t.workflow_id = w.id
+         LEFT JOIN shots s ON t.shot_id = s.id
+         WHERE t.id = ?1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&id)
+    .get_result(&mut conn)
+    .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    Ok(Json(task))
+    Ok(Json(task_row_to_json(row)))
 }
 
 /// POST /api/comfyui/tasks/:id/retry — retry a failed task
@@ -478,29 +509,33 @@ pub(super) async fn comfyui_retry_task(
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Only allow retrying failed tasks
-    let status: String = db
-        .query_row(
-            "SELECT status FROM enhancement_tasks WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        )
+    let status: String = enhancement_tasks::table
+        .filter(enhancement_tasks::id.eq(&id))
+        .select(enhancement_tasks::status)
+        .first(&mut conn)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
     if status != "failed" {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    db.execute(
-        "UPDATE enhancement_tasks SET status = 'pending', error_message = NULL, retry_count = 0 WHERE id = ?1",
-        params![id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to retry task: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&id)))
+        .set((
+            enhancement_tasks::status.eq("pending"),
+            enhancement_tasks::error_message.eq(None::<String>),
+            enhancement_tasks::retry_count.eq(0),
+        ))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to retry task: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(serde_json::json!({"status": "pending"})))
 }
@@ -526,37 +561,38 @@ pub(super) async fn comfyui_shot_generations(
     UState(state): UState,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mut stmt = db
-        .prepare(
-            "SELECT f.id, f.source_workflow_id, f.source_text_overrides
-             FROM files f
-             WHERE f.shot_id = ?1 AND f.source_workflow_id IS NOT NULL
-             ORDER BY f.created_at DESC",
-        )
+    let rows: Vec<(String, Option<String>, Option<String>)> = files::table
+        .filter(files::shot_id.eq(&shot_id))
+        .filter(files::source_workflow_id.is_not_null())
+        .select((
+            files::id,
+            files::source_workflow_id,
+            files::source_text_overrides,
+        ))
+        .order(files::created_at.desc())
+        .load(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to query generations: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let generations: Vec<serde_json::Value> = stmt
-        .query_map(params![shot_id], |row| {
-            let overrides_str: Option<String> = row.get(2)?;
+    let generations: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(file_id, workflow_id, overrides_str)| {
             let overrides: serde_json::Value = overrides_str
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(serde_json::json!({}));
-            Ok(serde_json::json!({
-                "file_id": row.get::<_, String>(0)?,
-                "workflow_id": row.get::<_, String>(1)?,
+            serde_json::json!({
+                "file_id": file_id,
+                "workflow_id": workflow_id,
                 "text_overrides": overrides,
-            }))
+            })
         })
-        .map_err(|e| {
-            tracing::error!("Failed to query generations: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .filter_map(|r| r.ok())
         .collect();
 
     Ok(Json(generations))
@@ -591,38 +627,36 @@ pub(super) async fn comfyui_list_presets(
     UState(state): UState,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mut stmt = db
-        .prepare(
-            "SELECT id, name, text_overrides, sort_order, created_at
-             FROM workflow_presets
-             WHERE workflow_id = ?1
-             ORDER BY sort_order ASC, created_at ASC",
-        )
+    let rows: Vec<crate::models::WorkflowPreset> = workflow_presets::table
+        .filter(workflow_presets::workflow_id.eq(&workflow_id))
+        .order((
+            workflow_presets::sort_order.asc(),
+            workflow_presets::created_at.asc(),
+        ))
+        .load(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to list presets: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let presets: Vec<serde_json::Value> = stmt
-        .query_map(params![workflow_id], |row| {
-            let overrides_str: String = row.get(2)?;
+    let presets: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|p| {
             let overrides: serde_json::Value =
-                serde_json::from_str(&overrides_str).unwrap_or(serde_json::json!({}));
-            Ok(serde_json::json!({
-                "id": row.get::<_, String>(0)?,
-                "name": row.get::<_, String>(1)?,
+                serde_json::from_str(&p.text_overrides).unwrap_or(serde_json::json!({}));
+            serde_json::json!({
+                "id": p.id,
+                "name": p.name,
                 "text_overrides": overrides,
-                "sort_order": row.get::<_, i64>(3)?,
-                "created_at": row.get::<_, String>(4)?,
-            }))
+                "sort_order": p.sort_order.unwrap_or(0),
+                "created_at": p.created_at,
+            })
         })
-        .map_err(|e| {
-            tracing::error!("Failed to query presets: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .filter_map(|r| r.ok())
         .collect();
 
     Ok(Json(presets))
@@ -650,15 +684,16 @@ pub(super) async fn comfyui_create_preset(
     Json(payload): Json<PresetPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Verify workflow exists
-    let wf_exists: bool = db
-        .query_row(
-            "SELECT COUNT(*) FROM comfyui_workflows WHERE id = ?1",
-            params![workflow_id],
-            |row| row.get::<_, i64>(0),
-        )
+    let wf_exists: bool = comfyui_workflows::table
+        .filter(comfyui_workflows::id.eq(&workflow_id))
+        .count()
+        .get_result::<i64>(&mut conn)
         .map(|c| c > 0)
         .unwrap_or(false);
 
@@ -669,16 +704,21 @@ pub(super) async fn comfyui_create_preset(
     let id = uuid::Uuid::new_v4().to_string();
     let overrides_json =
         serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
-    let sort_order = payload.sort_order.unwrap_or(0);
+    let sort_order = payload.sort_order.unwrap_or(0) as i32;
 
-    db.execute(
-        "INSERT INTO workflow_presets (id, workflow_id, name, text_overrides, sort_order) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, workflow_id, payload.name, overrides_json, sort_order],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to insert preset: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    diesel::insert_into(workflow_presets::table)
+        .values(NewWorkflowPreset {
+            id: &id,
+            workflow_id: &workflow_id,
+            name: &payload.name,
+            text_overrides: &overrides_json,
+            sort_order: Some(sort_order),
+        })
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to insert preset: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(serde_json::json!({
         "id": id,
@@ -713,21 +753,30 @@ pub(super) async fn comfyui_update_preset(
     Json(payload): Json<PresetPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let overrides_json =
         serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
-    let sort_order = payload.sort_order.unwrap_or(0);
+    let sort_order = payload.sort_order.unwrap_or(0) as i32;
 
-    let updated = db
-        .execute(
-            "UPDATE workflow_presets SET name = ?1, text_overrides = ?2, sort_order = ?3 WHERE id = ?4 AND workflow_id = ?5",
-            params![payload.name, overrides_json, sort_order, preset_id, workflow_id],
-        )
-        .map_err(|e| {
-            tracing::error!("Failed to update preset: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let updated = diesel::update(
+        workflow_presets::table
+            .filter(workflow_presets::id.eq(&preset_id))
+            .filter(workflow_presets::workflow_id.eq(&workflow_id)),
+    )
+    .set((
+        workflow_presets::name.eq(&payload.name),
+        workflow_presets::text_overrides.eq(&overrides_json),
+        workflow_presets::sort_order.eq(sort_order),
+    ))
+    .execute(&mut conn)
+    .map_err(|e| {
+        tracing::error!("Failed to update preset: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     if updated == 0 {
         return Err(StatusCode::NOT_FOUND);
@@ -764,17 +813,21 @@ pub(super) async fn comfyui_delete_preset(
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let deleted = db
-        .execute(
-            "DELETE FROM workflow_presets WHERE id = ?1 AND workflow_id = ?2",
-            params![preset_id, workflow_id],
-        )
-        .map_err(|e| {
-            tracing::error!("Failed to delete preset: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let deleted = diesel::delete(
+        workflow_presets::table
+            .filter(workflow_presets::id.eq(&preset_id))
+            .filter(workflow_presets::workflow_id.eq(&workflow_id)),
+    )
+    .execute(&mut conn)
+    .map_err(|e| {
+        tracing::error!("Failed to delete preset: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     if deleted == 0 {
         return Err(StatusCode::NOT_FOUND);
@@ -804,29 +857,28 @@ pub(super) async fn comfyui_delete_task(
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
-    let db = state.db.lock().await;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Only allow deleting failed or completed tasks
-    let status: String = db
-        .query_row(
-            "SELECT status FROM enhancement_tasks WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        )
+    let status: String = enhancement_tasks::table
+        .filter(enhancement_tasks::id.eq(&id))
+        .select(enhancement_tasks::status)
+        .first(&mut conn)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
     if status != "failed" && status != "completed" {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    db.execute(
-        "DELETE FROM enhancement_tasks WHERE id = ?1",
-        params![id],
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to delete task: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    diesel::delete(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&id)))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to delete task: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
