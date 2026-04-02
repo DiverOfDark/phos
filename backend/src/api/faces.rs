@@ -70,9 +70,9 @@ pub(super) async fn get_face_suggestions(
         )
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    let (target_embedding, _): (Vec<f32>, _) =
-        bincode::serde::decode_from_slice(&target_blob, bincode::config::legacy()).map_err(|e| {
-            tracing::error!("Failed to deserialize target face embedding: {}", e);
+    let target_embedding: Vec<f32> =
+        crate::embedding::decode_embedding(&target_blob).ok_or_else(|| {
+            tracing::error!("Failed to deserialize target face embedding");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -107,7 +107,7 @@ pub(super) async fn get_face_suggestions(
         })?
         .filter_map(|r| r.ok())
         .filter_map(|(person_id, person_name, thumbnail_face_id, blob)| {
-            let embedding: Vec<f32> = bincode::serde::decode_from_slice(&blob, bincode::config::legacy()).ok().map(|(v, _)| v)?;
+            let embedding: Vec<f32> = crate::embedding::decode_embedding(&blob)?;
             if embedding.len() != target_embedding.len() || embedding.is_empty() {
                 return None;
             }
@@ -488,8 +488,7 @@ pub(super) async fn add_manual_face(
                 emb
             };
 
-            let blob = bincode::serde::encode_to_vec(&embedding, bincode::config::legacy())
-                .map_err(|e| format!("Failed to serialize embedding: {}", e))?;
+            let blob = crate::embedding::encode_embedding(&embedding);
 
             let id = uuid::Uuid::new_v4().to_string();
             Ok((id, blob))

@@ -8,6 +8,7 @@ mod auth;
 mod cli_auth;
 mod comfyui;
 mod db;
+mod embedding;
 mod import;
 mod scanner;
 mod watcher;

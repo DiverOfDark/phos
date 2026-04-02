@@ -414,9 +414,7 @@ impl Scanner {
             })?
             .filter_map(|r| r.ok())
             .filter_map(|(id, blob)| {
-                bincode::serde::decode_from_slice::<Vec<f32>, _>(&blob, bincode::config::legacy())
-                    .ok()
-                    .map(|(v, _)| v)
+                crate::embedding::decode_embedding(&blob)
                     .filter(|e| !e.is_empty())
                     .map(|embedding| (id, embedding))
             })
@@ -454,9 +452,7 @@ impl Scanner {
                 .collect();
             rows.into_iter()
                 .filter_map(|(pid, blob, count)| {
-                    bincode::serde::decode_from_slice::<Vec<f32>, _>(&blob, bincode::config::legacy())
-                        .ok()
-                        .map(|(v, _)| v)
+                    crate::embedding::decode_embedding(&blob)
                         .filter(|e| !e.is_empty())
                         .map(|e| {
                             // Convert normalized centroid back to sum for running average
@@ -489,9 +485,7 @@ impl Scanner {
                     })?
                     .filter_map(|r| r.ok())
                     .filter_map(|blob| {
-                        bincode::serde::decode_from_slice::<Vec<f32>, _>(&blob, bincode::config::legacy())
-                            .ok()
-                            .map(|(v, _)| v)
+                        crate::embedding::decode_embedding(&blob)
                             .filter(|e| !e.is_empty())
                     })
                     .collect();
@@ -514,7 +508,7 @@ impl Scanner {
                 let norm: f32 = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
                 if norm > 0.0 {
                     let normalized: Vec<f32> = mean.iter().map(|v| v / norm).collect();
-                    let blob = bincode::serde::encode_to_vec(&normalized, bincode::config::legacy())?;
+                    let blob = crate::embedding::encode_embedding(&normalized);
                     conn.execute(
                         "UPDATE people SET representative_embedding = ? WHERE id = ?",
                         params![blob, &pid],
@@ -569,7 +563,7 @@ impl Scanner {
             } else {
                 // No match — create a new person
                 let pid = Uuid::new_v4().to_string();
-                let emb_blob = bincode::serde::encode_to_vec(embedding, bincode::config::legacy())?;
+                let emb_blob = crate::embedding::encode_embedding(embedding);
                 conn.execute(
                     "INSERT INTO people (id, thumbnail_face_id, representative_embedding) VALUES (?, ?, ?)",
                     params![&pid, face_id, emb_blob],
@@ -598,7 +592,7 @@ impl Scanner {
             let norm: f32 = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
             if norm > 0.0 {
                 let normalized: Vec<f32> = mean.iter().map(|v| v / norm).collect();
-                let blob = bincode::serde::encode_to_vec(&normalized, bincode::config::legacy())?;
+                let blob = crate::embedding::encode_embedding(&normalized);
                 conn.execute(
                     "UPDATE people SET representative_embedding = ? WHERE id = ?",
                     params![blob, pid],
@@ -1158,10 +1152,7 @@ fn detect_faces_collect(ai: &crate::ai::AiPipeline, img: &DynamicImage) -> Vec<F
             continue;
         }
 
-        let embedding_blob = match bincode::serde::encode_to_vec(&embedding, bincode::config::legacy()) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let embedding_blob = crate::embedding::encode_embedding(&embedding);
 
         results.push(FaceResult {
             face_id: Uuid::new_v4().to_string(),
