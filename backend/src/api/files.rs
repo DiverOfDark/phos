@@ -498,13 +498,12 @@ pub(super) async fn delete_file(
     let _ = std::fs::remove_file(thumb_dir.join(format!("{}.jpg", id)));
     let _ = crate::import::cleanup_empty_dirs(&state.library_root);
 
-    // Recalculate primary person for the shot (still uses rusqlite connection)
-    let db = state.db.lock().await;
-    let _ = super::recalculate_primary_person(&db, &shot_id);
+    // Recalculate primary person for the shot
+    let _ = super::recalculate_primary_person(&mut conn, &shot_id);
 
     // Clean up orphaned people
     for person_id in &affected_person_ids {
-        let _ = super::cleanup_orphaned_person(&db, person_id);
+        let _ = super::cleanup_orphaned_person(&mut conn, person_id);
     }
 
     Ok(Json(serde_json::json!({"status": "ok"})))

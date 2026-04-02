@@ -208,17 +208,12 @@ pub(super) async fn reassign_face(
     .execute(&mut conn);
 
     // Recalculate shot's primary_person_id (unless confirmed)
-    // This helper still uses rusqlite
-    {
-        let db = state.db.lock().await;
-        super::recalculate_primary_person(&db, &shot_id)?;
-    }
+    super::recalculate_primary_person(&mut conn, &shot_id)?;
 
     // If the old person has no remaining faces, delete them
     if let Some(pid) = &old_person_id {
         if pid != &payload.person_id {
-            let db = state.db.lock().await;
-            super::cleanup_orphaned_person(&db, pid)?;
+            super::cleanup_orphaned_person(&mut conn, pid)?;
         }
     }
 
@@ -272,16 +267,11 @@ pub(super) async fn delete_face(
     }
 
     // Recalculate shot's primary_person_id from remaining faces
-    // This helper still uses rusqlite
-    {
-        let db = state.db.lock().await;
-        super::recalculate_primary_person(&db, &shot_id)?;
-    }
+    super::recalculate_primary_person(&mut conn, &shot_id)?;
 
     // If the person has no remaining faces, delete them
     if let Some(pid) = &old_person_id {
-        let db = state.db.lock().await;
-        super::cleanup_orphaned_person(&db, pid)?;
+        super::cleanup_orphaned_person(&mut conn, pid)?;
     }
 
     Ok(Json(serde_json::json!({"status": "ok"})))
@@ -534,11 +524,7 @@ pub(super) async fn add_manual_face(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // This helper still uses rusqlite
-    {
-        let db = state.db.lock().await;
-        super::recalculate_primary_person(&db, &shot_id)?;
-    }
+    super::recalculate_primary_person(&mut conn, &shot_id)?;
 
     Ok(Json(serde_json::json!({"id": face_id})))
 }

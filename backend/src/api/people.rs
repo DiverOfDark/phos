@@ -574,10 +574,9 @@ pub(super) async fn delete_person(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Recalculate primary_person_id for all affected shots (uses rusqlite helper)
-    let db = state.db.lock().await;
+    // Recalculate primary_person_id for all affected shots
     for shot_id in &affected_shot_ids {
-        let _ = super::recalculate_primary_person(&db, shot_id);
+        let _ = super::recalculate_primary_person(&mut conn, shot_id);
     }
 
     Ok(Json(serde_json::json!({"status": "ok"})))

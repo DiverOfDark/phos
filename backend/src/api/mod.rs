@@ -16,7 +16,7 @@ use axum::{
     Router,
 };
 use crate::db::DbPool;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -336,14 +336,15 @@ async fn get_or_create_user_pool(
 /// and sets that as the shot's primary_person_id.
 /// Skips if `review_status == 'confirmed'`.
 /// If no faces have a person_id, sets primary_person_id = NULL.
-pub(crate) fn recalculate_primary_person(db: &Connection, shot_id: &str) -> Result<(), StatusCode> {
+pub(crate) fn recalculate_primary_person(conn: &mut diesel::SqliteConnection, shot_id: &str) -> Result<(), StatusCode> {
+    use crate::schema::shots;
+    use diesel::prelude::*;
+
     // Check review_status — skip confirmed shots
-    let review_status: Option<String> = db
-        .query_row(
-            "SELECT review_status FROM shots WHERE id = ?",
-            params![shot_id],
-            |row| row.get(0),
-        )
+    let review_status: Option<String> = shots::table
+        .filter(shots::id.eq(shot_id))
+        .select(shots::review_status)
+        .first(conn)
         .map_err(|e| {
             tracing::error!("Failed to get shot review_status: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -354,59 +355,66 @@ pub(crate) fn recalculate_primary_person(db: &Connection, shot_id: &str) -> Resu
     }
 
     // Find the face with the largest bounding box area that has a person_id
-    let primary_person: Option<String> = db
-        .query_row(
-            "SELECT fa.person_id FROM faces fa
-             JOIN files f ON fa.file_id = f.id
-             WHERE f.shot_id = ? AND fa.person_id IS NOT NULL
-             ORDER BY (fa.box_x2 - fa.box_x1) * (fa.box_y2 - fa.box_y1) DESC
-             LIMIT 1",
-            params![shot_id],
-            |row| row.get(0),
-        )
-        .ok();
+    // Uses sql_query for the computed ORDER BY expression
+    #[derive(diesel::QueryableByName)]
+    struct PersonIdRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        person_id: Option<String>,
+    }
 
-    db.execute(
-        "UPDATE shots SET primary_person_id = ? WHERE id = ?",
-        params![primary_person, shot_id],
+    let primary_person: Option<String> = diesel::sql_query(
+        "SELECT fa.person_id FROM faces fa
+         JOIN files f ON fa.file_id = f.id
+         WHERE f.shot_id = ?1 AND fa.person_id IS NOT NULL
+         ORDER BY (fa.box_x2 - fa.box_x1) * (fa.box_y2 - fa.box_y1) DESC
+         LIMIT 1",
     )
-    .map_err(|e| {
-        tracing::error!("Failed to update shot primary_person_id: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    .bind::<diesel::sql_types::Text, _>(shot_id)
+    .get_result::<PersonIdRow>(conn)
+    .ok()
+    .and_then(|r| r.person_id);
+
+    diesel::update(shots::table.filter(shots::id.eq(shot_id)))
+        .set(shots::primary_person_id.eq(primary_person))
+        .execute(conn)
+        .map_err(|e| {
+            tracing::error!("Failed to update shot primary_person_id: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(())
 }
 
 /// Delete a person record if they have no remaining faces.
 /// Clears primary_person_id on any shots referencing this person.
-pub(crate) fn cleanup_orphaned_person(db: &Connection, person_id: &str) -> Result<(), StatusCode> {
-    let face_count: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM faces WHERE person_id = ?",
-            params![person_id],
-            |row| row.get(0),
-        )
+pub(crate) fn cleanup_orphaned_person(conn: &mut diesel::SqliteConnection, person_id: &str) -> Result<(), StatusCode> {
+    use crate::schema::{faces, people, shots};
+    use diesel::prelude::*;
+
+    let face_count: i64 = faces::table
+        .filter(faces::person_id.eq(person_id))
+        .count()
+        .get_result(conn)
         .map_err(|e| {
             tracing::error!("Failed to count faces for person {}: {}", person_id, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     if face_count == 0 {
-        db.execute(
-            "UPDATE shots SET primary_person_id = NULL WHERE primary_person_id = ?",
-            params![person_id],
-        )
-        .map_err(|e| {
-            tracing::error!(
-                "Failed to clear primary_person_id for person {}: {}",
-                person_id,
-                e
-            );
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        diesel::update(shots::table.filter(shots::primary_person_id.eq(person_id)))
+            .set(shots::primary_person_id.eq(None::<String>))
+            .execute(conn)
+            .map_err(|e| {
+                tracing::error!(
+                    "Failed to clear primary_person_id for person {}: {}",
+                    person_id,
+                    e
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
-        db.execute("DELETE FROM people WHERE id = ?", params![person_id])
+        diesel::delete(people::table.filter(people::id.eq(person_id)))
+            .execute(conn)
             .map_err(|e| {
                 tracing::error!("Failed to delete orphaned person {}: {}", person_id, e);
                 StatusCode::INTERNAL_SERVER_ERROR
