@@ -1,11 +1,12 @@
 use axum::http::StatusCode;
 use axum::Json;
+use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 use super::UState;
-use crate::db;
+use crate::schema::settings;
 
 /// Fixed username used in single-user mode (no OIDC).
 const SINGLE_USER_WEBDAV_USERNAME: &str = "phos";
@@ -50,8 +51,12 @@ pub async fn get_webdav_settings(
 ) -> Result<Json<WebDavSettings>, StatusCode> {
     let (parts, _) = request.into_parts();
     let username = webdav_username(&state, &parts);
-    let db = state.db.lock().await;
-    let has_password = db::get_setting(&db, "webdav_password").is_some();
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let has_password: bool = settings::table
+        .filter(settings::key.eq("webdav_password"))
+        .select(settings::value)
+        .first::<String>(&mut conn)
+        .is_ok();
 
     Ok(Json(WebDavSettings {
         enabled: has_password,
@@ -78,8 +83,13 @@ pub async fn set_webdav_settings(
 
     let password_hash = format!("{:x}", Sha256::digest(creds.password.as_bytes()));
 
-    let db = state.db.lock().await;
-    db::set_setting(&db, "webdav_password", &password_hash)
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    diesel::insert_into(settings::table)
+        .values((settings::key.eq("webdav_password"), settings::value.eq(&password_hash)))
+        .on_conflict(settings::key)
+        .do_update()
+        .set(settings::value.eq(&password_hash))
+        .execute(&mut conn)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::OK)
@@ -96,8 +106,9 @@ pub async fn set_webdav_settings(
 pub async fn delete_webdav_settings(
     UState(state): UState,
 ) -> Result<StatusCode, StatusCode> {
-    let db = state.db.lock().await;
-    db::delete_setting(&db, "webdav_password")
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    diesel::delete(settings::table.filter(settings::key.eq("webdav_password")))
+        .execute(&mut conn)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::OK)

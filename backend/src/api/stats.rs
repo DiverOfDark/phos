@@ -1,8 +1,10 @@
 use axum::Json;
+use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::UState;
+use crate::schema::{files, people, shots};
 
 #[utoipa::path(
     get,
@@ -38,17 +40,11 @@ pub(super) struct StatsResponse {
     )
 )]
 pub(super) async fn get_stats(UState(state): UState) -> Json<StatsResponse> {
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().unwrap();
 
-    let total_shots: i64 = db
-        .query_row("SELECT COUNT(*) FROM shots", [], |r| r.get(0))
-        .unwrap_or(0);
-    let total_people: i64 = db
-        .query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0))
-        .unwrap_or(0);
-    let total_files: i64 = db
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-        .unwrap_or(0);
+    let total_shots: i64 = shots::table.count().get_result(&mut conn).unwrap_or(0);
+    let total_people: i64 = people::table.count().get_result(&mut conn).unwrap_or(0);
+    let total_files: i64 = files::table.count().get_result(&mut conn).unwrap_or(0);
 
     Json(StatsResponse {
         total_shots,
@@ -81,44 +77,30 @@ pub(super) struct OrganizeStatsResponse {
     )
 )]
 pub(super) async fn get_organize_stats(UState(state): UState) -> Json<OrganizeStatsResponse> {
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().unwrap();
 
-    let total_shots: i64 = db
-        .query_row("SELECT COUNT(*) FROM shots", [], |r| r.get(0))
+    let total_shots: i64 = shots::table.count().get_result(&mut conn).unwrap_or(0);
+    let total_files: i64 = files::table.count().get_result(&mut conn).unwrap_or(0);
+    let total_people: i64 = people::table.count().get_result(&mut conn).unwrap_or(0);
+    let pending_review: i64 = shots::table
+        .filter(shots::review_status.eq("pending"))
+        .count()
+        .get_result(&mut conn)
         .unwrap_or(0);
-    let total_files: i64 = db
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+    let confirmed: i64 = shots::table
+        .filter(shots::review_status.eq("confirmed"))
+        .count()
+        .get_result(&mut conn)
         .unwrap_or(0);
-    let total_people: i64 = db
-        .query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0))
+    let unsorted: i64 = shots::table
+        .filter(shots::primary_person_id.is_null())
+        .count()
+        .get_result(&mut conn)
         .unwrap_or(0);
-    let pending_review: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM shots WHERE review_status = 'pending'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let confirmed: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM shots WHERE review_status = 'confirmed'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let unsorted: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM shots WHERE primary_person_id IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let unnamed_people: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM people WHERE name IS NULL OR name = ''",
-            [],
-            |r| r.get(0),
-        )
+    let unnamed_people: i64 = people::table
+        .filter(people::name.is_null().or(people::name.eq("")))
+        .count()
+        .get_result(&mut conn)
         .unwrap_or(0);
 
     Json(OrganizeStatsResponse {
