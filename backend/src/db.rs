@@ -1,6 +1,7 @@
 use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager, CustomizeConnection, Pool};
 use diesel::sqlite::SqliteConnection;
+use diesel::Connection as DieselConnection;
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
 use rusqlite::{params, Connection, Result};
 use std::path::{Path, PathBuf};
@@ -48,6 +49,15 @@ pub fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", "60000")?;
+    Ok(conn)
+}
+
+/// Open a Diesel SQLite connection with WAL mode and busy timeout enabled.
+/// Use this when scanner/worker threads need their own Diesel connection.
+pub fn open_diesel_connection<P: AsRef<Path>>(path: P) -> anyhow::Result<SqliteConnection> {
+    let mut conn = SqliteConnection::establish(&path.as_ref().to_string_lossy())?;
+    diesel::sql_query("PRAGMA journal_mode = WAL").execute(&mut conn)?;
+    diesel::sql_query("PRAGMA busy_timeout = 60000").execute(&mut conn)?;
     Ok(conn)
 }
 

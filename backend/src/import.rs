@@ -1,10 +1,13 @@
 use crate::ai::{cosine_similarity, AiPipeline, MAX_FACE_DISTANCE};
 use crate::db;
+use crate::models::NewPerson;
 use crate::scanner::{self, Scanner};
+use crate::schema::{faces, files, people, shots, enhancement_tasks, video_keyframes};
+use diesel::prelude::*;
+use diesel::sqlite::SqliteConnection;
 use image::DynamicImage;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use rusqlite::{params, Connection};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,32 +32,21 @@ struct StoredFileRecord {
 
 /// Load all files with visual_embedding (dHash) from the DB.
 /// Resolves DB paths to absolute using the library root.
-fn load_dhash_cache(conn: &Connection, library_root: &Path) -> Vec<StoredFileRecord> {
-    let mut stmt = match conn
-        .prepare("SELECT path, visual_embedding FROM files WHERE visual_embedding IS NOT NULL")
+fn load_dhash_cache(conn: &mut SqliteConnection, library_root: &Path) -> Vec<StoredFileRecord> {
+    let rows: Vec<(String, Vec<u8>)> = match files::table
+        .select((files::path, files::visual_embedding.assume_not_null()))
+        .filter(files::visual_embedding.is_not_null())
+        .load::<(String, Vec<u8>)>(conn)
     {
-        Ok(s) => s,
+        Ok(r) => r,
         Err(e) => {
             warn!("Failed to load dHash cache: {}", e);
             return Vec::new();
         }
     };
 
-    let rows = match stmt.query_map([], |row| {
-        let path: String = row.get(0)?;
-        let blob: Vec<u8> = row.get(1)?;
-        Ok((path, blob))
-    }) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Failed to query dHash cache: {}", e);
-            return Vec::new();
-        }
-    };
-
     let mut records = Vec::new();
-    for row in rows.flatten() {
-        let (path, blob) = row;
+    for (path, blob) in rows {
         if blob.len() == 8 {
             let mut dhash = [0u8; 8];
             dhash.copy_from_slice(&blob);
@@ -131,10 +123,14 @@ pub fn run_import(
     // Ensure target directory exists
     fs::create_dir_all(target)?;
 
-    // Initialize DB in target
+    // Initialize DB in target (uses rusqlite for schema creation)
     let db_path = target.join(".phos.db");
-    let conn = db::init_db(&db_path)?;
+    let _rusqlite_conn = db::init_db(&db_path)?;
+    drop(_rusqlite_conn);
     info!("Database initialized at {:?}", db_path);
+
+    // Open Diesel connection for import-specific queries
+    let mut diesel_conn = db::open_diesel_connection(&db_path)?;
 
     // Create scanner for process_file calls
     let scanner = Scanner::new(db_path.clone(), Some(ai));
@@ -174,7 +170,7 @@ pub fn run_import(
     };
 
     // Load dHash cache (starts empty, grows as we import)
-    let dhash_cache = Mutex::new(load_dhash_cache(&conn, target));
+    let dhash_cache = Mutex::new(load_dhash_cache(&mut diesel_conn, target));
 
     info!("Using {} import threads", threads);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -356,14 +352,12 @@ fn import_single_file(
     let hash = scanner::calculate_hash(source_path)?;
 
     {
-        let conn = db::open_connection(db_path)?;
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT id FROM files WHERE hash = ?",
-                params![hash],
-                |row| row.get(0),
-            )
-            .ok();
+        let mut conn = db::open_diesel_connection(db_path)?;
+        let existing: Option<String> = files::table
+            .select(files::id)
+            .filter(files::hash.eq(&hash))
+            .first::<String>(&mut conn)
+            .optional()?;
 
         if existing.is_some() {
             warn!(
@@ -417,13 +411,13 @@ fn import_single_file(
                 stats.variations.fetch_add(1, Ordering::Relaxed);
             } else {
                 // Fallback: couldn't parse path, treat as new
-                let conn = db::open_connection(db_path)?;
-                target_dir = determine_person_folder(img, target, &conn, scanner)?;
+                let mut conn = db::open_diesel_connection(db_path)?;
+                target_dir = determine_person_folder(img, target, &mut conn, scanner)?;
             }
         } else {
             // 4. Not a variation — run face detection for person assignment
-            let conn = db::open_connection(db_path)?;
-            target_dir = determine_person_folder(img, target, &conn, scanner)?;
+            let mut conn = db::open_diesel_connection(db_path)?;
+            target_dir = determine_person_folder(img, target, &mut conn, scanner)?;
         }
     } else {
         // Couldn't load image — put in unsorted
@@ -477,8 +471,8 @@ fn import_single_file(
     // Import already handles variation detection separately via its own cache,
     // so this cache starts empty — its purpose is just to satisfy the API.
     let scan_dhash_cache = std::sync::Mutex::new(Vec::<scanner::DHashCacheEntry>::new());
-    let scan_conn = scanner.open_db()?;
-    scanner.process_file(&scan_conn, &target_path, &scan_dhash_cache)?;
+    let mut scan_conn = scanner.open_db()?;
+    scanner.process_file(&mut scan_conn, &target_path, &scan_dhash_cache)?;
 
     // Update dHash cache with the newly imported file (brief lock)
     if let Some(ref img) = img {
@@ -498,7 +492,7 @@ fn import_single_file(
 fn determine_person_folder(
     img: &DynamicImage,
     target: &Path,
-    conn: &Connection,
+    conn: &mut SqliteConnection,
     scanner: &Scanner,
 ) -> anyhow::Result<PathBuf> {
     // Access AI from scanner — we need to detect faces
@@ -562,20 +556,17 @@ fn determine_person_folder(
 /// Matches against person representative embeddings, or creates a new person.
 /// This is only used for deciding which folder to place a file in during import.
 fn find_or_create_person_for_import(
-    conn: &Connection,
+    conn: &mut SqliteConnection,
     embedding: &[f32],
 ) -> anyhow::Result<String> {
     // Match against person representative embeddings (populated during import)
-    let mut stmt = conn.prepare(
-        "SELECT id, representative_embedding FROM people WHERE representative_embedding IS NOT NULL",
-    )?;
-    let rows: Vec<(String, Vec<f32>)> = stmt
-        .query_map([], |row| {
-            let pid: String = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            Ok((pid, blob))
-        })?
-        .filter_map(|r| r.ok())
+    let rows: Vec<(String, Vec<u8>)> = people::table
+        .select((people::id, people::representative_embedding.assume_not_null()))
+        .filter(people::representative_embedding.is_not_null())
+        .load::<(String, Vec<u8>)>(conn)?;
+
+    let rows: Vec<(String, Vec<f32>)> = rows
+        .into_iter()
         .filter_map(|(pid, blob)| {
             crate::embedding::decode_embedding(&blob)
                 .filter(|e| e.len() == embedding.len())
@@ -602,10 +593,15 @@ fn find_or_create_person_for_import(
     } else {
         let person_id = Uuid::new_v4().to_string();
         let embedding_blob = crate::embedding::encode_embedding(embedding);
-        conn.execute(
-            "INSERT INTO people (id, representative_embedding) VALUES (?, ?)",
-            params![person_id, embedding_blob],
-        )?;
+        diesel::insert_into(people::table)
+            .values(&NewPerson {
+                id: &person_id,
+                name: None,
+                thumbnail_face_id: None,
+                representative_embedding: Some(&embedding_blob),
+                folder_name: None,
+            })
+            .execute(conn)?;
         Ok(person_id)
     }
 }
@@ -630,17 +626,14 @@ pub fn sanitize_folder_name(name: &str) -> String {
 /// Ensure every person in the DB has a non-NULL `folder_name`.
 /// For people with a `name`, sanitize it. For unnamed people, use the UUID.
 /// Handles collisions by appending " (2)", " (3)", etc.
-fn ensure_folder_names(conn: &Connection) -> anyhow::Result<()> {
+fn ensure_folder_names(conn: &mut SqliteConnection) -> anyhow::Result<()> {
     // Find people whose folder_name is NULL
-    let mut stmt = conn.prepare("SELECT id, name FROM people WHERE folder_name IS NULL")?;
-    let people: Vec<(String, Option<String>)> = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    let people_rows: Vec<(String, Option<String>)> = people::table
+        .select((people::id, people::name))
+        .filter(people::folder_name.is_null())
+        .load::<(String, Option<String>)>(conn)?;
 
-    for (person_id, name) in people {
+    for (person_id, name) in people_rows {
         let base = match name {
             Some(ref n) if !n.trim().is_empty() => sanitize_folder_name(n),
             _ => person_id.clone(),
@@ -648,10 +641,9 @@ fn ensure_folder_names(conn: &Connection) -> anyhow::Result<()> {
 
         let folder_name = find_unique_folder_name(conn, &base, Some(&person_id))?;
 
-        conn.execute(
-            "UPDATE people SET folder_name = ? WHERE id = ?",
-            params![folder_name, person_id],
-        )?;
+        diesel::update(people::table.filter(people::id.eq(&person_id)))
+            .set(people::folder_name.eq(&folder_name))
+            .execute(conn)?;
     }
     Ok(())
 }
@@ -659,7 +651,7 @@ fn ensure_folder_names(conn: &Connection) -> anyhow::Result<()> {
 /// Find a folder_name that doesn't collide with existing ones in the people table.
 /// `exclude_person_id` allows excluding the person being renamed from collision checks.
 fn find_unique_folder_name(
-    conn: &Connection,
+    conn: &mut SqliteConnection,
     base_name: &str,
     exclude_person_id: Option<&str>,
 ) -> anyhow::Result<String> {
@@ -684,21 +676,20 @@ fn find_unique_folder_name(
 /// Check if a folder_name already exists in the people table,
 /// optionally excluding a specific person_id from the check.
 fn folder_name_exists(
-    conn: &Connection,
+    conn: &mut SqliteConnection,
     folder_name: &str,
     exclude_person_id: Option<&str>,
 ) -> anyhow::Result<bool> {
     let count: i64 = match exclude_person_id {
-        Some(pid) => conn.query_row(
-            "SELECT COUNT(*) FROM people WHERE folder_name = ? AND id != ?",
-            params![folder_name, pid],
-            |row| row.get(0),
-        )?,
-        None => conn.query_row(
-            "SELECT COUNT(*) FROM people WHERE folder_name = ?",
-            params![folder_name],
-            |row| row.get(0),
-        )?,
+        Some(pid) => people::table
+            .filter(people::folder_name.eq(folder_name))
+            .filter(people::id.ne(pid))
+            .count()
+            .get_result(conn)?,
+        None => people::table
+            .filter(people::folder_name.eq(folder_name))
+            .count()
+            .get_result(conn)?,
     };
     Ok(count > 0)
 }
@@ -710,18 +701,16 @@ fn folder_name_exists(
 /// 3. Batch-updates `files.path` in the DB for all files under that person's shots.
 /// 4. Updates `people.folder_name` and `people.name`.
 pub fn rename_person_folder(
-    conn: &Connection,
+    conn: &mut SqliteConnection,
     library: &Path,
     person_id: &str,
     new_name: &str,
 ) -> anyhow::Result<()> {
     // Get the current folder_name for this person
-    let old_folder_name: Option<String> = conn
-        .query_row(
-            "SELECT folder_name FROM people WHERE id = ?",
-            params![person_id],
-            |row| row.get(0),
-        )
+    let old_folder_name: Option<String> = people::table
+        .select(people::folder_name)
+        .filter(people::id.eq(person_id))
+        .first::<Option<String>>(conn)
         .map_err(|_| anyhow::anyhow!("Person '{}' not found", person_id))?;
 
     let old_folder_name = old_folder_name.unwrap_or_else(|| person_id.to_string());
@@ -735,10 +724,9 @@ pub fn rename_person_folder(
 
     if old_folder_name == new_folder_name {
         // Just update the display name, folder_name stays the same
-        conn.execute(
-            "UPDATE people SET name = ? WHERE id = ?",
-            params![new_name, person_id],
-        )?;
+        diesel::update(people::table.filter(people::id.eq(person_id)))
+            .set(people::name.eq(new_name))
+            .execute(conn)?;
         return Ok(());
     }
 
@@ -759,33 +747,28 @@ pub fn rename_person_folder(
     let old_prefix = format!("{}/", old_folder_name);
     let new_prefix = format!("{}/", new_folder_name);
 
-    let mut stmt = conn.prepare(
-        "SELECT f.id, f.path FROM files f
-         JOIN shots s ON f.shot_id = s.id
-         WHERE s.primary_person_id = ?",
-    )?;
-    let files: Vec<(String, String)> = stmt
-        .query_map(params![person_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    let file_rows: Vec<(String, String)> = files::table
+        .inner_join(shots::table.on(files::shot_id.eq(shots::id)))
+        .select((files::id, files::path))
+        .filter(shots::primary_person_id.eq(person_id))
+        .load::<(String, String)>(conn)?;
 
-    for (file_id, file_path) in &files {
+    for (file_id, file_path) in &file_rows {
         if file_path.starts_with(&old_prefix) {
             let new_path = format!("{}{}", new_prefix, &file_path[old_prefix.len()..]);
-            conn.execute(
-                "UPDATE files SET path = ? WHERE id = ?",
-                params![new_path, file_id],
-            )?;
+            diesel::update(files::table.filter(files::id.eq(file_id)))
+                .set(files::path.eq(&new_path))
+                .execute(conn)?;
         }
     }
 
     // Update people table
-    conn.execute(
-        "UPDATE people SET name = ?, folder_name = ? WHERE id = ?",
-        params![new_name, new_folder_name, person_id],
-    )?;
+    diesel::update(people::table.filter(people::id.eq(person_id)))
+        .set((
+            people::name.eq(new_name),
+            people::folder_name.eq(&new_folder_name),
+        ))
+        .execute(conn)?;
 
     info!(
         "Person '{}' renamed to '{}' (folder: '{}' -> '{}')",
@@ -807,56 +790,51 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
         anyhow::bail!("No .phos.db found in {:?}", library);
     }
 
-    let conn = db::open_connection(&db_path)?;
+    let mut conn = db::open_diesel_connection(&db_path)?;
     info!("Database opened at {:?}", db_path);
 
     // Re-cluster faces (no AI models needed — uses existing embeddings)
     let scanner = Scanner::new(db_path.clone(), None);
     info!("Running face clustering...");
-    scanner.cluster_faces(&conn)?;
+    scanner.cluster_faces(&mut conn)?;
 
     // Reassign primary persons and folder numbers after re-clustering
-    scanner::assign_primary_persons(&conn)?;
-    scanner::assign_folder_numbers(&conn)?;
-    scanner::compact_folder_numbers(&conn)?;
+    scanner::assign_primary_persons(&mut conn)?;
+    scanner::assign_folder_numbers(&mut conn)?;
+    scanner::compact_folder_numbers(&mut conn)?;
 
     // Ensure all people have folder_name set (use UUID for unnamed people)
-    ensure_folder_names(&conn)?;
+    ensure_folder_names(&mut conn)?;
 
     // Load all shots with their files, joining people for folder_name and
-    // using shots.primary_person_id and shots.folder_number
-    let mut stmt = conn.prepare(
-        "SELECT s.id, f.id, f.path, s.primary_person_id, s.folder_number,
-                p.folder_name, s.review_status
-         FROM shots s
-         JOIN files f ON f.shot_id = s.id
-         LEFT JOIN people p ON s.primary_person_id = p.id",
-    )?;
-
+    // using shots.primary_person_id and shots.folder_number.
+    // This is a complex LEFT JOIN query — use diesel::sql_query for clarity.
+    #[derive(QueryableByName)]
     struct FileRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
         shot_id: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
         file_id: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
         path: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         primary_person_id: Option<String>,
-        folder_number: Option<i64>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+        folder_number: Option<i32>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         person_folder_name: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         review_status: Option<String>,
     }
 
-    let rows: Vec<FileRow> = stmt
-        .query_map([], |row| {
-            Ok(FileRow {
-                shot_id: row.get(0)?,
-                file_id: row.get(1)?,
-                path: row.get(2)?,
-                primary_person_id: row.get(3)?,
-                folder_number: row.get(4)?,
-                person_folder_name: row.get(5)?,
-                review_status: row.get(6)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    let rows: Vec<FileRow> = diesel::sql_query(
+        "SELECT s.id AS shot_id, f.id AS file_id, f.path, s.primary_person_id, s.folder_number,
+                p.folder_name AS person_folder_name, s.review_status
+         FROM shots s
+         JOIN files f ON f.shot_id = s.id
+         LEFT JOIN people p ON s.primary_person_id = p.id",
+    )
+    .load::<FileRow>(&mut conn)?;
 
     // Group by shot_id
     let mut shots: std::collections::BTreeMap<String, Vec<&FileRow>> =
@@ -959,57 +937,59 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                 pb.println(format!("CLEANUP: {} (file missing)", file_row.path));
 
                 // Collect person_ids that might become orphaned
-                let affected_person_ids: Vec<String> = conn
-                    .prepare("SELECT DISTINCT person_id FROM faces WHERE file_id = ? AND person_id IS NOT NULL")
-                    .and_then(|mut s| {
-                        s.query_map(params![file_row.file_id], |row| row.get(0))
-                            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    })
+                let affected_person_ids: Vec<String> = faces::table
+                    .select(faces::person_id.assume_not_null())
+                    .filter(faces::file_id.eq(&file_row.file_id))
+                    .filter(faces::person_id.is_not_null())
+                    .distinct()
+                    .load::<String>(&mut conn)
                     .unwrap_or_default();
 
-                let _ = conn.execute(
-                    "DELETE FROM faces WHERE file_id = ?",
-                    params![file_row.file_id],
-                );
-                let _ = conn.execute(
-                    "DELETE FROM video_keyframes WHERE video_file_id = ?",
-                    params![file_row.file_id],
-                );
-                let _ = conn.execute(
-                    "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?",
-                    params![file_row.file_id],
-                );
-                let _ = conn.execute("DELETE FROM files WHERE id = ?", params![file_row.file_id]);
+                let _ = diesel::delete(faces::table.filter(faces::file_id.eq(&file_row.file_id)))
+                    .execute(&mut conn);
+                let _ = diesel::delete(
+                    video_keyframes::table
+                        .filter(video_keyframes::video_file_id.eq(&file_row.file_id)),
+                )
+                .execute(&mut conn);
+                let _ = diesel::update(
+                    enhancement_tasks::table
+                        .filter(enhancement_tasks::output_file_id.eq(&file_row.file_id)),
+                )
+                .set(enhancement_tasks::output_file_id.eq(None::<String>))
+                .execute(&mut conn);
+                let _ = diesel::delete(files::table.filter(files::id.eq(&file_row.file_id)))
+                    .execute(&mut conn);
 
                 // Delete shot if no files remain
-                let remaining: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM files WHERE shot_id = ?",
-                        params![file_row.shot_id],
-                        |row| row.get(0),
-                    )
+                let remaining: i64 = files::table
+                    .filter(files::shot_id.eq(&file_row.shot_id))
+                    .count()
+                    .get_result(&mut conn)
                     .unwrap_or(0);
                 if remaining == 0 {
-                    let _ =
-                        conn.execute("DELETE FROM shots WHERE id = ?", params![file_row.shot_id]);
+                    let _ = diesel::delete(shots::table.filter(shots::id.eq(&file_row.shot_id)))
+                        .execute(&mut conn);
                     info!("Removed orphaned shot {}", file_row.shot_id);
                 }
 
                 // Clean up orphaned people
                 for person_id in &affected_person_ids {
-                    let face_count: i64 = conn
-                        .query_row(
-                            "SELECT COUNT(*) FROM faces WHERE person_id = ?",
-                            params![person_id],
-                            |row| row.get(0),
-                        )
+                    let face_count: i64 = faces::table
+                        .filter(faces::person_id.eq(person_id))
+                        .count()
+                        .get_result(&mut conn)
                         .unwrap_or(1);
                     if face_count == 0 {
-                        let _ = conn.execute(
-                            "UPDATE shots SET primary_person_id = NULL WHERE primary_person_id = ?",
-                            params![person_id],
-                        );
-                        let _ = conn.execute("DELETE FROM people WHERE id = ?", params![person_id]);
+                        let _ = diesel::update(
+                            shots::table
+                                .filter(shots::primary_person_id.eq(person_id)),
+                        )
+                        .set(shots::primary_person_id.eq(None::<String>))
+                        .execute(&mut conn);
+                        let _ =
+                            diesel::delete(people::table.filter(people::id.eq(person_id)))
+                                .execute(&mut conn);
                         info!("Removed orphaned person {}", person_id);
                     }
                 }
@@ -1051,10 +1031,9 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
 
                 // Update DB path (store relative to library root)
                 let relative_target = db::make_relative(library, &target_path);
-                conn.execute(
-                    "UPDATE files SET path = ? WHERE id = ?",
-                    params![relative_target, file_row.file_id],
-                )?;
+                diesel::update(files::table.filter(files::id.eq(&file_row.file_id)))
+                    .set(files::path.eq(&relative_target))
+                    .execute(&mut conn)?;
 
                 Ok(())
             })() {
@@ -1073,18 +1052,18 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     pb.finish_and_clear();
 
     // Clean up orphaned people (persons with no remaining faces)
-    let orphaned = conn.execute(
+    let orphaned = diesel::sql_query(
         "UPDATE shots SET primary_person_id = NULL \
          WHERE primary_person_id IN ( \
              SELECT p.id FROM people p \
              WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id) \
          )",
-        [],
-    )?;
-    let deleted_people = conn.execute(
+    )
+    .execute(&mut conn)?;
+    let deleted_people = diesel::sql_query(
         "DELETE FROM people WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = people.id)",
-        [],
-    )?;
+    )
+    .execute(&mut conn)?;
     if deleted_people > 0 {
         info!(
             "Removed {} orphaned people ({} shot references cleared)",
@@ -1099,8 +1078,9 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     }
 
     // Count unique people
-    let people_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM people", [], |row| row.get(0))
+    let people_count: i64 = people::table
+        .count()
+        .get_result(&mut conn)
         .unwrap_or(0);
 
     println!();

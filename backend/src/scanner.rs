@@ -1,18 +1,21 @@
 use crate::ai::{cosine_similarity, AiPipeline, MAX_FACE_DISTANCE};
 use crate::db;
+use crate::models::{NewFace, NewFile, NewPerson, NewShot, NewVideoKeyframe};
+use crate::schema::{faces, files, people, shots, video_keyframes};
+use diesel::prelude::*;
+use diesel::sqlite::SqliteConnection;
 use exif::{In, Tag};
 use ffmpeg_next as ffmpeg;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, RgbImage};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -132,22 +135,20 @@ impl Scanner {
         self.ai.as_deref()
     }
 
-    /// Open a connection to the scanner's database with WAL mode and busy timeout.
-    pub fn open_db(&self) -> anyhow::Result<Connection> {
-        Ok(db::open_connection(&self.db_path)?)
+    /// Open a Diesel connection to the scanner's database with WAL mode and busy timeout.
+    pub fn open_db(&self) -> anyhow::Result<SqliteConnection> {
+        db::open_diesel_connection(&self.db_path)
     }
 
     /// Recompute SHA256 hashes for all files in the DB.
     /// Updates the hash if it changed; removes the record if the file is missing from disk.
     pub fn rehash_files(&self) -> anyhow::Result<()> {
-        let conn = self.open_db()?;
+        let mut conn = self.open_db()?;
         let library_root = self.db_path.parent().unwrap();
 
-        let mut stmt = conn.prepare("SELECT id, path, hash FROM files")?;
-        let rows: Vec<(String, String, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let rows: Vec<(String, String, String)> = files::table
+            .select((files::id, files::path, files::hash))
+            .load::<(String, String, String)>(&mut conn)?;
 
         let total = rows.len();
         info!("Rehashing {} files...", total);
@@ -173,16 +174,23 @@ impl Scanner {
 
             if !path.exists() {
                 // File missing from disk — remove from DB
-                let _ = conn.execute("DELETE FROM faces WHERE file_id = ?", params![file_id]);
-                let _ = conn.execute(
-                    "DELETE FROM video_keyframes WHERE video_file_id = ?",
-                    params![file_id],
-                );
-                let _ = conn.execute(
-                    "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?",
-                    params![file_id],
-                );
-                let _ = conn.execute("DELETE FROM files WHERE id = ?", params![file_id]);
+                let _ = diesel::delete(faces::table.filter(faces::file_id.eq(file_id)))
+                    .execute(&mut conn);
+                let _ = diesel::delete(
+                    video_keyframes::table.filter(video_keyframes::video_file_id.eq(file_id)),
+                )
+                .execute(&mut conn);
+                let _ = diesel::update(
+                    crate::schema::enhancement_tasks::table
+                        .filter(crate::schema::enhancement_tasks::output_file_id.eq(file_id)),
+                )
+                .set(
+                    crate::schema::enhancement_tasks::output_file_id
+                        .eq(None::<String>),
+                )
+                .execute(&mut conn);
+                let _ = diesel::delete(files::table.filter(files::id.eq(file_id)))
+                    .execute(&mut conn);
                 removed += 1;
                 pb.inc(1);
                 continue;
@@ -191,10 +199,9 @@ impl Scanner {
             match calculate_hash(&path) {
                 Ok(new_hash) => {
                     if new_hash != *old_hash {
-                        let _ = conn.execute(
-                            "UPDATE files SET hash = ? WHERE id = ?",
-                            params![new_hash, file_id],
-                        );
+                        let _ = diesel::update(files::table.filter(files::id.eq(file_id)))
+                            .set(files::hash.eq(&new_hash))
+                            .execute(&mut conn);
                         updated += 1;
                     }
                 }
@@ -217,22 +224,22 @@ impl Scanner {
         }
 
         // Clean up orphaned shots (no files remaining)
-        let orphaned_shots = conn.execute(
+        let orphaned_shots = diesel::sql_query(
             "DELETE FROM shots WHERE id NOT IN (SELECT DISTINCT shot_id FROM files)",
-            [],
-        )?;
+        )
+        .execute(&mut conn)?;
         if orphaned_shots > 0 {
             info!("Removed {} orphaned shots", orphaned_shots);
         }
 
         // Clean up orphaned people (no faces remaining, or faces but no shots)
-        crate::db::cleanup_orphaned_people(&conn)?;
+        cleanup_orphaned_people_diesel(&mut conn)?;
 
         Ok(())
     }
 
     pub fn scan(&self, root: &Path) -> anyhow::Result<()> {
-        let files: Vec<PathBuf> = WalkDir::new(root)
+        let files_list: Vec<PathBuf> = WalkDir::new(root)
             .into_iter()
             .filter_entry(|e| {
                 // Skip .phos* directories (thumbnails cache, db files)
@@ -250,17 +257,14 @@ impl Scanner {
 
         // Build an in-memory dHash cache from existing files in the DB
         let dhash_cache = {
-            let conn = self.open_db()?;
-            let mut stmt = conn.prepare(
-                "SELECT f.shot_id, f.visual_embedding FROM files f WHERE f.visual_embedding IS NOT NULL"
-            )?;
-            let entries: Vec<DHashCacheEntry> = stmt
-                .query_map([], |row| {
-                    let shot_id: String = row.get(0)?;
-                    let blob: Vec<u8> = row.get(1)?;
-                    Ok((shot_id, blob))
-                })?
-                .filter_map(|r| r.ok())
+            let mut conn = self.open_db()?;
+            let entries: Vec<(String, Vec<u8>)> = files::table
+                .select((files::shot_id, files::visual_embedding.assume_not_null()))
+                .filter(files::visual_embedding.is_not_null())
+                .load::<(String, Vec<u8>)>(&mut conn)?;
+
+            let cache: Vec<DHashCacheEntry> = entries
+                .into_iter()
                 .filter_map(|(shot_id, blob)| {
                     if blob.len() == 8 {
                         let mut dhash = [0u8; 8];
@@ -271,7 +275,7 @@ impl Scanner {
                     }
                 })
                 .collect();
-            std::sync::Mutex::new(entries)
+            std::sync::Mutex::new(cache)
         };
 
         let pool = rayon::ThreadPoolBuilder::new()
@@ -279,35 +283,35 @@ impl Scanner {
             .build()?;
 
         pool.install(|| {
-            files.par_iter().for_each(|path| {
-                let conn = match self.open_db() {
+            files_list.par_iter().for_each(|path| {
+                let mut conn = match self.open_db() {
                     Ok(c) => c,
                     Err(e) => {
                         error!("Failed to open DB: {}", e);
                         return;
                     }
                 };
-                if let Err(e) = self.process_file(&conn, path, &dhash_cache) {
+                if let Err(e) = self.process_file(&mut conn, path, &dhash_cache) {
                     error!("Error processing {:?}: {}", path, e);
                 }
             });
         });
 
         // After all files are processed, run face clustering
-        let conn = self.open_db()?;
-        self.cluster_faces(&conn)?;
+        let mut conn = self.open_db()?;
+        self.cluster_faces(&mut conn)?;
 
         // Assign primary person to each shot based on largest face
-        assign_primary_persons(&conn)?;
+        assign_primary_persons(&mut conn)?;
 
         // Assign folder numbers to shots that don't have one yet
-        assign_folder_numbers(&conn)?;
+        assign_folder_numbers(&mut conn)?;
 
         // Compact folder numbers to remove gaps from reassignments
-        compact_folder_numbers(&conn)?;
+        compact_folder_numbers(&mut conn)?;
 
         // Clean up people with no shots (unassigns their faces, then deletes)
-        crate::db::cleanup_orphaned_people(&conn)?;
+        cleanup_orphaned_people_diesel(&mut conn)?;
 
         // Clean up empty directories left behind by duplicate moves or deletions
         crate::import::cleanup_empty_dirs(root)?;
@@ -320,74 +324,74 @@ impl Scanner {
     /// Deletes associated faces, video keyframes, and the file record itself.
     /// If the parent shot has no remaining files, the shot record is also removed.
     /// Orphaned person records (those with no remaining faces) are cleaned up too.
-    pub fn remove_file(&self, conn: &Connection, path: &Path) -> anyhow::Result<()> {
+    pub fn remove_file(&self, conn: &mut SqliteConnection, path: &Path) -> anyhow::Result<()> {
         let library_root = self.db_path.parent().unwrap();
         let path_str = db::make_relative(library_root, path);
 
         // Look up the file by path
-        let (file_id, shot_id): (String, String) = conn
-            .query_row(
-                "SELECT id, shot_id FROM files WHERE path = ?",
-                params![path_str],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        let (file_id, shot_id): (String, String) = files::table
+            .select((files::id, files::shot_id))
+            .filter(files::path.eq(&path_str))
+            .first::<(String, String)>(conn)
             .map_err(|_| anyhow::anyhow!("File not found in DB: {:?}", path))?;
 
         // Collect person_ids that might become orphaned after face deletion
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT person_id FROM faces WHERE file_id = ? AND person_id IS NOT NULL",
-        )?;
-        let affected_person_ids: Vec<String> = stmt
-            .query_map(params![file_id], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let affected_person_ids: Vec<String> = faces::table
+            .select(faces::person_id.assume_not_null())
+            .filter(faces::file_id.eq(&file_id))
+            .filter(faces::person_id.is_not_null())
+            .distinct()
+            .load::<String>(conn)?;
 
         // Delete associated faces
-        conn.execute("DELETE FROM faces WHERE file_id = ?", params![file_id])?;
+        diesel::delete(faces::table.filter(faces::file_id.eq(&file_id))).execute(conn)?;
         debug!("Deleted faces for file {}", file_id);
 
         // Delete associated video keyframes
-        conn.execute(
-            "DELETE FROM video_keyframes WHERE video_file_id = ?",
-            params![file_id],
-        )?;
+        diesel::delete(
+            video_keyframes::table.filter(video_keyframes::video_file_id.eq(&file_id)),
+        )
+        .execute(conn)?;
         debug!("Deleted video keyframes for file {}", file_id);
 
         // Clear enhancement_tasks referencing this file
-        conn.execute(
-            "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?",
-            params![file_id],
-        )?;
+        diesel::update(
+            crate::schema::enhancement_tasks::table
+                .filter(crate::schema::enhancement_tasks::output_file_id.eq(&file_id)),
+        )
+        .set(
+            crate::schema::enhancement_tasks::output_file_id.eq(None::<String>),
+        )
+        .execute(conn)?;
 
         // Delete the file record
-        conn.execute("DELETE FROM files WHERE id = ?", params![file_id])?;
+        diesel::delete(files::table.filter(files::id.eq(&file_id))).execute(conn)?;
         info!("Removed file record {} for {:?}", file_id, path);
 
         // Check if the shot has any remaining files
-        let remaining_files: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM files WHERE shot_id = ?",
-            params![shot_id],
-            |row| row.get(0),
-        )?;
+        let remaining_files: i64 = files::table
+            .filter(files::shot_id.eq(&shot_id))
+            .count()
+            .get_result(conn)?;
 
         if remaining_files == 0 {
-            conn.execute("DELETE FROM shots WHERE id = ?", params![shot_id])?;
+            diesel::delete(shots::table.filter(shots::id.eq(&shot_id))).execute(conn)?;
             info!("Removed orphaned shot record {}", shot_id);
         }
 
         // Clean up orphaned person records (persons with no remaining faces)
         for person_id in &affected_person_ids {
-            let face_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM faces WHERE person_id = ?",
-                params![person_id],
-                |row| row.get(0),
-            )?;
+            let face_count: i64 = faces::table
+                .filter(faces::person_id.eq(person_id))
+                .count()
+                .get_result(conn)?;
             if face_count == 0 {
-                conn.execute(
-                    "UPDATE shots SET primary_person_id = NULL WHERE primary_person_id = ?",
-                    params![person_id],
-                )?;
-                conn.execute("DELETE FROM people WHERE id = ?", params![person_id])?;
+                diesel::update(
+                    shots::table.filter(shots::primary_person_id.eq(person_id)),
+                )
+                .set(shots::primary_person_id.eq(None::<String>))
+                .execute(conn)?;
+                diesel::delete(people::table.filter(people::id.eq(person_id))).execute(conn)?;
                 info!("Removed orphaned person record {}", person_id);
             }
         }
@@ -400,19 +404,17 @@ impl Scanner {
     /// Each face is compared against existing person representative embeddings (centroids).
     /// If it matches within `MAX_FACE_DISTANCE`, it's assigned to that person and the
     /// centroid is updated as a running average. Otherwise a new person is created.
-    /// This is O(n × k) where k = number of people, instead of the previous O(n²) pairwise approach.
-    pub fn cluster_faces(&self, conn: &Connection) -> anyhow::Result<()> {
+    /// This is O(n x k) where k = number of people, instead of the previous O(n^2) pairwise approach.
+    pub fn cluster_faces(&self, conn: &mut SqliteConnection) -> anyhow::Result<()> {
         // Load unassigned faces with embeddings
-        let mut stmt = conn.prepare(
-            "SELECT id, embedding FROM faces WHERE embedding IS NOT NULL AND person_id IS NULL",
-        )?;
-        let unassigned: Vec<(String, Vec<f32>)> = stmt
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let blob: Vec<u8> = row.get(1)?;
-                Ok((id, blob))
-            })?
-            .filter_map(|r| r.ok())
+        let unassigned_rows: Vec<(String, Vec<u8>)> = faces::table
+            .select((faces::id, faces::embedding.assume_not_null()))
+            .filter(faces::embedding.is_not_null())
+            .filter(faces::person_id.is_null())
+            .load::<(String, Vec<u8>)>(conn)?;
+
+        let unassigned: Vec<(String, Vec<f32>)> = unassigned_rows
+            .into_iter()
             .filter_map(|(id, blob)| {
                 crate::embedding::decode_embedding(&blob)
                     .filter(|e| !e.is_empty())
@@ -421,11 +423,10 @@ impl Scanner {
             .collect();
 
         if unassigned.is_empty() {
-            let total: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM faces WHERE embedding IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )?;
+            let total: i64 = faces::table
+                .filter(faces::embedding.is_not_null())
+                .count()
+                .get_result(conn)?;
             info!("All {} faces already assigned, nothing to cluster", total);
             return Ok(());
         }
@@ -436,29 +437,34 @@ impl Scanner {
         // We track the unnormalized sum so we can update it incrementally.
         // cosine_similarity normalizes internally, so comparisons still work correctly.
         let mut centroids: Vec<(String, Vec<f32>, usize)> = {
-            let mut pstmt = conn.prepare(
+            // Use sql_query for the subquery count
+            #[derive(QueryableByName)]
+            struct PersonCentroid {
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                id: String,
+                #[diesel(sql_type = diesel::sql_types::Binary)]
+                representative_embedding: Vec<u8>,
+                #[diesel(sql_type = diesel::sql_types::Integer)]
+                face_count: i32,
+            }
+
+            let rows: Vec<PersonCentroid> = diesel::sql_query(
                 "SELECT p.id, p.representative_embedding, \
-                 (SELECT COUNT(*) FROM faces f WHERE f.person_id = p.id) \
+                 (SELECT COUNT(*) FROM faces f WHERE f.person_id = p.id) AS face_count \
                  FROM people p WHERE p.representative_embedding IS NOT NULL",
-            )?;
-            let rows: Vec<(String, Vec<u8>, usize)> = pstmt
-                .query_map([], |row| {
-                    let pid: String = row.get(0)?;
-                    let blob: Vec<u8> = row.get(1)?;
-                    let count: usize = row.get::<_, u32>(2)? as usize;
-                    Ok((pid, blob, count))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
+            )
+            .load::<PersonCentroid>(conn)?;
+
             rows.into_iter()
-                .filter_map(|(pid, blob, count)| {
-                    crate::embedding::decode_embedding(&blob)
+                .filter_map(|row| {
+                    let count = row.face_count as usize;
+                    crate::embedding::decode_embedding(&row.representative_embedding)
                         .filter(|e| !e.is_empty())
                         .map(|e| {
                             // Convert normalized centroid back to sum for running average
                             let sum: Vec<f32> =
                                 e.iter().map(|v| v * count as f32).collect();
-                            (pid, sum, count)
+                            (row.id, sum, count)
                         })
                 })
                 .collect()
@@ -467,23 +473,28 @@ impl Scanner {
         // Also ensure people without representative_embedding get one computed
         // from their existing faces (handles old data from before this migration)
         {
-            let orphan_pids: Vec<String> = conn
-                .prepare(
-                    "SELECT id FROM people WHERE representative_embedding IS NULL \
-                     AND EXISTS (SELECT 1 FROM faces WHERE person_id = people.id AND embedding IS NOT NULL)",
-                )?
-                .query_map([], |row| row.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
+            #[derive(QueryableByName)]
+            struct OrphanPid {
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                id: String,
+            }
 
-            for pid in orphan_pids {
-                let face_embs: Vec<Vec<f32>> = conn
-                    .prepare("SELECT embedding FROM faces WHERE person_id = ? AND embedding IS NOT NULL")?
-                    .query_map(params![&pid], |row| {
-                        let blob: Vec<u8> = row.get(0)?;
-                        Ok(blob)
-                    })?
-                    .filter_map(|r| r.ok())
+            let orphan_pids: Vec<OrphanPid> = diesel::sql_query(
+                "SELECT id FROM people WHERE representative_embedding IS NULL \
+                 AND EXISTS (SELECT 1 FROM faces WHERE person_id = people.id AND embedding IS NOT NULL)",
+            )
+            .load::<OrphanPid>(conn)?;
+
+            for orphan in orphan_pids {
+                let pid = orphan.id;
+                let face_blobs: Vec<Vec<u8>> = faces::table
+                    .select(faces::embedding.assume_not_null())
+                    .filter(faces::person_id.eq(&pid))
+                    .filter(faces::embedding.is_not_null())
+                    .load::<Vec<u8>>(conn)?;
+
+                let face_embs: Vec<Vec<f32>> = face_blobs
+                    .into_iter()
                     .filter_map(|blob| {
                         crate::embedding::decode_embedding(&blob)
                             .filter(|e| !e.is_empty())
@@ -509,10 +520,9 @@ impl Scanner {
                 if norm > 0.0 {
                     let normalized: Vec<f32> = mean.iter().map(|v| v / norm).collect();
                     let blob = crate::embedding::encode_embedding(&normalized);
-                    conn.execute(
-                        "UPDATE people SET representative_embedding = ? WHERE id = ?",
-                        params![blob, &pid],
-                    )?;
+                    diesel::update(people::table.filter(people::id.eq(&pid)))
+                        .set(people::representative_embedding.eq(&blob))
+                        .execute(conn)?;
                 }
 
                 centroids.push((pid, sum, count));
@@ -528,7 +538,6 @@ impl Scanner {
         );
         pb.set_message("Assigning faces to people");
 
-        let mut update_stmt = conn.prepare("UPDATE faces SET person_id = ? WHERE id = ?")?;
         let mut affected_people: HashSet<String> = HashSet::new();
         let mut assigned_count = 0usize;
 
@@ -564,15 +573,22 @@ impl Scanner {
                 // No match — create a new person
                 let pid = Uuid::new_v4().to_string();
                 let emb_blob = crate::embedding::encode_embedding(embedding);
-                conn.execute(
-                    "INSERT INTO people (id, thumbnail_face_id, representative_embedding) VALUES (?, ?, ?)",
-                    params![&pid, face_id, emb_blob],
-                )?;
+                diesel::insert_into(people::table)
+                    .values(NewPerson {
+                        id: &pid,
+                        name: None,
+                        thumbnail_face_id: Some(face_id.as_str()),
+                        representative_embedding: Some(&emb_blob),
+                        folder_name: None,
+                    })
+                    .execute(conn)?;
                 centroids.push((pid.clone(), embedding.clone(), 1));
                 pid
             };
 
-            update_stmt.execute(params![&person_id, face_id])?;
+            diesel::update(faces::table.filter(faces::id.eq(face_id)))
+                .set(faces::person_id.eq(&person_id))
+                .execute(conn)?;
             affected_people.insert(person_id);
             assigned_count += 1;
             pb.inc(1);
@@ -593,53 +609,46 @@ impl Scanner {
             if norm > 0.0 {
                 let normalized: Vec<f32> = mean.iter().map(|v| v / norm).collect();
                 let blob = crate::embedding::encode_embedding(&normalized);
-                conn.execute(
-                    "UPDATE people SET representative_embedding = ? WHERE id = ?",
-                    params![blob, pid],
-                )?;
+                diesel::update(people::table.filter(people::id.eq(pid)))
+                    .set(people::representative_embedding.eq(&blob))
+                    .execute(conn)?;
             }
         }
 
         // Update thumbnail_face_id for each person to the first face
-        let person_ids: Vec<String> = conn
-            .prepare("SELECT id FROM people")?
-            .query_map([], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let person_ids: Vec<String> = people::table
+            .select(people::id)
+            .load::<String>(conn)?;
         for pid in &person_ids {
-            let first_face: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM faces WHERE person_id = ? LIMIT 1",
-                    params![pid],
-                    |row| row.get(0),
-                )
+            let first_face: Option<String> = faces::table
+                .select(faces::id)
+                .filter(faces::person_id.eq(pid))
+                .first::<String>(conn)
                 .ok();
             if let Some(fid) = first_face {
-                conn.execute(
-                    "UPDATE people SET thumbnail_face_id = ? WHERE id = ?",
-                    params![fid, pid],
-                )?;
+                diesel::update(people::table.filter(people::id.eq(pid)))
+                    .set(people::thumbnail_face_id.eq(&fid))
+                    .execute(conn)?;
             }
         }
 
         // Clean up people with no remaining faces
         // First clear stale shots.primary_person_id references to avoid FK violations
-        conn.execute(
+        diesel::sql_query(
             "UPDATE shots SET primary_person_id = NULL \
              WHERE primary_person_id IN ( \
                  SELECT p.id FROM people p \
                  WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id) \
              )",
-            [],
-        )?;
-        conn.execute(
+        )
+        .execute(conn)?;
+        diesel::sql_query(
             "DELETE FROM people \
              WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = people.id)",
-            [],
-        )?;
+        )
+        .execute(conn)?;
 
-        let person_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM people", [], |row| row.get(0))?;
+        let person_count: i64 = people::table.count().get_result(conn)?;
         info!(
             "Clustering complete: {} faces assigned to {} persons",
             assigned_count, person_count
@@ -650,7 +659,7 @@ impl Scanner {
 
     pub fn process_file(
         &self,
-        conn: &Connection,
+        conn: &mut SqliteConnection,
         path: &Path,
         dhash_cache: &std::sync::Mutex<Vec<DHashCacheEntry>>,
     ) -> anyhow::Result<()> {
@@ -661,9 +670,12 @@ impl Scanner {
         // Quick path duplicate check — catches concurrent processing of the
         // same file (e.g. upload handler + watcher race).
         {
-            let mut stmt = conn.prepare("SELECT id FROM files WHERE path = ?")?;
-            let mut rows = stmt.query(params![&relative_path])?;
-            if rows.next()?.is_some() {
+            let existing: Option<String> = files::table
+                .select(files::id)
+                .filter(files::path.eq(&relative_path))
+                .first::<String>(conn)
+                .ok();
+            if existing.is_some() {
                 debug!("File already indexed at path {:?}, skipping", path);
                 return Ok(());
             }
@@ -674,12 +686,12 @@ impl Scanner {
         // Hash duplicate check — same content at a different path.
         // Delete the duplicate file directly.
         {
-            let mut stmt = conn.prepare("SELECT id, path FROM files WHERE hash = ?")?;
-            let mut rows = stmt.query(params![hash])?;
-            if let Some(row) = rows.next()? {
-                let existing_id: String = row.get(0)?;
-                let existing_path: String = row.get(1)?;
-
+            let existing: Option<(String, String)> = files::table
+                .select((files::id, files::path))
+                .filter(files::hash.eq(&hash))
+                .first::<(String, String)>(conn)
+                .ok();
+            if let Some((existing_id, existing_path)) = existing {
                 std::fs::remove_file(path)?;
 
                 info!(
@@ -788,54 +800,102 @@ impl Scanner {
 
         // --- Phase 3: Write everything to DB in a single transaction ---
 
-        conn.execute_batch("BEGIN IMMEDIATE")?;
+        diesel::sql_query("BEGIN IMMEDIATE").execute(conn)?;
 
         let result = (|| -> anyhow::Result<()> {
             if is_new_shot {
-                conn.execute(
-                    "INSERT INTO shots (id, main_file_id, width, height) VALUES (?, ?, ?, ?)",
-                    params![actual_shot_id, id, width, height],
-                )?;
+                diesel::insert_into(shots::table)
+                    .values(NewShot {
+                        id: &actual_shot_id,
+                        main_file_id: Some(&id),
+                        width,
+                        height,
+                        timestamp: None,
+                        latitude: None,
+                        longitude: None,
+                        primary_person_id: None,
+                        folder_number: None,
+                        review_status: None,
+                        description: None,
+                    })
+                    .execute(conn)?;
             }
 
-            conn.execute(
-                "INSERT INTO files (id, shot_id, path, hash, mime_type, file_size, is_original) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![id, actual_shot_id, relative_path, hash, mime_type, file_size, is_original],
-            )?;
+            diesel::insert_into(files::table)
+                .values(NewFile {
+                    id: &id,
+                    shot_id: &actual_shot_id,
+                    path: &relative_path,
+                    hash: &hash,
+                    mime_type: Some(mime_type),
+                    file_size: Some(file_size as i32),
+                    is_original: Some(is_original),
+                    visual_embedding: None,
+                    source_workflow_id: None,
+                    source_text_overrides: None,
+                })
+                .execute(conn)?;
 
             if is_new_shot {
-                if let Some((ts, lat, lon)) = &exif_data {
-                    conn.execute(
-                        "UPDATE shots SET timestamp = ?, latitude = ?, longitude = ? WHERE id = ?",
-                        params![ts, lat, lon, actual_shot_id],
-                    )?;
+                if let Some((ref ts, lat, lon)) = exif_data {
+                    let ts_str = ts.as_deref();
+                    let lat_f32 = lat.map(|v| v as f32);
+                    let lon_f32 = lon.map(|v| v as f32);
+                    diesel::update(shots::table.filter(shots::id.eq(&actual_shot_id)))
+                        .set((
+                            shots::timestamp.eq(ts_str),
+                            shots::latitude.eq(lat_f32),
+                            shots::longitude.eq(lon_f32),
+                        ))
+                        .execute(conn)?;
                 }
             }
 
-            if let Some(dhash) = &dhash {
-                conn.execute(
-                    "UPDATE files SET visual_embedding = ? WHERE id = ?",
-                    params![dhash.as_slice(), id],
-                )?;
+            if let Some(ref dhash_val) = dhash {
+                diesel::update(files::table.filter(files::id.eq(&id)))
+                    .set(files::visual_embedding.eq(dhash_val.as_slice()))
+                    .execute(conn)?;
             }
 
             for face in &image_faces {
-                conn.execute(
-                    "INSERT INTO faces (id, file_id, person_id, box_x1, box_y1, box_x2, box_y2, embedding, score) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
-                    params![face.face_id, id, face.box_x1, face.box_y1, face.box_x2, face.box_y2, face.embedding_blob, face.score],
-                )?;
+                diesel::insert_into(faces::table)
+                    .values(NewFace {
+                        id: &face.face_id,
+                        file_id: &id,
+                        person_id: None,
+                        box_x1: Some(face.box_x1),
+                        box_y1: Some(face.box_y1),
+                        box_x2: Some(face.box_x2),
+                        box_y2: Some(face.box_y2),
+                        embedding: Some(&face.embedding_blob),
+                        score: Some(face.score),
+                    })
+                    .execute(conn)?;
             }
 
             for kfr in &keyframe_results {
-                conn.execute(
-                    "INSERT INTO video_keyframes (id, video_file_id, timestamp_ms, path) VALUES (?, ?, ?, ?)",
-                    params![kfr.kf_id, id, kfr.timestamp_ms, kfr.kf_path],
-                )?;
+                diesel::insert_into(video_keyframes::table)
+                    .values(NewVideoKeyframe {
+                        id: &kfr.kf_id,
+                        video_file_id: &id,
+                        timestamp_ms: Some(kfr.timestamp_ms as i32),
+                        path: &kfr.kf_path,
+                    })
+                    .execute(conn)?;
                 for face in &kfr.faces {
-                    conn.execute(
-                        "INSERT INTO faces (id, file_id, person_id, box_x1, box_y1, box_x2, box_y2, embedding, score) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
-                        params![face.face_id, id, face.box_x1, face.box_y1, face.box_x2, face.box_y2, face.embedding_blob, face.score],
-                    )?;
+                    diesel::insert_into(faces::table)
+                        .values(NewFace {
+                            id: &face.face_id,
+                            file_id: &id,
+                            person_id: None,
+                            box_x1: Some(face.box_x1),
+                            box_y1: Some(face.box_y1),
+                            box_x2: Some(face.box_x2),
+                            box_y2: Some(face.box_y2),
+                            embedding: Some(&face.embedding_blob),
+                            score: Some(face.score),
+                        })
+                        .execute(conn)?;
                 }
             }
 
@@ -844,7 +904,7 @@ impl Scanner {
 
         match result {
             Ok(()) => {
-                conn.execute_batch("COMMIT")?;
+                diesel::sql_query("COMMIT").execute(conn)?;
 
                 // Add to the dHash cache so subsequent files can match against this one
                 if let Some(ref file_dhash) = dhash {
@@ -859,7 +919,7 @@ impl Scanner {
                 Ok(())
             }
             Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
+                let _ = diesel::sql_query("ROLLBACK").execute(conn);
                 Err(e)
             }
         }
@@ -878,28 +938,33 @@ impl Scanner {
             return Ok(());
         }
 
-        let conn = self.open_db()?;
+        let mut conn = self.open_db()?;
         let library_root = self.db_path.parent().unwrap_or(root);
 
         // Find shots without descriptions, joined with their main file path
-        let mut stmt = conn.prepare(
-            "SELECT s.id, f.path FROM shots s
-             JOIN files f ON s.main_file_id = f.id
-             WHERE s.description IS NULL"
-        )?;
-        let shots: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect();
+        #[derive(QueryableByName)]
+        struct ShotFilePath {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            id: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            path: String,
+        }
 
-        if shots.is_empty() {
+        let uncaptioned: Vec<ShotFilePath> = diesel::sql_query(
+            "SELECT s.id, f.path FROM shots s \
+             JOIN files f ON s.main_file_id = f.id \
+             WHERE s.description IS NULL",
+        )
+        .load::<ShotFilePath>(&mut conn)?;
+
+        if uncaptioned.is_empty() {
             info!("All shots already have captions");
             return Ok(());
         }
 
-        info!("Generating captions for {} shots", shots.len());
+        info!("Generating captions for {} shots", uncaptioned.len());
 
-        let pb = ProgressBar::new(shots.len() as u64);
+        let pb = ProgressBar::new(uncaptioned.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} captioning")
@@ -907,13 +972,9 @@ impl Scanner {
                 .progress_chars("#>-"),
         );
 
-        let mut update_stmt = conn.prepare(
-            "UPDATE shots SET description = ? WHERE id = ?"
-        )?;
-
-        for (shot_id, file_path) in &shots {
-            let abs_path = db::resolve_path(library_root, file_path);
-            info!("Captioning shot {} ({:?})", shot_id, abs_path);
+        for shot in &uncaptioned {
+            let abs_path = db::resolve_path(library_root, &shot.path);
+            info!("Captioning shot {} ({:?})", shot.id, abs_path);
             let result = (|| -> anyhow::Result<String> {
                 let img = open_image(&abs_path)?;
                 ai.generate_caption(&img)
@@ -921,13 +982,19 @@ impl Scanner {
 
             match result {
                 Ok(ref caption) => {
-                    info!("Captioned shot {}: {:?}", shot_id, caption);
-                    if let Err(e) = update_stmt.execute(rusqlite::params![caption, shot_id]) {
-                        error!("Failed to save caption for shot {}: {}", shot_id, e);
+                    info!("Captioned shot {}: {:?}", shot.id, caption);
+                    if let Err(e) = diesel::update(shots::table.filter(shots::id.eq(&shot.id)))
+                        .set(shots::description.eq(caption))
+                        .execute(&mut conn)
+                    {
+                        error!("Failed to save caption for shot {}: {}", shot.id, e);
                     }
                 }
                 Err(e) => {
-                    error!("Failed to generate caption for shot {} ({:?}): {}", shot_id, abs_path, e);
+                    error!(
+                        "Failed to generate caption for shot {} ({:?}): {}",
+                        shot.id, abs_path, e
+                    );
                 }
             }
 
@@ -951,42 +1018,46 @@ impl Scanner {
 /// largest bounding box area `(box_x2 - box_x1) * (box_y2 - box_y1)` that has a
 /// `person_id` assigned. Sets `shots.primary_person_id` to that person. If no
 /// faces have a `person_id`, sets it to NULL (unsorted).
-pub fn assign_primary_persons(conn: &Connection) -> anyhow::Result<()> {
+pub fn assign_primary_persons(conn: &mut SqliteConnection) -> anyhow::Result<()> {
     // Find shots that need primary person assignment (not confirmed by user)
-    let mut shot_stmt = conn.prepare(
-        "SELECT id, primary_person_id FROM shots WHERE review_status != 'confirmed' OR review_status IS NULL"
-    )?;
-    let shots: Vec<(String, Option<String>)> = shot_stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let shot_rows: Vec<(String, Option<String>)> = shots::table
+        .select((shots::id, shots::primary_person_id))
+        .filter(
+            shots::review_status
+                .ne("confirmed")
+                .or(shots::review_status.is_null()),
+        )
+        .load::<(String, Option<String>)>(conn)?;
 
-    if shots.is_empty() {
+    if shot_rows.is_empty() {
         return Ok(());
     }
 
-    // When person changes, also reset folder_number so assign_folder_numbers will reassign it
-    let mut update_with_reset_stmt =
-        conn.prepare("UPDATE shots SET primary_person_id = ?, folder_number = NULL WHERE id = ?")?;
-    let mut update_same_stmt =
-        conn.prepare("UPDATE shots SET primary_person_id = ? WHERE id = ?")?;
-
-    // For each shot, find the face with the largest bbox area that has a person_id
-    let mut face_stmt = conn.prepare(
-        "SELECT f.person_id, (f.box_x2 - f.box_x1) * (f.box_y2 - f.box_y1) AS area
-         FROM faces f
-         JOIN files fl ON f.file_id = fl.id
-         WHERE fl.shot_id = ? AND f.person_id IS NOT NULL
-         ORDER BY area DESC
-         LIMIT 1",
-    )?;
+    // For each shot, find the face with the largest bbox area that has a person_id.
+    // We use sql_query because of the computed expression for area.
+    #[derive(QueryableByName)]
+    struct BestPerson {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        person_id: String,
+    }
 
     let mut assigned = 0;
     let mut cleared = 0;
     let mut reassigned = 0;
-    for (shot_id, old_person_id) in &shots {
-        let best_person: Option<String> =
-            face_stmt.query_row(params![shot_id], |row| row.get(0)).ok();
+    for (shot_id, old_person_id) in &shot_rows {
+        let best_person: Option<String> = diesel::sql_query(
+            "SELECT f.person_id \
+             FROM faces f \
+             JOIN files fl ON f.file_id = fl.id \
+             WHERE fl.shot_id = ? AND f.person_id IS NOT NULL \
+             ORDER BY (f.box_x2 - f.box_x1) * (f.box_y2 - f.box_y1) DESC \
+             LIMIT 1",
+        )
+        .bind::<diesel::sql_types::Text, _>(shot_id)
+        .load::<BestPerson>(conn)?
+        .into_iter()
+        .next()
+        .map(|r| r.person_id);
 
         match &best_person {
             Some(_) => assigned += 1,
@@ -995,10 +1066,17 @@ pub fn assign_primary_persons(conn: &Connection) -> anyhow::Result<()> {
 
         if &best_person != old_person_id {
             // Person changed — reset folder_number so it gets reassigned
-            update_with_reset_stmt.execute(params![best_person, shot_id])?;
+            diesel::update(shots::table.filter(shots::id.eq(shot_id)))
+                .set((
+                    shots::primary_person_id.eq(&best_person),
+                    shots::folder_number.eq(None::<i32>),
+                ))
+                .execute(conn)?;
             reassigned += 1;
         } else {
-            update_same_stmt.execute(params![best_person, shot_id])?;
+            diesel::update(shots::table.filter(shots::id.eq(shot_id)))
+                .set(shots::primary_person_id.eq(&best_person))
+                .execute(conn)?;
         }
     }
 
@@ -1015,44 +1093,48 @@ pub fn assign_primary_persons(conn: &Connection) -> anyhow::Result<()> {
 /// For each shot with a `primary_person_id` but NULL `folder_number`, assigns
 /// `MAX(folder_number) + 1` for that person. Unsorted shots (NULL primary_person_id)
 /// are treated as their own separate namespace.
-pub fn assign_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
+pub fn assign_folder_numbers(conn: &mut SqliteConnection) -> anyhow::Result<()> {
     // Get all shots needing folder number assignment, grouped by primary_person_id
     // We handle NULL primary_person_id (unsorted) as a separate group
-    let mut shots_stmt = conn.prepare(
-        "SELECT id, primary_person_id FROM shots WHERE folder_number IS NULL ORDER BY created_at",
-    )?;
-    let shots: Vec<(String, Option<String>)> = shots_stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let shot_rows: Vec<(String, Option<String>)> = shots::table
+        .select((shots::id, shots::primary_person_id))
+        .filter(shots::folder_number.is_null())
+        .order(shots::created_at.asc())
+        .load::<(String, Option<String>)>(conn)?;
 
-    if shots.is_empty() {
+    if shot_rows.is_empty() {
         return Ok(());
     }
-
-    let mut update_stmt = conn.prepare("UPDATE shots SET folder_number = ? WHERE id = ?")?;
 
     // Cache the current max folder_number per person (including NULL for unsorted)
     let mut max_numbers: HashMap<Option<String>, i64> = HashMap::new();
 
     // Load existing max folder numbers for each person
-    let mut max_stmt = conn.prepare(
-        "SELECT primary_person_id, MAX(folder_number) FROM shots WHERE folder_number IS NOT NULL GROUP BY primary_person_id"
-    )?;
-    let existing_maxes: Vec<(Option<String>, i64)> = max_stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
+    #[derive(QueryableByName)]
+    struct MaxFolder {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        primary_person_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        max_num: i32,
+    }
 
-    for (person_id, max_num) in existing_maxes {
-        max_numbers.insert(person_id, max_num);
+    let existing_maxes: Vec<MaxFolder> = diesel::sql_query(
+        "SELECT primary_person_id, MAX(folder_number) AS max_num \
+         FROM shots WHERE folder_number IS NOT NULL GROUP BY primary_person_id",
+    )
+    .load::<MaxFolder>(conn)?;
+
+    for row in existing_maxes {
+        max_numbers.insert(row.primary_person_id, row.max_num as i64);
     }
 
     let mut total_assigned = 0;
-    for (shot_id, person_id) in &shots {
+    for (shot_id, person_id) in &shot_rows {
         let next_number = max_numbers.get(person_id).map(|n| n + 1).unwrap_or(1);
 
-        update_stmt.execute(params![next_number, shot_id])?;
+        diesel::update(shots::table.filter(shots::id.eq(shot_id)))
+            .set(shots::folder_number.eq(next_number as i32))
+            .execute(conn)?;
         max_numbers.insert(person_id.clone(), next_number);
         total_assigned += 1;
     }
@@ -1070,46 +1152,53 @@ pub fn assign_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
 /// For each person (including NULL for unsorted), queries all shots ordered by
 /// current `folder_number` (with `created_at` as tiebreaker), then reassigns
 /// folder_numbers as 1, 2, 3, ... Only updates shots whose number actually changed.
-pub fn compact_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
+pub fn compact_folder_numbers(conn: &mut SqliteConnection) -> anyhow::Result<()> {
     // Get all distinct person IDs (including NULL for unsorted)
-    let mut person_stmt = conn
-        .prepare("SELECT DISTINCT primary_person_id FROM shots WHERE folder_number IS NOT NULL")?;
-    let person_ids: Vec<Option<String>> = person_stmt
-        .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+    #[derive(QueryableByName)]
+    struct PersonId {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        primary_person_id: Option<String>,
+    }
 
-    let mut update_stmt = conn.prepare("UPDATE shots SET folder_number = ? WHERE id = ?")?;
-
-    let mut person_shots_stmt = conn.prepare(
-        "SELECT id, folder_number FROM shots
-         WHERE primary_person_id = ? AND folder_number IS NOT NULL
-         ORDER BY folder_number, created_at",
-    )?;
-    let mut unsorted_shots_stmt = conn.prepare(
-        "SELECT id, folder_number FROM shots
-         WHERE primary_person_id IS NULL AND folder_number IS NOT NULL
-         ORDER BY folder_number, created_at",
-    )?;
+    let person_ids: Vec<PersonId> = diesel::sql_query(
+        "SELECT DISTINCT primary_person_id FROM shots WHERE folder_number IS NOT NULL",
+    )
+    .load::<PersonId>(conn)?;
 
     let mut total_compacted = 0;
-    for person_id in &person_ids {
+    for person_row in &person_ids {
         // Get shots for this person ordered by folder_number, then created_at
-        let shots: Vec<(String, i64)> = match person_id {
-            Some(pid) => person_shots_stmt
-                .query_map(params![pid], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect(),
-            None => unsorted_shots_stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect(),
+        let shots_for_person: Vec<(String, i32)> = match &person_row.primary_person_id {
+            Some(pid) => shots::table
+                .select((shots::id, shots::folder_number.assume_not_null()))
+                .filter(shots::primary_person_id.eq(pid))
+                .filter(shots::folder_number.is_not_null())
+                .order((shots::folder_number.asc(), shots::created_at.asc()))
+                .load::<(String, i32)>(conn)?,
+            None => {
+                #[derive(QueryableByName)]
+                struct ShotFolder {
+                    #[diesel(sql_type = diesel::sql_types::Text)]
+                    id: String,
+                    #[diesel(sql_type = diesel::sql_types::Integer)]
+                    folder_number: i32,
+                }
+                let rows: Vec<ShotFolder> = diesel::sql_query(
+                    "SELECT id, folder_number FROM shots \
+                     WHERE primary_person_id IS NULL AND folder_number IS NOT NULL \
+                     ORDER BY folder_number, created_at",
+                )
+                .load::<ShotFolder>(conn)?;
+                rows.into_iter().map(|r| (r.id, r.folder_number)).collect()
+            }
         };
 
-        for (i, (shot_id, current_number)) in shots.iter().enumerate() {
-            let new_number = (i as i64) + 1;
+        for (i, (shot_id, current_number)) in shots_for_person.iter().enumerate() {
+            let new_number = (i as i32) + 1;
             if new_number != *current_number {
-                update_stmt.execute(params![new_number, shot_id])?;
+                diesel::update(shots::table.filter(shots::id.eq(shot_id)))
+                    .set(shots::folder_number.eq(new_number))
+                    .execute(conn)?;
                 total_compacted += 1;
             }
         }
@@ -1122,6 +1211,38 @@ pub fn compact_folder_numbers(conn: &Connection) -> anyhow::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Diesel equivalent of db::cleanup_orphaned_people for SqliteConnection.
+pub fn cleanup_orphaned_people_diesel(conn: &mut SqliteConnection) -> anyhow::Result<()> {
+    // First, unassign faces for people who have no shots
+    let unassigned = diesel::sql_query(
+        "UPDATE faces SET person_id = NULL \
+         WHERE person_id IS NOT NULL \
+           AND person_id NOT IN ( \
+               SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL \
+           )",
+    )
+    .execute(conn)?;
+    if unassigned > 0 {
+        info!("Unassigned {} faces from people with no shots", unassigned);
+    }
+
+    // Then delete people with no shots and no faces
+    let deleted = diesel::sql_query(
+        "DELETE FROM people \
+         WHERE id NOT IN ( \
+             SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL \
+         ) \
+         AND id NOT IN ( \
+             SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL \
+         )",
+    )
+    .execute(conn)?;
+    if deleted > 0 {
+        info!("Cleaned up {} orphaned people", deleted);
+    }
     Ok(())
 }
 
@@ -1497,6 +1618,7 @@ pub fn calculate_hash(path: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diesel::prelude::*;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1522,10 +1644,8 @@ mod tests {
 
         scanner.scan(&media_dir).unwrap();
 
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-            .unwrap();
+        let mut conn = db::open_diesel_connection(&db_path).unwrap();
+        let count: i64 = files::table.count().get_result(&mut conn).unwrap();
         assert_eq!(count, 1);
     }
 
@@ -1544,37 +1664,29 @@ mod tests {
 
         // Process the file first
         {
-            let conn = scanner.open_db().unwrap();
+            let mut conn = scanner.open_db().unwrap();
             let dhash_cache = std::sync::Mutex::new(Vec::<DHashCacheEntry>::new());
             scanner
-                .process_file(&conn, &shot_path, &dhash_cache)
+                .process_file(&mut conn, &shot_path, &dhash_cache)
                 .unwrap();
 
-            let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-                .unwrap();
+            let count: i64 = files::table.count().get_result(&mut conn).unwrap();
             assert_eq!(count, 1);
 
-            let shot_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM shots", [], |r| r.get(0))
-                .unwrap();
+            let shot_count: i64 = shots::table.count().get_result(&mut conn).unwrap();
             assert_eq!(shot_count, 1);
         }
 
         // Now remove it
         {
-            let conn = scanner.open_db().unwrap();
-            scanner.remove_file(&conn, &shot_path).unwrap();
+            let mut conn = scanner.open_db().unwrap();
+            scanner.remove_file(&mut conn, &shot_path).unwrap();
 
-            let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-                .unwrap();
+            let count: i64 = files::table.count().get_result(&mut conn).unwrap();
             assert_eq!(count, 0);
 
             // Shot should also be removed since it has no remaining files
-            let shot_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM shots", [], |r| r.get(0))
-                .unwrap();
+            let shot_count: i64 = shots::table.count().get_result(&mut conn).unwrap();
             assert_eq!(shot_count, 0);
         }
     }
@@ -1586,8 +1698,8 @@ mod tests {
         let _conn = crate::db::init_db(&db_path).unwrap();
         let scanner = Scanner::new(db_path.clone(), None);
 
-        let conn = scanner.open_db().unwrap();
-        let result = scanner.remove_file(&conn, Path::new("/nonexistent/file.jpg"));
+        let mut conn = scanner.open_db().unwrap();
+        let result = scanner.remove_file(&mut conn, Path::new("/nonexistent/file.jpg"));
         assert!(result.is_err());
     }
 

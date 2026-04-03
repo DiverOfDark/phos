@@ -85,7 +85,7 @@ pub(super) async fn upload_file_raw(
     let scanner = state.scanner.clone();
     let target_path_owned = target_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let conn = match scanner.open_db() {
+        let mut conn = match scanner.open_db() {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Failed to open DB for upload scan: {}", e);
@@ -93,7 +93,7 @@ pub(super) async fn upload_file_raw(
             }
         };
         let dhash_cache = std::sync::Mutex::new(Vec::<crate::scanner::DHashCacheEntry>::new());
-        if let Err(e) = scanner.process_file(&conn, &target_path_owned, &dhash_cache) {
+        if let Err(e) = scanner.process_file(&mut conn, &target_path_owned, &dhash_cache) {
             tracing::error!(
                 "Failed to index uploaded file {:?}: {}",
                 target_path_owned,
@@ -133,11 +133,11 @@ pub(super) async fn finalize_import(
         // 1. Run face clustering (drop connection before reorganize)
         tracing::info!("Finalize: running face clustering...");
         {
-            let conn = scanner
+            let mut conn = scanner
                 .open_db()
                 .map_err(|e| format!("Failed to open DB: {}", e))?;
             scanner
-                .cluster_faces(&conn)
+                .cluster_faces(&mut conn)
                 .map_err(|e| format!("Face clustering failed: {}", e))?;
         }
 

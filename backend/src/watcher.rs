@@ -160,7 +160,7 @@ fn flush_pending(
 
     info!("Processing {} debounced file watcher events", pending.len());
 
-    let conn = match scanner.open_db() {
+    let mut conn = match scanner.open_db() {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to open DB for watcher processing: {}", e);
@@ -191,14 +191,14 @@ fn flush_pending(
                     debug!("Watcher: path {:?} no longer exists, skipping", path);
                     continue;
                 }
-                if let Err(e) = scanner.process_file(&conn, &path, &dhash_cache) {
+                if let Err(e) = scanner.process_file(&mut conn, &path, &dhash_cache) {
                     error!("Watcher: failed to process {:?}: {}", path, e);
                 } else {
                     had_upserts = true;
                 }
             }
             FileAction::Remove => {
-                if let Err(e) = scanner.remove_file(&conn, &path) {
+                if let Err(e) = scanner.remove_file(&mut conn, &path) {
                     warn!("Watcher: failed to remove {:?}: {}", path, e);
                 }
             }

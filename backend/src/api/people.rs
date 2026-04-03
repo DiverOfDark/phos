@@ -293,9 +293,9 @@ pub(super) async fn rename_person(
     UState(state): UState,
     Json(payload): Json<RenamePersonPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let db = state.db.lock().await;
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    crate::import::rename_person_folder(&db, &state.library_root, &id, &payload.name).map_err(|e| {
+    crate::import::rename_person_folder(&mut conn, &state.library_root, &id, &payload.name).map_err(|e| {
         tracing::error!("Failed to rename person folder: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
