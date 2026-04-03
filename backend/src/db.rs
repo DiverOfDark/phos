@@ -19,7 +19,7 @@ impl CustomizeConnection<SqliteConnection, r2d2::Error> for SqlitePragmaCustomiz
         diesel::sql_query("PRAGMA journal_mode = WAL")
             .execute(conn)
             .map_err(|e| r2d2::Error::QueryError(e))?;
-        diesel::sql_query("PRAGMA busy_timeout = 5000")
+        diesel::sql_query("PRAGMA busy_timeout = 60000")
             .execute(conn)
             .map_err(|e| r2d2::Error::QueryError(e))?;
         Ok(())
