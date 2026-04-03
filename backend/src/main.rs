@@ -160,8 +160,9 @@ async fn run_server() {
         info!("Initializing database at {:?}", db_path);
     }
 
-    // Run legacy init_db for schema creation (will be removed once fully on Diesel migrations)
-    db::init_db(&db_path).expect("Failed to initialize database");
+    // Run data migrations (photos->shots, path relativization, cleanup).
+    // Must run before Diesel migrations so legacy schema changes happen first.
+    db::init_db(&db_path).expect("Failed to run data migrations");
 
     let ai = ai::AiPipeline::new().expect("Failed to load AI models");
     let scanner = Arc::new(scanner::Scanner::new(db_path.to_path_buf(), Some(ai)));

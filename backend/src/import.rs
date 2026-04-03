@@ -123,10 +123,9 @@ pub fn run_import(
     // Ensure target directory exists
     fs::create_dir_all(target)?;
 
-    // Initialize DB in target (uses rusqlite for schema creation)
+    // Initialize DB in target: run Diesel migrations then data migrations
     let db_path = target.join(".phos.db");
-    let _rusqlite_conn = db::init_db(&db_path)?;
-    drop(_rusqlite_conn);
+    db::init_and_migrate(&db_path)?;
     info!("Database initialized at {:?}", db_path);
 
     // Open Diesel connection for import-specific queries

@@ -240,7 +240,7 @@ fn check_basic_auth(
     };
 
     let db_path = user_library.join(".phos.db");
-    let conn = db::open_connection(&db_path).map_err(|e| {
+    let mut conn = db::open_diesel_connection(&db_path).map_err(|e| {
         tracing::error!("WebDAV: failed to open database at {:?}: {}", db_path, e);
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -248,7 +248,7 @@ fn check_basic_auth(
             .unwrap()
     })?;
 
-    let stored_password_hash = db::get_setting(&conn, "webdav_password");
+    let stored_password_hash = db::get_setting(&mut conn, "webdav_password");
 
     if stored_password_hash.is_none() {
         tracing::warn!(

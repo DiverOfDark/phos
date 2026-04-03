@@ -1184,45 +1184,11 @@ pub(super) async fn merge_shots(
     }
 
     // Clean up people who lost all their shots after this merge
-    // Use Diesel sql_query since the original cleanup_orphaned_people uses rusqlite
-    if let Err(e) = cleanup_orphaned_people_diesel(&mut conn) {
+    if let Err(e) = crate::db::cleanup_orphaned_people(&mut conn) {
         tracing::error!("Failed to cleanup orphaned people after merge: {}", e);
     }
 
     Ok(Json(serde_json::json!({"status": "ok"})))
-}
-
-/// Diesel-based equivalent of `crate::db::cleanup_orphaned_people`.
-fn cleanup_orphaned_people_diesel(conn: &mut diesel::SqliteConnection) -> Result<(), diesel::result::Error> {
-    // Unassign faces for people who have no shots
-    let unassigned = diesel::sql_query(
-        "UPDATE faces SET person_id = NULL
-         WHERE person_id IS NOT NULL
-           AND person_id NOT IN (
-               SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL
-           )",
-    )
-    .execute(conn)?;
-    if unassigned > 0 {
-        tracing::info!("Unassigned {} faces from people with no shots", unassigned);
-    }
-
-    // Delete people with no shots and no faces
-    let deleted = diesel::sql_query(
-        "DELETE FROM people
-         WHERE id NOT IN (
-             SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL
-         )
-         AND id NOT IN (
-             SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL
-         )",
-    )
-    .execute(conn)?;
-    if deleted > 0 {
-        tracing::info!("Cleaned up {} orphaned people", deleted);
-    }
-
-    Ok(())
 }
 
 /// POST /api/shots/batch/confirm - batch set review_status = 'confirmed'

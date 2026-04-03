@@ -1,10 +1,11 @@
+use crate::schema::{files, settings};
 use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager, CustomizeConnection, Pool};
 use diesel::sqlite::SqliteConnection;
 use diesel::Connection as DieselConnection;
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
-use rusqlite::{params, Connection, Result};
 use std::path::{Path, PathBuf};
+use tracing::info;
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
@@ -37,19 +38,13 @@ pub fn establish_pool<P: AsRef<Path>>(path: P) -> std::result::Result<DbPool, r2
 }
 
 /// Run pending Diesel migrations on a pooled connection.
-pub fn run_migrations(pool: &DbPool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut conn = pool.get().map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    conn.run_pending_migrations(MIGRATIONS)
-        .map(|_| ())
-}
-
-/// Open a connection with WAL mode and busy timeout enabled.
-/// Use this when worker threads need their own connection.
-pub fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection> {
-    let conn = Connection::open(path)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "busy_timeout", "60000")?;
-    Ok(conn)
+pub fn run_migrations(
+    pool: &DbPool,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = pool
+        .get()
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    conn.run_pending_migrations(MIGRATIONS).map(|_| ())
 }
 
 /// Open a Diesel SQLite connection with WAL mode and busy timeout enabled.
@@ -81,498 +76,185 @@ pub fn resolve_path(library_root: &Path, db_path: &str) -> PathBuf {
     }
 }
 
-pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
-    tracing::info!("Initializing database at {:?}", path.as_ref());
-    let conn = Connection::open(&path)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "busy_timeout", "5000")?;
+/// Create schema (via Diesel migrations) and run data migrations.
+/// Convenience function that does everything needed to initialize a database.
+pub fn init_and_migrate<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
+    let pool = establish_pool(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to create connection pool: {}", e))?;
+    run_migrations(&pool).map_err(|e| anyhow::anyhow!("Failed to run migrations: {}", e))?;
+    drop(pool);
+    init_db(&path)
+}
+
+/// Run data migrations and cleanup on an existing database.
+/// Schema creation is handled by Diesel migrations; this function handles:
+/// - Legacy photos -> shots table migration
+/// - Absolute -> relative path migration
+/// - Dropping legacy tables
+/// - Orphaned people cleanup
+/// - VACUUM
+pub fn init_db<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
+    info!("Running data migrations on database at {:?}", path.as_ref());
+    let mut conn = open_diesel_connection(&path)?;
 
     // Check if we need to migrate from old schema (photos -> shots)
-    let has_photos_table: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='photos'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|c| c > 0)
-        .unwrap_or(false);
+    let has_photos_table: bool = diesel::sql_query(
+        "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='table' AND name='photos'",
+    )
+    .get_result::<CountResult>(&mut conn)
+    .map(|r| r.cnt > 0)
+    .unwrap_or(false);
 
-    let has_shots_table: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='shots'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|c| c > 0)
-        .unwrap_or(false);
+    let has_shots_table: bool = diesel::sql_query(
+        "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='table' AND name='shots'",
+    )
+    .get_result::<CountResult>(&mut conn)
+    .map(|r| r.cnt > 0)
+    .unwrap_or(false);
 
     if has_photos_table && !has_shots_table {
-        tracing::info!("Detected old schema with 'photos' table. Running migration to 'shots'...");
-        migrate_photos_to_shots(&conn, &path)?;
+        info!("Detected old schema with 'photos' table. Running migration to 'shots'...");
+        migrate_photos_to_shots(&mut conn, &path)?;
     }
-
-    // We store people (clusters)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS people (
-            id TEXT PRIMARY KEY,
-            name TEXT,
-            thumbnail_face_id TEXT,
-            representative_embedding BLOB,
-            folder_name TEXT UNIQUE,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )",
-        [],
-    )?;
-
-    // A shot is a conceptual media item that can have multiple files (original + edits)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS shots (
-            id TEXT PRIMARY KEY,
-            main_file_id TEXT,
-            timestamp DATETIME,
-            width INTEGER,
-            height INTEGER,
-            latitude REAL,
-            longitude REAL,
-            primary_person_id TEXT,
-            folder_number INTEGER,
-            review_status TEXT DEFAULT 'pending',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(primary_person_id) REFERENCES people(id)
-        )",
-        [],
-    )?;
-
-    // Files physical on disk
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS files (
-            id TEXT PRIMARY KEY,
-            shot_id TEXT NOT NULL,
-            path TEXT NOT NULL UNIQUE,
-            hash TEXT NOT NULL,
-            mime_type TEXT,
-            file_size INTEGER,
-            is_original BOOLEAN DEFAULT 0,
-            visual_embedding BLOB,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(shot_id) REFERENCES shots(id)
-        )",
-        [],
-    )?;
-
-    // Faces detected in files
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS faces (
-            id TEXT PRIMARY KEY,
-            file_id TEXT NOT NULL,
-            person_id TEXT,
-            box_x1 REAL,
-            box_y1 REAL,
-            box_x2 REAL,
-            box_y2 REAL,
-            embedding BLOB,
-            thumbnail_path TEXT,
-            FOREIGN KEY(file_id) REFERENCES files(id),
-            FOREIGN KEY(person_id) REFERENCES people(id)
-        )",
-        [],
-    )?;
-
-    // Videos table for keyframes reference
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS video_keyframes (
-            id TEXT PRIMARY KEY,
-            video_file_id TEXT NOT NULL,
-            timestamp_ms INTEGER,
-            path TEXT NOT NULL,
-            FOREIGN KEY(video_file_id) REFERENCES files(id)
-        )",
-        [],
-    )?;
 
     // Drop legacy O(n²) pairwise distance cache — clustering now uses person centroids
-    conn.execute("DROP TABLE IF EXISTS face_neighbors", [])?;
-
-    // ComfyUI workflow templates
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS comfyui_workflows (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT,
-            workflow_json TEXT NOT NULL,
-            inputs_json TEXT,
-            outputs_json TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )",
-        [],
-    )?;
-
-    // Enhancement tasks
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS enhancement_tasks (
-            id TEXT PRIMARY KEY,
-            shot_id TEXT NOT NULL,
-            workflow_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            comfyui_prompt_id TEXT,
-            text_overrides TEXT DEFAULT '{}',
-            source_file_id TEXT,
-            output_file_id TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            started_at DATETIME,
-            completed_at DATETIME,
-            FOREIGN KEY(shot_id) REFERENCES shots(id),
-            FOREIGN KEY(workflow_id) REFERENCES comfyui_workflows(id),
-            FOREIGN KEY(source_file_id) REFERENCES files(id),
-            FOREIGN KEY(output_file_id) REFERENCES files(id)
-        )",
-        [],
-    )?;
-
-    // Workflow prompt presets (saved text override collections per workflow)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS workflow_presets (
-            id TEXT PRIMARY KEY,
-            workflow_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            text_overrides TEXT NOT NULL DEFAULT '{}',
-            sort_order INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(workflow_id) REFERENCES comfyui_workflows(id) ON DELETE CASCADE
-        )",
-        [],
-    )?;
-
-    // Ignored merges (for Variations Queue)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS ignored_merges (
-            shot_id_1 TEXT NOT NULL,
-            shot_id_2 TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (shot_id_1, shot_id_2)
-        )",
-        [],
-    )?;
-
-    // Key-value settings (e.g. WebDAV credentials)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )",
-        [],
-    )?;
-
-    // Add representative_embedding column to people if it doesn't exist (migration)
-    // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we check via pragma
-    let people_columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(people)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if !people_columns.contains(&"representative_embedding".to_string()) {
-        conn.execute(
-            "ALTER TABLE people ADD COLUMN representative_embedding BLOB",
-            [],
-        )?;
-    }
-
-    if !people_columns.contains(&"folder_name".to_string()) {
-        conn.execute("ALTER TABLE people ADD COLUMN folder_name TEXT UNIQUE", [])?;
-    }
-
-    // Add score column to faces if it doesn't exist (migration)
-    let faces_columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(faces)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if !faces_columns.contains(&"score".to_string()) {
-        conn.execute("ALTER TABLE faces ADD COLUMN score REAL", [])?;
-    }
-
-    // Add new shot columns if they don't exist (for existing shots tables without them)
-    let shots_columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(shots)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if !shots_columns.is_empty() {
-        if !shots_columns.contains(&"primary_person_id".to_string()) {
-            conn.execute("ALTER TABLE shots ADD COLUMN primary_person_id TEXT", [])?;
-        }
-        if !shots_columns.contains(&"folder_number".to_string()) {
-            conn.execute("ALTER TABLE shots ADD COLUMN folder_number INTEGER", [])?;
-        }
-        if !shots_columns.contains(&"review_status".to_string()) {
-            conn.execute(
-                "ALTER TABLE shots ADD COLUMN review_status TEXT DEFAULT 'pending'",
-                [],
-            )?;
-        }
-        if !shots_columns.contains(&"description".to_string()) {
-            conn.execute("ALTER TABLE shots ADD COLUMN description TEXT", [])?;
-        }
-    }
-
-    // Add updated_at column to people if it doesn't exist
-    // Note: SQLite does not allow CURRENT_TIMESTAMP as a default in ALTER TABLE,
-    // so we add the column without a default and backfill.
-    if !people_columns.contains(&"updated_at".to_string()) {
-        conn.execute(
-            "ALTER TABLE people ADD COLUMN updated_at DATETIME",
-            [],
-        )?;
-        conn.execute(
-            "UPDATE people SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL",
-            [],
-        )?;
-    }
-
-    // Add updated_at column to shots if it doesn't exist
-    if !shots_columns.contains(&"updated_at".to_string()) {
-        conn.execute(
-            "ALTER TABLE shots ADD COLUMN updated_at DATETIME",
-            [],
-        )?;
-        conn.execute(
-            "UPDATE shots SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL",
-            [],
-        )?;
-    }
-
-    // Add updated_at column to files if it doesn't exist
-    let files_columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(files)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if !files_columns.contains(&"source_workflow_id".to_string()) {
-        conn.execute(
-            "ALTER TABLE files ADD COLUMN source_workflow_id TEXT",
-            [],
-        )?;
-    }
-
-    if !files_columns.contains(&"source_text_overrides".to_string()) {
-        conn.execute(
-            "ALTER TABLE files ADD COLUMN source_text_overrides TEXT",
-            [],
-        )?;
-    }
-
-    if !files_columns.contains(&"updated_at".to_string()) {
-        conn.execute(
-            "ALTER TABLE files ADD COLUMN updated_at DATETIME",
-            [],
-        )?;
-        conn.execute(
-            "UPDATE files SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL",
-            [],
-        )?;
-    }
-
-    // Create triggers to auto-update updated_at on modifications
-    // Use a conditional check to avoid infinite recursion
-    conn.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS people_updated_at AFTER UPDATE ON people
-         FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
-         BEGIN
-             UPDATE people SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-         END;
-
-         CREATE TRIGGER IF NOT EXISTS shots_updated_at AFTER UPDATE ON shots
-         FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
-         BEGIN
-             UPDATE shots SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-         END;
-
-         CREATE TRIGGER IF NOT EXISTS files_updated_at AFTER UPDATE ON files
-         FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
-         BEGIN
-             UPDATE files SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-         END;"
-    )?;
-
-    // Add description column to comfyui_workflows if it doesn't exist
-    let workflows_columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(comfyui_workflows)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if !workflows_columns.is_empty()
-        && !workflows_columns.contains(&"description".to_string())
-    {
-        conn.execute(
-            "ALTER TABLE comfyui_workflows ADD COLUMN description TEXT",
-            [],
-        )?;
-    }
-
-    // Add source_file_id column to enhancement_tasks if it doesn't exist
-    {
-        let et_columns: Vec<String> = conn
-            .prepare("PRAGMA table_info(enhancement_tasks)")?
-            .query_map([], |row| row.get::<_, String>(1))?
-            .filter_map(|r| r.ok())
-            .collect();
-        if !et_columns.is_empty() && !et_columns.contains(&"source_file_id".to_string()) {
-            conn.execute(
-                "ALTER TABLE enhancement_tasks ADD COLUMN source_file_id TEXT REFERENCES files(id)",
-                [],
-            )?;
-        }
-    }
+    diesel::sql_query("DROP TABLE IF EXISTS face_neighbors").execute(&mut conn)?;
 
     // Migration: convert absolute file paths to relative paths.
-    // Paths stored as absolute (e.g. /home/user/library/person/001/photo.jpg) become
-    // relative to the library root (e.g. person/001/photo.jpg).
-    // Idempotent: already-relative paths don't match the LIKE prefix.
-    // Uses OR IGNORE to handle races where the scanner already stored relative paths.
     {
         let library_root = path.as_ref().parent().unwrap_or(Path::new("."));
         let prefix = format!("{}/", library_root.to_string_lossy());
 
         // Convert absolute paths to relative, skipping any that would conflict
-        // with already-relative entries (e.g. from a scanner run before migration).
-        let files_migrated = conn.execute(
+        let files_migrated = diesel::sql_query(
             "UPDATE OR IGNORE files SET path = SUBSTR(path, LENGTH(?1) + 1) WHERE path LIKE (?1 || '%')",
-            params![prefix],
-        )?;
+        )
+        .bind::<diesel::sql_types::Text, _>(&prefix)
+        .execute(&mut conn)?;
 
         // Clean up remaining absolute-path duplicates that couldn't be converted.
-        // These are entries where a relative-path version already exists.
-        let duplicate_ids: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM files WHERE path LIKE (?1 || '%')",
-            )?;
-            let ids: Vec<String> = stmt.query_map(params![prefix], |row| row.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-            ids
-        };
+        let duplicate_ids: Vec<String> = diesel::sql_query(
+            "SELECT id FROM files WHERE path LIKE (?1 || '%')",
+        )
+        .bind::<diesel::sql_types::Text, _>(&prefix)
+        .load::<IdResult>(&mut conn)?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+
         if !duplicate_ids.is_empty() {
             for file_id in &duplicate_ids {
-                conn.execute("DELETE FROM faces WHERE file_id = ?", params![file_id])?;
-                conn.execute("DELETE FROM video_keyframes WHERE video_file_id = ?", params![file_id])?;
-                conn.execute("UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?", params![file_id])?;
-                conn.execute("DELETE FROM files WHERE id = ?", params![file_id])?;
+                diesel::sql_query("DELETE FROM faces WHERE file_id = ?1")
+                    .bind::<diesel::sql_types::Text, _>(file_id)
+                    .execute(&mut conn)?;
+                diesel::sql_query("DELETE FROM video_keyframes WHERE video_file_id = ?1")
+                    .bind::<diesel::sql_types::Text, _>(file_id)
+                    .execute(&mut conn)?;
+                diesel::sql_query(
+                    "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?1",
+                )
+                .bind::<diesel::sql_types::Text, _>(file_id)
+                .execute(&mut conn)?;
+                diesel::delete(files::table.filter(files::id.eq(file_id))).execute(&mut conn)?;
             }
-            conn.execute(
+            diesel::sql_query(
                 "DELETE FROM shots WHERE id NOT IN (SELECT DISTINCT shot_id FROM files)",
-                [],
-            )?;
-            tracing::info!(
+            )
+            .execute(&mut conn)?;
+            info!(
                 "Cleaned up {} duplicate absolute-path entries during migration",
                 duplicate_ids.len()
             );
         }
 
-        let faces_migrated = conn.execute(
+        let faces_migrated = diesel::sql_query(
             "UPDATE OR IGNORE faces SET thumbnail_path = SUBSTR(thumbnail_path, LENGTH(?1) + 1) WHERE thumbnail_path LIKE (?1 || '%')",
-            params![prefix],
-        )?;
+        )
+        .bind::<diesel::sql_types::Text, _>(&prefix)
+        .execute(&mut conn)?;
 
         if files_migrated > 0 || faces_migrated > 0 {
-            tracing::info!(
+            info!(
                 "Migrated paths to relative: {} files, {} face thumbnails",
-                files_migrated,
-                faces_migrated
+                files_migrated, faces_migrated
             );
         }
     }
 
-    // Indexes for join/filter performance (IF NOT EXISTS is idempotent)
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_faces_person_id ON faces(person_id);
-         CREATE INDEX IF NOT EXISTS idx_faces_file_id ON faces(file_id);
-         CREATE INDEX IF NOT EXISTS idx_files_shot_id ON files(shot_id);
-         CREATE INDEX IF NOT EXISTS idx_shots_primary_person_id ON shots(primary_person_id);
-         CREATE INDEX IF NOT EXISTS idx_shots_timestamp ON shots(timestamp);"
-    )?;
-
     // Clean up people who lost all their shots (e.g. after shot merges)
-    cleanup_orphaned_people(&conn)?;
+    cleanup_orphaned_people(&mut conn)?;
 
     // Reclaim unused space
-    tracing::info!("Running VACUUM on database");
-    conn.execute_batch("VACUUM;")?;
+    info!("Running VACUUM on database");
+    diesel::sql_query("VACUUM").execute(&mut conn)?;
 
-    Ok(conn)
+    Ok(())
 }
 
 /// Get a setting value by key.
-pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = ?",
-        params![key],
-        |row| row.get(0),
-    )
-    .ok()
+pub fn get_setting(conn: &mut SqliteConnection, key: &str) -> Option<String> {
+    settings::table
+        .filter(settings::key.eq(key))
+        .select(settings::value)
+        .first::<String>(conn)
+        .ok()
 }
 
 /// Set a setting value (insert or update).
-pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
-    )?;
+pub fn set_setting(conn: &mut SqliteConnection, key: &str, value: &str) -> QueryResult<()> {
+    diesel::sql_query(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind::<diesel::sql_types::Text, _>(key)
+    .bind::<diesel::sql_types::Text, _>(value)
+    .execute(conn)?;
     Ok(())
 }
 
 /// Delete a setting by key.
-pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
-    conn.execute("DELETE FROM settings WHERE key = ?", params![key])?;
+pub fn delete_setting(conn: &mut SqliteConnection, key: &str) -> QueryResult<()> {
+    diesel::delete(settings::table.filter(settings::key.eq(key))).execute(conn)?;
     Ok(())
 }
 
 /// Delete people who have no shots assigned to them and no faces referencing them.
 /// This can happen when shots are merged and a person loses all their shots.
-pub fn cleanup_orphaned_people(conn: &Connection) -> Result<()> {
+pub fn cleanup_orphaned_people(conn: &mut SqliteConnection) -> anyhow::Result<()> {
     // First, unassign faces for people who have no shots
-    let unassigned = conn.execute(
-        "UPDATE faces SET person_id = NULL
-         WHERE person_id IS NOT NULL
-           AND person_id NOT IN (
-               SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL
+    let unassigned = diesel::sql_query(
+        "UPDATE faces SET person_id = NULL \
+         WHERE person_id IS NOT NULL \
+           AND person_id NOT IN ( \
+               SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL \
            )",
-        [],
-    )?;
+    )
+    .execute(conn)?;
     if unassigned > 0 {
-        tracing::info!("Unassigned {} faces from people with no shots", unassigned);
+        info!("Unassigned {} faces from people with no shots", unassigned);
     }
 
     // Then delete people with no shots and no faces
-    let deleted = conn.execute(
-        "DELETE FROM people
-         WHERE id NOT IN (
-             SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL
-         )
-         AND id NOT IN (
-             SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL
+    let deleted = diesel::sql_query(
+        "DELETE FROM people \
+         WHERE id NOT IN ( \
+             SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL \
+         ) \
+         AND id NOT IN ( \
+             SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL \
          )",
-        [],
-    )?;
+    )
+    .execute(conn)?;
     if deleted > 0 {
-        tracing::info!("Cleaned up {} orphaned people", deleted);
+        info!("Cleaned up {} orphaned people", deleted);
     }
     Ok(())
 }
 
 /// Migrate from the old `photos` table schema to the new `shots` table schema.
-/// This creates a backup, renames tables/columns within a transaction, and drops the old table.
-fn migrate_photos_to_shots<P: AsRef<Path>>(conn: &Connection, db_path: P) -> Result<()> {
+fn migrate_photos_to_shots<P: AsRef<Path>>(
+    conn: &mut SqliteConnection,
+    db_path: P,
+) -> anyhow::Result<()> {
     // Back up the database file
     let db_path = db_path.as_ref();
     let backup_path = db_path.with_extension("db.bak");
@@ -583,13 +265,13 @@ fn migrate_photos_to_shots<P: AsRef<Path>>(conn: &Connection, db_path: P) -> Res
             e
         );
     } else {
-        tracing::info!("Database backed up to {:?}", backup_path);
+        info!("Database backed up to {:?}", backup_path);
     }
 
-    conn.execute_batch("BEGIN TRANSACTION")?;
+    diesel::sql_query("BEGIN TRANSACTION").execute(conn)?;
 
     // Create the new shots table with all new columns
-    conn.execute_batch(
+    diesel::sql_query(
         "CREATE TABLE shots (
             id TEXT PRIMARY KEY,
             main_file_id TEXT,
@@ -603,44 +285,48 @@ fn migrate_photos_to_shots<P: AsRef<Path>>(conn: &Connection, db_path: P) -> Res
             review_status TEXT DEFAULT 'pending',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(primary_person_id) REFERENCES people(id)
-        );
+        )",
+    )
+    .execute(conn)?;
 
-        INSERT INTO shots (id, main_file_id, timestamp, width, height, latitude, longitude, created_at)
+    diesel::sql_query(
+        "INSERT INTO shots (id, main_file_id, timestamp, width, height, latitude, longitude, created_at)
             SELECT id, main_file_id, timestamp, width, height, latitude, longitude, created_at
-            FROM photos;"
-    )?;
+            FROM photos",
+    )
+    .execute(conn)?;
 
-    // Rename photo_id -> shot_id in files table
-    // SQLite ALTER TABLE RENAME COLUMN is supported since 3.25.0
-    let files_columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(files)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .collect();
+    // Rename photo_id -> shot_id in files table (SQLite 3.25.0+)
+    let has_photo_id: bool = diesel::sql_query(
+        "SELECT COUNT(*) as cnt FROM pragma_table_info('files') WHERE name = 'photo_id'",
+    )
+    .get_result::<CountResult>(conn)
+    .map(|r| r.cnt > 0)
+    .unwrap_or(false);
 
-    if files_columns.contains(&"photo_id".to_string()) {
-        conn.execute_batch("ALTER TABLE files RENAME COLUMN photo_id TO shot_id")?;
+    if has_photo_id {
+        diesel::sql_query("ALTER TABLE files RENAME COLUMN photo_id TO shot_id").execute(conn)?;
     }
 
     // Add folder_name column to people if it doesn't exist
-    let people_columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(people)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let has_folder_name: bool = diesel::sql_query(
+        "SELECT COUNT(*) as cnt FROM pragma_table_info('people') WHERE name = 'folder_name'",
+    )
+    .get_result::<CountResult>(conn)
+    .map(|r| r.cnt > 0)
+    .unwrap_or(false);
 
-    if !people_columns.contains(&"folder_name".to_string()) {
-        conn.execute_batch("ALTER TABLE people ADD COLUMN folder_name TEXT UNIQUE")?;
+    if !has_folder_name {
+        diesel::sql_query("ALTER TABLE people ADD COLUMN folder_name TEXT UNIQUE")
+            .execute(conn)?;
     }
 
     // Populate folder_name from name or id
-    conn.execute_batch(
-        "UPDATE people SET folder_name = COALESCE(name, id) WHERE folder_name IS NULL",
-    )?;
+    diesel::sql_query("UPDATE people SET folder_name = COALESCE(name, id) WHERE folder_name IS NULL")
+        .execute(conn)?;
 
     // Ensure exactly one is_original = 1 per shot.
-    // For shots where no file has is_original = 1, set the first file as original.
-    conn.execute_batch(
+    diesel::sql_query(
         "UPDATE files SET is_original = 1
          WHERE id IN (
              SELECT MIN(f.id) FROM files f
@@ -648,13 +334,27 @@ fn migrate_photos_to_shots<P: AsRef<Path>>(conn: &Connection, db_path: P) -> Res
              WHERE o.shot_id IS NULL
              GROUP BY f.shot_id
          )",
-    )?;
+    )
+    .execute(conn)?;
 
     // Drop the old photos table
-    conn.execute_batch("DROP TABLE photos")?;
+    diesel::sql_query("DROP TABLE photos").execute(conn)?;
 
-    conn.execute_batch("COMMIT")?;
+    diesel::sql_query("COMMIT").execute(conn)?;
 
-    tracing::info!("Migration from 'photos' to 'shots' completed successfully.");
+    info!("Migration from 'photos' to 'shots' completed successfully.");
     Ok(())
+}
+
+// Helper structs for sql_query results
+#[derive(QueryableByName)]
+struct CountResult {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    cnt: i64,
+}
+
+#[derive(QueryableByName)]
+struct IdResult {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    id: String,
 }

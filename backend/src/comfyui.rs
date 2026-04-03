@@ -1,7 +1,10 @@
 use crate::db;
+use crate::models::NewFile;
 use crate::scanner;
+use crate::schema::{comfyui_workflows, enhancement_tasks, files};
+use diesel::prelude::*;
+use diesel::sqlite::SqliteConnection;
 use image::DynamicImage;
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -311,25 +314,21 @@ pub fn prepare_workflow(
 /// If `source_file_id` is provided, uses that specific file; otherwise falls back to the original.
 /// For images: reads the file directly.
 /// For videos: extracts the first frame.
-fn get_source_image(conn: &Connection, shot_id: &str, source_file_id: Option<&str>, library_root: &Path) -> anyhow::Result<(Vec<u8>, String)> {
+fn get_source_image(conn: &mut SqliteConnection, shot_id: &str, source_file_id: Option<&str>, library_root: &Path) -> anyhow::Result<(Vec<u8>, String)> {
     // If a specific source file is requested, use it; otherwise fall back to the original
     let (file_path, mime_type): (String, String) = if let Some(file_id) = source_file_id {
-        conn.query_row(
-            "SELECT f.path, COALESCE(f.mime_type, '') FROM files f
-             WHERE f.id = ?1 AND f.shot_id = ?2 LIMIT 1",
-            params![file_id, shot_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|_| anyhow::anyhow!("Source file {} not found for shot {}", file_id, shot_id))?
+        files::table
+            .filter(files::id.eq(file_id).and(files::shot_id.eq(shot_id)))
+            .select((files::path, diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(mime_type, '')")))
+            .first::<(String, String)>(conn)
+            .map_err(|_| anyhow::anyhow!("Source file {} not found for shot {}", file_id, shot_id))?
     } else {
-        conn.query_row(
-            "SELECT f.path, COALESCE(f.mime_type, '') FROM files f
-             WHERE f.shot_id = ?1 AND f.is_original = 1
-             ORDER BY f.created_at ASC LIMIT 1",
-            params![shot_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|_| anyhow::anyhow!("No original file found for shot {}", shot_id))?
+        files::table
+            .filter(files::shot_id.eq(shot_id).and(files::is_original.eq(true)))
+            .order(files::created_at.asc())
+            .select((files::path, diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(mime_type, '')")))
+            .first::<(String, String)>(conn)
+            .map_err(|_| anyhow::anyhow!("No original file found for shot {}", shot_id))?
     };
 
     let path = db::resolve_path(library_root, &file_path);
@@ -366,7 +365,7 @@ pub fn spawn_enhancement_worker(
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let library_root = db_path.parent().unwrap().to_path_buf();
-        let conn = match db::open_connection(&db_path) {
+        let mut conn = match db::open_diesel_connection(&db_path) {
             Ok(c) => c,
             Err(e) => {
                 error!("ComfyUI worker: failed to open DB: {}", e);
@@ -382,7 +381,7 @@ pub fn spawn_enhancement_worker(
             .unwrap_or(3600);
 
         // Recover tasks that were mid-processing when we last shut down
-        recover_interrupted_tasks(&conn);
+        recover_interrupted_tasks(&mut conn);
 
         let (lock, cvar) = &*shutdown;
         loop {
@@ -392,10 +391,10 @@ pub fn spawn_enhancement_worker(
                 break;
             }
 
-            process_pending_tasks(&conn, &client, &library_root);
-            poll_active_tasks(&conn, &client, timeout_secs, &library_root);
-            check_retries(&conn);
-            cleanup_completed_tasks(&conn);
+            process_pending_tasks(&mut conn, &client, &library_root);
+            poll_active_tasks(&mut conn, &client, timeout_secs, &library_root);
+            check_retries(&mut conn);
+            cleanup_completed_tasks(&mut conn);
 
             // Sleep 3 seconds or until shutdown
             let guard = lock.lock().unwrap();
@@ -407,61 +406,56 @@ pub fn spawn_enhancement_worker(
 }
 
 /// Mark any tasks that were in intermediate states as needing retry.
-fn recover_interrupted_tasks(conn: &Connection) {
+fn recover_interrupted_tasks(conn: &mut SqliteConnection) {
     let intermediate_states = ["uploading", "queued", "processing", "downloading"];
-    for state in &intermediate_states {
-        if let Err(e) = conn.execute(
-            "UPDATE enhancement_tasks SET status = 'pending', error_message = 'Recovered after restart'
-             WHERE status = ?1",
-            params![state],
-        ) {
-            warn!("Failed to recover {} tasks: {}", state, e);
-        }
+    if let Err(e) = diesel::update(
+        enhancement_tasks::table
+            .filter(enhancement_tasks::status.eq_any(&intermediate_states)),
+    )
+    .set((
+        enhancement_tasks::status.eq("pending"),
+        enhancement_tasks::error_message.eq("Recovered after restart"),
+    ))
+    .execute(conn)
+    {
+        warn!("Failed to recover interrupted tasks: {}", e);
     }
 }
 
 /// Pick up pending tasks and start processing them.
-fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient, library_root: &Path) {
-    let tasks: Vec<(String, String, String, String, String, Option<String>)> = {
-        let mut stmt = match conn.prepare(
-            "SELECT t.id, t.shot_id, t.workflow_id, w.workflow_json, COALESCE(t.text_overrides, '{}'), t.source_file_id
-             FROM enhancement_tasks t
-             JOIN comfyui_workflows w ON t.workflow_id = w.id
-             WHERE t.status = 'pending'
-             ORDER BY t.created_at ASC
-             LIMIT 5",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to query pending tasks: {}", e);
-                return;
-            }
-        };
-        let result = match stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e) => {
-                error!("Failed to fetch pending tasks: {}", e);
-                return;
-            }
-        };
-        result
+fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, library_root: &Path) {
+    let tasks: Vec<(String, String, String, String, String, Option<String>)> = match enhancement_tasks::table
+        .inner_join(comfyui_workflows::table.on(comfyui_workflows::id.eq(enhancement_tasks::workflow_id)))
+        .filter(enhancement_tasks::status.eq("pending"))
+        .order(enhancement_tasks::created_at.asc())
+        .limit(5)
+        .select((
+            enhancement_tasks::id,
+            enhancement_tasks::shot_id,
+            enhancement_tasks::workflow_id,
+            comfyui_workflows::workflow_json,
+            diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(enhancement_tasks.text_overrides, '{}')"),
+            enhancement_tasks::source_file_id,
+        ))
+        .load::<(String, String, String, String, String, Option<String>)>(conn)
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!("Failed to query pending tasks: {}", e);
+            return;
+        }
     };
+
+    let now = chrono::Utc::now().naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
 
     for (task_id, shot_id, _workflow_id, workflow_json_str, text_overrides_str, source_file_id) in tasks {
         // Set uploading
-        let _ = conn.execute(
-            "UPDATE enhancement_tasks SET status = 'uploading', started_at = CURRENT_TIMESTAMP WHERE id = ?1",
-            params![task_id],
-        );
+        let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task_id)))
+            .set((
+                enhancement_tasks::status.eq("uploading"),
+                enhancement_tasks::started_at.eq(&now),
+            ))
+            .execute(conn);
 
         // 1. Get source image (use specific file if provided, otherwise original)
         let (image_data, upload_name) = match get_source_image(conn, &shot_id, source_file_id.as_deref(), library_root) {
@@ -515,47 +509,39 @@ fn process_pending_tasks(conn: &Connection, client: &ComfyUiClient, library_root
         };
 
         // 5. Set queued with comfyui_prompt_id
-        let _ = conn.execute(
-            "UPDATE enhancement_tasks SET status = 'queued', comfyui_prompt_id = ?2 WHERE id = ?1",
-            params![task_id, prompt_id],
-        );
+        let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task_id)))
+            .set((
+                enhancement_tasks::status.eq("queued"),
+                enhancement_tasks::comfyui_prompt_id.eq(&prompt_id),
+            ))
+            .execute(conn);
 
         info!("Task {} queued as ComfyUI prompt {}", task_id, prompt_id);
     }
 }
 
 /// Poll tasks that are queued/processing against ComfyUI history.
-fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u64, library_root: &Path) {
-    let tasks: Vec<(String, String, String, String, String, String)> = {
-        let mut stmt = match conn.prepare(
-            "SELECT t.id, t.shot_id, t.comfyui_prompt_id, t.started_at, t.workflow_id, COALESCE(t.text_overrides, '{}')
-             FROM enhancement_tasks t
-             WHERE t.status IN ('queued', 'processing')
-             AND t.comfyui_prompt_id IS NOT NULL",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to query active tasks: {}", e);
-                return;
-            }
-        };
-        let result = match stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e) => {
-                error!("Failed to fetch active tasks: {}", e);
-                return;
-            }
-        };
-        result
+fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, timeout_secs: u64, library_root: &Path) {
+    let tasks: Vec<(String, String, String, String, String, String)> = match enhancement_tasks::table
+        .filter(
+            enhancement_tasks::status.eq_any(&["queued", "processing"])
+                .and(enhancement_tasks::comfyui_prompt_id.is_not_null()),
+        )
+        .select((
+            enhancement_tasks::id,
+            enhancement_tasks::shot_id,
+            enhancement_tasks::comfyui_prompt_id.assume_not_null(),
+            enhancement_tasks::started_at.assume_not_null(),
+            enhancement_tasks::workflow_id,
+            diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(text_overrides, '{}')"),
+        ))
+        .load::<(String, String, String, String, String, String)>(conn)
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!("Failed to query active tasks: {}", e);
+            return;
+        }
     };
 
     for (task_id, shot_id, prompt_id, started_at, workflow_id, text_overrides_str) in tasks {
@@ -573,10 +559,13 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
         }
 
         // Update to processing if still queued
-        let _ = conn.execute(
-            "UPDATE enhancement_tasks SET status = 'processing' WHERE id = ?1 AND status = 'queued'",
-            params![task_id],
-        );
+        let _ = diesel::update(
+            enhancement_tasks::table.filter(
+                enhancement_tasks::id.eq(&task_id).and(enhancement_tasks::status.eq("queued")),
+            ),
+        )
+        .set(enhancement_tasks::status.eq("processing"))
+        .execute(conn);
 
         // Check ComfyUI history
         let history = match client.get_history(&prompt_id) {
@@ -659,10 +648,9 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
         }
 
         // Set downloading
-        let _ = conn.execute(
-            "UPDATE enhancement_tasks SET status = 'downloading' WHERE id = ?1",
-            params![task_id],
-        );
+        let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task_id)))
+            .set(enhancement_tasks::status.eq("downloading"))
+            .execute(conn);
 
         // Find output images in any node's output
         let mut downloaded = false;
@@ -734,12 +722,14 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
 
         if !downloaded {
             // Check if a previous attempt already saved an output file for this task
-            let has_existing_output: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM enhancement_tasks WHERE id = ?1 AND output_file_id IS NOT NULL",
-                    params![task_id],
-                    |row| row.get(0),
+            let has_existing_output: bool = enhancement_tasks::table
+                .filter(
+                    enhancement_tasks::id.eq(&task_id)
+                        .and(enhancement_tasks::output_file_id.is_not_null()),
                 )
+                .count()
+                .get_result::<i64>(conn)
+                .map(|c| c > 0)
                 .unwrap_or(false);
             if has_existing_output {
                 downloaded = true;
@@ -747,11 +737,15 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
             }
         }
 
+        let now = chrono::Utc::now().naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
+
         if downloaded {
-            let _ = conn.execute(
-                "UPDATE enhancement_tasks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                params![task_id],
-            );
+            let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task_id)))
+                .set((
+                    enhancement_tasks::status.eq("completed"),
+                    enhancement_tasks::completed_at.eq(&now),
+                ))
+                .execute(conn);
             info!("Task {} completed successfully", task_id);
         } else {
             // Log the full outputs for debugging
@@ -777,7 +771,7 @@ fn poll_active_tasks(conn: &Connection, client: &ComfyUiClient, timeout_secs: u6
 
 /// Download an output file from ComfyUI and save it alongside the original.
 fn download_and_save_output(
-    conn: &Connection,
+    conn: &mut SqliteConnection,
     client: &ComfyUiClient,
     task_id: &str,
     shot_id: &str,
@@ -791,12 +785,10 @@ fn download_and_save_output(
     let data = client.download_output(filename, subfolder, output_type)?;
 
     // Get the original file path to determine where to save
-    let original_path_str: String = conn
-        .query_row(
-            "SELECT path FROM files WHERE shot_id = ?1 AND is_original = 1 LIMIT 1",
-            params![shot_id],
-            |row| row.get(0),
-        )
+    let original_path_str: String = files::table
+        .filter(files::shot_id.eq(shot_id).and(files::is_original.eq(true)))
+        .select(files::path)
+        .first::<String>(conn)
         .map_err(|_| anyhow::anyhow!("No original file found for shot {}", shot_id))?;
 
     let original = db::resolve_path(library_root, &original_path_str);
@@ -838,12 +830,10 @@ fn download_and_save_output(
     let base_path_str = db::make_relative(library_root, &base_output_path);
 
     // Check if a file with the expected path already exists in the DB (from a previous attempt)
-    let existing: Option<(String, String)> = conn
-        .query_row(
-            "SELECT id, hash FROM files WHERE path = ?1",
-            params![base_path_str],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    let existing: Option<(String, String)> = files::table
+        .filter(files::path.eq(&base_path_str))
+        .select((files::id, files::hash))
+        .first::<(String, String)>(conn)
         .ok();
 
     let actual_file_id: String = match existing {
@@ -863,11 +853,20 @@ fn download_and_save_output(
 
             let variant_path_str = db::make_relative(library_root, &variant_path);
             let file_id = Uuid::new_v4().to_string();
-            conn.execute(
-                "INSERT INTO files (id, shot_id, path, hash, mime_type, file_size, is_original, source_workflow_id, source_text_overrides)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
-                params![file_id, shot_id, variant_path_str, hash, mime_type, file_size, workflow_id, text_overrides_json],
-            )?;
+            diesel::insert_into(files::table)
+                .values(NewFile {
+                    id: &file_id,
+                    shot_id,
+                    path: &variant_path_str,
+                    hash: &hash,
+                    mime_type: Some(mime_type),
+                    file_size: Some(file_size as i32),
+                    is_original: Some(false),
+                    visual_embedding: None,
+                    source_workflow_id: Some(workflow_id),
+                    source_text_overrides: Some(text_overrides_json),
+                })
+                .execute(conn)?;
             file_id
         }
         None => {
@@ -876,97 +875,116 @@ fn download_and_save_output(
             info!("Saved enhanced output to {:?}", base_output_path);
 
             let file_id = Uuid::new_v4().to_string();
-            conn.execute(
-                "INSERT INTO files (id, shot_id, path, hash, mime_type, file_size, is_original, source_workflow_id, source_text_overrides)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
-                params![file_id, shot_id, base_path_str, hash, mime_type, file_size, workflow_id, text_overrides_json],
-            )?;
+            diesel::insert_into(files::table)
+                .values(NewFile {
+                    id: &file_id,
+                    shot_id,
+                    path: &base_path_str,
+                    hash: &hash,
+                    mime_type: Some(mime_type),
+                    file_size: Some(file_size as i32),
+                    is_original: Some(false),
+                    visual_embedding: None,
+                    source_workflow_id: Some(workflow_id),
+                    source_text_overrides: Some(text_overrides_json),
+                })
+                .execute(conn)?;
             file_id
         }
     };
 
     // Store the output file ID on the task
-    conn.execute(
-        "UPDATE enhancement_tasks SET output_file_id = ?2 WHERE id = ?1",
-        params![task_id, actual_file_id],
-    )?;
+    diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id)))
+        .set(enhancement_tasks::output_file_id.eq(&actual_file_id))
+        .execute(conn)?;
 
     Ok(())
 }
 
 /// Mark a task as failed with an error message.
 /// If `permanent` is true, set retry_count to max so it won't be retried.
-fn mark_failed(conn: &Connection, task_id: &str, error_msg: &str, permanent: bool) {
+fn mark_failed(conn: &mut SqliteConnection, task_id: &str, error_msg: &str, permanent: bool) {
     error!("Task {} failed: {}", task_id, error_msg);
     if permanent {
-        let _ = conn.execute(
-            "UPDATE enhancement_tasks SET status = 'failed', error_message = ?2, retry_count = 3 WHERE id = ?1",
-            params![task_id, error_msg],
-        );
+        let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id)))
+            .set((
+                enhancement_tasks::status.eq("failed"),
+                enhancement_tasks::error_message.eq(error_msg),
+                enhancement_tasks::retry_count.eq(3),
+            ))
+            .execute(conn);
     } else {
-        let _ = conn.execute(
-            "UPDATE enhancement_tasks SET status = 'failed', error_message = ?2 WHERE id = ?1",
-            params![task_id, error_msg],
-        );
+        let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id)))
+            .set((
+                enhancement_tasks::status.eq("failed"),
+                enhancement_tasks::error_message.eq(error_msg),
+            ))
+            .execute(conn);
     }
 }
 
 /// Check failed tasks that can be retried (retry_count < 3).
 /// Uses exponential backoff: 10s, 30s, 120s.
-fn check_retries(conn: &Connection) {
-    let backoff_seconds = [10, 30, 120];
-    let tasks: Vec<(String, i64, String)> = {
-        let mut stmt = match conn.prepare(
-            "SELECT id, retry_count, COALESCE(completed_at, created_at) as last_attempt
-             FROM enhancement_tasks
-             WHERE status = 'failed' AND retry_count < 3",
-        ) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let result = match stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
+fn check_retries(conn: &mut SqliteConnection) {
+    let backoff_seconds: [i64; 3] = [10, 30, 120];
+    let tasks: Vec<(String, Option<i32>, Option<String>, Option<String>)> =
+        match enhancement_tasks::table
+            .filter(
+                enhancement_tasks::status
+                    .eq("failed")
+                    .and(enhancement_tasks::retry_count.lt(3)),
+            )
+            .select((
+                enhancement_tasks::id,
+                enhancement_tasks::retry_count,
+                enhancement_tasks::completed_at,
+                enhancement_tasks::created_at,
             ))
-        }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            .load(conn)
+        {
+            Ok(rows) => rows,
             Err(_) => return,
         };
-        result
-    };
 
-    for (task_id, retry_count, _last_attempt) in tasks {
+    let now = chrono::Utc::now().naive_utc();
+
+    for (task_id, retry_count, completed_at, created_at) in tasks {
+        let retry_count = retry_count.unwrap_or(0) as i64;
         let idx = (retry_count as usize).min(backoff_seconds.len() - 1);
         let wait = backoff_seconds[idx];
 
-        // Simple approach: check if enough time has passed since the task was last updated
-        let ready: bool = conn
-            .query_row(
-                "SELECT (strftime('%s','now') - strftime('%s', COALESCE(completed_at, created_at))) > ?2
-                 FROM enhancement_tasks WHERE id = ?1",
-                params![task_id, wait],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
+        // Use completed_at or created_at as last attempt time
+        let last_attempt_str = completed_at.or(created_at).unwrap_or_default();
+        let ready = chrono::NaiveDateTime::parse_from_str(&last_attempt_str, "%Y-%m-%d %H:%M:%S")
+            .map(|t| (now - t).num_seconds() > wait)
+            .unwrap_or(true);
 
         if ready {
             info!("Retrying task {} (attempt {})", task_id, retry_count + 1);
-            let _ = conn.execute(
+            let _ = diesel::sql_query(
                 "UPDATE enhancement_tasks SET status = 'pending', retry_count = retry_count + 1, error_message = NULL WHERE id = ?1",
-                params![task_id],
-            );
+            )
+            .bind::<diesel::sql_types::Text, _>(&task_id)
+            .execute(conn);
         }
     }
 }
 
 /// Remove completed tasks older than 5 minutes.
-fn cleanup_completed_tasks(conn: &Connection) {
-    match conn.execute(
-        "DELETE FROM enhancement_tasks WHERE status = 'completed' AND completed_at IS NOT NULL AND (strftime('%s','now') - strftime('%s', completed_at)) > 300",
-        [],
-    ) {
+fn cleanup_completed_tasks(conn: &mut SqliteConnection) {
+    let cutoff = (chrono::Utc::now().naive_utc() - chrono::Duration::seconds(300))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    match diesel::delete(
+        enhancement_tasks::table.filter(
+            enhancement_tasks::status
+                .eq("completed")
+                .and(enhancement_tasks::completed_at.is_not_null())
+                .and(enhancement_tasks::completed_at.lt(&cutoff)),
+        ),
+    )
+    .execute(conn)
+    {
         Ok(n) if n > 0 => info!("Cleaned up {} completed enhancement tasks", n),
         Err(e) => warn!("Failed to clean up completed tasks: {}", e),
         _ => {}

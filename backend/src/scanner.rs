@@ -233,7 +233,7 @@ impl Scanner {
         }
 
         // Clean up orphaned people (no faces remaining, or faces but no shots)
-        cleanup_orphaned_people_diesel(&mut conn)?;
+        crate::db::cleanup_orphaned_people(&mut conn)?;
 
         Ok(())
     }
@@ -311,7 +311,7 @@ impl Scanner {
         compact_folder_numbers(&mut conn)?;
 
         // Clean up people with no shots (unassigns their faces, then deletes)
-        cleanup_orphaned_people_diesel(&mut conn)?;
+        crate::db::cleanup_orphaned_people(&mut conn)?;
 
         // Clean up empty directories left behind by duplicate moves or deletions
         crate::import::cleanup_empty_dirs(root)?;
@@ -1214,38 +1214,6 @@ pub fn compact_folder_numbers(conn: &mut SqliteConnection) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Diesel equivalent of db::cleanup_orphaned_people for SqliteConnection.
-pub fn cleanup_orphaned_people_diesel(conn: &mut SqliteConnection) -> anyhow::Result<()> {
-    // First, unassign faces for people who have no shots
-    let unassigned = diesel::sql_query(
-        "UPDATE faces SET person_id = NULL \
-         WHERE person_id IS NOT NULL \
-           AND person_id NOT IN ( \
-               SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL \
-           )",
-    )
-    .execute(conn)?;
-    if unassigned > 0 {
-        info!("Unassigned {} faces from people with no shots", unassigned);
-    }
-
-    // Then delete people with no shots and no faces
-    let deleted = diesel::sql_query(
-        "DELETE FROM people \
-         WHERE id NOT IN ( \
-             SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL \
-         ) \
-         AND id NOT IN ( \
-             SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL \
-         )",
-    )
-    .execute(conn)?;
-    if deleted > 0 {
-        info!("Cleaned up {} orphaned people", deleted);
-    }
-    Ok(())
-}
-
 /// Run face detection on an image and collect results without writing to DB.
 fn detect_faces_collect(ai: &crate::ai::AiPipeline, img: &DynamicImage) -> Vec<FaceResult> {
     let (img_w, img_h) = img.dimensions();
@@ -1639,7 +1607,7 @@ mod tests {
         let file_path = media_dir.join("test.jpg");
         fs::write(&file_path, b"fake image data").unwrap();
 
-        let _conn = crate::db::init_db(&db_path).unwrap();
+        let _conn = crate::db::init_and_migrate(&db_path).unwrap();
         let scanner = Scanner::new(db_path.clone(), None);
 
         scanner.scan(&media_dir).unwrap();
@@ -1659,7 +1627,7 @@ mod tests {
         let shot_path = shots_dir.join("remove_me.jpg");
         fs::write(&shot_path, b"fake image data for removal").unwrap();
 
-        let _conn = crate::db::init_db(&db_path).unwrap();
+        let _conn = crate::db::init_and_migrate(&db_path).unwrap();
         let scanner = Scanner::new(db_path.clone(), None);
 
         // Process the file first
@@ -1695,7 +1663,7 @@ mod tests {
     fn test_remove_file_not_found() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let _conn = crate::db::init_db(&db_path).unwrap();
+        let _conn = crate::db::init_and_migrate(&db_path).unwrap();
         let scanner = Scanner::new(db_path.clone(), None);
 
         let mut conn = scanner.open_db().unwrap();
