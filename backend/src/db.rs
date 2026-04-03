@@ -32,7 +32,7 @@ pub fn establish_pool<P: AsRef<Path>>(path: P) -> std::result::Result<DbPool, r2
     let database_url = path.as_ref().to_string_lossy().to_string();
     let manager = ConnectionManager::<SqliteConnection>::new(database_url);
     Pool::builder()
-        .max_size(4)
+        .max_size(2)
         .min_idle(Some(0))
         .connection_customizer(Box::new(SqlitePragmaCustomizer))
         .build(manager)
