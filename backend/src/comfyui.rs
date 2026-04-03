@@ -641,11 +641,56 @@ fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, timeou
             }
         }
 
-        // Try to extract output images from history
-        let outputs = history.get("outputs");
-        if outputs.is_none() {
-            continue; // Still processing
-        }
+        // Try to extract output images from history.
+        // ComfyUI has a race condition where the history endpoint can report
+        // completion before outputs are fully populated. If completed but outputs
+        // are empty, re-fetch history a few times before giving up.
+        let history = if !outputs_has_downloadable_items(history.get("outputs")) {
+            const EMPTY_OUTPUT_RETRIES: u32 = 5;
+            const EMPTY_OUTPUT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+            let mut resolved_history = None;
+            for attempt in 1..=EMPTY_OUTPUT_RETRIES {
+                info!(
+                    "Task {} completed but outputs empty, re-fetching history (attempt {}/{})",
+                    task_id, attempt, EMPTY_OUTPUT_RETRIES
+                );
+                std::thread::sleep(EMPTY_OUTPUT_DELAY);
+
+                match client.get_history(&prompt_id) {
+                    Ok(Some(h)) => {
+                        if outputs_has_downloadable_items(h.get("outputs")) {
+                            info!("Task {} outputs became available on retry {}", task_id, attempt);
+                            resolved_history = Some(h);
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        warn!("Task {} history entry disappeared on retry {}", task_id, attempt);
+                    }
+                    Err(e) => {
+                        warn!("Task {} history re-fetch failed on retry {}: {}", task_id, attempt, e);
+                    }
+                }
+            }
+
+            match resolved_history {
+                Some(h) => h,
+                None => {
+                    // If outputs was truly absent/null, continue polling on next cycle
+                    let original_outputs = history.get("outputs");
+                    if original_outputs.is_none()
+                        || original_outputs.map(|v| v.is_null()).unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    // Outputs present but empty — fall through to failure path
+                    history
+                }
+            }
+        } else {
+            history
+        };
 
         // Set downloading
         let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task_id)))
@@ -653,6 +698,7 @@ fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, timeou
             .execute(conn);
 
         // Find output images in any node's output
+        let outputs = history.get("outputs");
         let mut downloaded = false;
         if let Some(outputs) = outputs.and_then(|v| v.as_object()) {
             for (_node_id, node_output) in outputs {
@@ -767,6 +813,28 @@ fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, timeou
             );
         }
     }
+}
+
+/// Check whether a history response's `outputs` contains any downloadable items
+/// (images or gifs with a filename in any node's output).
+fn outputs_has_downloadable_items(outputs: Option<&Value>) -> bool {
+    let obj = match outputs.and_then(|v| v.as_object()) {
+        Some(o) if !o.is_empty() => o,
+        _ => return false,
+    };
+    for (_node_id, node_output) in obj {
+        if let Some(images) = node_output.get("images").and_then(|v| v.as_array()) {
+            if images.iter().any(|img| img.get("filename").and_then(|v| v.as_str()).is_some()) {
+                return true;
+            }
+        }
+        if let Some(gifs) = node_output.get("gifs").and_then(|v| v.as_array()) {
+            if gifs.iter().any(|g| g.get("filename").and_then(|v| v.as_str()).is_some()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Download an output file from ComfyUI and save it alongside the original.
