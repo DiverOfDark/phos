@@ -16,11 +16,10 @@ use axum::{
     Router,
 };
 use crate::db::DbPool;
-use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
@@ -183,13 +182,11 @@ impl utoipa::Modify for SecurityAddon {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Arc<Mutex<Connection>>,
     pub pool: DbPool,
     pub scanner: Arc<crate::scanner::Scanner>,
     pub comfyui_url: Option<String>,
     pub library_root: PathBuf,
     pub multi_user: bool,
-    pub user_dbs: Arc<RwLock<HashMap<String, Arc<Mutex<Connection>>>>>,
     pub user_pools: Arc<RwLock<HashMap<String, DbPool>>>,
     pub shutdown_flag: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
@@ -229,22 +226,19 @@ pub async fn resolve_user_db(
             .cloned()
         {
             let user_sub = &claims.sub;
-            let db = match get_or_create_user_db(&state, user_sub).await {
-                Ok(db) => db,
+            let user_pool = match get_or_create_user_pool(&state, user_sub).await {
+                Ok(p) => p,
                 Err(status) => return status.into_response(),
             };
             let user_library = state.library_root.join(user_sub);
             let user_scanner =
                 Arc::new(state.scanner.with_db_path(user_library.join(".phos.db")));
-            let user_pool = get_or_create_user_pool(&state, user_sub).await.unwrap_or_else(|_| state.pool.clone());
             AppState {
-                db,
                 pool: user_pool,
                 scanner: user_scanner,
                 comfyui_url: state.comfyui_url.clone(),
                 library_root: user_library,
                 multi_user: state.multi_user,
-                user_dbs: state.user_dbs.clone(),
                 user_pools: state.user_pools.clone(),
                 shutdown_flag: state.shutdown_flag.clone(),
             }
@@ -256,49 +250,6 @@ pub async fn resolve_user_db(
     };
     request.extensions_mut().insert(user_state);
     next.run(request).await
-}
-
-async fn get_or_create_user_db(
-    state: &AppState,
-    user_sub: &str,
-) -> Result<Arc<Mutex<Connection>>, StatusCode> {
-    // Fast path: read lock
-    {
-        let dbs = state.user_dbs.read().await;
-        if let Some(db) = dbs.get(user_sub) {
-            return Ok(db.clone());
-        }
-    }
-    // Slow path: write lock (re-check to avoid TOCTOU race)
-    let mut dbs = state.user_dbs.write().await;
-    if let Some(db) = dbs.get(user_sub) {
-        return Ok(db.clone());
-    }
-    // Create under the write lock so no two requests init the same user
-    let user_dir = state.library_root.join(user_sub);
-    std::fs::create_dir_all(&user_dir).map_err(|e| {
-        tracing::error!("Failed to create user directory {:?}: {}", user_dir, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let db_path = user_dir.join(".phos.db");
-    let conn = crate::db::init_db(&db_path).map_err(|e| {
-        tracing::error!("Failed to initialize database for user {}: {}", user_sub, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let shared = Arc::new(Mutex::new(conn));
-    dbs.insert(user_sub.to_string(), shared.clone());
-    drop(dbs);
-
-    // Spawn a ComfyUI enhancement worker for the new user
-    if let Some(ref url) = state.comfyui_url {
-        tracing::info!("Spawning ComfyUI worker for user {}", user_sub);
-        crate::comfyui::spawn_enhancement_worker(
-            db_path,
-            url.clone(),
-            state.shutdown_flag.clone(),
-        );
-    }
-    Ok(shared)
 }
 
 async fn get_or_create_user_pool(
@@ -328,6 +279,17 @@ async fn get_or_create_user_pool(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     pools.insert(user_sub.to_string(), pool.clone());
+    drop(pools);
+
+    // Spawn a ComfyUI enhancement worker for the new user
+    if let Some(ref url) = state.comfyui_url {
+        tracing::info!("Spawning ComfyUI worker for user {}", user_sub);
+        crate::comfyui::spawn_enhancement_worker(
+            db_path,
+            url.clone(),
+            state.shutdown_flag.clone(),
+        );
+    }
     Ok(pool)
 }
 

@@ -160,24 +160,17 @@ pub(super) async fn trigger_scan(
     UState(state): UState,
     Json(payload): Json<ScanParams>,
 ) -> Json<serde_json::Value> {
-    let db_path_result: Result<String, rusqlite::Error> = {
-        let db = state.db.lock().await;
-        db.query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
-    };
-
-    if let Ok(_db_path) = db_path_result {
-        let scanner = state.scanner.clone();
-        let scan_path = payload.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let path = std::path::Path::new(&scan_path);
-            if let Err(e) = scanner.scan(path) {
-                tracing::error!("Triggered scan failed: {}", e);
-            }
-            if let Err(e) = scanner.caption_shots(path) {
-                tracing::error!("Triggered captioning failed: {}", e);
-            }
-        });
-    }
+    let scanner = state.scanner.clone();
+    let scan_path = payload.path.clone();
+    tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(&scan_path);
+        if let Err(e) = scanner.scan(path) {
+            tracing::error!("Triggered scan failed: {}", e);
+        }
+        if let Err(e) = scanner.caption_shots(path) {
+            tracing::error!("Triggered captioning failed: {}", e);
+        }
+    });
 
     Json(serde_json::json!({"status": "started"}))
 }

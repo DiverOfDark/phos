@@ -142,16 +142,6 @@ async fn main() {
     }
 }
 
-fn init_shared_db(path: &Path) -> Arc<Mutex<rusqlite::Connection>> {
-    let conn = db::init_db(path)
-        .map_err(|e| {
-            tracing::error!("Failed to initialize database at {:?}: {}", path, e);
-            e
-        })
-        .expect("Failed to initialize database");
-    Arc::new(Mutex::new(conn))
-}
-
 async fn run_server() {
     let library_path =
         std::env::var("PHOS_LIBRARY_PATH").unwrap_or_else(|_| "./library".to_string());
@@ -169,7 +159,9 @@ async fn run_server() {
     } else {
         info!("Initializing database at {:?}", db_path);
     }
-    let shared_conn = init_shared_db(&db_path);
+
+    // Run legacy init_db for schema creation (will be removed once fully on Diesel migrations)
+    db::init_db(&db_path).expect("Failed to initialize database");
 
     let ai = ai::AiPipeline::new().expect("Failed to load AI models");
     let scanner = Arc::new(scanner::Scanner::new(db_path.to_path_buf(), Some(ai)));
@@ -179,9 +171,6 @@ async fn run_server() {
         info!("ComfyUI integration enabled (url: {})", url);
     }
 
-    let user_dbs: Arc<RwLock<HashMap<String, Arc<Mutex<rusqlite::Connection>>>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-
     let pool = db::establish_pool(&db_path).expect("Failed to create connection pool");
     db::run_migrations(&pool).expect("Failed to run Diesel migrations");
 
@@ -190,13 +179,11 @@ async fn run_server() {
     let shutdown_flag = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
 
     let state = api::AppState {
-        db: shared_conn.clone(),
         pool,
         scanner: scanner.clone(),
         comfyui_url: comfyui_url.clone(),
         library_root: root_path.to_path_buf(),
         multi_user,
-        user_dbs: user_dbs.clone(),
         user_pools: Arc::new(RwLock::new(HashMap::new())),
         shutdown_flag: shutdown_flag.clone(),
     };
