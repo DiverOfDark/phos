@@ -354,33 +354,43 @@ pub(super) async fn comfyui_list_tasks(
     Ok(Json(tasks))
 }
 
-/// Row returned from the task JOIN query.
-#[derive(QueryableByName)]
+/// Task row from DSL join query.
 struct TaskRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
     id: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     shot_id: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     workflow_id: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     workflow_name: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     status: String,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     error_message: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     retry_count: Option<i32>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     output_file_id: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     created_at: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     started_at: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     completed_at: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     main_file_id: Option<String>,
+}
+
+type TaskTuple = (
+    String, String, String, String, String,
+    Option<String>, Option<i32>, Option<String>,
+    Option<String>, Option<String>, Option<String>,
+);
+
+fn task_tuple_to_row(t: TaskTuple, main_file_id: Option<String>) -> TaskRow {
+    TaskRow {
+        id: t.0,
+        shot_id: t.1,
+        workflow_id: t.2,
+        workflow_name: t.3,
+        status: t.4,
+        error_message: t.5,
+        retry_count: t.6,
+        output_file_id: t.7,
+        created_at: t.8,
+        started_at: t.9,
+        completed_at: t.10,
+        main_file_id,
+    }
 }
 
 fn task_row_to_json(row: TaskRow) -> serde_json::Value {
@@ -405,46 +415,65 @@ fn task_row_to_json(row: TaskRow) -> serde_json::Value {
 
 fn query_tasks(
     conn: &mut diesel::SqliteConnection,
-    shot_id: Option<&String>,
+    filter_shot_id: Option<&String>,
 ) -> Result<Vec<serde_json::Value>, StatusCode> {
-    if let Some(shot_id) = shot_id {
-        let rows: Vec<TaskRow> = diesel::sql_query(
-            "SELECT t.id, t.shot_id, t.workflow_id, w.name AS workflow_name, t.status, t.error_message,
-                    t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
-                    s.main_file_id
-             FROM enhancement_tasks t
-             JOIN comfyui_workflows w ON t.workflow_id = w.id
-             LEFT JOIN shots s ON t.shot_id = s.id
-             WHERE t.shot_id = ?1
-             ORDER BY t.created_at DESC",
-        )
-        .bind::<diesel::sql_types::Text, _>(shot_id)
-        .load(conn)
-        .map_err(|e| {
-            tracing::error!("Failed to query tasks: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let task_select = (
+        enhancement_tasks::id,
+        enhancement_tasks::shot_id,
+        enhancement_tasks::workflow_id,
+        comfyui_workflows::name,
+        enhancement_tasks::status,
+        enhancement_tasks::error_message,
+        enhancement_tasks::retry_count,
+        enhancement_tasks::output_file_id,
+        enhancement_tasks::created_at,
+        enhancement_tasks::started_at,
+        enhancement_tasks::completed_at,
+    );
 
-        Ok(rows.into_iter().map(task_row_to_json).collect())
+    let tuples: Vec<TaskTuple> = if let Some(sid) = filter_shot_id {
+        enhancement_tasks::table
+            .inner_join(comfyui_workflows::table)
+            .select(task_select)
+            .filter(enhancement_tasks::shot_id.eq(sid))
+            .order(enhancement_tasks::created_at.desc())
+            .load(conn)
     } else {
-        let rows: Vec<TaskRow> = diesel::sql_query(
-            "SELECT t.id, t.shot_id, t.workflow_id, w.name AS workflow_name, t.status, t.error_message,
-                    t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
-                    s.main_file_id
-             FROM enhancement_tasks t
-             JOIN comfyui_workflows w ON t.workflow_id = w.id
-             LEFT JOIN shots s ON t.shot_id = s.id
-             ORDER BY t.created_at DESC
-             LIMIT 100",
-        )
-        .load(conn)
-        .map_err(|e| {
-            tracing::error!("Failed to query tasks: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        Ok(rows.into_iter().map(task_row_to_json).collect())
+        enhancement_tasks::table
+            .inner_join(comfyui_workflows::table)
+            .select(task_select)
+            .order(enhancement_tasks::created_at.desc())
+            .limit(100)
+            .load(conn)
     }
+    .map_err(|e| {
+        tracing::error!("Failed to query tasks: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Batch-fetch shot main_file_ids
+    let shot_ids: Vec<&str> = tuples.iter().map(|t| t.1.as_str()).collect();
+    let shot_main_files: std::collections::HashMap<String, Option<String>> = if !shot_ids.is_empty() {
+        shots::table
+            .filter(shots::id.eq_any(&shot_ids))
+            .select((shots::id, shots::main_file_id))
+            .load::<(String, Option<String>)>(conn)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let rows: Vec<TaskRow> = tuples
+        .into_iter()
+        .map(|t| {
+            let main_fid = shot_main_files.get(&t.1).cloned().flatten();
+            task_tuple_to_row(t, main_fid)
+        })
+        .collect();
+
+    Ok(rows.into_iter().map(task_row_to_json).collect())
 }
 
 /// GET /api/comfyui/tasks/:id
@@ -472,20 +501,33 @@ pub(super) async fn comfyui_get_task(
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let row: TaskRow = diesel::sql_query(
-        "SELECT t.id, t.shot_id, t.workflow_id, w.name AS workflow_name, t.status, t.error_message,
-                t.retry_count, t.output_file_id, t.created_at, t.started_at, t.completed_at,
-                s.main_file_id
-         FROM enhancement_tasks t
-         JOIN comfyui_workflows w ON t.workflow_id = w.id
-         LEFT JOIN shots s ON t.shot_id = s.id
-         WHERE t.id = ?1",
-    )
-    .bind::<diesel::sql_types::Text, _>(&id)
-    .get_result(&mut conn)
-    .map_err(|_| StatusCode::NOT_FOUND)?;
+    let tuple: TaskTuple = enhancement_tasks::table
+        .inner_join(comfyui_workflows::table)
+        .select((
+            enhancement_tasks::id,
+            enhancement_tasks::shot_id,
+            enhancement_tasks::workflow_id,
+            comfyui_workflows::name,
+            enhancement_tasks::status,
+            enhancement_tasks::error_message,
+            enhancement_tasks::retry_count,
+            enhancement_tasks::output_file_id,
+            enhancement_tasks::created_at,
+            enhancement_tasks::started_at,
+            enhancement_tasks::completed_at,
+        ))
+        .filter(enhancement_tasks::id.eq(&id))
+        .first(&mut conn)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    Ok(Json(task_row_to_json(row)))
+    let main_fid: Option<String> = shots::table
+        .select(shots::main_file_id)
+        .filter(shots::id.eq(&tuple.1))
+        .first::<Option<String>>(&mut conn)
+        .ok()
+        .flatten();
+
+    Ok(Json(task_row_to_json(task_tuple_to_row(tuple, main_fid))))
 }
 
 /// POST /api/comfyui/tasks/:id/retry — retry a failed task

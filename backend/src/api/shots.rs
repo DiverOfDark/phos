@@ -292,41 +292,30 @@ pub(super) async fn get_shot_detail(
 ) -> Result<Json<ShotDetailResponse>, StatusCode> {
     let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Get shot metadata with person name via sql_query (LEFT JOIN)
-    #[derive(diesel::QueryableByName)]
-    struct ShotMetaRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        id: String,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        timestamp: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        primary_person_id: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        review_status: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
-        folder_number: Option<i32>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        person_name: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
-        width: Option<i32>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
-        height: Option<i32>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        description: Option<String>,
-    }
+    // Get shot metadata
+    let (shot_id_val, shot_timestamp, shot_ppid, shot_review_status, shot_folder_number, shot_width_i32, shot_height_i32, shot_description): (
+        String, Option<String>, Option<String>, Option<String>, Option<i32>, Option<i32>, Option<i32>, Option<String>,
+    ) = shots::table
+        .select((
+            shots::id, shots::timestamp, shots::primary_person_id, shots::review_status,
+            shots::folder_number, shots::width, shots::height, shots::description,
+        ))
+        .filter(shots::id.eq(&id))
+        .first(&mut conn)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    let shot_row: ShotMetaRow = diesel::sql_query(
-        "SELECT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number, p.name AS person_name, s.width, s.height, s.description
-         FROM shots s
-         LEFT JOIN people p ON s.primary_person_id = p.id
-         WHERE s.id = ?1",
-    )
-    .bind::<diesel::sql_types::Text, _>(&id)
-    .get_result::<ShotMetaRow>(&mut conn)
-    .map_err(|_| StatusCode::NOT_FOUND)?;
+    // Get person name if primary person assigned
+    let shot_person_name: Option<String> = shot_ppid.as_ref().and_then(|pid| {
+        people::table
+            .select(people::name)
+            .filter(people::id.eq(pid))
+            .first::<Option<String>>(&mut conn)
+            .ok()
+            .flatten()
+    });
 
-    let shot_width = shot_row.width.map(|v| v as i64);
-    let shot_height = shot_row.height.map(|v| v as i64);
+    let shot_width = shot_width_i32.map(|v| v as i64);
+    let shot_height = shot_height_i32.map(|v| v as i64);
 
     // Get files for this shot
     let file_rows: Vec<(String, String, Option<String>, Option<bool>, Option<i32>)> = files::table
@@ -356,52 +345,52 @@ pub(super) async fn get_shot_detail(
 
     // We already set width/height from shot metadata above in the map
 
-    // Get faces for files in this shot, with person names
-    #[derive(diesel::QueryableByName)]
-    struct FaceRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        id: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        file_id: String,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        person_id: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        person_name: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Float>)]
-        box_x1: Option<f32>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Float>)]
-        box_y1: Option<f32>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Float>)]
-        box_x2: Option<f32>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Float>)]
-        box_y2: Option<f32>,
-    }
+    // Get faces for files in this shot
+    let face_rows: Vec<(String, String, Option<String>, Option<f32>, Option<f32>, Option<f32>, Option<f32>)> = faces::table
+        .inner_join(files::table.on(faces::file_id.eq(files::id)))
+        .select((faces::id, faces::file_id, faces::person_id, faces::box_x1, faces::box_y1, faces::box_x2, faces::box_y2))
+        .filter(files::shot_id.eq(&id))
+        .load(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to query faces: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    let face_rows: Vec<FaceRow> = diesel::sql_query(
-        "SELECT fa.id, fa.file_id, fa.person_id, p.name AS person_name, fa.box_x1, fa.box_y1, fa.box_x2, fa.box_y2
-         FROM faces fa
-         JOIN files f ON fa.file_id = f.id
-         LEFT JOIN people p ON fa.person_id = p.id
-         WHERE f.shot_id = ?1",
-    )
-    .bind::<diesel::sql_types::Text, _>(&id)
-    .load::<FaceRow>(&mut conn)
-    .map_err(|e| {
-        tracing::error!("Failed to query faces: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Batch-fetch person names for faces
+    let face_person_ids: Vec<String> = face_rows.iter()
+        .filter_map(|(_, _, pid, _, _, _, _)| pid.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let person_name_map: std::collections::HashMap<String, Option<String>> = if !face_person_ids.is_empty() {
+        people::table
+            .filter(people::id.eq_any(&face_person_ids))
+            .select((people::id, people::name))
+            .load::<(String, Option<String>)>(&mut conn)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let detail_faces: Vec<FaceDetail> = face_rows
         .into_iter()
-        .map(|row| FaceDetail {
-            id: row.id,
-            file_id: row.file_id,
-            person_id: row.person_id,
-            person_name: row.person_name,
-            box_x1: row.box_x1.unwrap_or(0.0),
-            box_y1: row.box_y1.unwrap_or(0.0),
-            box_x2: row.box_x2.unwrap_or(0.0),
-            box_y2: row.box_y2.unwrap_or(0.0),
+        .map(|(fid, file_id, person_id, bx1, by1, bx2, by2)| {
+            let person_name = person_id.as_ref()
+                .and_then(|pid| person_name_map.get(pid))
+                .cloned()
+                .flatten();
+            FaceDetail {
+                id: fid,
+                file_id,
+                person_id,
+                person_name,
+                box_x1: bx1.unwrap_or(0.0),
+                box_y1: by1.unwrap_or(0.0),
+                box_x2: bx2.unwrap_or(0.0),
+                box_y2: by2.unwrap_or(0.0),
+            }
         })
         .collect();
 
@@ -411,7 +400,7 @@ pub(super) async fn get_shot_detail(
     for face in &detail_faces {
         if let Some(ref pid) = face.person_id {
             // Skip the primary person and duplicates
-            if Some(pid.as_str()) != shot_row.primary_person_id.as_deref() && seen_person_ids.insert(pid.clone()) {
+            if Some(pid.as_str()) != shot_ppid.as_deref() && seen_person_ids.insert(pid.clone()) {
                 also_contains.push(AlsoContainsPerson {
                     id: pid.clone(),
                     name: face.person_name.clone(),
@@ -433,7 +422,7 @@ pub(super) async fn get_shot_detail(
          ORDER BY timestamp ASC, id ASC
          LIMIT 1",
     )
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&shot_row.timestamp)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&shot_timestamp)
     .bind::<diesel::sql_types::Text, _>(&id)
     .get_result::<NavRow>(&mut conn)
     .ok()
@@ -446,22 +435,22 @@ pub(super) async fn get_shot_detail(
          ORDER BY timestamp DESC, id DESC
          LIMIT 1",
     )
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&shot_row.timestamp)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&shot_timestamp)
     .bind::<diesel::sql_types::Text, _>(&id)
     .get_result::<NavRow>(&mut conn)
     .ok()
     .map(|r| r.id);
 
     Ok(Json(ShotDetailResponse {
-        id: shot_row.id,
-        timestamp: shot_row.timestamp,
-        primary_person_id: shot_row.primary_person_id,
-        primary_person_name: shot_row.person_name,
-        review_status: shot_row.review_status,
-        folder_number: shot_row.folder_number.map(|v| v as i64),
+        id: shot_id_val,
+        timestamp: shot_timestamp,
+        primary_person_id: shot_ppid,
+        primary_person_name: shot_person_name,
+        review_status: shot_review_status,
+        folder_number: shot_folder_number.map(|v| v as i64),
         width: shot_width,
         height: shot_height,
-        description: shot_row.description,
+        description: shot_description,
         files: detail_files,
         faces: detail_faces,
         also_contains,
@@ -874,24 +863,21 @@ pub(super) async fn split_shot(
 
     // Determine primary person for the new shot based on its faces
     // (face with the largest bounding box area that has a person_id)
-    #[derive(diesel::QueryableByName)]
-    struct PersonIdRow {
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        person_id: Option<String>,
-    }
-
-    let new_primary_person: Option<String> = diesel::sql_query(
-        "SELECT fa.person_id
-         FROM faces fa
-         JOIN files f ON fa.file_id = f.id
-         WHERE f.shot_id = ?1 AND fa.person_id IS NOT NULL
-         ORDER BY (fa.box_x2 - fa.box_x1) * (fa.box_y2 - fa.box_y1) DESC
-         LIMIT 1",
-    )
-    .bind::<diesel::sql_types::Text, _>(&new_shot_id)
-    .get_result::<PersonIdRow>(&mut conn)
-    .ok()
-    .and_then(|r| r.person_id);
+    let new_primary_person: Option<String> = faces::table
+        .inner_join(files::table.on(faces::file_id.eq(files::id)))
+        .select(faces::person_id.assume_not_null())
+        .filter(files::shot_id.eq(&new_shot_id))
+        .filter(faces::person_id.is_not_null())
+        .order(
+            diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::Float>>(
+                "(faces.box_x2 - faces.box_x1) * (faces.box_y2 - faces.box_y1)",
+            )
+            .desc(),
+        )
+        .first::<String>(&mut conn)
+        .optional()
+        .ok()
+        .flatten();
 
     if let Some(ref ppid) = new_primary_person {
         let max_folder: i64 = shots::table
@@ -990,33 +976,28 @@ pub(super) async fn get_similar_shots(
 
     // Add secondary people from faces on this shot's files
     {
-        #[derive(diesel::QueryableByName)]
-        struct SecondaryPersonRow {
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-            person_id: Option<String>,
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-            name: Option<String>,
+        let mut secondary_query = faces::table
+            .inner_join(files::table.on(faces::file_id.eq(files::id)))
+            .inner_join(people::table.on(faces::person_id.eq(people::id.nullable())))
+            .select((faces::person_id, people::name))
+            .filter(files::shot_id.eq(&id))
+            .filter(faces::person_id.is_not_null())
+            .distinct()
+            .into_boxed();
+
+        if let Some(ref ppid) = primary_person_id {
+            secondary_query = secondary_query.filter(faces::person_id.ne(ppid));
         }
 
-        let secondary: Vec<SecondaryPersonRow> = diesel::sql_query(
-            "SELECT DISTINCT fa.person_id, p.name
-             FROM faces fa
-             JOIN files fi ON fi.id = fa.file_id
-             JOIN people p ON p.id = fa.person_id
-             WHERE fi.shot_id = ?1
-               AND fa.person_id IS NOT NULL
-               AND (?2 IS NULL OR fa.person_id != ?2)",
-        )
-        .bind::<diesel::sql_types::Text, _>(&id)
-        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&primary_person_id)
-        .load::<SecondaryPersonRow>(&mut conn)
-        .map_err(|e| {
-            tracing::error!("Failed to query faces: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        let secondary: Vec<(Option<String>, Option<String>)> = secondary_query
+            .load(&mut conn)
+            .map_err(|e| {
+                tracing::error!("Failed to query faces: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
-        for row in secondary {
-            person_ids.push((row.person_id, row.name));
+        for (pid, name) in secondary {
+            person_ids.push((pid, name));
         }
     }
 

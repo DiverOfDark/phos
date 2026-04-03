@@ -805,35 +805,49 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     // Ensure all people have folder_name set (use UUID for unnamed people)
     ensure_folder_names(&mut conn)?;
 
-    // Load all shots with their files, joining people for folder_name and
-    // using shots.primary_person_id and shots.folder_number.
-    // This is a complex LEFT JOIN query — use diesel::sql_query for clarity.
-    #[derive(QueryableByName)]
+    // Load all shots with their files
     struct FileRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
         shot_id: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
         file_id: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
         path: String,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         primary_person_id: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
         folder_number: Option<i32>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         person_folder_name: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         review_status: Option<String>,
     }
 
-    let rows: Vec<FileRow> = diesel::sql_query(
-        "SELECT s.id AS shot_id, f.id AS file_id, f.path, s.primary_person_id, s.folder_number,
-                p.folder_name AS person_folder_name, s.review_status
-         FROM shots s
-         JOIN files f ON f.shot_id = s.id
-         LEFT JOIN people p ON s.primary_person_id = p.id",
-    )
-    .load::<FileRow>(&mut conn)?;
+    let raw_rows: Vec<(String, String, String, Option<String>, Option<i32>, Option<String>)> = shots::table
+        .inner_join(files::table)
+        .select((
+            shots::id, files::id, files::path,
+            shots::primary_person_id, shots::folder_number, shots::review_status,
+        ))
+        .load(&mut conn)?;
+
+    // Batch-fetch person folder names
+    let person_ids: Vec<String> = raw_rows.iter()
+        .filter_map(|r| r.3.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let folder_name_map: std::collections::HashMap<String, Option<String>> = if !person_ids.is_empty() {
+        people::table
+            .filter(people::id.eq_any(&person_ids))
+            .select((people::id, people::folder_name))
+            .load::<(String, Option<String>)>(&mut conn)?
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let rows: Vec<FileRow> = raw_rows.into_iter().map(|(shot_id, file_id, path, ppid, folder_number, review_status)| {
+        let person_folder_name = ppid.as_ref()
+            .and_then(|pid| folder_name_map.get(pid))
+            .cloned()
+            .flatten();
+        FileRow { shot_id, file_id, path, primary_person_id: ppid, folder_number, person_folder_name, review_status }
+    }).collect();
 
     // Group by shot_id
     let mut shots: std::collections::BTreeMap<String, Vec<&FileRow>> =
@@ -1051,23 +1065,28 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
     pb.finish_and_clear();
 
     // Clean up orphaned people (persons with no remaining faces)
-    let orphaned = diesel::sql_query(
-        "UPDATE shots SET primary_person_id = NULL \
-         WHERE primary_person_id IN ( \
-             SELECT p.id FROM people p \
-             WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id) \
-         )",
-    )
-    .execute(&mut conn)?;
-    let deleted_people = diesel::sql_query(
-        "DELETE FROM people WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.person_id = people.id)",
-    )
-    .execute(&mut conn)?;
-    if deleted_people > 0 {
-        info!(
-            "Removed {} orphaned people ({} shot references cleared)",
-            deleted_people, orphaned
-        );
+    let orphan_ids: Vec<String> = people::table
+        .select(people::id)
+        .filter(diesel::dsl::not(diesel::dsl::exists(
+            faces::table.filter(faces::person_id.eq(people::id.nullable())),
+        )))
+        .load::<String>(&mut conn)?;
+    if !orphan_ids.is_empty() {
+        let orphaned = diesel::update(
+            shots::table.filter(shots::primary_person_id.eq_any(&orphan_ids)),
+        )
+        .set(shots::primary_person_id.eq(None::<String>))
+        .execute(&mut conn)?;
+        let deleted_people = diesel::delete(
+            people::table.filter(people::id.eq_any(&orphan_ids)),
+        )
+        .execute(&mut conn)?;
+        if deleted_people > 0 {
+            info!(
+                "Removed {} orphaned people ({} shot references cleared)",
+                deleted_people, orphaned
+            );
+        }
     }
 
     // Clean up empty directories (but never the library root or .phos.db)

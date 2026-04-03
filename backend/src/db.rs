@@ -1,4 +1,4 @@
-use crate::schema::{files, settings};
+use crate::schema::{faces, files, people, settings, shots};
 use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager, CustomizeConnection, Pool};
 use diesel::sqlite::SqliteConnection;
@@ -200,48 +200,42 @@ pub fn get_setting(conn: &mut SqliteConnection, key: &str) -> Option<String> {
         .ok()
 }
 
-/// Set a setting value (insert or update).
-pub fn set_setting(conn: &mut SqliteConnection, key: &str, value: &str) -> QueryResult<()> {
-    diesel::sql_query(
-        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind::<diesel::sql_types::Text, _>(key)
-    .bind::<diesel::sql_types::Text, _>(value)
-    .execute(conn)?;
-    Ok(())
-}
-
-/// Delete a setting by key.
-pub fn delete_setting(conn: &mut SqliteConnection, key: &str) -> QueryResult<()> {
-    diesel::delete(settings::table.filter(settings::key.eq(key))).execute(conn)?;
-    Ok(())
-}
-
 /// Delete people who have no shots assigned to them and no faces referencing them.
 /// This can happen when shots are merged and a person loses all their shots.
 pub fn cleanup_orphaned_people(conn: &mut SqliteConnection) -> anyhow::Result<()> {
-    // First, unassign faces for people who have no shots
-    let unassigned = diesel::sql_query(
-        "UPDATE faces SET person_id = NULL \
-         WHERE person_id IS NOT NULL \
-           AND person_id NOT IN ( \
-               SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL \
-           )",
+    // Collect people who still have at least one shot assigned
+    let people_with_shots: Vec<String> = shots::table
+        .select(shots::primary_person_id.assume_not_null())
+        .filter(shots::primary_person_id.is_not_null())
+        .distinct()
+        .load::<String>(conn)?;
+
+    // Unassign faces for people who have no shots
+    let unassigned = diesel::update(
+        faces::table
+            .filter(faces::person_id.is_not_null())
+            .filter(diesel::dsl::not(
+                faces::person_id.eq_any(&people_with_shots),
+            )),
     )
+    .set(faces::person_id.eq(None::<String>))
     .execute(conn)?;
     if unassigned > 0 {
         info!("Unassigned {} faces from people with no shots", unassigned);
     }
 
-    // Then delete people with no shots and no faces
-    let deleted = diesel::sql_query(
-        "DELETE FROM people \
-         WHERE id NOT IN ( \
-             SELECT DISTINCT primary_person_id FROM shots WHERE primary_person_id IS NOT NULL \
-         ) \
-         AND id NOT IN ( \
-             SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL \
-         )",
+    // Collect people who still have at least one face assigned
+    let people_with_faces: Vec<String> = faces::table
+        .select(faces::person_id.assume_not_null())
+        .filter(faces::person_id.is_not_null())
+        .distinct()
+        .load::<String>(conn)?;
+
+    // Delete people with no shots and no faces
+    let deleted = diesel::delete(
+        people::table
+            .filter(diesel::dsl::not(people::id.eq_any(&people_with_shots)))
+            .filter(diesel::dsl::not(people::id.eq_any(&people_with_faces))),
     )
     .execute(conn)?;
     if deleted > 0 {

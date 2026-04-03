@@ -299,7 +299,7 @@ async fn get_or_create_user_pool(
 /// Skips if `review_status == 'confirmed'`.
 /// If no faces have a person_id, sets primary_person_id = NULL.
 pub(crate) fn recalculate_primary_person(conn: &mut diesel::SqliteConnection, shot_id: &str) -> Result<(), StatusCode> {
-    use crate::schema::shots;
+    use crate::schema::{faces, files, shots};
     use diesel::prelude::*;
 
     // Check review_status — skip confirmed shots
@@ -317,24 +317,21 @@ pub(crate) fn recalculate_primary_person(conn: &mut diesel::SqliteConnection, sh
     }
 
     // Find the face with the largest bounding box area that has a person_id
-    // Uses sql_query for the computed ORDER BY expression
-    #[derive(diesel::QueryableByName)]
-    struct PersonIdRow {
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        person_id: Option<String>,
-    }
-
-    let primary_person: Option<String> = diesel::sql_query(
-        "SELECT fa.person_id FROM faces fa
-         JOIN files f ON fa.file_id = f.id
-         WHERE f.shot_id = ?1 AND fa.person_id IS NOT NULL
-         ORDER BY (fa.box_x2 - fa.box_x1) * (fa.box_y2 - fa.box_y1) DESC
-         LIMIT 1",
-    )
-    .bind::<diesel::sql_types::Text, _>(shot_id)
-    .get_result::<PersonIdRow>(conn)
-    .ok()
-    .and_then(|r| r.person_id);
+    let primary_person: Option<String> = faces::table
+        .inner_join(files::table.on(faces::file_id.eq(files::id)))
+        .select(faces::person_id.assume_not_null())
+        .filter(files::shot_id.eq(shot_id))
+        .filter(faces::person_id.is_not_null())
+        .order(
+            diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::Float>>(
+                "(faces.box_x2 - faces.box_x1) * (faces.box_y2 - faces.box_y1)",
+            )
+            .desc(),
+        )
+        .first::<String>(conn)
+        .optional()
+        .ok()
+        .flatten();
 
     diesel::update(shots::table.filter(shots::id.eq(shot_id)))
         .set(shots::primary_person_id.eq(primary_person))

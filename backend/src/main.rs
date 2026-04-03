@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};

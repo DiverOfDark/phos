@@ -961,10 +961,14 @@ fn check_retries(conn: &mut SqliteConnection) {
 
         if ready {
             info!("Retrying task {} (attempt {})", task_id, retry_count + 1);
-            let _ = diesel::sql_query(
-                "UPDATE enhancement_tasks SET status = 'pending', retry_count = retry_count + 1, error_message = NULL WHERE id = ?1",
+            let _ = diesel::update(
+                enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task_id)),
             )
-            .bind::<diesel::sql_types::Text, _>(&task_id)
+            .set((
+                enhancement_tasks::status.eq("pending"),
+                enhancement_tasks::retry_count.eq(enhancement_tasks::retry_count + 1),
+                enhancement_tasks::error_message.eq(None::<String>),
+            ))
             .execute(conn);
         }
     }

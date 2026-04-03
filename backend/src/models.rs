@@ -3,18 +3,6 @@ use crate::schema::*;
 
 // ── People ──
 
-#[derive(Queryable, Selectable, Debug)]
-#[diesel(table_name = people)]
-pub struct Person {
-    pub id: String,
-    pub name: Option<String>,
-    pub thumbnail_face_id: Option<String>,
-    pub representative_embedding: Option<Vec<u8>>,
-    pub folder_name: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-}
-
 #[derive(Insertable)]
 #[diesel(table_name = people)]
 pub struct NewPerson<'a> {
@@ -35,24 +23,6 @@ pub struct PersonChangeset<'a> {
 }
 
 // ── Shots ──
-
-#[derive(Queryable, Selectable, Debug)]
-#[diesel(table_name = shots)]
-pub struct Shot {
-    pub id: String,
-    pub main_file_id: Option<String>,
-    pub timestamp: Option<String>,
-    pub width: Option<i32>,
-    pub height: Option<i32>,
-    pub latitude: Option<f32>,
-    pub longitude: Option<f32>,
-    pub primary_person_id: Option<String>,
-    pub folder_number: Option<i32>,
-    pub review_status: Option<String>,
-    pub description: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-}
 
 #[derive(Insertable)]
 #[diesel(table_name = shots)]
@@ -87,23 +57,6 @@ pub struct ShotChangeset<'a> {
 
 // ── Files ──
 
-#[derive(Queryable, Selectable, Debug)]
-#[diesel(table_name = files)]
-pub struct File {
-    pub id: String,
-    pub shot_id: String,
-    pub path: String,
-    pub hash: String,
-    pub mime_type: Option<String>,
-    pub file_size: Option<i32>,
-    pub is_original: Option<bool>,
-    pub visual_embedding: Option<Vec<u8>>,
-    pub source_workflow_id: Option<String>,
-    pub source_text_overrides: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-}
-
 #[derive(Insertable)]
 #[diesel(table_name = files)]
 pub struct NewFile<'a> {
@@ -121,21 +74,6 @@ pub struct NewFile<'a> {
 
 // ── Faces ──
 
-#[derive(Queryable, Selectable, Debug)]
-#[diesel(table_name = faces)]
-pub struct Face {
-    pub id: String,
-    pub file_id: String,
-    pub person_id: Option<String>,
-    pub box_x1: Option<f32>,
-    pub box_y1: Option<f32>,
-    pub box_x2: Option<f32>,
-    pub box_y2: Option<f32>,
-    pub embedding: Option<Vec<u8>>,
-    pub thumbnail_path: Option<String>,
-    pub score: Option<f32>,
-}
-
 #[derive(Insertable)]
 #[diesel(table_name = faces)]
 pub struct NewFace<'a> {
@@ -152,15 +90,6 @@ pub struct NewFace<'a> {
 
 // ── Video Keyframes ──
 
-#[derive(Queryable, Selectable, Debug)]
-#[diesel(table_name = video_keyframes)]
-pub struct VideoKeyframe {
-    pub id: String,
-    pub video_file_id: String,
-    pub timestamp_ms: Option<i32>,
-    pub path: String,
-}
-
 #[derive(Insertable)]
 #[diesel(table_name = video_keyframes)]
 pub struct NewVideoKeyframe<'a> {
@@ -174,6 +103,7 @@ pub struct NewVideoKeyframe<'a> {
 
 #[derive(Queryable, Selectable, Debug)]
 #[diesel(table_name = comfyui_workflows)]
+#[allow(dead_code)]
 pub struct ComfyuiWorkflow {
     pub id: String,
     pub name: String,
@@ -196,24 +126,6 @@ pub struct NewComfyuiWorkflow<'a> {
 }
 
 // ── Enhancement Tasks ──
-
-#[derive(Queryable, Selectable, Debug)]
-#[diesel(table_name = enhancement_tasks)]
-pub struct EnhancementTask {
-    pub id: String,
-    pub shot_id: String,
-    pub workflow_id: String,
-    pub status: String,
-    pub comfyui_prompt_id: Option<String>,
-    pub text_overrides: Option<String>,
-    pub source_file_id: Option<String>,
-    pub output_file_id: Option<String>,
-    pub error_message: Option<String>,
-    pub retry_count: Option<i32>,
-    pub created_at: Option<String>,
-    pub started_at: Option<String>,
-    pub completed_at: Option<String>,
-}
 
 #[derive(Insertable)]
 #[diesel(table_name = enhancement_tasks)]
@@ -241,6 +153,7 @@ pub struct EnhancementTaskChangeset<'a> {
 
 #[derive(Queryable, Selectable, Debug)]
 #[diesel(table_name = workflow_presets)]
+#[allow(dead_code)]
 pub struct WorkflowPreset {
     pub id: String,
     pub workflow_id: String,

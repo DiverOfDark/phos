@@ -138,28 +138,6 @@ pub(super) async fn create_person(
     Ok(Json(serde_json::json!({"id": id, "name": name})))
 }
 
-#[derive(QueryableByName)]
-struct PersonShotRow {
-    #[diesel(sql_type = Text)]
-    id: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    timestamp: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    primary_person_id: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    review_status: Option<String>,
-    #[diesel(sql_type = Nullable<Integer>)]
-    folder_number: Option<i32>,
-    #[diesel(sql_type = Nullable<Text>)]
-    main_file_id: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    person_name: Option<String>,
-    #[diesel(sql_type = Integer)]
-    file_count: i32,
-    #[diesel(sql_type = Nullable<Text>)]
-    description: Option<String>,
-}
-
 #[utoipa::path(
     get,
     path = "/api/people/{id}",
@@ -180,39 +158,57 @@ pub(super) async fn get_person_shots(
 ) -> Result<Json<Vec<ShotBrief>>, StatusCode> {
     let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let rows: Vec<PersonShotRow> = diesel::sql_query(
-        "SELECT DISTINCT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number,
-                f.id AS main_file_id, p.name AS person_name,
-                (SELECT COUNT(*) FROM files WHERE shot_id = s.id) AS file_count,
-                s.description
-         FROM shots s
-         LEFT JOIN files f ON s.main_file_id = f.id
-         LEFT JOIN people p ON s.primary_person_id = p.id
-         WHERE s.primary_person_id = ?1
-         ORDER BY s.timestamp DESC",
-    )
-    .bind::<Text, _>(&id)
-    .load(&mut conn)
-    .map_err(|e| {
-        tracing::error!("Failed to query person shots: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Get person name
+    let person_name: Option<String> = people::table
+        .select(people::name)
+        .filter(people::id.eq(&id))
+        .first::<Option<String>>(&mut conn)
+        .ok()
+        .flatten();
 
-    let shots: Vec<ShotBrief> = rows
+    // Load shots for this person
+    let shot_rows: Vec<(String, Option<String>, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>)> = shots::table
+        .select((
+            shots::id, shots::timestamp, shots::primary_person_id, shots::review_status,
+            shots::folder_number, shots::main_file_id, shots::description,
+        ))
+        .filter(shots::primary_person_id.eq(&id))
+        .order(shots::timestamp.desc())
+        .load(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to query person shots: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Batch count files per shot
+    let shot_ids: Vec<&str> = shot_rows.iter().map(|r| r.0.as_str()).collect();
+    let file_counts: std::collections::HashMap<String, i64> = if !shot_ids.is_empty() {
+        files::table
+            .filter(files::shot_id.eq_any(&shot_ids))
+            .group_by(files::shot_id)
+            .select((files::shot_id, diesel::dsl::count_star()))
+            .load::<(String, i64)>(&mut conn)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let shots: Vec<ShotBrief> = shot_rows
         .into_iter()
-        .map(|row| ShotBrief {
-            id: row.id,
-            timestamp: row.timestamp,
-            primary_person_id: row.primary_person_id,
-            review_status: row.review_status,
-            folder_number: row.folder_number.map(|n| n as i64),
-            thumbnail_url: row
-                .main_file_id
+        .map(|(sid, timestamp, ppid, review_status, folder_number, main_file_id, description)| ShotBrief {
+            file_count: *file_counts.get(&sid).unwrap_or(&0),
+            id: sid,
+            timestamp,
+            primary_person_id: ppid,
+            review_status,
+            folder_number: folder_number.map(|n| n as i64),
+            thumbnail_url: main_file_id
                 .map(|fid| format!("/api/files/{}/thumbnail", fid))
                 .unwrap_or_default(),
-            primary_person_name: row.person_name,
-            file_count: row.file_count as i64,
-            description: row.description,
+            primary_person_name: person_name.clone(),
+            description,
         })
         .collect();
 
@@ -391,24 +387,6 @@ pub(super) struct PersonBrowseResponse {
     shots: Vec<BrowseShotDetail>,
 }
 
-#[derive(QueryableByName)]
-struct BrowseRow {
-    #[diesel(sql_type = Text)]
-    shot_id: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    timestamp: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    review_status: Option<String>,
-    #[diesel(sql_type = Text)]
-    file_id: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    mime_type: Option<String>,
-    #[diesel(sql_type = Nullable<diesel::sql_types::Bool>)]
-    is_original: Option<bool>,
-    #[diesel(sql_type = Nullable<Integer>)]
-    file_size: Option<i32>,
-}
-
 #[utoipa::path(
     get,
     path = "/api/people/{id}/browse",
@@ -449,44 +427,43 @@ pub(super) async fn get_person_browse(
     };
 
     // Query 2: Get all shots with their files in one go
-    let rows: Vec<BrowseRow> = diesel::sql_query(
-        "SELECT s.id AS shot_id, s.timestamp, s.review_status,
-                f.id AS file_id, f.mime_type, f.is_original, f.file_size
-         FROM shots s
-         JOIN files f ON f.shot_id = s.id
-         WHERE s.primary_person_id = ?1
-         ORDER BY s.id, f.is_original DESC, f.path ASC",
-    )
-    .bind::<Text, _>(&id)
-    .load(&mut conn)
-    .map_err(|e| {
-        tracing::error!("Failed to execute browse query for person {}: {}", id, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let rows: Vec<(String, Option<String>, Option<String>, String, Option<String>, Option<bool>, Option<i32>)> = shots::table
+        .inner_join(files::table)
+        .select((
+            shots::id, shots::timestamp, shots::review_status,
+            files::id, files::mime_type, files::is_original, files::file_size,
+        ))
+        .filter(shots::primary_person_id.eq(&id))
+        .order((shots::id.asc(), files::is_original.desc(), files::path.asc()))
+        .load(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to execute browse query for person {}: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Group files by shot
     let mut shots_vec: Vec<BrowseShotDetail> = Vec::new();
     let mut current_shot_id: Option<String> = None;
 
-    for row in rows {
+    for (shot_id, timestamp, review_status, file_id, mime_type, is_original, file_size) in rows {
         let file = BrowseFileDetail {
-            thumbnail_url: format!("/api/files/{}/thumbnail", row.file_id),
-            id: row.file_id,
-            mime_type: row.mime_type,
-            is_original: row.is_original.unwrap_or(false),
-            file_size: row.file_size.map(|s| s as i64),
+            thumbnail_url: format!("/api/files/{}/thumbnail", file_id),
+            id: file_id,
+            mime_type,
+            is_original: is_original.unwrap_or(false),
+            file_size: file_size.map(|s| s as i64),
         };
 
-        if current_shot_id.as_deref() == Some(&row.shot_id) {
+        if current_shot_id.as_deref() == Some(&shot_id) {
             // Same shot — append file to the last shot entry
             shots_vec.last_mut().unwrap().files.push(file);
         } else {
             // New shot
-            current_shot_id = Some(row.shot_id.clone());
+            current_shot_id = Some(shot_id.clone());
             shots_vec.push(BrowseShotDetail {
-                id: row.shot_id,
-                timestamp: row.timestamp,
-                review_status: row.review_status,
+                id: shot_id,
+                timestamp,
+                review_status,
                 files: vec![file],
             });
         }
