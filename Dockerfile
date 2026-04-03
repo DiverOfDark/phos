@@ -26,6 +26,7 @@ WORKDIR /app/backend
 # Stage 2b: Generate dependency recipe
 FROM chef AS planner
 COPY backend/Cargo.toml backend/Cargo.lock backend/build.rs ./
+COPY backend/migrations ./migrations
 COPY backend/src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -37,6 +38,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 ARG PHOS_VERSION
 ENV PHOS_VERSION=${PHOS_VERSION}
 COPY backend/Cargo.toml backend/Cargo.lock backend/build.rs ./
+COPY backend/migrations ./migrations
 COPY backend/src ./src
 RUN cargo test --release --lib
 

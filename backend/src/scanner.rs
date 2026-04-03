@@ -1552,7 +1552,6 @@ pub fn calculate_hash(path: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diesel::prelude::*;
     use std::fs;
     use tempfile::tempdir;
 
