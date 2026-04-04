@@ -375,11 +375,6 @@ pub fn spawn_enhancement_worker(
         let client = ComfyUiClient::new(&comfyui_url);
         info!("ComfyUI enhancement worker started (url: {})", comfyui_url);
 
-        let timeout_secs: u64 = std::env::var("PHOS_COMFYUI_TIMEOUT")
-            .unwrap_or_else(|_| "3600".to_string())
-            .parse()
-            .unwrap_or(3600);
-
         // Recover tasks that were mid-processing when we last shut down
         recover_interrupted_tasks(&mut conn);
 
@@ -392,8 +387,7 @@ pub fn spawn_enhancement_worker(
             }
 
             process_pending_tasks(&mut conn, &client, &library_root);
-            poll_active_tasks(&mut conn, &client, timeout_secs, &library_root);
-            check_retries(&mut conn);
+            poll_active_tasks(&mut conn, &client, &library_root);
             cleanup_completed_tasks(&mut conn);
 
             // Sleep 3 seconds or until shutdown
@@ -465,7 +459,6 @@ fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, li
                     conn,
                     &task_id,
                     &format!("Source image extraction failed: {}", e),
-                    true,
                 );
                 continue;
             }
@@ -475,7 +468,7 @@ fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, li
         let uploaded_name = match client.upload_image(&upload_name, &image_data) {
             Ok(name) => name,
             Err(e) => {
-                mark_failed(conn, &task_id, &format!("Upload failed: {}", e), false);
+                mark_failed(conn, &task_id, &format!("Upload failed: {}", e));
                 continue;
             }
         };
@@ -488,7 +481,6 @@ fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, li
                     conn,
                     &task_id,
                     &format!("Invalid workflow JSON: {}", e),
-                    true,
                 );
                 continue;
             }
@@ -503,7 +495,7 @@ fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, li
         let prompt_id = match client.queue_prompt(&prepared) {
             Ok(id) => id,
             Err(e) => {
-                mark_failed(conn, &task_id, &format!("Queue failed: {}", e), false);
+                mark_failed(conn, &task_id, &format!("Queue failed: {}", e));
                 continue;
             }
         };
@@ -521,8 +513,8 @@ fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, li
 }
 
 /// Poll tasks that are queued/processing against ComfyUI history.
-fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, timeout_secs: u64, library_root: &Path) {
-    let tasks: Vec<(String, String, String, String, String, String)> = match enhancement_tasks::table
+fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, library_root: &Path) {
+    let tasks: Vec<(String, String, String, String, String)> = match enhancement_tasks::table
         .filter(
             enhancement_tasks::status.eq_any(&["queued", "processing"])
                 .and(enhancement_tasks::comfyui_prompt_id.is_not_null()),
@@ -531,11 +523,10 @@ fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, timeou
             enhancement_tasks::id,
             enhancement_tasks::shot_id,
             enhancement_tasks::comfyui_prompt_id.assume_not_null(),
-            enhancement_tasks::started_at.assume_not_null(),
             enhancement_tasks::workflow_id,
             diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(text_overrides, '{}')"),
         ))
-        .load::<(String, String, String, String, String, String)>(conn)
+        .load::<(String, String, String, String, String)>(conn)
     {
         Ok(rows) => rows,
         Err(e) => {
@@ -544,20 +535,7 @@ fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, timeou
         }
     };
 
-    for (task_id, shot_id, prompt_id, started_at, workflow_id, text_overrides_str) in tasks {
-        // Check timeout
-        if let Ok(started) = chrono::NaiveDateTime::parse_from_str(&started_at, "%Y-%m-%d %H:%M:%S")
-        {
-            let elapsed = chrono::Utc::now()
-                .naive_utc()
-                .signed_duration_since(started)
-                .num_seconds() as u64;
-            if elapsed > timeout_secs {
-                mark_failed(conn, &task_id, "Timed out waiting for ComfyUI", false);
-                continue;
-            }
-        }
-
+    for (task_id, shot_id, prompt_id, workflow_id, text_overrides_str) in tasks {
         // Update to processing if still queued
         let _ = diesel::update(
             enhancement_tasks::table.filter(
@@ -570,7 +548,12 @@ fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, timeou
         // Check ComfyUI history
         let history = match client.get_history(&prompt_id) {
             Ok(Some(h)) => h,
-            Ok(None) => continue, // Not done yet
+            Ok(None) => {
+                mark_failed(conn, &task_id, &format!(
+                    "Prompt {} not found in ComfyUI history (job may have been lost)", prompt_id
+                ));
+                continue;
+            }
             Err(e) => {
                 warn!("Failed to get history for prompt {}: {}", prompt_id, e);
                 continue;
@@ -613,7 +596,7 @@ fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, timeou
                                 if !traceback.is_empty() {
                                     error!("Task {} traceback:\n{}", task_id, traceback);
                                 }
-                                mark_failed(conn, &task_id, &err_detail, false);
+                                mark_failed(conn, &task_id, &err_detail);
                                 found_error = true;
                                 break;
                             }
@@ -632,7 +615,7 @@ fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, timeou
                         status_str,
                         serde_json::to_string(status).unwrap_or_else(|_| "N/A".to_string())
                     );
-                    mark_failed(conn, &task_id, &err_msg, false);
+                    mark_failed(conn, &task_id, &err_msg);
                     continue;
                 }
 
@@ -809,7 +792,6 @@ fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, timeou
                 conn,
                 &task_id,
                 "No output images found in ComfyUI response (workflow completed but produced no downloadable files)",
-                false,
             );
         }
     }
@@ -970,76 +952,14 @@ fn download_and_save_output(
 }
 
 /// Mark a task as failed with an error message.
-/// If `permanent` is true, set retry_count to max so it won't be retried.
-fn mark_failed(conn: &mut SqliteConnection, task_id: &str, error_msg: &str, permanent: bool) {
+fn mark_failed(conn: &mut SqliteConnection, task_id: &str, error_msg: &str) {
     error!("Task {} failed: {}", task_id, error_msg);
-    if permanent {
-        let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id)))
-            .set((
-                enhancement_tasks::status.eq("failed"),
-                enhancement_tasks::error_message.eq(error_msg),
-                enhancement_tasks::retry_count.eq(3),
-            ))
-            .execute(conn);
-    } else {
-        let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id)))
-            .set((
-                enhancement_tasks::status.eq("failed"),
-                enhancement_tasks::error_message.eq(error_msg),
-            ))
-            .execute(conn);
-    }
-}
-
-/// Check failed tasks that can be retried (retry_count < 3).
-/// Uses exponential backoff: 10s, 30s, 120s.
-fn check_retries(conn: &mut SqliteConnection) {
-    let backoff_seconds: [i64; 3] = [10, 30, 120];
-    let tasks: Vec<(String, Option<i32>, Option<String>, Option<String>)> =
-        match enhancement_tasks::table
-            .filter(
-                enhancement_tasks::status
-                    .eq("failed")
-                    .and(enhancement_tasks::retry_count.lt(3)),
-            )
-            .select((
-                enhancement_tasks::id,
-                enhancement_tasks::retry_count,
-                enhancement_tasks::completed_at,
-                enhancement_tasks::created_at,
-            ))
-            .load(conn)
-        {
-            Ok(rows) => rows,
-            Err(_) => return,
-        };
-
-    let now = chrono::Utc::now().naive_utc();
-
-    for (task_id, retry_count, completed_at, created_at) in tasks {
-        let retry_count = retry_count.unwrap_or(0) as i64;
-        let idx = (retry_count as usize).min(backoff_seconds.len() - 1);
-        let wait = backoff_seconds[idx];
-
-        // Use completed_at or created_at as last attempt time
-        let last_attempt_str = completed_at.or(created_at).unwrap_or_default();
-        let ready = chrono::NaiveDateTime::parse_from_str(&last_attempt_str, "%Y-%m-%d %H:%M:%S")
-            .map(|t| (now - t).num_seconds() > wait)
-            .unwrap_or(true);
-
-        if ready {
-            info!("Retrying task {} (attempt {})", task_id, retry_count + 1);
-            let _ = diesel::update(
-                enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task_id)),
-            )
-            .set((
-                enhancement_tasks::status.eq("pending"),
-                enhancement_tasks::retry_count.eq(enhancement_tasks::retry_count + 1),
-                enhancement_tasks::error_message.eq(None::<String>),
-            ))
-            .execute(conn);
-        }
-    }
+    let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id)))
+        .set((
+            enhancement_tasks::status.eq("failed"),
+            enhancement_tasks::error_message.eq(error_msg),
+        ))
+        .execute(conn);
 }
 
 /// Remove completed tasks older than 5 minutes.
