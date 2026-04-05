@@ -137,6 +137,28 @@ impl ComfyUiClient {
         }
     }
 
+    /// Check if a prompt is still in ComfyUI's queue (pending or running).
+    pub fn is_prompt_in_queue(&self, prompt_id: &str) -> anyhow::Result<bool> {
+        let url = format!("{}/queue", self.base_url);
+        let mut resp = ureq::get(&url)
+            .call()
+            .map_err(|e| anyhow::anyhow!("Queue fetch failed: {}", e))?;
+        let json: Value = resp.body_mut().read_json()?;
+        // queue_running and queue_pending are arrays of [number, prompt_id, ...]
+        for key in &["queue_running", "queue_pending"] {
+            if let Some(items) = json.get(*key).and_then(|v| v.as_array()) {
+                for item in items {
+                    if let Some(arr) = item.as_array() {
+                        if arr.get(1).and_then(|v| v.as_str()) == Some(prompt_id) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Download an output image from ComfyUI.
     pub fn download_output(
         &self,
@@ -549,9 +571,18 @@ fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, librar
         let history = match client.get_history(&prompt_id) {
             Ok(Some(h)) => h,
             Ok(None) => {
-                mark_failed(conn, &task_id, &format!(
-                    "Prompt {} not found in ComfyUI history (job may have been lost)", prompt_id
-                ));
+                // Not in history yet — check if still queued/running in ComfyUI
+                match client.is_prompt_in_queue(&prompt_id) {
+                    Ok(true) => continue, // Still pending/running, check again next cycle
+                    Ok(false) => {
+                        mark_failed(conn, &task_id, &format!(
+                            "Prompt {} not found in ComfyUI history or queue (job lost)", prompt_id
+                        ));
+                    }
+                    Err(e) => {
+                        warn!("Failed to check queue for prompt {}: {}", prompt_id, e);
+                    }
+                }
                 continue;
             }
             Err(e) => {
