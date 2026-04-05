@@ -338,19 +338,21 @@ pub fn prepare_workflow(
 /// For videos: extracts the first frame.
 fn get_source_image(conn: &mut SqliteConnection, shot_id: &str, source_file_id: Option<&str>, library_root: &Path) -> anyhow::Result<(Vec<u8>, String)> {
     // If a specific source file is requested, use it; otherwise fall back to the original
-    let (file_path, mime_type): (String, String) = if let Some(file_id) = source_file_id {
-        files::table
+    let (file_id_used, file_path, mime_type): (String, String, String) = if let Some(file_id) = source_file_id {
+        let (fp, mt) = files::table
             .filter(files::id.eq(file_id).and(files::shot_id.eq(shot_id)))
             .select((files::path, diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(mime_type, '')")))
             .first::<(String, String)>(conn)
-            .map_err(|_| anyhow::anyhow!("Source file {} not found for shot {}", file_id, shot_id))?
+            .map_err(|_| anyhow::anyhow!("Source file {} not found for shot {}", file_id, shot_id))?;
+        (file_id.to_string(), fp, mt)
     } else {
-        files::table
+        let (fid, fp, mt) = files::table
             .filter(files::shot_id.eq(shot_id).and(files::is_original.eq(true)))
             .order(files::created_at.asc())
-            .select((files::path, diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(mime_type, '')")))
-            .first::<(String, String)>(conn)
-            .map_err(|_| anyhow::anyhow!("No original file found for shot {}", shot_id))?
+            .select((files::id, files::path, diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(mime_type, '')")))
+            .first::<(String, String, String)>(conn)
+            .map_err(|_| anyhow::anyhow!("No original file found for shot {}", shot_id))?;
+        (fid, fp, mt)
     };
 
     let path = db::resolve_path(library_root, &file_path);
@@ -369,8 +371,8 @@ fn get_source_image(conn: &mut SqliteConnection, shot_id: &str, source_file_id: 
     let mut cursor = std::io::Cursor::new(&mut buf);
     img.write_to(&mut cursor, image::ImageFormat::Png)?;
 
-    // Use the shot_id as the upload filename base
-    let upload_name = format!("phos_{}.png", &shot_id[..8.min(shot_id.len())]);
+    // Include file ID in the upload name so ComfyUI doesn't reuse a cached image from a different variant
+    let upload_name = format!("phos_{}_{}.png", &shot_id[..8.min(shot_id.len())], &file_id_used[..8.min(file_id_used.len())]);
     Ok((buf, upload_name))
 }
 

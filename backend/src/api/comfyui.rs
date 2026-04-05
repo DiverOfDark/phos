@@ -367,6 +367,7 @@ struct TaskRow {
     created_at: Option<String>,
     started_at: Option<String>,
     completed_at: Option<String>,
+    source_file_id: Option<String>,
     main_file_id: Option<String>,
 }
 
@@ -374,6 +375,7 @@ type TaskTuple = (
     String, String, String, String, String,
     Option<String>, Option<i32>, Option<String>,
     Option<String>, Option<String>, Option<String>,
+    Option<String>,
 );
 
 fn task_tuple_to_row(t: TaskTuple, main_file_id: Option<String>) -> TaskRow {
@@ -389,13 +391,15 @@ fn task_tuple_to_row(t: TaskTuple, main_file_id: Option<String>) -> TaskRow {
         created_at: t.8,
         started_at: t.9,
         completed_at: t.10,
+        source_file_id: t.11,
         main_file_id,
     }
 }
 
 fn task_row_to_json(row: TaskRow) -> serde_json::Value {
     let thumbnail_url = row
-        .main_file_id
+        .source_file_id
+        .or(row.main_file_id)
         .map(|fid| format!("/api/files/{}/thumbnail", fid));
     serde_json::json!({
         "id": row.id,
@@ -429,6 +433,7 @@ fn query_tasks(
         enhancement_tasks::created_at,
         enhancement_tasks::started_at,
         enhancement_tasks::completed_at,
+        enhancement_tasks::source_file_id,
     );
 
     let tuples: Vec<TaskTuple> = if let Some(sid) = filter_shot_id {
@@ -515,6 +520,7 @@ pub(super) async fn comfyui_get_task(
             enhancement_tasks::created_at,
             enhancement_tasks::started_at,
             enhancement_tasks::completed_at,
+            enhancement_tasks::source_file_id,
         ))
         .filter(enhancement_tasks::id.eq(&id))
         .first(&mut conn)
