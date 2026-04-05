@@ -533,7 +533,8 @@ async function fetchShotTasks() {
   try {
     const res = await fetch(`/api/comfyui/tasks?shot_id=${shotId.value}`)
     if (!res.ok) return
-    shotTasks.value = await res.json()
+    const data = await res.json()
+    shotTasks.value = data.items
   } catch {
     // ignore
   }

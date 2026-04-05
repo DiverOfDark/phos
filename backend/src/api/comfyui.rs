@@ -316,10 +316,14 @@ pub(super) async fn comfyui_enhance(
     })))
 }
 
-/// GET /api/comfyui/tasks?shot_id=X
+/// GET /api/comfyui/tasks?shot_id=X&limit=N&cursor=TIMESTAMP
 #[derive(Deserialize, utoipa::IntoParams)]
 pub(super) struct TasksQuery {
     shot_id: Option<String>,
+    /// Max items to return (default 50)
+    limit: Option<i64>,
+    /// Cursor: created_at value of the last item from the previous page
+    cursor: Option<String>,
 }
 
 #[utoipa::path(
@@ -338,20 +342,17 @@ pub(super) struct TasksQuery {
 pub(super) async fn comfyui_list_tasks(
     UState(state): UState,
     Query(query): Query<TasksQuery>,
-) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
     let mut conn = state
         .pool
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let tasks: Vec<serde_json::Value> = if let Some(shot_id) = &query.shot_id {
-        query_tasks(&mut conn, Some(shot_id))?
-    } else {
-        query_tasks(&mut conn, None)?
-    };
+    let limit = query.limit.unwrap_or(50).min(200);
+    let result = query_tasks(&mut conn, query.shot_id.as_ref(), query.cursor.as_ref(), limit)?;
 
-    Ok(Json(tasks))
+    Ok(Json(result))
 }
 
 /// Task row from DSL join query.
@@ -420,7 +421,9 @@ fn task_row_to_json(row: TaskRow) -> serde_json::Value {
 fn query_tasks(
     conn: &mut diesel::SqliteConnection,
     filter_shot_id: Option<&String>,
-) -> Result<Vec<serde_json::Value>, StatusCode> {
+    cursor: Option<&String>,
+    limit: i64,
+) -> Result<serde_json::Value, StatusCode> {
     let task_select = (
         enhancement_tasks::id,
         enhancement_tasks::shot_id,
@@ -436,25 +439,35 @@ fn query_tasks(
         enhancement_tasks::source_file_id,
     );
 
-    let tuples: Vec<TaskTuple> = if let Some(sid) = filter_shot_id {
-        enhancement_tasks::table
-            .inner_join(comfyui_workflows::table)
-            .select(task_select)
-            .filter(enhancement_tasks::shot_id.eq(sid))
-            .order(enhancement_tasks::created_at.desc())
-            .load(conn)
-    } else {
-        enhancement_tasks::table
-            .inner_join(comfyui_workflows::table)
-            .select(task_select)
-            .order(enhancement_tasks::created_at.desc())
-            .limit(100)
-            .load(conn)
+    // Fetch limit+1 to detect if there's a next page
+    let fetch_limit = limit + 1;
+
+    let mut query = enhancement_tasks::table
+        .inner_join(comfyui_workflows::table)
+        .select(task_select)
+        .order(enhancement_tasks::created_at.desc())
+        .limit(fetch_limit)
+        .into_boxed();
+
+    if let Some(sid) = filter_shot_id {
+        query = query.filter(enhancement_tasks::shot_id.eq(sid));
     }
-    .map_err(|e| {
-        tracing::error!("Failed to query tasks: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+
+    if let Some(c) = cursor {
+        query = query.filter(enhancement_tasks::created_at.lt(c));
+    }
+
+    let mut tuples: Vec<TaskTuple> = query
+        .load(conn)
+        .map_err(|e| {
+            tracing::error!("Failed to query tasks: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let has_more = tuples.len() as i64 > limit;
+    if has_more {
+        tuples.truncate(limit as usize);
+    }
 
     // Batch-fetch shot main_file_ids
     let shot_ids: Vec<&str> = tuples.iter().map(|t| t.1.as_str()).collect();
@@ -478,7 +491,18 @@ fn query_tasks(
         })
         .collect();
 
-    Ok(rows.into_iter().map(task_row_to_json).collect())
+    let next_cursor = if has_more {
+        rows.last().and_then(|r| r.created_at.clone())
+    } else {
+        None
+    };
+
+    let items: Vec<serde_json::Value> = rows.into_iter().map(task_row_to_json).collect();
+
+    Ok(serde_json::json!({
+        "items": items,
+        "next_cursor": next_cursor,
+    }))
 }
 
 /// GET /api/comfyui/tasks/:id

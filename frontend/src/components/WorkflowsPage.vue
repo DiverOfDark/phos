@@ -263,18 +263,50 @@ watch(selectedWorkflowId, (id) => {
 // ===== QUEUE TAB =====
 const tasks = ref([])
 const loadingTasks = ref(false)
+const loadingMore = ref(false)
+const nextCursor = ref(null)
 let taskRefreshInterval = null
 
 async function fetchTasks() {
   loadingTasks.value = true
   try {
-    const res = await fetch('/api/comfyui/tasks')
+    const res = await fetch('/api/comfyui/tasks?limit=50')
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    tasks.value = await res.json()
+    const data = await res.json()
+    tasks.value = data.items
+    nextCursor.value = data.next_cursor
   } catch (e) {
     console.error('Failed to fetch tasks', e)
   } finally {
     loadingTasks.value = false
+  }
+}
+
+async function fetchMoreTasks() {
+  if (!nextCursor.value || loadingMore.value) return
+  loadingMore.value = true
+  try {
+    const res = await fetch(`/api/comfyui/tasks?limit=50&cursor=${encodeURIComponent(nextCursor.value)}`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    // Deduplicate by id in case polling shifted items
+    const existingIds = new Set(tasks.value.map(t => t.id))
+    const newItems = data.items.filter(t => !existingIds.has(t.id))
+    tasks.value = [...tasks.value, ...newItems]
+    nextCursor.value = data.next_cursor
+  } catch (e) {
+    console.error('Failed to fetch more tasks', e)
+  } finally {
+    loadingMore.value = false
+  }
+}
+
+const taskListRef = ref(null)
+
+function onTaskListScroll(event) {
+  const el = event.target
+  if (el.scrollHeight - el.scrollTop - el.clientHeight < 200) {
+    fetchMoreTasks()
   }
 }
 
@@ -760,7 +792,7 @@ onUnmounted(() => {
           </div>
 
           <!-- Task list -->
-          <div v-else-if="tasks.length" class="space-y-2">
+          <div v-else-if="tasks.length" ref="taskListRef" class="space-y-2 max-h-[calc(100vh-16rem)] overflow-y-auto" @scroll="onTaskListScroll">
             <div
               v-for="task in tasks"
               :key="task.id"
@@ -854,6 +886,13 @@ onUnmounted(() => {
                   </Button>
                 </router-link>
               </div>
+            </div>
+            <!-- Load more indicator -->
+            <div v-if="loadingMore" class="flex items-center justify-center py-4">
+              <RefreshCw class="w-4 h-4 text-indigo-400 animate-spin" />
+            </div>
+            <div v-else-if="nextCursor" class="flex items-center justify-center py-2">
+              <span class="text-xs text-zinc-600">Scroll for more</span>
             </div>
           </div>
 
