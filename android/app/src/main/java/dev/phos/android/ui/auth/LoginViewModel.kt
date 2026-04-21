@@ -36,6 +36,7 @@ data class LoginUiState(
     val isLoading: Boolean = false,
     val isFetchingConfig: Boolean = false,
     val error: String? = null,
+    val info: String? = null,
     val isLoggedIn: Boolean = false,
 )
 
@@ -91,39 +92,75 @@ class LoginViewModel @Inject constructor(
     }
 
     fun fetchAuthConfig() {
-        val serverUrl = _uiState.value.serverUrl.trimEnd('/')
-        if (serverUrl.isBlank()) return
+        val raw = _uiState.value.serverUrl.trim().trimEnd('/')
+        if (raw.isBlank()) return
+        if (!raw.startsWith("http://") && !raw.startsWith("https://")) {
+            _uiState.value = _uiState.value.copy(
+                error = "Server URL must start with http:// or https://",
+                info = null,
+            )
+            return
+        }
 
-        _uiState.value = _uiState.value.copy(isFetchingConfig = true)
+        _uiState.value = _uiState.value.copy(isFetchingConfig = true, error = null, info = null)
         viewModelScope.launch {
-            try {
-                val config = withContext(Dispatchers.IO) {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
                     val request = Request.Builder()
-                        .url("$serverUrl/api/auth/config")
+                        .url("$raw/api/auth/config")
                         .get()
                         .build()
-                    val response = okHttpClient.newCall(request).execute()
-                    if (response.isSuccessful) {
-                        response.body?.string()?.let { body ->
-                            mapper.readValue<AuthConfigDto>(body)
-                        }
-                    } else null
+                    okHttpClient.newCall(request).execute().use { response ->
+                        FetchResult(
+                            code = response.code,
+                            body = response.body?.string(),
+                        )
+                    }
                 }
-                if (config != null) {
-                    _uiState.value = _uiState.value.copy(
-                        oidcIssuer = config.issuer ?: "",
-                        oidcClientId = config.mobile_client_id ?: config.client_id ?: "",
-                        isFetchingConfig = false,
-                    )
-                } else {
-                    _uiState.value = _uiState.value.copy(isFetchingConfig = false)
-                }
-            } catch (_: Exception) {
-                // Server may not have auth configured (single-user mode) — that's fine
-                _uiState.value = _uiState.value.copy(isFetchingConfig = false)
             }
+
+            result.fold(
+                onSuccess = { res ->
+                    when {
+                        res.code == 404 -> _uiState.value = _uiState.value.copy(
+                            isFetchingConfig = false,
+                            info = "Server has no OIDC configured. Leave issuer blank and press Connect.",
+                        )
+                        res.code !in 200..299 -> _uiState.value = _uiState.value.copy(
+                            isFetchingConfig = false,
+                            error = "Server returned HTTP ${res.code}",
+                        )
+                        else -> {
+                            val config = res.body?.let {
+                                runCatching { mapper.readValue<AuthConfigDto>(it) }.getOrNull()
+                            }
+                            if (config?.issuer.isNullOrBlank()) {
+                                _uiState.value = _uiState.value.copy(
+                                    isFetchingConfig = false,
+                                    error = "Unexpected response from server",
+                                )
+                            } else {
+                                _uiState.value = _uiState.value.copy(
+                                    oidcIssuer = config.issuer,
+                                    oidcClientId = config.mobile_client_id ?: config.client_id ?: "",
+                                    isFetchingConfig = false,
+                                    info = "Auth config loaded.",
+                                )
+                            }
+                        }
+                    }
+                },
+                onFailure = { e ->
+                    _uiState.value = _uiState.value.copy(
+                        isFetchingConfig = false,
+                        error = "Couldn't reach server: ${e.message ?: e.javaClass.simpleName}",
+                    )
+                },
+            )
         }
     }
+
+    private data class FetchResult(val code: Int, val body: String?)
 
     fun startLogin(context: Context) {
         val state = _uiState.value

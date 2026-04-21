@@ -138,6 +138,14 @@ fun LoginScreen(
             if (uiState.error != null) {
                 ErrorBanner(message = uiState.error!!)
                 Spacer(modifier = Modifier.height(16.dp))
+            } else if (uiState.info != null) {
+                Text(
+                    text = uiState.info!!,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(modifier = Modifier.height(16.dp))
             }
 
             Button(
