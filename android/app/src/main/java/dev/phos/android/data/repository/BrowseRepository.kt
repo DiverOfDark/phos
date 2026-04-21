@@ -1,14 +1,11 @@
 package dev.phos.android.data.repository
 
-import dev.phos.android.data.local.dao.FileDao
-import dev.phos.android.data.local.dao.ShotDao
-import dev.phos.android.data.local.dao.SyncStateDao
-import dev.phos.android.data.local.entity.FileEntity
-import dev.phos.android.data.local.entity.ShotEntity
-import dev.phos.android.data.local.entity.ViewPositionEntity
-import dev.phos.android.data.remote.model.PersonBrowseResponse
+import dev.phos.android.data.local.ViewPosition
+import dev.phos.android.data.local.ViewPositionStore
 import dev.phos.android.data.remote.PhosApi
-import kotlinx.coroutines.flow.first
+import dev.phos.android.data.remote.model.PersonBrowseResponse
+import dev.phos.android.domain.model.MediaFile
+import dev.phos.android.domain.model.Shot
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -18,57 +15,19 @@ data class BrowseData(
 )
 
 data class ShotWithFiles(
-    val shot: ShotEntity,
-    val files: List<FileEntity>,
+    val shot: Shot,
+    val files: List<MediaFile>,
 )
 
 @Singleton
 class BrowseRepository @Inject constructor(
-    private val shotDao: ShotDao,
-    private val fileDao: FileDao,
-    private val syncStateDao: SyncStateDao,
     private val api: PhosApi,
     private val authRepository: AuthRepository,
+    private val viewPositionStore: ViewPositionStore,
 ) {
     suspend fun fetchBrowseData(personId: String): BrowseData {
-        return try {
-            val response = api.getPersonBrowse(personId)
-            upsertBrowseData(personId, response)
-            toBrowseData(personId, response)
-        } catch (e: Exception) {
-            loadLocalBrowseData(personId)
-        }
-    }
-
-    private suspend fun upsertBrowseData(personId: String, response: PersonBrowseResponse) {
-        val shots = response.shots.map { shot ->
-            ShotEntity(
-                id = shot.id,
-                timestamp = shot.timestamp,
-                primaryPersonId = personId,
-                reviewStatus = shot.reviewStatus,
-                updatedAt = null,
-            )
-        }
-        shotDao.upsertAll(shots)
-
-        val files = response.shots.flatMap { shot ->
-            shot.files.map { file ->
-                FileEntity(
-                    id = file.id,
-                    shotId = shot.id,
-                    mimeType = file.mimeType,
-                    isOriginal = file.isOriginal ?: false,
-                    fileSize = file.fileSize,
-                    width = null,
-                    height = null,
-                    durationMs = null,
-                    thumbnailUrl = file.thumbnailUrl,
-                    updatedAt = null,
-                )
-            }
-        }
-        fileDao.upsertAll(files)
+        val response = api.getPersonBrowse(personId)
+        return toBrowseData(personId, response)
     }
 
     private fun toBrowseData(personId: String, response: PersonBrowseResponse): BrowseData {
@@ -76,25 +35,20 @@ class BrowseRepository @Inject constructor(
             personName = response.person.name,
             shots = response.shots.map { shot ->
                 ShotWithFiles(
-                    shot = ShotEntity(
+                    shot = Shot(
                         id = shot.id,
                         timestamp = shot.timestamp,
                         primaryPersonId = personId,
                         reviewStatus = shot.reviewStatus,
-                        updatedAt = null,
                     ),
                     files = shot.files.map { file ->
-                        FileEntity(
+                        MediaFile(
                             id = file.id,
                             shotId = shot.id,
                             mimeType = file.mimeType,
                             isOriginal = file.isOriginal ?: false,
                             fileSize = file.fileSize,
-                            width = null,
-                            height = null,
-                            durationMs = null,
                             thumbnailUrl = file.thumbnailUrl,
-                            updatedAt = null,
                         )
                     },
                 )
@@ -102,29 +56,16 @@ class BrowseRepository @Inject constructor(
         )
     }
 
-    private suspend fun loadLocalBrowseData(personId: String): BrowseData {
-        val shots = mutableListOf<ShotWithFiles>()
-        val collectedShots = shotDao.getShotsByPersonId(personId).first()
-        for (shot in collectedShots) {
-            val files = fileDao.getFilesByShotIdOnce(shot.id)
-            shots.add(ShotWithFiles(shot = shot, files = files))
-        }
-        return BrowseData(personName = null, shots = shots)
+    fun getViewPosition(personId: String): ViewPosition? {
+        return viewPositionStore.getViewPosition(personId)
     }
 
-    suspend fun getViewPosition(personId: String): ViewPositionEntity? {
-        return syncStateDao.getViewPosition(personId)
-    }
-
-    suspend fun saveViewPosition(personId: String, shotIndex: Int, fileIndex: Int) {
-        syncStateDao.upsertViewPosition(
-            ViewPositionEntity(personId = personId, shotIndex = shotIndex, fileIndex = fileIndex)
-        )
+    fun saveViewPosition(personId: String, shotIndex: Int, fileIndex: Int) {
+        viewPositionStore.saveViewPosition(personId, shotIndex, fileIndex)
     }
 
     suspend fun deleteFile(fileId: String) {
         api.deleteFile(fileId)
-        fileDao.deleteById(fileId)
     }
 
     fun buildThumbnailUrl(fileId: String, width: Int = 1080): String {

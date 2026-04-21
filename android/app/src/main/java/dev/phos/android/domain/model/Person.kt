@@ -1,11 +1,7 @@
-package dev.phos.android.data.local.entity
+package dev.phos.android.domain.model
 
-import androidx.room.Entity
-import androidx.room.PrimaryKey
-
-@Entity(tableName = "people")
-data class PersonEntity(
-    @PrimaryKey val id: String,
+data class Person(
+    val id: String,
     val name: String?,
     val faceCount: Int,
     val thumbnailUrl: String?,

@@ -1,20 +1,12 @@
 package dev.phos.android.di
 
-import android.content.Context
-import androidx.room.Room
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
-import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
-import dev.phos.android.data.local.PhosDatabase
-import dev.phos.android.data.local.dao.FileDao
-import dev.phos.android.data.local.dao.PersonDao
-import dev.phos.android.data.local.dao.ShotDao
-import dev.phos.android.data.local.dao.SyncStateDao
 import dev.phos.android.data.remote.AuthInterceptor
 import dev.phos.android.data.remote.BaseUrlInterceptor
 import dev.phos.android.data.remote.PhosApi
@@ -70,21 +62,4 @@ object AppModule {
     fun providePhosApi(retrofit: Retrofit): PhosApi {
         return retrofit.create(PhosApi::class.java)
     }
-
-    @Provides
-    @Singleton
-    fun provideDatabase(@ApplicationContext context: Context): PhosDatabase {
-        return Room.databaseBuilder(
-            context,
-            PhosDatabase::class.java,
-            "phos.db",
-        )
-            .fallbackToDestructiveMigration()
-            .build()
-    }
-
-    @Provides fun providePersonDao(db: PhosDatabase): PersonDao = db.personDao()
-    @Provides fun provideShotDao(db: PhosDatabase): ShotDao = db.shotDao()
-    @Provides fun provideFileDao(db: PhosDatabase): FileDao = db.fileDao()
-    @Provides fun provideSyncStateDao(db: PhosDatabase): SyncStateDao = db.syncStateDao()
 }

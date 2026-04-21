@@ -3,14 +3,12 @@ package dev.phos.android.ui.people
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
-import dev.phos.android.data.local.entity.PersonEntity
 import dev.phos.android.data.repository.AuthRepository
 import dev.phos.android.data.repository.PeopleRepository
+import dev.phos.android.domain.model.Person
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -20,8 +18,8 @@ class PeopleViewModel @Inject constructor(
     private val authRepository: AuthRepository,
 ) : ViewModel() {
 
-    val people: StateFlow<List<PersonEntity>> = peopleRepository.observePeople()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    private val _people = MutableStateFlow<List<Person>>(emptyList())
+    val people: StateFlow<List<Person>> = _people.asStateFlow()
 
     private val _isRefreshing = MutableStateFlow(false)
     val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
@@ -40,8 +38,9 @@ class PeopleViewModel @Inject constructor(
             _isRefreshing.value = true
             _error.value = null
             try {
-                peopleRepository.refreshPeople()
+                _people.value = peopleRepository.fetchPeople()
             } catch (e: Exception) {
+                _people.value = emptyList()
                 _error.value = "Failed to refresh: ${e.message}"
             } finally {
                 _isRefreshing.value = false
@@ -53,7 +52,7 @@ class PeopleViewModel @Inject constructor(
         authRepository.clearToken()
     }
 
-    fun buildCoverUrl(person: PersonEntity): String? {
+    fun buildCoverUrl(person: Person): String? {
         val thumbnailUrl = person.coverShotThumbnailUrl ?: person.thumbnailUrl ?: return null
         val baseUrl = authRepository.getServerUrl()?.trimEnd('/') ?: return null
         return if (thumbnailUrl.startsWith("/")) "$baseUrl$thumbnailUrl" else thumbnailUrl

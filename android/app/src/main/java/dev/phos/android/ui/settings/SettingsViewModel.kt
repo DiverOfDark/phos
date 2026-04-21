@@ -5,11 +5,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
-import dev.phos.android.data.local.PhosDatabase
 import dev.phos.android.data.repository.AuthRepository
 import dev.phos.android.data.update.UpdateRepository
 import dev.phos.android.data.update.UpdateState
-import dev.phos.android.sync.SyncWorker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -23,8 +21,6 @@ data class SettingsUiState(
     val serverUrl: String = "",
     val cacheSize: String = "Calculating...",
     val isClearing: Boolean = false,
-    val isClearingMetadata: Boolean = false,
-    val wifiOnlySync: Boolean = false,
     val updateState: UpdateState = UpdateState.Idle,
     val currentVersion: String = "",
 )
@@ -32,7 +28,6 @@ data class SettingsUiState(
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val authRepository: AuthRepository,
-    private val database: PhosDatabase,
     private val updateRepository: UpdateRepository,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
@@ -43,7 +38,6 @@ class SettingsViewModel @Inject constructor(
     init {
         _uiState.value = SettingsUiState(
             serverUrl = authRepository.getServerUrl() ?: "",
-            wifiOnlySync = authRepository.isWifiOnlySync(),
             currentVersion = updateRepository.getCurrentVersion(),
         )
         calculateCacheSize()
@@ -71,23 +65,6 @@ class SettingsViewModel @Inject constructor(
             }
             _uiState.value = _uiState.value.copy(isClearing = false, cacheSize = "0 B")
         }
-    }
-
-    fun clearMetadataCache() {
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isClearingMetadata = true)
-            withContext(Dispatchers.IO) {
-                database.clearAllTables()
-            }
-            _uiState.value = _uiState.value.copy(isClearingMetadata = false)
-        }
-    }
-
-    fun setWifiOnlySync(enabled: Boolean) {
-        authRepository.setWifiOnlySync(enabled)
-        _uiState.value = _uiState.value.copy(wifiOnlySync = enabled)
-        // Re-enqueue sync worker with updated constraints
-        SyncWorker.enqueue(context, wifiOnly = enabled)
     }
 
     fun checkForUpdate() {

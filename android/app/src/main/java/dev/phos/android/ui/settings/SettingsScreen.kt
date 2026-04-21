@@ -20,7 +20,6 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -76,19 +75,6 @@ fun SettingsScreen(
             HorizontalDivider()
 
             ListItem(
-                headlineContent = { Text("Sync over Wi-Fi only") },
-                supportingContent = { Text("Only sync metadata when connected to Wi-Fi") },
-                trailingContent = {
-                    Switch(
-                        checked = uiState.wifiOnlySync,
-                        onCheckedChange = viewModel::setWifiOnlySync,
-                    )
-                },
-            )
-
-            HorizontalDivider()
-
-            ListItem(
                 headlineContent = { Text("Image cache") },
                 supportingContent = { Text(uiState.cacheSize) },
                 trailingContent = {
@@ -101,24 +87,6 @@ fun SettingsScreen(
                 },
                 modifier = Modifier.clickable(enabled = !uiState.isClearing) {
                     viewModel.clearCache()
-                },
-            )
-
-            HorizontalDivider()
-
-            ListItem(
-                headlineContent = { Text("Metadata cache") },
-                supportingContent = { Text("Clear locally cached people, shots, and files") },
-                trailingContent = {
-                    if (uiState.isClearingMetadata) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.padding(8.dp),
-                            strokeWidth = 2.dp,
-                        )
-                    }
-                },
-                modifier = Modifier.clickable(enabled = !uiState.isClearingMetadata) {
-                    viewModel.clearMetadataCache()
                 },
             )
 

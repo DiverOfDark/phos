@@ -18,7 +18,6 @@ class AuthRepository @Inject constructor(
         private const val KEY_SERVER_URL = "server_url"
         private const val KEY_OIDC_ISSUER = "oidc_issuer"
         private const val KEY_OIDC_CLIENT_ID = "oidc_client_id"
-        private const val KEY_WIFI_ONLY_SYNC = "wifi_only_sync"
     }
 
     private val _authExpired = MutableStateFlow(false)
@@ -78,12 +77,6 @@ class AuthRepository @Inject constructor(
     fun getOidcClientId(): String? = prefs.getString(KEY_OIDC_CLIENT_ID, null)
 
     fun isLoggedIn(): Boolean = getToken() != null && getServerUrl() != null
-
-    fun isWifiOnlySync(): Boolean = prefs.getBoolean(KEY_WIFI_ONLY_SYNC, false)
-
-    fun setWifiOnlySync(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_WIFI_ONLY_SYNC, enabled).apply()
-    }
 
     fun logout() {
         prefs.edit().clear().apply()

@@ -5,7 +5,6 @@ mod people;
 pub mod settings;
 mod shots;
 mod stats;
-mod sync;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -93,8 +92,6 @@ use utoipa::OpenApi;
         comfyui::comfyui_create_preset,
         comfyui::comfyui_update_preset,
         comfyui::comfyui_delete_preset,
-        // Sync
-        sync::get_sync,
         // Settings
         settings::get_webdav_settings,
         settings::set_webdav_settings,
@@ -144,12 +141,6 @@ use utoipa::OpenApi;
             comfyui::ImportWorkflowPayload,
             comfyui::EnhancePayload,
             comfyui::PresetPayload,
-            // Sync
-            sync::SyncResponse,
-            sync::SyncPerson,
-            sync::SyncShot,
-            sync::SyncFile,
-            sync::SyncQuery,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
@@ -480,8 +471,6 @@ pub fn create_router(state: AppState) -> Router {
             post(comfyui::comfyui_retry_task),
         )
         .route("/api/version", get(stats::get_version))
-        // Sync
-        .route("/api/sync", get(sync::get_sync))
         // Settings
         .route(
             "/api/settings/webdav",

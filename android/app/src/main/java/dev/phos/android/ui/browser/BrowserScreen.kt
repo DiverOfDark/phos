@@ -62,7 +62,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
-import dev.phos.android.data.local.entity.FileEntity
+import dev.phos.android.domain.model.MediaFile
 import dev.phos.android.ui.common.FullScreenLoading
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -261,7 +261,7 @@ fun BrowserScreen(
 
 @Composable
 private fun MediaPage(
-    file: FileEntity,
+    file: MediaFile,
     thumbnailUrl: String,
     previewUrl: String,
     originalUrl: String,

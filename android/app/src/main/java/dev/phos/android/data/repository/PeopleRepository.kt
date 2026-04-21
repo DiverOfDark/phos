@@ -1,23 +1,17 @@
 package dev.phos.android.data.repository
 
-import dev.phos.android.data.local.dao.PersonDao
-import dev.phos.android.data.local.entity.PersonEntity
 import dev.phos.android.data.remote.PhosApi
-import kotlinx.coroutines.flow.Flow
+import dev.phos.android.domain.model.Person
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
 class PeopleRepository @Inject constructor(
-    private val personDao: PersonDao,
     private val api: PhosApi,
 ) {
-    fun observePeople(): Flow<List<PersonEntity>> = personDao.getAll()
-
-    suspend fun refreshPeople() {
-        val people = api.getPeople()
-        personDao.upsertAll(people.map { brief ->
-            PersonEntity(
+    suspend fun fetchPeople(): List<Person> {
+        return api.getPeople().map { brief ->
+            Person(
                 id = brief.id,
                 name = brief.name,
                 faceCount = brief.faceCount?.toInt() ?: 0,
@@ -27,6 +21,6 @@ class PeopleRepository @Inject constructor(
                 updatedAt = brief.updatedAt,
                 coverShotThumbnailUrl = brief.coverShotThumbnailUrl,
             )
-        })
+        }
     }
 }

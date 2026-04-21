@@ -7,9 +7,9 @@ import coil3.ImageLoader
 import coil3.request.ImageRequest
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
-import dev.phos.android.data.local.entity.FileEntity
 import dev.phos.android.data.repository.BrowseRepository
 import dev.phos.android.data.repository.ShotWithFiles
+import dev.phos.android.domain.model.MediaFile
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -126,7 +126,7 @@ class BrowserViewModel @Inject constructor(
 
     fun getOkHttpClient(): OkHttpClient = okHttpClient
 
-    fun isVideo(file: FileEntity): Boolean {
+    fun isVideo(file: MediaFile): Boolean {
         return file.mimeType?.startsWith("video/") == true
     }
 }

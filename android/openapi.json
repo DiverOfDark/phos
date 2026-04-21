@@ -866,7 +866,7 @@
           "files"
         ],
         "summary": "Delete a file",
-        "description": "Delete a non-original file from a shot. The original file cannot be deleted directly — delete the shot instead.",
+        "description": "Delete a non-original file from a shot. The original file cannot be deleted directly \u2014 delete the shot instead.",
         "operationId": "delete_file",
         "parameters": [
           {
@@ -1968,45 +1968,6 @@
         }
       }
     },
-    "/api/sync": {
-      "get": {
-        "tags": [
-          "sync"
-        ],
-        "summary": "Incremental sync",
-        "description": "Returns all people, shots, and files changed since the given timestamp. If no `since` parameter is provided, returns everything (full sync).",
-        "operationId": "get_sync",
-        "parameters": [
-          {
-            "name": "since",
-            "in": "query",
-            "description": "ISO8601 timestamp. If omitted, returns everything (full sync).",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Sync data",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SyncResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        }
-      }
-    },
     "/api/version": {
       "get": {
         "tags": [
@@ -2214,7 +2175,7 @@
       },
       "EnhancePayload": {
         "type": "object",
-        "description": "POST /api/comfyui/enhance — queue an enhancement task",
+        "description": "POST /api/comfyui/enhance \u2014 queue an enhancement task",
         "required": [
           "shot_id",
           "workflow_id"
@@ -2384,7 +2345,7 @@
       },
       "ImportWorkflowPayload": {
         "type": "object",
-        "description": "POST /api/comfyui/workflows — import a workflow template",
+        "description": "POST /api/comfyui/workflows \u2014 import a workflow template",
         "required": [
           "name",
           "workflow"
@@ -2973,170 +2934,6 @@
           "total_shots": {
             "type": "integer",
             "format": "int64"
-          }
-        }
-      },
-      "SyncFile": {
-        "type": "object",
-        "required": [
-          "id",
-          "shot_id",
-          "is_original",
-          "deleted"
-        ],
-        "properties": {
-          "deleted": {
-            "type": "boolean"
-          },
-          "file_size": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
-          },
-          "id": {
-            "type": "string"
-          },
-          "is_original": {
-            "type": "boolean"
-          },
-          "mime_type": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "shot_id": {
-            "type": "string"
-          },
-          "updated_at": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        }
-      },
-      "SyncPerson": {
-        "type": "object",
-        "required": [
-          "id",
-          "shot_count",
-          "deleted"
-        ],
-        "properties": {
-          "deleted": {
-            "type": "boolean"
-          },
-          "id": {
-            "type": "string"
-          },
-          "name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "shot_count": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "thumbnail_url": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "updated_at": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        }
-      },
-      "SyncQuery": {
-        "type": "object",
-        "properties": {
-          "since": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "ISO8601 timestamp. If omitted, returns everything (full sync)."
-          }
-        }
-      },
-      "SyncResponse": {
-        "type": "object",
-        "required": [
-          "people",
-          "shots",
-          "files",
-          "sync_token"
-        ],
-        "properties": {
-          "files": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/SyncFile"
-            }
-          },
-          "people": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/SyncPerson"
-            }
-          },
-          "shots": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/SyncShot"
-            }
-          },
-          "sync_token": {
-            "type": "string",
-            "description": "ISO8601 timestamp to use as `since` in the next request."
-          }
-        }
-      },
-      "SyncShot": {
-        "type": "object",
-        "required": [
-          "id",
-          "deleted"
-        ],
-        "properties": {
-          "deleted": {
-            "type": "boolean"
-          },
-          "id": {
-            "type": "string"
-          },
-          "primary_person_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "review_status": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "timestamp": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "updated_at": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
         }
       },

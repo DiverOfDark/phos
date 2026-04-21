@@ -2,7 +2,6 @@ package dev.phos.android.data.remote
 
 import dev.phos.android.data.remote.model.PersonBrief
 import dev.phos.android.data.remote.model.PersonBrowseResponse
-import dev.phos.android.data.remote.model.SyncResponse
 import dev.phos.android.data.remote.model.TokenExchangeRequest
 import retrofit2.http.Body
 import retrofit2.http.DELETE
@@ -20,9 +19,6 @@ interface PhosApi {
 
     @GET("api/people/{id}/browse")
     suspend fun getPersonBrowse(@Path("id") id: String): PersonBrowseResponse
-
-    @GET("api/sync")
-    suspend fun getSync(@Query("since") since: String? = null): SyncResponse
 
     @GET("api/files/{id}/thumbnail")
     suspend fun getFileThumbnail(

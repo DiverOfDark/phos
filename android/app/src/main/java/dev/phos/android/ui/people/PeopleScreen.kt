@@ -38,7 +38,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import coil3.compose.AsyncImage
-import dev.phos.android.data.local.entity.PersonEntity
+import dev.phos.android.domain.model.Person
 import dev.phos.android.ui.common.AuthExpiredBanner
 import dev.phos.android.ui.common.ErrorBanner
 import dev.phos.android.ui.common.ShimmerBox
@@ -125,7 +125,7 @@ fun PeopleScreen(
 
 @Composable
 private fun PersonCard(
-    person: PersonEntity,
+    person: Person,
     coverUrl: String?,
     onClick: () -> Unit,
 ) {
