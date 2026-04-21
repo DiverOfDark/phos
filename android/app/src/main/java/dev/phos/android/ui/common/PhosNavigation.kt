@@ -24,16 +24,19 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import dev.phos.android.ui.auth.LoginScreen
 import dev.phos.android.ui.browser.BrowserScreen
+import dev.phos.android.ui.grid.PersonGridScreen
 import dev.phos.android.ui.people.PeopleScreen
 import dev.phos.android.ui.settings.SettingsScreen
 
 object Routes {
     const val LOGIN = "login"
     const val PEOPLE = "people"
-    const val BROWSER = "browser/{personId}"
+    const val GRID = "grid/{personId}"
+    const val BROWSER = "browser/{personId}?shot={shot}"
     const val SETTINGS = "settings"
 
-    fun browser(personId: String) = "browser/$personId"
+    fun grid(personId: String) = "grid/$personId"
+    fun browser(personId: String, shotIndex: Int = -1) = "browser/$personId?shot=$shotIndex"
 }
 
 @Composable
@@ -57,7 +60,7 @@ fun PhosNavigation() {
         composable(Routes.PEOPLE) {
             PeopleScreen(
                 onPersonClick = { personId ->
-                    navController.navigate(Routes.browser(personId))
+                    navController.navigate(Routes.grid(personId))
                 },
                 onSettingsClick = {
                     navController.navigate(Routes.SETTINGS)
@@ -71,8 +74,27 @@ fun PhosNavigation() {
         }
 
         composable(
-            route = Routes.BROWSER,
+            route = Routes.GRID,
             arguments = listOf(navArgument("personId") { type = NavType.StringType }),
+        ) { backStackEntry ->
+            val personId = backStackEntry.arguments?.getString("personId") ?: return@composable
+            PersonGridScreen(
+                onBack = { navController.popBackStack() },
+                onTileClick = { shotIndex ->
+                    navController.navigate(Routes.browser(personId, shotIndex))
+                },
+            )
+        }
+
+        composable(
+            route = Routes.BROWSER,
+            arguments = listOf(
+                navArgument("personId") { type = NavType.StringType },
+                navArgument("shot") {
+                    type = NavType.IntType
+                    defaultValue = -1
+                },
+            ),
         ) {
             BrowserScreen(
                 onBack = { navController.popBackStack() },

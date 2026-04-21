@@ -35,6 +35,7 @@ class BrowserViewModel @Inject constructor(
 ) : ViewModel() {
 
     private val personId: String = savedStateHandle["personId"] ?: ""
+    private val requestedShotIndex: Int = savedStateHandle["shot"] ?: -1
     private val _uiState = MutableStateFlow(BrowserUiState())
     val uiState: StateFlow<BrowserUiState> = _uiState.asStateFlow()
 
@@ -48,12 +49,19 @@ class BrowserViewModel @Inject constructor(
             try {
                 val data = browseRepository.fetchBrowseData(personId)
                 val savedPosition = browseRepository.getViewPosition(personId)
+                val maxShotIndex = maxOf(0, data.shots.size - 1)
+                val initialShot = if (requestedShotIndex >= 0) {
+                    requestedShotIndex.coerceIn(0, maxShotIndex)
+                } else {
+                    savedPosition?.shotIndex?.coerceIn(0, maxShotIndex) ?: 0
+                }
+                val initialFile = if (requestedShotIndex >= 0) 0 else (savedPosition?.fileIndex ?: 0)
                 _uiState.value = BrowserUiState(
                     personName = data.personName,
                     shots = data.shots,
                     isLoading = false,
-                    initialShotIndex = savedPosition?.shotIndex?.coerceIn(0, maxOf(0, data.shots.size - 1)) ?: 0,
-                    initialFileIndex = savedPosition?.fileIndex ?: 0,
+                    initialShotIndex = initialShot,
+                    initialFileIndex = initialFile,
                 )
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
