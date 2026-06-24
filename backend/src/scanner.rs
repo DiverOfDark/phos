@@ -303,6 +303,12 @@ impl Scanner {
 
         // After all files are processed, run face clustering
         let mut conn = self.open_db()?;
+
+        // Remove overlapping duplicate detections (e.g. the same face across many
+        // video keyframes) from not-yet-reviewed shots before clustering, so
+        // duplicates don't spawn phantom people or skew person centroids.
+        self.dedupe_overlapping_faces(&mut conn)?;
+
         self.cluster_faces(&mut conn)?;
 
         // Assign primary person to each shot based on largest face
@@ -659,6 +665,107 @@ impl Scanner {
         Ok(())
     }
 
+    /// Remove overlapping duplicate face detections from files whose shot has not
+    /// yet been reviewed (`review_status` is `pending` or NULL). Confirmed shots
+    /// are left untouched. Uses the same embedding-aware suppression as the
+    /// insert-time path (see [`cluster_duplicate_faces`]). When a kept face has no
+    /// person assigned but one of its duplicates does, the label is preserved.
+    /// Returns the number of faces removed.
+    pub fn dedupe_overlapping_faces(&self, conn: &mut SqliteConnection) -> anyhow::Result<usize> {
+        // Files belonging to not-yet-reviewed shots.
+        let file_ids: Vec<String> = files::table
+            .inner_join(shots::table.on(files::shot_id.eq(shots::id)))
+            .filter(
+                shots::review_status
+                    .ne("confirmed")
+                    .or(shots::review_status.is_null()),
+            )
+            .select(files::id)
+            .load::<String>(conn)?;
+
+        let mut total_removed = 0usize;
+
+        for file_id in file_ids {
+            type FaceRow = (
+                String,
+                Option<String>,
+                Option<f32>,
+                Option<f32>,
+                Option<f32>,
+                Option<f32>,
+                Option<f32>,
+                Option<Vec<u8>>,
+            );
+            let rows: Vec<FaceRow> = faces::table
+                .filter(faces::file_id.eq(&file_id))
+                .select((
+                    faces::id,
+                    faces::person_id,
+                    faces::box_x1,
+                    faces::box_y1,
+                    faces::box_x2,
+                    faces::box_y2,
+                    faces::score,
+                    faces::embedding,
+                ))
+                .load::<FaceRow>(conn)?;
+
+            if rows.len() < 2 {
+                continue;
+            }
+
+            let views: Vec<DedupFace> = rows
+                .iter()
+                .map(|r| DedupFace {
+                    x1: r.2.unwrap_or(0.0),
+                    y1: r.3.unwrap_or(0.0),
+                    x2: r.4.unwrap_or(0.0),
+                    y2: r.5.unwrap_or(0.0),
+                    score: r.6.unwrap_or(0.0),
+                    embedding: r
+                        .7
+                        .as_ref()
+                        .and_then(|b| crate::embedding::decode_embedding(b))
+                        .unwrap_or_default(),
+                })
+                .collect();
+
+            for (keeper, suppressed) in cluster_duplicate_faces(&views) {
+                if suppressed.is_empty() {
+                    continue;
+                }
+
+                // Preserve a person label if the keeper lacks one.
+                if rows[keeper].1.is_none() {
+                    if let Some(pid) = suppressed.iter().find_map(|&j| rows[j].1.clone()) {
+                        diesel::update(faces::table.filter(faces::id.eq(&rows[keeper].0)))
+                            .set(faces::person_id.eq(&pid))
+                            .execute(conn)?;
+                    }
+                }
+
+                let to_delete: Vec<&str> =
+                    suppressed.iter().map(|&j| rows[j].0.as_str()).collect();
+
+                // Repoint any person thumbnail pointing at a duplicate we're about
+                // to delete onto the keeper (same identity), so we don't dangle it.
+                diesel::update(
+                    people::table.filter(people::thumbnail_face_id.eq_any(&to_delete)),
+                )
+                .set(people::thumbnail_face_id.eq(&rows[keeper].0))
+                .execute(conn)?;
+
+                total_removed += diesel::delete(faces::table.filter(faces::id.eq_any(to_delete)))
+                    .execute(conn)?;
+            }
+        }
+
+        if total_removed > 0 {
+            info!("Removed {} overlapping duplicate faces", total_removed);
+        }
+        Ok(total_removed)
+    }
+
     pub fn process_file(
         &self,
         conn: &mut SqliteConnection,
@@ -782,6 +889,20 @@ impl Scanner {
             None
         };
 
+        // Collapse overlapping duplicate detections before they reach the DB.
+        // For images this is mostly a no-op (NMS already ran); for videos it
+        // merges the same face seen across many keyframes into one box.
+        let image_faces = dedup_face_results(image_faces);
+        let video_faces: Vec<FaceResult> = if keyframe_results.is_empty() {
+            Vec::new()
+        } else {
+            let pooled: Vec<FaceResult> = keyframe_results
+                .iter_mut()
+                .flat_map(|k| std::mem::take(&mut k.faces))
+                .collect();
+            dedup_face_results(pooled)
+        };
+
         // --- Phase 2: dHash shot grouping ---
         // Check the dhash_cache for a match (Hamming distance <= 10).
         // If match found: add file to existing shot (is_original = false).
@@ -884,21 +1005,23 @@ impl Scanner {
                         path: &kfr.kf_path,
                     })
                     .execute(conn)?;
-                for face in &kfr.faces {
-                    diesel::insert_into(faces::table)
-                        .values(NewFace {
-                            id: &face.face_id,
-                            file_id: &id,
-                            person_id: None,
-                            box_x1: Some(face.box_x1),
-                            box_y1: Some(face.box_y1),
-                            box_x2: Some(face.box_x2),
-                            box_y2: Some(face.box_y2),
-                            embedding: Some(&face.embedding_blob),
-                            score: Some(face.score),
-                        })
-                        .execute(conn)?;
-                }
+            }
+
+            // Faces pooled+deduplicated across all keyframes (attached to the video file).
+            for face in &video_faces {
+                diesel::insert_into(faces::table)
+                    .values(NewFace {
+                        id: &face.face_id,
+                        file_id: &id,
+                        person_id: None,
+                        box_x1: Some(face.box_x1),
+                        box_y1: Some(face.box_y1),
+                        box_x2: Some(face.box_x2),
+                        box_y2: Some(face.box_y2),
+                        embedding: Some(&face.embedding_blob),
+                        score: Some(face.score),
+                    })
+                    .execute(conn)?;
             }
 
             Ok(())
@@ -1242,6 +1365,139 @@ struct KeyframeResult {
     faces: Vec<FaceResult>,
 }
 
+// ── Overlapping-face deduplication ───────────────────────────────────────────
+//
+// Face detection runs NMS per image, but a video's faces are pooled from many
+// keyframes (one per few seconds), so the same person standing still yields many
+// near-identical boxes. Re-scans and manual additions can also leave overlaps.
+//
+// We collapse such duplicates with *embedding-aware* greedy suppression: two
+// boxes are merged only when they are BOTH spatially coincident AND share an
+// identity (high embedding similarity). The identity guard is the crucial part —
+// two genuinely different people standing cheek-to-cheek can produce boxes with
+// high IoU, and pure spatial NMS would wrongly delete the second person.
+
+/// Min IoU for two boxes to be considered the same location.
+const DEDUP_IOU_THRESHOLD: f32 = 0.5;
+/// Min `intersection / min(area)` for one box being largely inside the other
+/// (catches the same face whose box drifts/rescales across keyframes).
+const DEDUP_CONTAINMENT_THRESHOLD: f32 = 0.7;
+/// Min cosine similarity for two faces to be treated as the same identity.
+const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.5;
+
+/// A minimal face view for overlap dedup.
+struct DedupFace {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    score: f32,
+    embedding: Vec<f32>,
+}
+
+impl DedupFace {
+    fn area(&self) -> f32 {
+        (self.x2 - self.x1).max(0.0) * (self.y2 - self.y1).max(0.0)
+    }
+}
+
+/// True when two faces are spatially coincident AND share an identity, i.e. they
+/// are duplicate detections of the same physical face.
+fn faces_are_duplicate(a: &DedupFace, b: &DedupFace) -> bool {
+    let inter_w = (a.x2.min(b.x2) - a.x1.max(b.x1)).max(0.0);
+    let inter_h = (a.y2.min(b.y2) - a.y1.max(b.y1)).max(0.0);
+    let inter = inter_w * inter_h;
+    if inter <= 0.0 {
+        return false;
+    }
+
+    let union = (a.area() + b.area() - inter).max(1e-6);
+    let iou = inter / union;
+    let containment = inter / a.area().min(b.area()).max(1e-6);
+
+    if iou <= DEDUP_IOU_THRESHOLD && containment <= DEDUP_CONTAINMENT_THRESHOLD {
+        return false;
+    }
+
+    // Identity guard: only collapse if the embeddings agree. When an embedding is
+    // missing we fall back to spatial-only (still very likely a duplicate box).
+    if a.embedding.is_empty() || b.embedding.is_empty() || a.embedding.len() != b.embedding.len() {
+        return true;
+    }
+    cosine_similarity(&a.embedding, &b.embedding) >= DEDUP_SIMILARITY_THRESHOLD
+}
+
+/// Greedy embedding-aware suppression over a set of faces.
+///
+/// Returns clusters as `(keeper_index, suppressed_indices)`, where the keeper is
+/// the highest-confidence (then largest) detection and the suppressed entries are
+/// its duplicates. Indices refer to positions in `faces`.
+fn cluster_duplicate_faces(faces: &[DedupFace]) -> Vec<(usize, Vec<usize>)> {
+    let mut order: Vec<usize> = (0..faces.len()).collect();
+    order.sort_by(|&a, &b| {
+        faces[b]
+            .score
+            .partial_cmp(&faces[a].score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                faces[b]
+                    .area()
+                    .partial_cmp(&faces[a].area())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let mut suppressed = vec![false; faces.len()];
+    let mut clusters = Vec::new();
+    for &i in &order {
+        if suppressed[i] {
+            continue;
+        }
+        let mut members = Vec::new();
+        for &j in &order {
+            if j == i || suppressed[j] {
+                continue;
+            }
+            if faces_are_duplicate(&faces[i], &faces[j]) {
+                suppressed[j] = true;
+                members.push(j);
+            }
+        }
+        clusters.push((i, members));
+    }
+    clusters
+}
+
+/// Drop duplicate detections from a freshly-detected face set (a single image, or
+/// a video's pooled keyframe faces) so duplicates never reach the database.
+fn dedup_face_results(faces: Vec<FaceResult>) -> Vec<FaceResult> {
+    if faces.len() < 2 {
+        return faces;
+    }
+    let views: Vec<DedupFace> = faces
+        .iter()
+        .map(|f| DedupFace {
+            x1: f.box_x1,
+            y1: f.box_y1,
+            x2: f.box_x2,
+            y2: f.box_y2,
+            score: f.score,
+            embedding: crate::embedding::decode_embedding(&f.embedding_blob).unwrap_or_default(),
+        })
+        .collect();
+
+    let keep: HashSet<usize> = cluster_duplicate_faces(&views)
+        .into_iter()
+        .map(|(keeper, _)| keeper)
+        .collect();
+
+    faces
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, f)| keep.contains(&i).then_some(f))
+        .collect()
+}
+
 /// Get video dimensions using ffmpeg.
 fn get_video_dimensions(path: &Path) -> (Option<i32>, Option<i32>) {
     match ffmpeg::format::input(&path) {
@@ -1554,6 +1810,77 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    fn dedup_face(x1: f32, y1: f32, x2: f32, y2: f32, score: f32, emb: &[f32]) -> DedupFace {
+        DedupFace {
+            x1,
+            y1,
+            x2,
+            y2,
+            score,
+            embedding: emb.to_vec(),
+        }
+    }
+
+    #[test]
+    fn dedup_collapses_overlapping_same_identity() {
+        // Two near-identical boxes (same person across keyframes) -> one survivor.
+        let faces = vec![
+            dedup_face(0.0, 0.0, 100.0, 100.0, 0.9, &[1.0, 0.0, 0.0]),
+            dedup_face(2.0, 2.0, 102.0, 102.0, 0.8, &[0.99, 0.01, 0.0]),
+        ];
+        let clusters = cluster_duplicate_faces(&faces);
+        assert_eq!(clusters.len(), 1);
+        // Highest score is the keeper.
+        assert_eq!(clusters[0].0, 0);
+        assert_eq!(clusters[0].1, vec![1]);
+    }
+
+    #[test]
+    fn dedup_keeps_overlapping_different_identities() {
+        // Two heavily-overlapping boxes but different people -> both survive.
+        let faces = vec![
+            dedup_face(0.0, 0.0, 100.0, 100.0, 0.9, &[1.0, 0.0, 0.0]),
+            dedup_face(10.0, 10.0, 110.0, 110.0, 0.8, &[0.0, 1.0, 0.0]),
+        ];
+        let clusters = cluster_duplicate_faces(&faces);
+        assert_eq!(clusters.len(), 2, "different identities must not be merged");
+    }
+
+    #[test]
+    fn dedup_keeps_distant_boxes() {
+        // Same identity but far apart (two photos of one person) -> both survive.
+        let faces = vec![
+            dedup_face(0.0, 0.0, 50.0, 50.0, 0.9, &[1.0, 0.0, 0.0]),
+            dedup_face(500.0, 500.0, 550.0, 550.0, 0.8, &[1.0, 0.0, 0.0]),
+        ];
+        let clusters = cluster_duplicate_faces(&faces);
+        assert_eq!(clusters.len(), 2);
+    }
+
+    #[test]
+    fn dedup_collapses_contained_box() {
+        // A small box almost entirely inside a larger one (drifted/rescaled
+        // detection of the same face) with low IoU but high containment.
+        let faces = vec![
+            dedup_face(0.0, 0.0, 100.0, 100.0, 0.9, &[1.0, 0.0, 0.0]),
+            dedup_face(10.0, 10.0, 60.0, 60.0, 0.8, &[1.0, 0.0, 0.0]),
+        ];
+        // IoU = 2500/10000 = 0.25 (below 0.5) but containment = 2500/2500 = 1.0.
+        let clusters = cluster_duplicate_faces(&faces);
+        assert_eq!(clusters.len(), 1);
+    }
+
+    #[test]
+    fn dedup_missing_embedding_falls_back_to_spatial() {
+        // No embeddings -> overlapping boxes are treated as duplicates.
+        let faces = vec![
+            dedup_face(0.0, 0.0, 100.0, 100.0, 0.9, &[]),
+            dedup_face(2.0, 2.0, 102.0, 102.0, 0.8, &[]),
+        ];
+        let clusters = cluster_duplicate_faces(&faces);
+        assert_eq!(clusters.len(), 1);
+    }
 
     #[test]
     fn test_is_media_file() {
