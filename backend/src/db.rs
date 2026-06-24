@@ -16,10 +16,13 @@ struct SqlitePragmaCustomizer;
 
 impl CustomizeConnection<SqliteConnection, r2d2::Error> for SqlitePragmaCustomizer {
     fn on_acquire(&self, conn: &mut SqliteConnection) -> std::result::Result<(), r2d2::Error> {
-        diesel::sql_query("PRAGMA journal_mode = WAL")
+        // Set busy_timeout BEFORE journal_mode: switching to WAL needs a brief
+        // exclusive lock, and without an active timeout concurrent opens would
+        // get SQLITE_BUSY ("database is locked") immediately instead of waiting.
+        diesel::sql_query("PRAGMA busy_timeout = 60000")
             .execute(conn)
             .map_err(|e| r2d2::Error::QueryError(e))?;
-        diesel::sql_query("PRAGMA busy_timeout = 60000")
+        diesel::sql_query("PRAGMA journal_mode = WAL")
             .execute(conn)
             .map_err(|e| r2d2::Error::QueryError(e))?;
         Ok(())
@@ -52,8 +55,11 @@ pub fn run_migrations(
 /// Use this when scanner/worker threads need their own Diesel connection.
 pub fn open_diesel_connection<P: AsRef<Path>>(path: P) -> anyhow::Result<SqliteConnection> {
     let mut conn = SqliteConnection::establish(&path.as_ref().to_string_lossy())?;
-    diesel::sql_query("PRAGMA journal_mode = WAL").execute(&mut conn)?;
+    // busy_timeout must be set BEFORE journal_mode: the WAL switch needs a brief
+    // exclusive lock, and with no active timeout concurrent opens (e.g. the
+    // parallel scan fan-out) would get "database is locked" immediately.
     diesel::sql_query("PRAGMA busy_timeout = 60000").execute(&mut conn)?;
+    diesel::sql_query("PRAGMA journal_mode = WAL").execute(&mut conn)?;
     Ok(conn)
 }
 
