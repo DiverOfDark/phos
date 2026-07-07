@@ -11,6 +11,7 @@ mod db;
 mod embedding;
 mod import;
 mod models;
+mod s3;
 mod scanner;
 mod schema;
 mod watcher;
@@ -371,6 +372,11 @@ async fn run_server() {
     // credentials are configured via the settings API.
     let webdav_service = webdav::WebDavService::new(root_path, multi_user, "/webdav");
 
+    // S3-compatible service — mounted at /phos (= the bucket name) so path-style
+    // requests keep their full signed path (SigV4 breaks under prefix stripping).
+    // Rejects all requests until credentials are generated via the settings API.
+    let s3_service = s3::build_s3_service(root_path, multi_user);
+
     let port = std::env::var("PHOS_PORT")
         .unwrap_or_else(|_| "33000".to_string())
         .parse::<u16>()
@@ -430,6 +436,9 @@ async fn run_server() {
             .merge(auth_router)
             .merge(protected_api)
             .nest_service("/webdav", webdav_service.clone())
+            .route_service(&format!("/{}", s3::BUCKET_NAME), s3_service.clone())
+            .route_service(&format!("/{}/", s3::BUCKET_NAME), s3_service.clone())
+            .route_service(&format!("/{}/{{*key}}", s3::BUCKET_NAME), s3_service.clone())
             .merge(Scalar::with_url("/api/docs", api::ApiDoc::openapi()))
             .fallback_service(serve_static)
             .layer(
@@ -443,6 +452,9 @@ async fn run_server() {
         Router::new()
             .merge(api_router)
             .nest_service("/webdav", webdav_service.clone())
+            .route_service(&format!("/{}", s3::BUCKET_NAME), s3_service.clone())
+            .route_service(&format!("/{}/", s3::BUCKET_NAME), s3_service.clone())
+            .route_service(&format!("/{}/{{*key}}", s3::BUCKET_NAME), s3_service.clone())
             .merge(Scalar::with_url("/api/docs", api::ApiDoc::openapi()))
             .fallback_service(serve_static)
             .layer(
@@ -467,6 +479,23 @@ async fn run_server() {
                 .expect("Failed to bind WebDAV port");
             tokio::spawn(async move {
                 axum::serve(webdav_listener, webdav_app).await.unwrap();
+            });
+        }
+    }
+
+    // Optional: serve the S3 API on a separate port at `/` (there `ListBuckets`
+    // on `GET /` also works, which the main port can't offer).
+    if let Ok(s3_port_str) = std::env::var("PHOS_S3_PORT") {
+        if let Ok(s3_port) = s3_port_str.parse::<u16>() {
+            let s3_standalone = s3::build_s3_service(root_path, multi_user);
+            let s3_app = Router::new().fallback_service(s3_standalone);
+            let s3_addr = SocketAddr::from(([0, 0, 0, 0], s3_port));
+            info!("S3 also listening on {}", s3_addr);
+            let s3_listener = tokio::net::TcpListener::bind(s3_addr)
+                .await
+                .expect("Failed to bind S3 port");
+            tokio::spawn(async move {
+                axum::serve(s3_listener, s3_app).await.unwrap();
             });
         }
     }

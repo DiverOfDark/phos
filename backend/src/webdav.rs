@@ -20,9 +20,9 @@ use crate::db;
 /// Fixed username used in single-user mode (no OIDC).
 const SINGLE_USER_WEBDAV_USERNAME: &str = "phos";
 
-/// Check if a filename should be hidden from WebDAV clients.
+/// Check if a filename should be hidden from WebDAV/S3 clients.
 /// Hides Phos internal files (.phos.db, .phos_thumbnails/, .phos.db-wal, etc.)
-fn is_hidden_name(name: &str) -> bool {
+pub(crate) fn is_hidden_name(name: &str) -> bool {
     name.starts_with(".phos")
 }
 

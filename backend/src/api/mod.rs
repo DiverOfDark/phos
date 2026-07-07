@@ -96,6 +96,9 @@ use utoipa::OpenApi;
         settings::get_webdav_settings,
         settings::set_webdav_settings,
         settings::delete_webdav_settings,
+        settings::get_s3_settings,
+        settings::generate_s3_settings,
+        settings::delete_s3_settings,
     ),
     components(
         schemas(
@@ -144,6 +147,7 @@ use utoipa::OpenApi;
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
+            settings::S3Settings,
         )
     ),
     modifiers(&SecurityAddon),
@@ -477,6 +481,12 @@ pub fn create_router(state: AppState) -> Router {
             get(settings::get_webdav_settings)
                 .put(settings::set_webdav_settings)
                 .delete(settings::delete_webdav_settings),
+        )
+        .route(
+            "/api/settings/s3",
+            get(settings::get_s3_settings)
+                .post(settings::generate_s3_settings)
+                .delete(settings::delete_s3_settings),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

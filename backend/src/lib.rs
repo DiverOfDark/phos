@@ -10,3 +10,4 @@ pub mod import;
 pub mod scanner;
 pub mod watcher;
 pub mod webdav;
+pub mod s3;

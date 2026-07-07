@@ -78,6 +78,13 @@ Setting `PHOS_OIDC_ISSUER` enables multi-user mode — each authenticated user g
 |----------|---------|-------------|
 | `PHOS_WEBDAV_PORT` | *(unset)* | Serve WebDAV on a separate port at `/` (e.g. `4918`). Useful for clients that have trouble with path-prefixed WebDAV |
 
+### S3
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PHOS_S3_PORT` | *(unset)* | Also serve the S3 API on a separate port at `/` (e.g. `9000`). There `ListBuckets` works too, which the main port cannot offer |
+| `PHOS_S3_PUBLIC_URL` | *(unset)* | External S3 endpoint URL shown in the settings UI (for reverse-proxy setups) |
+
 ### ComfyUI Integration
 
 | Variable | Default | Description |
@@ -159,6 +166,37 @@ rclone mount :webdav: ~/phos-library \
   --webdav-user myuser \
   --webdav-pass mypass \
   --read-only
+```
+
+## S3 Access
+
+Phos also exposes the library through a read-only S3-compatible API, usable with rclone, the AWS CLI, Cyberduck, backup tools, etc.
+
+1. Open **Settings** in the web UI and scroll to **S3 Access**
+2. Click **Generate credentials** — the access key, secret key, endpoint, and bucket are displayed
+3. Configure your S3 client with those values, region `us-east-1`, and **path-style addressing**
+
+The bucket is always named `phos` and is served on the main port (the endpoint is the plain Phos URL, e.g. `http://localhost:33000`). Requests are authenticated with AWS Signature V4. Internal metadata files are hidden and all write operations are rejected.
+
+Notes:
+
+- The secret key is stored unhashed on the server — SigV4 verification requires the real secret. Rotate it anytime by clicking **Generate credentials** again.
+- `ListBuckets` (`GET /`) is not available on the main port; clients must reference the `phos` bucket explicitly. Set `PHOS_S3_PORT` to serve the S3 API on a dedicated port where bucket listing also works.
+- Reverse proxies must forward `/phos/...` unmodified — any path rewrite breaks request signatures.
+- ETags are synthetic (mtime + size), so checksum-based verification won't work; size/modtime-based sync does.
+
+### Example: sync with rclone
+
+```bash
+rclone sync ":s3,provider=Other,endpoint=http://localhost:33000,access_key_id=phos,secret_access_key=SECRET:phos" ~/phos-backup
+```
+
+### Example: AWS CLI
+
+```bash
+aws configure set default.s3.addressing_style path
+AWS_ACCESS_KEY_ID=phos AWS_SECRET_ACCESS_KEY=SECRET \
+  aws s3 ls s3://phos/ --endpoint-url http://localhost:33000 --region us-east-1
 ```
 
 ## Architecture

@@ -42,6 +42,7 @@ import {
   Eye,
   EyeOff,
   Copy,
+  Cloud,
 } from 'lucide-vue-next'
 
 // --- Version ---
@@ -356,10 +357,90 @@ function copyWebdavUrl() {
   setTimeout(() => { webdavUrlCopied.value = false }, 2000)
 }
 
+// --- S3 Settings ---
+const s3Enabled = ref(false)
+const s3AccessKey = ref('')
+const s3SecretKey = ref('')
+const s3Bucket = ref('phos')
+const s3Endpoint = ref('')
+const s3Generating = ref(false)
+const s3Message = ref('')
+const s3Error = ref('')
+const s3ShowSecret = ref(false)
+const s3EndpointCopied = ref(false)
+const s3SecretCopied = ref(false)
+
+const s3Url = computed(() => {
+  return s3Endpoint.value || `${window.location.protocol}//${window.location.host}`
+})
+
+async function fetchS3Settings() {
+  try {
+    const res = await fetch('/api/settings/s3')
+    if (!res.ok) return
+    const data = await res.json()
+    s3Enabled.value = data.enabled
+    s3AccessKey.value = data.access_key || ''
+    s3SecretKey.value = data.secret_key || ''
+    s3Bucket.value = data.bucket || 'phos'
+    s3Endpoint.value = data.endpoint || ''
+  } catch {
+    // ignore
+  }
+}
+
+async function generateS3Credentials() {
+  s3Generating.value = true
+  s3Message.value = ''
+  s3Error.value = ''
+  try {
+    const res = await fetch('/api/settings/s3', { method: 'POST' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    s3Enabled.value = data.enabled
+    s3AccessKey.value = data.access_key || ''
+    s3SecretKey.value = data.secret_key || ''
+    s3Message.value = 'S3 credentials generated!'
+    setTimeout(() => { s3Message.value = '' }, 3000)
+  } catch (e) {
+    s3Error.value = e.message || 'Failed to generate credentials.'
+  } finally {
+    s3Generating.value = false
+  }
+}
+
+async function disableS3() {
+  s3Message.value = ''
+  s3Error.value = ''
+  try {
+    const res = await fetch('/api/settings/s3', { method: 'DELETE' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    s3Enabled.value = false
+    s3SecretKey.value = ''
+    s3Message.value = 'S3 access disabled.'
+    setTimeout(() => { s3Message.value = '' }, 3000)
+  } catch (e) {
+    s3Error.value = e.message || 'Failed to disable S3 access.'
+  }
+}
+
+function copyS3Endpoint() {
+  navigator.clipboard.writeText(s3Url.value)
+  s3EndpointCopied.value = true
+  setTimeout(() => { s3EndpointCopied.value = false }, 2000)
+}
+
+function copyS3Secret() {
+  navigator.clipboard.writeText(s3SecretKey.value)
+  s3SecretCopied.value = true
+  setTimeout(() => { s3SecretCopied.value = false }, 2000)
+}
+
 // --- Init ---
 onMounted(() => {
   fetchPendingCount()
   fetchWebdavSettings()
+  fetchS3Settings()
 })
 </script>
 
@@ -614,6 +695,112 @@ onMounted(() => {
                     <div v-if="webdavError" class="flex items-start gap-2 p-2 rounded-lg bg-red-500/10 border border-red-500/20">
                       <AlertCircle class="w-3.5 h-3.5 text-red-500 mt-0.5 shrink-0" />
                       <p class="text-xs text-red-400">{{ webdavError }}</p>
+                    </div>
+                  </div>
+
+                  <!-- S3 Access -->
+                  <div class="space-y-3 pt-6 border-t border-white/5">
+                    <div class="flex items-center gap-2">
+                      <Cloud class="w-4 h-4 text-zinc-400" />
+                      <Label class="text-sm font-medium">S3 Access</Label>
+                      <span
+                        v-if="s3Enabled"
+                        class="ml-auto px-2 py-0.5 bg-emerald-500/15 text-emerald-400 rounded text-[10px] font-bold"
+                      >ENABLED</span>
+                      <span
+                        v-else
+                        class="ml-auto px-2 py-0.5 bg-zinc-700/50 text-zinc-500 rounded text-[10px] font-bold"
+                      >DISABLED</span>
+                    </div>
+                    <p class="text-xs text-zinc-500">
+                      Read-only S3-compatible access for tools like rclone or the AWS CLI.
+                      Use path-style addressing; the secret key is stored on the server.
+                    </p>
+
+                    <div class="flex gap-2 pt-1">
+                      <Button
+                        size="sm"
+                        class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs"
+                        :disabled="s3Generating"
+                        @click="generateS3Credentials"
+                      >
+                        <RefreshCw v-if="s3Generating" class="w-3 h-3 mr-1 animate-spin" />
+                        {{ s3Enabled ? 'Rotate credentials' : 'Generate credentials' }}
+                      </Button>
+                      <Button
+                        v-if="s3Enabled"
+                        size="sm"
+                        variant="outline"
+                        class="text-xs border-red-500/30 text-red-400 hover:bg-red-500/10"
+                        @click="disableS3"
+                      >
+                        <Trash2 class="w-3 h-3 mr-1" />
+                        Disable
+                      </Button>
+                    </div>
+
+                    <!-- Connection details -->
+                    <div v-if="s3Enabled" class="p-3 rounded-xl bg-zinc-900/50 border border-white/5 space-y-2">
+                      <div>
+                        <p class="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Endpoint URL</p>
+                        <div class="flex items-center gap-2">
+                          <code class="text-xs text-indigo-400 flex-1 truncate">{{ s3Url }}</code>
+                          <button
+                            class="text-zinc-500 hover:text-white transition-colors shrink-0"
+                            @click="copyS3Endpoint"
+                            :title="s3EndpointCopied ? 'Copied!' : 'Copy URL'"
+                          >
+                            <Check v-if="s3EndpointCopied" class="w-3.5 h-3.5 text-emerald-500" />
+                            <Copy v-else class="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                      <div class="grid grid-cols-2 gap-2">
+                        <div>
+                          <p class="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Bucket</p>
+                          <code class="text-xs text-zinc-300">{{ s3Bucket }}</code>
+                        </div>
+                        <div>
+                          <p class="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Region</p>
+                          <code class="text-xs text-zinc-300">us-east-1</code>
+                        </div>
+                      </div>
+                      <div>
+                        <p class="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Access Key</p>
+                        <code class="text-xs text-zinc-300">{{ s3AccessKey }}</code>
+                      </div>
+                      <div>
+                        <p class="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Secret Key</p>
+                        <div class="flex items-center gap-2">
+                          <code class="text-xs text-zinc-300 flex-1 truncate">{{ s3ShowSecret ? s3SecretKey : '••••••••••••••••' }}</code>
+                          <button
+                            type="button"
+                            class="text-zinc-500 hover:text-zinc-300 shrink-0"
+                            @click="s3ShowSecret = !s3ShowSecret"
+                          >
+                            <EyeOff v-if="s3ShowSecret" class="w-3.5 h-3.5" />
+                            <Eye v-else class="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            class="text-zinc-500 hover:text-white transition-colors shrink-0"
+                            @click="copyS3Secret"
+                            :title="s3SecretCopied ? 'Copied!' : 'Copy secret'"
+                          >
+                            <Check v-if="s3SecretCopied" class="w-3.5 h-3.5 text-emerald-500" />
+                            <Copy v-else class="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <!-- Feedback -->
+                    <div v-if="s3Message" class="flex items-start gap-2 p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
+                      <Check class="w-3.5 h-3.5 text-emerald-500 mt-0.5 shrink-0" />
+                      <p class="text-xs text-emerald-400">{{ s3Message }}</p>
+                    </div>
+                    <div v-if="s3Error" class="flex items-start gap-2 p-2 rounded-lg bg-red-500/10 border border-red-500/20">
+                      <AlertCircle class="w-3.5 h-3.5 text-red-500 mt-0.5 shrink-0" />
+                      <p class="text-xs text-red-400">{{ s3Error }}</p>
                     </div>
                   </div>
               </div>

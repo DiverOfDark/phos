@@ -39,6 +39,8 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `PHOS_PORT` | `33000` | Backend HTTP port |
+| `PHOS_S3_PORT` | unset | Also serve the read-only S3 API on a separate port at `/` |
+| `PHOS_S3_PUBLIC_URL` | unset | External S3 endpoint URL shown in the settings UI |
 | `PHOS_STATIC_DIR` | `static` | Path to built frontend files |
 | `PHOS_DUMMY_AI` | unset | Set to `1` to skip ONNX model loading (for testing without models) |
 | `RUST_LOG` | unset | Tracing log level (e.g. `info`, `debug`) |
