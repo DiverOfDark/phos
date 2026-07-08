@@ -11,3 +11,4 @@ pub mod scanner;
 pub mod watcher;
 pub mod webdav;
 pub mod s3;
+pub mod virtualfs;

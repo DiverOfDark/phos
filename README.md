@@ -156,6 +156,8 @@ Phos includes a built-in read-only WebDAV server so you can mount your library a
 
 The WebDAV endpoint is always available at `/webdav/` on the main port. Internal metadata files (`.phos.db`, thumbnails, etc.) are automatically hidden, and all write operations are rejected.
 
+WebDAV (and S3) present a flattened view of the library: instead of the on-disk `{person}/{series}/{photo}.jpg`, each person folder is one flat list named `{person}/{series}_{photo}.jpg` — no per-series subfolders.
+
 For clients that require WebDAV at the root path (e.g. older Windows Explorer), set `PHOS_WEBDAV_PORT` to serve WebDAV on a dedicated port at `/`.
 
 ### Example: mount with rclone
@@ -177,6 +179,8 @@ Phos also exposes the library through a read-only S3-compatible API, usable with
 3. Configure your S3 client with those values, region `us-east-1`, and **path-style addressing**
 
 The bucket is always named `phos` and is served on the main port (the endpoint is the plain Phos URL, e.g. `http://localhost:33000`). Requests are authenticated with AWS Signature V4. Internal metadata files are hidden and all write operations are rejected.
+
+Like WebDAV, S3 serves the flattened library view: object keys are `{person}/{series}_{photo}.jpg` rather than the on-disk `{person}/{series}/{photo}.jpg`.
 
 Notes:
 

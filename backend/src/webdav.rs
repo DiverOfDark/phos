@@ -12,7 +12,6 @@ use dav_server::fakels::FakeLs;
 use dav_server::fs::*;
 use dav_server::localfs::LocalFs;
 use dav_server::DavHandler;
-use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 
 use crate::db;
@@ -40,18 +39,108 @@ fn is_hidden_dav_path(path: &DavPath) -> bool {
     false
 }
 
-/// Read-only, filtering DavFileSystem that wraps LocalFs.
-/// - Hides internal Phos metadata files from directory listings and metadata requests
+/// Metadata for virtual entries, backed by the real file's std metadata.
+#[derive(Debug, Clone)]
+struct VirtualMetaData(std::fs::Metadata);
+
+impl DavMetaData for VirtualMetaData {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+
+    fn modified(&self) -> FsResult<std::time::SystemTime> {
+        self.0.modified().map_err(|_| FsError::GeneralFailure)
+    }
+
+    fn is_dir(&self) -> bool {
+        self.0.is_dir()
+    }
+
+    fn created(&self) -> FsResult<std::time::SystemTime> {
+        self.0.created().map_err(|_| FsError::NotImplemented)
+    }
+
+    fn accessed(&self) -> FsResult<std::time::SystemTime> {
+        self.0.accessed().map_err(|_| FsError::NotImplemented)
+    }
+}
+
+/// Directory entry with a virtual (flattened) name and real-file metadata.
+struct VirtualDirEntry {
+    name: String,
+    meta: std::fs::Metadata,
+}
+
+impl DavDirEntry for VirtualDirEntry {
+    fn name(&self) -> Vec<u8> {
+        self.name.clone().into_bytes()
+    }
+
+    fn metadata(&self) -> FsFuture<'_, Box<dyn DavMetaData>> {
+        let meta = VirtualMetaData(self.meta.clone());
+        Box::pin(async move { Ok(Box::new(meta) as Box<dyn DavMetaData>) })
+    }
+}
+
+/// The virtual path a client requested, classified by depth.
+enum VirtualPath {
+    Root,
+    /// One segment: a top-level dir (person) or a root-level file.
+    TopLevel(String),
+    /// Two segments: `{top}/{flattened_name}` — always a file in the virtual view.
+    Flattened(String),
+    /// Deeper paths don't exist in the virtual namespace.
+    NotFound,
+}
+
+fn classify(path: &DavPath) -> VirtualPath {
+    let rel = path.as_rel_ospath();
+    let comps: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    match comps.len() {
+        0 => VirtualPath::Root,
+        1 => VirtualPath::TopLevel(comps.into_iter().next().unwrap()),
+        2 => VirtualPath::Flattened(comps.join("/")),
+        _ => VirtualPath::NotFound,
+    }
+}
+
+/// Read-only DavFileSystem presenting the flattened virtual view (see
+/// `crate::virtualfs`): top-level person dirs each contain one flat list of
+/// `{series}_{file}` entries.
+/// - Hides internal Phos metadata files
 /// - Rejects all write operations (create, delete, rename, copy)
 #[derive(Clone)]
 struct PhosFs {
+    root: PathBuf,
+    /// Used only to open real files (ranged reads etc.) after virtual→real mapping.
     inner: Box<LocalFs>,
 }
 
 impl PhosFs {
     fn new(root: &Path) -> Self {
         PhosFs {
+            root: root.to_path_buf(),
             inner: LocalFs::new(root, false, false, false),
+        }
+    }
+
+    /// Resolve a virtual DavPath to the real absolute path (files and the
+    /// root/top-level dirs that exist verbatim).
+    fn resolve_real(&self, path: &DavPath) -> Option<PathBuf> {
+        match classify(path) {
+            VirtualPath::Root => Some(self.root.clone()),
+            VirtualPath::TopLevel(name) => {
+                if is_hidden_name(&name) || name == "." || name == ".." || name.contains('\\') {
+                    return None;
+                }
+                let p = self.root.join(&name);
+                p.exists().then_some(p)
+            }
+            VirtualPath::Flattened(vpath) => crate::virtualfs::resolve(&self.root, &vpath),
+            VirtualPath::NotFound => None,
         }
     }
 }
@@ -70,32 +159,51 @@ impl DavFileSystem for PhosFs {
         {
             return Box::pin(async { Err(FsError::Forbidden) });
         }
-        DavFileSystem::open(&*self.inner, path, options)
+        Box::pin(async move {
+            let real = self.resolve_real(path).ok_or(FsError::NotFound)?;
+            let rel = real.strip_prefix(&self.root).map_err(|_| FsError::NotFound)?;
+            // Hand LocalFs the real path (it joins its base with the DavPath's
+            // relative path), percent-encoding each segment.
+            let encoded = rel
+                .components()
+                .map(|c| urlencoding::encode(&c.as_os_str().to_string_lossy()).into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            let real_dav = DavPath::new(&format!("/{encoded}")).map_err(|_| FsError::NotFound)?;
+            DavFileSystem::open(&*self.inner, &real_dav, options).await
+        })
     }
 
     fn read_dir<'a>(
         &'a self,
         path: &'a DavPath,
-        meta: ReadDirMeta,
+        _meta: ReadDirMeta,
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         if is_hidden_dav_path(path) {
             return Box::pin(async { Err(FsError::NotFound) });
         }
-        let fut = DavFileSystem::read_dir(&*self.inner, path, meta);
         Box::pin(async move {
-            let stream = fut.await?;
-            let filtered = stream.filter(|result| {
-                let keep = match result {
-                    Ok(entry) => {
-                        let name_bytes = entry.name();
-                        let name = String::from_utf8_lossy(&name_bytes);
-                        !is_hidden_name(&name)
-                    }
-                    Err(_) => true, // pass through errors
-                };
-                async move { keep }
-            });
-            Ok(Box::pin(filtered) as FsStream<Box<dyn DavDirEntry>>)
+            let entries = match classify(path) {
+                VirtualPath::Root => {
+                    crate::virtualfs::list_root(&self.root).map_err(|_| FsError::GeneralFailure)?
+                }
+                VirtualPath::TopLevel(_) => {
+                    let dir = self
+                        .resolve_real(path)
+                        .filter(|p| p.is_dir())
+                        .ok_or(FsError::NotFound)?;
+                    crate::virtualfs::list_flattened(&dir).map_err(|_| FsError::GeneralFailure)?
+                }
+                // Flattened entries are files; deeper paths don't exist.
+                VirtualPath::Flattened(_) | VirtualPath::NotFound => return Err(FsError::NotFound),
+            };
+            let stream = futures_util::stream::iter(entries.into_iter().map(|e| {
+                Ok(Box::new(VirtualDirEntry {
+                    name: e.name,
+                    meta: e.metadata,
+                }) as Box<dyn DavDirEntry>)
+            }));
+            Ok(Box::pin(stream) as FsStream<Box<dyn DavDirEntry>>)
         })
     }
 
@@ -106,17 +214,18 @@ impl DavFileSystem for PhosFs {
         if is_hidden_dav_path(path) {
             return Box::pin(async { Err(FsError::NotFound) });
         }
-        DavFileSystem::metadata(&*self.inner, path)
+        Box::pin(async move {
+            let real = self.resolve_real(path).ok_or(FsError::NotFound)?;
+            let meta = std::fs::metadata(&real).map_err(|_| FsError::NotFound)?;
+            Ok(Box::new(VirtualMetaData(meta)) as Box<dyn DavMetaData>)
+        })
     }
 
     fn symlink_metadata<'a>(
         &'a self,
         path: &'a DavPath,
     ) -> FsFuture<'a, Box<dyn DavMetaData>> {
-        if is_hidden_dav_path(path) {
-            return Box::pin(async { Err(FsError::NotFound) });
-        }
-        DavFileSystem::symlink_metadata(&*self.inner, path)
+        DavFileSystem::metadata(self, path)
     }
 
     // Read-only enforcement: reject all write operations
@@ -378,6 +487,72 @@ impl tower_service::Service<Request<Body>> for WebDavService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+
+    fn setup_library() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("unsorted/001")).unwrap();
+        std::fs::create_dir_all(root.join("unsorted/002")).unwrap();
+        std::fs::write(root.join("unsorted/001/b.mp4"), b"vid").unwrap();
+        std::fs::write(root.join("unsorted/002/photo_1.jpg"), b"jpg").unwrap();
+        std::fs::write(root.join(".phos.db"), b"db").unwrap();
+        dir
+    }
+
+    async fn list_names(fs: &PhosFs, path: &str) -> Vec<String> {
+        let dav_path = DavPath::new(path).unwrap();
+        let mut stream = DavFileSystem::read_dir(fs, &dav_path, ReadDirMeta::None)
+            .await
+            .unwrap();
+        let mut names = Vec::new();
+        while let Some(entry) = stream.next().await {
+            names.push(String::from_utf8(entry.unwrap().name()).unwrap());
+        }
+        names
+    }
+
+    #[tokio::test]
+    async fn test_virtual_view() {
+        let dir = setup_library();
+        let fs = PhosFs::new(dir.path());
+
+        // Root lists person dirs as-is; hidden files are absent.
+        assert_eq!(list_names(&fs, "/").await, vec!["unsorted"]);
+
+        // A person dir is one flat list of {series}_{file} entries.
+        assert_eq!(
+            list_names(&fs, "/unsorted/").await,
+            vec!["001_b.mp4", "002_photo_1.jpg"]
+        );
+
+        // Virtual file metadata comes from the real file.
+        let meta = DavFileSystem::metadata(&fs, &DavPath::new("/unsorted/001_b.mp4").unwrap())
+            .await
+            .unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.len(), 3);
+
+        // The raw nested path is not part of the virtual namespace.
+        assert!(
+            DavFileSystem::metadata(&fs, &DavPath::new("/unsorted/001/b.mp4").unwrap())
+                .await
+                .is_err()
+        );
+
+        // Opening a virtual file reads the real one.
+        let opts = OpenOptions {
+            read: true,
+            ..Default::default()
+        };
+        assert!(DavFileSystem::open(
+            &fs,
+            &DavPath::new("/unsorted/002_photo_1.jpg").unwrap(),
+            opts
+        )
+        .await
+        .is_ok());
+    }
 
     #[test]
     fn test_is_hidden_name() {

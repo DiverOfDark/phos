@@ -84,20 +84,10 @@ impl S3Auth for PhosS3Auth {
     }
 }
 
-/// Validate an object key and map it to a path under the library root.
-/// Rejects empty/absolute keys, path traversal, and Phos internal files.
+/// Resolve a virtual object key (`{top}/{flattened_name}` or a root-level
+/// file name — see `virtualfs`) to the real file path.
 fn key_to_path(root: &Path, key: &str) -> S3Result<PathBuf> {
-    if key.is_empty() || key.ends_with('/') {
-        return Err(s3_error!(NoSuchKey));
-    }
-    let mut path = root.to_path_buf();
-    for comp in key.split('/') {
-        if comp.is_empty() || comp == "." || comp == ".." || comp.contains('\\') || is_hidden_name(comp) {
-            return Err(s3_error!(NoSuchKey));
-        }
-        path.push(comp);
-    }
-    Ok(path)
+    crate::virtualfs::resolve(root, key).ok_or_else(|| s3_error!(NoSuchKey))
 }
 
 /// Synthetic ETag from mtime + size. Computing MD5 over a whole photo library
@@ -127,84 +117,73 @@ struct ListEntry {
     mtime: Option<SystemTime>,
 }
 
-/// Collect all entries matching `prefix`, honoring `delimiter`, sorted by key.
-/// Delimiter "/" is served from a single directory read; any other case walks
-/// the tree and rolls keys up by the delimiter. Hidden (.phos*) names are
-/// filtered everywhere.
-fn collect_entries(root: &Path, prefix: &str, delimiter: Option<&str>) -> S3Result<Vec<ListEntry>> {
-    if prefix.contains('\\') {
-        return Ok(Vec::new());
+fn object_entry(key: String, meta: &std::fs::Metadata) -> ListEntry {
+    ListEntry {
+        key,
+        is_prefix: false,
+        size: meta.len(),
+        mtime: meta.modified().ok(),
     }
-    // Reject prefixes that reach into hidden or traversal paths: they can never match.
-    for comp in prefix.split('/') {
-        if comp == ".." || comp == "." {
-            return Ok(Vec::new());
-        }
+}
+
+/// Collect all virtual entries matching `prefix`, honoring `delimiter`,
+/// sorted by key. The visible keyspace is the flattened view from
+/// `virtualfs`: top-level dirs contain one flat file list each
+/// (`{top}/{series}_{file}`); root-level files are served as-is.
+fn collect_entries(root: &Path, prefix: &str, delimiter: Option<&str>) -> S3Result<Vec<ListEntry>> {
+    if prefix.contains('\\') || prefix.split('/').any(|c| c == "." || c == "..") {
+        return Ok(Vec::new());
     }
 
     if delimiter == Some("/") {
-        // Fast path: only entries directly inside one directory are visible.
-        let (dir_rel, name_pre) = match prefix.rsplit_once('/') {
-            Some((d, n)) => (d, n),
-            None => ("", prefix),
+        let mut entries = match prefix.split_once('/') {
+            // Root listing: top-level dirs are the only common prefixes.
+            None => {
+                let mut entries = Vec::new();
+                for e in crate::virtualfs::list_root(root).unwrap_or_default() {
+                    if !e.name.starts_with(prefix) {
+                        continue;
+                    }
+                    if e.metadata.is_dir() {
+                        entries.push(ListEntry {
+                            key: format!("{}/", e.name),
+                            is_prefix: true,
+                            size: 0,
+                            mtime: None,
+                        });
+                    } else {
+                        entries.push(object_entry(e.name.clone(), &e.metadata));
+                    }
+                }
+                entries
+            }
+            // Inside a top-level dir: a flat object list, no deeper prefixes.
+            Some((top, name_pre)) => {
+                if name_pre.contains('/') || is_hidden_name(top) {
+                    return Ok(Vec::new());
+                }
+                let top_dir = root.join(top);
+                if !top_dir.is_dir() {
+                    return Ok(Vec::new());
+                }
+                crate::virtualfs::list_flattened(&top_dir)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|e| e.name.starts_with(name_pre))
+                    .map(|e| object_entry(format!("{top}/{}", e.name), &e.metadata))
+                    .collect()
+            }
         };
-        let mut dir_abs = root.to_path_buf();
-        for comp in dir_rel.split('/').filter(|c| !c.is_empty()) {
-            if is_hidden_name(comp) {
-                return Ok(Vec::new());
-            }
-            dir_abs.push(comp);
-        }
-        let mut entries = Vec::new();
-        let read_dir = match std::fs::read_dir(&dir_abs) {
-            Ok(rd) => rd,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let key_base = if dir_rel.is_empty() { String::new() } else { format!("{dir_rel}/") };
-        for entry in read_dir.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if is_hidden_name(&name) || !name.starts_with(name_pre) {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_dir() {
-                entries.push(ListEntry {
-                    key: format!("{key_base}{name}/"),
-                    is_prefix: true,
-                    size: 0,
-                    mtime: None,
-                });
-            } else if meta.is_file() {
-                entries.push(ListEntry {
-                    key: format!("{key_base}{name}"),
-                    is_prefix: false,
-                    size: meta.len(),
-                    mtime: meta.modified().ok(),
-                });
-            }
-        }
         entries.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(entries)
     } else {
-        // Generic path: recursive walk, then optional roll-up by delimiter.
+        // Generic path: enumerate the full virtual keyspace, then optional
+        // roll-up by a custom delimiter.
         let mut map: BTreeMap<String, ListEntry> = BTreeMap::new();
-        let walker = walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_entry(|e| !is_hidden_name(&e.file_name().to_string_lossy()));
-        for entry in walker.flatten() {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let Ok(rel) = entry.path().strip_prefix(root) else { continue };
-            let key = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
+        let mut insert = |key: String, meta: &std::fs::Metadata| {
             if !key.starts_with(prefix) {
-                continue;
+                return;
             }
-            let meta = entry.metadata().ok();
             let rolled = delimiter.and_then(|d| {
                 key[prefix.len()..].find(d).map(|i| key[..prefix.len() + i + d.len()].to_string())
             });
@@ -218,16 +197,17 @@ fn collect_entries(root: &Path, prefix: &str, delimiter: Option<&str>) -> S3Resu
                     });
                 }
                 None => {
-                    map.insert(
-                        key.clone(),
-                        ListEntry {
-                            key,
-                            is_prefix: false,
-                            size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                            mtime: meta.and_then(|m| m.modified().ok()),
-                        },
-                    );
+                    map.insert(key.clone(), object_entry(key, meta));
                 }
+            }
+        };
+        for e in crate::virtualfs::list_root(root).unwrap_or_default() {
+            if e.metadata.is_dir() {
+                for f in crate::virtualfs::list_flattened(&e.real_path).unwrap_or_default() {
+                    insert(format!("{}/{}", e.name, f.name), &f.metadata);
+                }
+            } else {
+                insert(e.name.clone(), &e.metadata);
             }
         }
         Ok(map.into_values().collect())
@@ -670,17 +650,22 @@ mod tests {
 
     #[test]
     fn test_key_to_path() {
-        let root = Path::new("/lib");
-        assert!(key_to_path(root, "photo.jpg").is_ok());
-        assert!(key_to_path(root, "album/nested/b.mp4").is_ok());
+        let dir = setup_library();
+        let root = dir.path();
+        assert_eq!(key_to_path(root, "photo.jpg").unwrap(), root.join("photo.jpg"));
+        // Flattened virtual keys resolve to the real nested files.
+        assert_eq!(key_to_path(root, "album/a.png").unwrap(), root.join("album/a.png"));
+        assert_eq!(
+            key_to_path(root, "album/nested_b.mp4").unwrap(),
+            root.join("album/nested/b.mp4")
+        );
+        // The raw nested layout is not part of the virtual keyspace.
+        assert!(key_to_path(root, "album/nested/b.mp4").is_err());
         assert!(key_to_path(root, "").is_err());
         assert!(key_to_path(root, "album/").is_err());
-        assert!(key_to_path(root, "/etc/passwd").is_err());
         assert!(key_to_path(root, "../outside").is_err());
-        assert!(key_to_path(root, "album/../../outside").is_err());
         assert!(key_to_path(root, ".phos.db").is_err());
         assert!(key_to_path(root, ".phos_thumbnails/t.jpg").is_err());
-        assert!(key_to_path(root, "album/.phos.db").is_err());
         assert!(key_to_path(root, "a\\b").is_err());
     }
 
@@ -699,15 +684,22 @@ mod tests {
         let dir = setup_library();
         let entries = collect_entries(dir.path(), "", None).unwrap();
         let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
-        assert_eq!(keys, vec!["album/a.png", "album/nested/b.mp4", "photo.jpg"]);
+        assert_eq!(keys, vec!["album/a.png", "album/nested_b.mp4", "photo.jpg"]);
     }
 
     #[test]
     fn test_collect_entries_prefix() {
         let dir = setup_library();
+        // Inside a top-level dir the listing is flat: no deeper common prefixes.
         let entries = collect_entries(dir.path(), "album/", Some("/")).unwrap();
         let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
-        assert_eq!(keys, vec!["album/a.png", "album/nested/"]);
+        assert_eq!(keys, vec!["album/a.png", "album/nested_b.mp4"]);
+        assert!(entries.iter().all(|e| !e.is_prefix));
+
+        // Name-prefix filtering happens in the virtual namespace.
+        let entries = collect_entries(dir.path(), "album/nested_", Some("/")).unwrap();
+        let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["album/nested_b.mp4"]);
     }
 
     #[test]

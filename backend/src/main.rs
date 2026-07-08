@@ -14,6 +14,7 @@ mod models;
 mod s3;
 mod scanner;
 mod schema;
+mod virtualfs;
 mod watcher;
 mod webdav;
 
