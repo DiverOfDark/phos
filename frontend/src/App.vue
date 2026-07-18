@@ -43,6 +43,8 @@ import {
   EyeOff,
   Copy,
   Cloud,
+  Smartphone,
+  Download,
 } from 'lucide-vue-next'
 
 // --- Version ---
@@ -436,11 +438,26 @@ function copyS3Secret() {
   setTimeout(() => { s3SecretCopied.value = false }, 2000)
 }
 
+// --- Android App ---
+const apkAvailable = ref(false)
+
+async function checkApkAvailable() {
+  try {
+    const res = await fetch('/phos.apk', { method: 'HEAD' })
+    // Missing static files fall back to index.html, so a 200 alone isn't enough.
+    const type = res.headers.get('content-type') || ''
+    apkAvailable.value = res.ok && !type.includes('text/html')
+  } catch {
+    apkAvailable.value = false
+  }
+}
+
 // --- Init ---
 onMounted(() => {
   fetchPendingCount()
   fetchWebdavSettings()
   fetchS3Settings()
+  checkApkAvailable()
 })
 </script>
 
@@ -802,6 +819,35 @@ onMounted(() => {
                       <AlertCircle class="w-3.5 h-3.5 text-red-500 mt-0.5 shrink-0" />
                       <p class="text-xs text-red-400">{{ s3Error }}</p>
                     </div>
+                  </div>
+
+                  <!-- Android App -->
+                  <div class="space-y-3 pt-6 border-t border-white/5">
+                    <div class="flex items-center gap-2">
+                      <Smartphone class="w-4 h-4 text-zinc-400" />
+                      <Label class="text-sm font-medium">Android App</Label>
+                      <span
+                        v-if="apkAvailable"
+                        class="ml-auto px-2 py-0.5 bg-emerald-500/15 text-emerald-400 rounded text-[10px] font-bold"
+                      >{{ version }}</span>
+                    </div>
+                    <p class="text-xs text-zinc-500">
+                      Install the Phos app on your phone to browse your library and upload photos on the go.
+                    </p>
+                    <Button
+                      v-if="apkAvailable"
+                      as-child
+                      size="sm"
+                      class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs"
+                    >
+                      <a href="/phos.apk" download>
+                        <Download class="w-3 h-3 mr-1" />
+                        Download APK
+                      </a>
+                    </Button>
+                    <p v-else class="text-xs text-zinc-600">
+                      The APK is not bundled with this build.
+                    </p>
                   </div>
               </div>
             </SheetContent>

@@ -50,6 +50,7 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 ### Monorepo Layout
 - **`backend/`** — Rust binary (Axum web server, SQLite, ONNX Runtime, FFmpeg)
 - **`frontend/`** — Vue 3 SPA (Vite, Tailwind CSS 4, shadcn-vue/radix-vue)
+- **`android/`** — Kotlin/Compose app (Gradle, Hilt, Retrofit client generated from `android/openapi.json`)
 
 ### Backend Modules (`backend/src/`)
 - **`main.rs`** — Entry point: initializes DB, AI pipeline, spawns background scan, serves static files + API
@@ -68,6 +69,7 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - AI models (ONNX) are auto-downloaded from Hugging Face (`public-data/insightface`) on first run and cached locally by `hf-hub`; startup fails hard if download fails (unless `PHOS_DUMMY_AI=1`)
 - Backend serves the built frontend as static files via `fallback_service`
 - API routes are mounted under `/api/`, everything else falls through to static file serving
+- The Docker image also builds the Android app and ships the APK at `static/phos.apk`, so users can install it from the settings UI (`/phos.apk`). Release signing uses the `keystore_password` BuildKit secret; without it the APK is unsigned. Version comes from the `PHOS_VERSION` build arg (semver tags map to `versionName`/`versionCode`)
 
 ### REST API Endpoints
 - `GET /api/photos` — List all photos

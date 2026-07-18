@@ -108,6 +108,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: PHOS_VERSION=${{ steps.version.outputs.version }}
+          secrets: |
+            keystore_password=${{ secrets.KEYSTORE_PASSWORD }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
