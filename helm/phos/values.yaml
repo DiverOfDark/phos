@@ -1,0 +1,119 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/diverofdark/phos
+  # CI publishes sha-<7-char-sha> for every commit on master, semver tags on
+  # releases, and a rolling `latest`. When deployed by ArgoCD straight from
+  # this repo, pin with `image.tag=sha-$ARGOCD_APP_REVISION_SHORT` so the
+  # image always matches the commit being synced.
+  tag: "latest"
+  # sha-/semver tags are immutable, so IfNotPresent is safe. Switch to
+  # Always if you deploy the rolling `latest` tag.
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Extra labels applied to the pod template. Useful for things like
+# gethomepage's pod-selector annotation:
+#   podLabels:
+#     app.kubernetes.io/pod: phos
+podLabels: {}
+
+podAnnotations: {}
+
+# fsGroup 1000 matches the phos user in the image so the PVC is writable.
+podSecurityContext:
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+
+securityContext: {}
+
+service:
+  type: ClusterIP
+  # External port the Service exposes; targetPort is always the container's
+  # phos.port. 80 matches the convention of putting an Ingress in front.
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # cert-manager.io/cluster-issuer: acme-issuer
+    # gethomepage.dev/enabled: "true"
+  host: phos.example.com
+  tls: []
+    # - hosts: [phos.example.com]
+    #   secretName: phos-tls
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 2Gi
+  limits:
+    memory: 8Gi
+
+# Photo library storage.
+persistence:
+  # Name of a PVC managed out-of-band. When empty the chart creates
+  # <fullname>-data (annotated keep/Delete=false — the library must survive
+  # chart or app deletion).
+  existingClaim: ""
+  size: 50Gi
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+
+phos:
+  port: 33000
+  libraryPath: /app/data
+  jwtTtl: "86400"
+  rustLog: info
+  # ComfyUI endpoint for AI image processing; empty disables the env var.
+  comfyuiUrl: ""
+
+oidc:
+  issuer: "https://auth.example.com"
+  # Defaults to https://<ingress.host>/api/auth/callback when empty.
+  redirectUri: ""
+  scopes: "openid profile email"
+  # Name of a Secret with client_id / client_secret / mobile_client_id keys.
+  # When set, the chart's own ExternalSecret is not rendered.
+  existingSecret: ""
+  # Render an ExternalSecret producing <fullname>-zitadel from two remote
+  # entries: web credentials (client_id + client_secret) and the native/mobile
+  # app credentials (client_id only — public client, no secret).
+  externalSecret:
+    enabled: false
+    store: openbao-store
+    storeKind: ClusterSecretStore
+    refreshInterval: "1h"
+    webCredentialsKey: zitadel/phos-credentials
+    mobileCredentialsKey: zitadel/phos_android-credentials
+
+# Health probes. Defaults match the manifests previously used in homelab.
+livenessProbe:
+  httpGet:
+    path: /
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 30
+  timeoutSeconds: 10
+  successThreshold: 1
+  failureThreshold: 10
+
+readinessProbe:
+  httpGet:
+    path: /
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 5
+  successThreshold: 1
+  failureThreshold: 15
+
+# Extra environment variables appended verbatim to the phos container.
+extraEnv: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

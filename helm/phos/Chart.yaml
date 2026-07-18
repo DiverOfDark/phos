@@ -1,0 +1,17 @@
+apiVersion: v2
+name: phos
+description: AI-powered photo manager.
+type: application
+version: 0.1.0
+appVersion: "0.9.0"
+kubeVersion: ">=1.27.0-0"
+keywords:
+  - photos
+  - photo-manager
+  - ai
+home: https://github.com/DiverOfDark/phos
+sources:
+  - https://github.com/DiverOfDark/phos
+maintainers:
+  - name: Kirill Orlov
+    url: https://github.com/DiverOfDark

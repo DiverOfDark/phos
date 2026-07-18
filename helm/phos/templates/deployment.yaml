@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "phos.fullname" . }}
+  labels:
+    {{- include "phos.labels" . | nindent 4 }}
+spec:
+  progressDeadlineSeconds: 600
+  # Single replica with a ReadWriteOnce library PVC: Recreate avoids the new
+  # pod deadlocking on the volume while the old pod still holds it.
+  strategy:
+    type: Recreate
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      {{- include "phos.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "phos.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: phos-data
+          persistentVolumeClaim:
+            claimName: {{ include "phos.dataClaimName" . }}
+      containers:
+        - name: phos
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.phos.port }}
+              protocol: TCP
+          env:
+            - name: PHOS_PORT
+              value: {{ .Values.phos.port | quote }}
+            - name: PHOS_LIBRARY_PATH
+              value: {{ .Values.phos.libraryPath | quote }}
+            - name: PHOS_OIDC_ISSUER
+              value: {{ .Values.oidc.issuer | quote }}
+            - name: PHOS_OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "phos.oidcSecretName" . }}
+                  key: client_id
+            - name: PHOS_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "phos.oidcSecretName" . }}
+                  key: client_secret
+            - name: PHOS_OIDC_MOBILE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "phos.oidcSecretName" . }}
+                  key: mobile_client_id
+            - name: PHOS_OIDC_REDIRECT_URI
+              value: {{ include "phos.oidcRedirectUri" . | quote }}
+            - name: PHOS_OIDC_SCOPES
+              value: {{ .Values.oidc.scopes | quote }}
+            {{- if .Values.phos.comfyuiUrl }}
+            - name: PHOS_COMFYUI_URL
+              value: {{ .Values.phos.comfyuiUrl | quote }}
+            {{- end }}
+            - name: PHOS_JWT_TTL
+              value: {{ .Values.phos.jwtTtl | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.phos.rustLog | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: phos-data
+              mountPath: {{ .Values.phos.libraryPath }}
+            # Model downloads land on the same PVC instead of ephemeral disk.
+            - name: phos-data
+              mountPath: /home/phos/.cache/huggingface
+              subPath: hf-cache
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
