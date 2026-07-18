@@ -3,6 +3,8 @@ package dev.phos.android.data.remote
 import dev.phos.android.data.remote.model.PersonBrief
 import dev.phos.android.data.remote.model.PersonBrowseResponse
 import dev.phos.android.data.remote.model.TokenExchangeRequest
+import dev.phos.android.data.remote.model.TokenResponse
+import retrofit2.Call
 import retrofit2.http.Body
 import retrofit2.http.DELETE
 import retrofit2.http.GET
@@ -30,7 +32,15 @@ interface PhosApi {
     suspend fun deleteFile(@Path("id") id: String): okhttp3.ResponseBody
 
     @POST("api/auth/token")
-    suspend fun exchangeToken(@Body request: TokenExchangeRequest): TokenExchangeResponse
+    suspend fun exchangeToken(@Body request: TokenExchangeRequest): TokenResponse
+
+    // Synchronous variants for use inside OkHttp interceptors/authenticators,
+    // where suspend functions can't be called.
+    @POST("api/auth/token")
+    fun exchangeTokenCall(@Body request: TokenExchangeRequest): Call<TokenResponse>
+
+    @POST("api/auth/refresh")
+    fun refreshTokenCall(): Call<TokenResponse>
 
     @GET("api/auth/config")
     suspend fun getAuthConfig(): dev.phos.android.data.remote.model.AuthConfigResponse
@@ -39,13 +49,7 @@ interface PhosApi {
     suspend fun getVersion(): VersionResponse
 }
 
-// These two aren't in the OpenAPI spec (token response is inline JSON, version is simple)
-data class TokenExchangeResponse(
-    val token: String = "",
-    @com.fasterxml.jackson.annotation.JsonProperty("expires_in")
-    val expiresIn: Long = 0,
-)
-
+// Not in the OpenAPI spec (simple inline JSON)
 data class VersionResponse(
     val version: String = "",
 )

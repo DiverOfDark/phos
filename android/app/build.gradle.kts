@@ -54,6 +54,10 @@ android {
     buildFeatures {
         compose = true
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 // OpenAPI Generator configuration
@@ -116,6 +120,7 @@ dependencies {
     // Lifecycle
     implementation(libs.lifecycle.runtime)
     implementation(libs.lifecycle.viewmodel)
+    implementation(libs.lifecycle.process)
 
     // Navigation
     implementation(libs.navigation.compose)
@@ -160,4 +165,8 @@ dependencies {
     // Core
     implementation(libs.core.ktx)
     implementation(libs.core.splashscreen)
+
+    // Testing
+    testImplementation(libs.junit)
+    testImplementation(libs.mockk)
 }

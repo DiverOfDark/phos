@@ -150,6 +150,36 @@
         ]
       }
     },
+    "/api/auth/refresh": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Refresh session JWT",
+        "description": "Accepts a currently-valid session (Authorization: Bearer header or session cookie) and issues a new session JWT with a fresh expiry. Expired or invalid sessions are rejected with 401 \u2014 this endpoint cannot resurrect an expired session. Cookie-authenticated callers also get the session cookie re-set.",
+        "operationId": "refresh",
+        "responses": {
+          "200": {
+            "description": "New session JWT",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Session missing, invalid, or expired"
+          }
+        },
+        "security": [
+          {
+            "session_cookie": []
+          }
+        ]
+      }
+    },
     "/api/auth/token": {
       "post": {
         "tags": [
@@ -174,7 +204,9 @@
             "description": "Session JWT token",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
               }
             }
           },
@@ -286,6 +318,31 @@
           {
             "name": "shot_id",
             "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max items to return (default 50)",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Cursor: created_at value of the last item from the previous page",
             "required": false,
             "schema": {
               "type": [
@@ -1438,6 +1495,55 @@
         }
       }
     },
+    "/api/settings/s3": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "operationId": "get_s3_settings",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/S3Settings"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "operationId": "generate_s3_settings",
+        "responses": {
+          "200": {
+            "description": "Credentials generated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/S3Settings"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Settings"
+        ],
+        "operationId": "delete_s3_settings",
+        "responses": {
+          "200": {
+            "description": "S3 access disabled"
+          }
+        }
+      }
+    },
     "/api/settings/webdav": {
       "get": {
         "tags": [
@@ -2184,6 +2290,13 @@
           "shot_id": {
             "type": "string"
           },
+          "source_file_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional: specific file to use as source. If omitted, the original file is used."
+          },
           "text_overrides": {
             "type": "object",
             "additionalProperties": {
@@ -2595,6 +2708,41 @@
           }
         }
       },
+      "S3Settings": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "access_key",
+          "bucket"
+        ],
+        "properties": {
+          "access_key": {
+            "type": "string",
+            "description": "The S3 access key id (OIDC sub in multi-user mode, \"phos\" in single-user)."
+          },
+          "bucket": {
+            "type": "string",
+            "description": "The fixed bucket name the library is exposed as."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "External endpoint URL override (PHOS_S3_PUBLIC_URL), if configured."
+          },
+          "secret_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The secret key. Stored in plaintext server-side because SigV4 signing\nrequires the real secret; only returned to the authenticated owner."
+          }
+        }
+      },
       "ScanParams": {
         "type": "object",
         "required": [
@@ -2944,6 +3092,24 @@
         ],
         "properties": {
           "id_token": {
+            "type": "string"
+          }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "description": "Response containing a Phos session JWT.",
+        "required": [
+          "token",
+          "expires_in"
+        ],
+        "properties": {
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "token": {
             "type": "string"
           }
         }

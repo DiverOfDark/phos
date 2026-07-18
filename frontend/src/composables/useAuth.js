@@ -13,6 +13,8 @@ export function useAuth() {
       if (res.ok) {
         user.value = await res.json()
         authEnabled.value = true
+        // Slide the session cookie so active users never hit the absolute expiry
+        fetch('/api/auth/refresh', { method: 'POST' }).catch(() => {})
       } else if (res.status === 401) {
         user.value = null
         authEnabled.value = true

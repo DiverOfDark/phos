@@ -19,7 +19,7 @@ services:
       #- PHOS_OIDC_CLIENT_SECRET=your-client-secret
       #- PHOS_OIDC_REDIRECT_URI=https://phos.example.com/api/auth/callback
       #- PHOS_JWT_SECRET=your-random-secret
-      #- PHOS_JWT_TTL=3600
+      #- PHOS_JWT_TTL=1209600  # session JWT lifetime in seconds, default 14 days
       #- PHOS_OIDC_SCOPES=openid profile email
       - PHOS_COMFYUI_URL=http://host.docker.internal:8188
     extra_hosts:

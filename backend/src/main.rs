@@ -402,9 +402,9 @@ async fn run_server() {
             s
         });
         let jwt_ttl: u64 = std::env::var("PHOS_JWT_TTL")
-            .unwrap_or_else(|_| "3600".to_string())
+            .unwrap_or_else(|_| "1209600".to_string()) // 14 days
             .parse()
-            .unwrap_or(3600);
+            .unwrap_or(1_209_600);
         let scopes: Vec<String> = std::env::var("PHOS_OIDC_SCOPES")
             .unwrap_or_else(|_| "openid profile email".to_string())
             .split_whitespace()

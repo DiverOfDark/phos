@@ -36,6 +36,7 @@ use utoipa::OpenApi;
         crate::auth::me,
         crate::auth::logout,
         crate::auth::token_exchange,
+        crate::auth::refresh,
         crate::auth::auth_config,
         // Shots
         shots::get_shots,
@@ -105,6 +106,7 @@ use utoipa::OpenApi;
             // Auth
             crate::auth::SessionClaims,
             crate::auth::TokenExchangeRequest,
+            crate::auth::TokenResponse,
             crate::auth::AuthConfigResponse,
             // Shots
             shots::ShotBrief,

@@ -70,7 +70,7 @@ Setting `PHOS_OIDC_ISSUER` enables multi-user mode — each authenticated user g
 | `PHOS_OIDC_REDIRECT_URI` | `http://localhost:{port}/api/auth/callback` | OAuth2 redirect URI |
 | `PHOS_OIDC_SCOPES` | `openid profile email` | Space-separated OIDC scopes |
 | `PHOS_JWT_SECRET` | *(auto-generated)* | Secret for signing session JWTs. Auto-generated and persisted to `.phos_jwt_secret` if not set |
-| `PHOS_JWT_TTL` | `3600` | Session JWT lifetime in seconds |
+| `PHOS_JWT_TTL` | `1209600` (14 days) | Session JWT lifetime in seconds |
 
 ### WebDAV
 

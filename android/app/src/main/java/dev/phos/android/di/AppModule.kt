@@ -10,6 +10,7 @@ import dagger.hilt.components.SingletonComponent
 import dev.phos.android.data.remote.AuthInterceptor
 import dev.phos.android.data.remote.BaseUrlInterceptor
 import dev.phos.android.data.remote.PhosApi
+import dev.phos.android.data.remote.PhosAuthenticator
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
@@ -32,8 +33,10 @@ object AppModule {
     fun provideOkHttpClient(
         baseUrlInterceptor: BaseUrlInterceptor,
         authInterceptor: AuthInterceptor,
+        phosAuthenticator: PhosAuthenticator,
     ): OkHttpClient {
         return OkHttpClient.Builder()
+            .authenticator(phosAuthenticator)
             .addInterceptor(baseUrlInterceptor)
             .addInterceptor(authInterceptor)
             .addInterceptor(HttpLoggingInterceptor().apply {

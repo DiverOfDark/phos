@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import net.openid.appauth.AuthState
 import net.openid.appauth.AuthorizationException
 import net.openid.appauth.AuthorizationRequest
 import net.openid.appauth.AuthorizationResponse
@@ -140,6 +141,7 @@ class LoginViewModel @Inject constructor(
                                     error = "Unexpected response from server",
                                 )
                             } else {
+                                authRepository.saveOidcScopes(config.scopes)
                                 _uiState.value = _uiState.value.copy(
                                     oidcIssuer = config.issuer,
                                     oidcClientId = config.mobile_client_id ?: config.client_id ?: "",
@@ -203,17 +205,31 @@ class LoginViewModel @Inject constructor(
                         return@fetchFromIssuer
                     }
 
+                    // Server-configured scopes plus openid (required for an id_token on
+                    // refresh) and offline_access (required by Zitadel and others for a
+                    // refresh token — requested client-side only, the web client doesn't need it).
+                    val scopes = (authRepository.getOidcScopes() ?: listOf("openid", "profile", "email"))
+                        .toMutableSet()
+                        .apply {
+                            add("openid")
+                            add("offline_access")
+                        }
+
                     val authRequest = AuthorizationRequest.Builder(
                         config,
                         state.oidcClientId,
                         ResponseTypeValues.CODE,
                         Uri.parse("dev.phos.android://callback"),
                     )
-                        .setScopes("openid", "profile", "email")
+                        .setScopes(scopes)
                         .build()
 
                     val authService = AuthorizationService(context)
-                    _authIntent.value = authService.getAuthorizationRequestIntent(authRequest)
+                    try {
+                        _authIntent.value = authService.getAuthorizationRequestIntent(authRequest)
+                    } finally {
+                        authService.dispose()
+                    }
                 }
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
@@ -248,9 +264,13 @@ class LoginViewModel @Inject constructor(
             return
         }
 
-        // Exchange authorization code for tokens via AppAuth
+        // Exchange authorization code for tokens via AppAuth. Keep the full AuthState
+        // so the refresh token can silently renew the session later.
+        val authState = AuthState(response, exception)
         val authService = AuthorizationService(appContext)
         authService.performTokenRequest(response.createTokenExchangeRequest()) { tokenResponse, tokenEx ->
+            authService.dispose()
+            authState.update(tokenResponse, tokenEx)
             if (tokenEx != null || tokenResponse == null) {
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
@@ -274,6 +294,7 @@ class LoginViewModel @Inject constructor(
                     val request = TokenExchangeRequest().apply { this.idToken = idToken }
                     val backendResponse = phosApi.exchangeToken(request)
                     authRepository.saveToken(backendResponse.token, backendResponse.expiresIn)
+                    authRepository.saveAppAuthState(authState.jsonSerializeString())
                     _uiState.value = _uiState.value.copy(isLoading = false, isLoggedIn = true)
                 } catch (e: Exception) {
                     _uiState.value = _uiState.value.copy(

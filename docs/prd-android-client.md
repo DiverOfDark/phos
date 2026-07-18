@@ -172,9 +172,9 @@ The app must support **OIDC Authorization Code Flow with PKCE**.
 - Browser-based sign-in (Custom Tabs / system browser)
 - Redirect back into app via app link or custom scheme
 - Secure token persistence
-- Refresh token support if available
+- Automatic session renewal: sliding renewal via `POST /api/auth/refresh` while the session JWT is valid, falling back to the stored OIDC refresh token (requires the `offline_access` scope and refresh tokens enabled on the IdP client) to re-exchange at `POST /api/auth/token` after expiry
 - Explicit logout
-- Re-auth flow on token failure
+- Re-auth flow on token failure (only when all silent renewal paths fail)
 
 #### Backend implications
 Current backend OIDC implementation is cookie-session based for the SPA. To support Android cleanly, backend should add one of these models:

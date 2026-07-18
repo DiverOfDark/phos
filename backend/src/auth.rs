@@ -11,7 +11,7 @@ use openidconnect::{
     core::{CoreClient, CoreIdToken, CoreProviderMetadata, CoreResponseType},
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
     EndpointMaybeSet, EndpointNotSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier,
-    RedirectUrl, Scope, TokenResponse,
+    RedirectUrl, Scope, TokenResponse as OidcTokenResponse,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -245,25 +245,22 @@ pub(crate) async fn callback(
         })?;
 
     // Build our session JWT.
-    let now = chrono::Utc::now().timestamp() as usize;
-    let session = SessionClaims {
-        sub: claims.subject().to_string(),
-        name: claims
-            .name()
-            .and_then(|n| n.get(None))
-            .map(|n| n.to_string())
-            .unwrap_or_default(),
-        email: claims.email().map(|e| e.to_string()).unwrap_or_default(),
-        exp: now + auth.jwt_ttl_secs as usize,
-        iat: now,
-    };
-    let session_jwt = encode(&Header::default(), &session, &auth.jwt_encoding_key)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let name = claims
+        .name()
+        .and_then(|n| n.get(None))
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    let email = claims.email().map(|e| e.to_string()).unwrap_or_default();
+    let session_jwt = issue_session_jwt(
+        claims.subject(),
+        &name,
+        &email,
+        auth.jwt_ttl_secs,
+        &auth.jwt_encoding_key,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let session_cookie = format!(
-        "{SESSION_COOKIE}={session_jwt}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
-        auth.jwt_ttl_secs
-    );
+    let session_cookie = session_cookie_header(&session_jwt, auth.jwt_ttl_secs);
 
     Ok((
         AppendHeaders(vec![
@@ -373,6 +370,13 @@ pub(crate) struct TokenExchangeRequest {
     id_token: String,
 }
 
+/// Response containing a Phos session JWT.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct TokenResponse {
+    token: String,
+    expires_in: u64,
+}
+
 #[utoipa::path(
     post,
     path = "/api/auth/token",
@@ -381,7 +385,7 @@ pub(crate) struct TokenExchangeRequest {
     description = "Mobile clients perform the OIDC Authorization Code + PKCE flow directly with the identity provider, then send the resulting ID token here. Phos validates it against the provider's JWKS and returns a session JWT that can be used in the `Authorization: Bearer` header.",
     request_body(content = TokenExchangeRequest, description = "OIDC ID token to exchange"),
     responses(
-        (status = 200, description = "Session JWT token", body = serde_json::Value),
+        (status = 200, description = "Session JWT token", body = TokenResponse),
         (status = 400, description = "Invalid ID token format"),
         (status = 401, description = "ID token verification failed"),
     )
@@ -389,7 +393,7 @@ pub(crate) struct TokenExchangeRequest {
 pub(crate) async fn token_exchange(
     State(auth): State<AuthState>,
     Json(payload): Json<TokenExchangeRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<TokenResponse>, StatusCode> {
     // Parse the raw ID token string into a CoreIdToken
     let id_token: CoreIdToken = serde_json::from_value(serde_json::Value::String(
         payload.id_token,
@@ -411,25 +415,69 @@ pub(crate) async fn token_exchange(
         })?;
 
     // Build a Phos session JWT with the same structure as the web flow.
-    let now = chrono::Utc::now().timestamp() as usize;
-    let session = SessionClaims {
-        sub: claims.subject().to_string(),
-        name: claims
-            .name()
-            .and_then(|n| n.get(None))
-            .map(|n| n.to_string())
-            .unwrap_or_default(),
-        email: claims.email().map(|e| e.to_string()).unwrap_or_default(),
-        exp: now + auth.jwt_ttl_secs as usize,
-        iat: now,
-    };
-    let token = encode(&Header::default(), &session, &auth.jwt_encoding_key)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let name = claims
+        .name()
+        .and_then(|n| n.get(None))
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    let email = claims.email().map(|e| e.to_string()).unwrap_or_default();
+    let token = issue_session_jwt(
+        claims.subject(),
+        &name,
+        &email,
+        auth.jwt_ttl_secs,
+        &auth.jwt_encoding_key,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(serde_json::json!({
-        "token": token,
-        "expires_in": auth.jwt_ttl_secs
-    })))
+    Ok(Json(TokenResponse {
+        token,
+        expires_in: auth.jwt_ttl_secs,
+    }))
+}
+
+/// POST /api/auth/refresh — sliding session renewal.
+#[utoipa::path(
+    post,
+    path = "/api/auth/refresh",
+    tag = "auth",
+    summary = "Refresh session JWT",
+    description = "Accepts a currently-valid session (Authorization: Bearer header or session cookie) and issues a new session JWT with a fresh expiry. Expired or invalid sessions are rejected with 401 — this endpoint cannot resurrect an expired session. Cookie-authenticated callers also get the session cookie re-set.",
+    responses(
+        (status = 200, description = "New session JWT", body = TokenResponse),
+        (status = 401, description = "Session missing, invalid, or expired"),
+    ),
+    security(("session_cookie" = []))
+)]
+pub(crate) async fn refresh(
+    State(auth): State<AuthState>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    // parse_session_token validates exp, so refresh can only extend a live session.
+    let claims = parse_session_token(&headers, &auth.jwt_decoding_key)?;
+
+    let token = issue_session_jwt(
+        &claims.sub,
+        &claims.name,
+        &claims.email,
+        auth.jwt_ttl_secs,
+        &auth.jwt_encoding_key,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut response = Json(TokenResponse {
+        token: token.clone(),
+        expires_in: auth.jwt_ttl_secs,
+    })
+    .into_response();
+
+    // Cookie-authenticated callers (web) get the cookie re-set too.
+    if headers.get(header::AUTHORIZATION).is_none() {
+        if let Ok(value) = session_cookie_header(&token, auth.jwt_ttl_secs).parse() {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +491,7 @@ pub fn create_auth_router(auth: AuthState) -> Router {
         .route("/api/auth/me", get(me))
         .route("/api/auth/logout", get(logout))
         .route("/api/auth/token", post(token_exchange))
+        .route("/api/auth/refresh", post(refresh))
         .route("/api/auth/config", get(auth_config))
         .with_state(auth)
 }
@@ -485,4 +534,122 @@ fn get_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 
 fn clear_cookie(name: &str) -> String {
     format!("{name}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+}
+
+/// Issue a fresh session JWT for the given identity.
+fn issue_session_jwt(
+    sub: &str,
+    name: &str,
+    email: &str,
+    ttl_secs: u64,
+    key: &EncodingKey,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    let now = chrono::Utc::now().timestamp() as usize;
+    let claims = SessionClaims {
+        sub: sub.to_string(),
+        name: name.to_string(),
+        email: email.to_string(),
+        exp: now + ttl_secs as usize,
+        iat: now,
+    };
+    encode(&Header::default(), &claims, key)
+}
+
+fn session_cookie_header(session_jwt: &str, ttl_secs: u64) -> String {
+    format!("{SESSION_COOKIE}={session_jwt}; HttpOnly; SameSite=Lax; Path=/; Max-Age={ttl_secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_keys(secret: &str) -> (EncodingKey, DecodingKey) {
+        (
+            EncodingKey::from_secret(secret.as_bytes()),
+            DecodingKey::from_secret(secret.as_bytes()),
+        )
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn issue_and_parse_roundtrip_via_bearer_header() {
+        let (enc, dec) = make_keys("test-secret");
+        let token = issue_session_jwt("user-1", "Alice", "alice@example.com", 3600, &enc).unwrap();
+        let claims = parse_session_token(&bearer_headers(&token), &dec).unwrap();
+        assert_eq!(claims.sub, "user-1");
+        assert_eq!(claims.name, "Alice");
+        assert_eq!(claims.email, "alice@example.com");
+        assert!(claims.exp > claims.iat);
+    }
+
+    #[test]
+    fn parse_falls_back_to_cookie() {
+        let (enc, dec) = make_keys("test-secret");
+        let token = issue_session_jwt("user-1", "Alice", "alice@example.com", 3600, &enc).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("other=x; {SESSION_COOKIE}={token}").parse().unwrap(),
+        );
+        let claims = parse_session_token(&headers, &dec).unwrap();
+        assert_eq!(claims.sub, "user-1");
+    }
+
+    #[test]
+    fn parse_rejects_expired_token() {
+        let (enc, dec) = make_keys("test-secret");
+        // exp beyond jsonwebtoken's default 60s leeway
+        let now = chrono::Utc::now().timestamp() as usize;
+        let claims = SessionClaims {
+            sub: "user-1".into(),
+            name: String::new(),
+            email: String::new(),
+            exp: now - 120,
+            iat: now - 3720,
+        };
+        let token = encode(&Header::default(), &claims, &enc).unwrap();
+        let result = parse_session_token(&bearer_headers(&token), &dec);
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn parse_rejects_wrong_secret() {
+        let (enc, _) = make_keys("secret-a");
+        let (_, dec) = make_keys("secret-b");
+        let token = issue_session_jwt("user-1", "", "", 3600, &enc).unwrap();
+        let result = parse_session_token(&bearer_headers(&token), &dec);
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn refresh_extends_expiry_and_preserves_claims() {
+        let (enc, dec) = make_keys("test-secret");
+        // Simulate an older-but-valid session: issued a while ago, still unexpired.
+        let now = chrono::Utc::now().timestamp() as usize;
+        let old = SessionClaims {
+            sub: "user-1".into(),
+            name: "Alice".into(),
+            email: "alice@example.com".into(),
+            exp: now + 60,
+            iat: now - 3540,
+        };
+        let old_token = encode(&Header::default(), &old, &enc).unwrap();
+        let parsed = parse_session_token(&bearer_headers(&old_token), &dec).unwrap();
+
+        let new_token =
+            issue_session_jwt(&parsed.sub, &parsed.name, &parsed.email, 3600, &enc).unwrap();
+        let renewed = parse_session_token(&bearer_headers(&new_token), &dec).unwrap();
+        assert_eq!(renewed.sub, old.sub);
+        assert_eq!(renewed.name, old.name);
+        assert_eq!(renewed.email, old.email);
+        assert!(renewed.exp > old.exp);
+    }
 }
