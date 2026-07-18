@@ -3,14 +3,15 @@ package dev.phos.android.ui.auth
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.qualifiers.ApplicationContext
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
-import com.fasterxml.jackson.module.kotlin.readValue
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.phos.android.data.remote.PhosApi
+import dev.phos.android.data.remote.model.AuthConfigResponse
 import dev.phos.android.data.remote.model.TokenExchangeRequest
 import dev.phos.android.data.repository.AuthRepository
 import kotlinx.coroutines.Dispatchers
@@ -41,12 +42,7 @@ data class LoginUiState(
     val isLoggedIn: Boolean = false,
 )
 
-private data class AuthConfigDto(
-    val issuer: String? = null,
-    val client_id: String? = null,
-    val mobile_client_id: String? = null,
-    val scopes: List<String>? = null,
-)
+private const val TAG = "LoginViewModel"
 
 @HiltViewModel
 class LoginViewModel @Inject constructor(
@@ -132,8 +128,14 @@ class LoginViewModel @Inject constructor(
                             error = "Server returned HTTP ${res.code}",
                         )
                         else -> {
+                            // Parse into the OpenAPI-generated model (proguard keeps its
+                            // members) and pass the Class directly: the reified readValue<T>
+                            // builds an anonymous TypeReference whose generic signature R8
+                            // strips in release builds, throwing before parsing even starts.
                             val config = res.body?.let {
-                                runCatching { mapper.readValue<AuthConfigDto>(it) }.getOrNull()
+                                runCatching { mapper.readValue(it, AuthConfigResponse::class.java) }
+                                    .onFailure { e -> Log.e(TAG, "Auth config parse failed", e) }
+                                    .getOrNull()
                             }
                             if (config?.issuer.isNullOrBlank()) {
                                 _uiState.value = _uiState.value.copy(
@@ -144,7 +146,7 @@ class LoginViewModel @Inject constructor(
                                 authRepository.saveOidcScopes(config.scopes)
                                 _uiState.value = _uiState.value.copy(
                                     oidcIssuer = config.issuer,
-                                    oidcClientId = config.mobile_client_id ?: config.client_id ?: "",
+                                    oidcClientId = config.mobileClientId ?: config.clientId ?: "",
                                     isFetchingConfig = false,
                                     info = "Auth config loaded.",
                                 )

@@ -18,6 +18,11 @@
     *;
 }
 
+# Jackson TypeReference (used by reified readValue<T>) resolves its generic
+# supertype reflectively; keep subclasses so R8 retains their Signature
+# attribute (-keepattributes only applies to classes matched by a keep rule).
+-keep,allowobfuscation,allowshrinking class * extends com.fasterxml.jackson.core.type.TypeReference
+
 # Room
 -keep class * extends androidx.room.RoomDatabase
 -dontwarn androidx.room.paging.**
