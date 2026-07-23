@@ -11,6 +11,7 @@ mod db;
 mod embedding;
 mod import;
 mod models;
+mod organizer;
 mod s3;
 mod scanner;
 mod schema;
@@ -181,6 +182,11 @@ async fn run_server() {
     // can wait on, and the signal handler sets.
     let shutdown_flag = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
 
+    // Debounced background reorganizer: moves files into person folders
+    // shortly after clustering-relevant changes (confirms, reassigns, new
+    // files) instead of only at startup.
+    let organizer = organizer::Organizer::new();
+
     let state = api::AppState {
         pool,
         scanner: scanner.clone(),
@@ -189,6 +195,7 @@ async fn run_server() {
         multi_user,
         user_pools: Arc::new(RwLock::new(HashMap::new())),
         shutdown_flag: shutdown_flag.clone(),
+        organizer: organizer.clone(),
     };
 
     let bg_shutdown = shutdown_flag.clone();
@@ -199,8 +206,9 @@ async fn run_server() {
         let scanner_ref = scanner.clone();
         let comfyui_url_bg = comfyui_url.clone();
         let comfyui_shutdown = shutdown_flag.clone();
+        let bg_organizer = organizer.clone();
         tokio::task::spawn_blocking(move || {
-            let (lock, _cvar) = &*bg_shutdown;
+            let (lock, cvar) = &*bg_shutdown;
             if *lock.lock().unwrap() {
                 return;
             }
@@ -224,6 +232,7 @@ async fn run_server() {
                 }
             };
 
+            let mut watcher_handles = Vec::new();
             for user_dir in &user_dirs {
                 if *lock.lock().unwrap() {
                     return;
@@ -243,7 +252,7 @@ async fn run_server() {
                     continue;
                 }
 
-                let user_scanner = scanner_ref.with_db_path(user_db_path.clone());
+                let user_scanner = Arc::new(scanner_ref.with_db_path(user_db_path.clone()));
 
                 if let Err(e) = user_scanner.rehash_files() {
                     tracing::error!("Rehash failed for user {}: {}", user_name, e);
@@ -257,8 +266,21 @@ async fn run_server() {
                 if let Err(e) = user_scanner.caption_shots(user_dir) {
                     tracing::error!("Captioning failed for user {}: {}", user_name, e);
                 }
-                if let Err(e) = import::run_reorganize(user_dir, false) {
+                if let Err(e) = bg_organizer.run_now(user_dir) {
                     tracing::error!("Reorganize failed for user {}: {}", user_name, e);
+                }
+                // Debounced + periodic reorganize for this user's library.
+                bg_organizer.watch(user_dir);
+
+                match watcher::start_watcher(
+                    user_dir.clone(),
+                    user_scanner.clone(),
+                    bg_organizer.clone(),
+                ) {
+                    Ok(handle) => watcher_handles.push(handle),
+                    Err(e) => {
+                        tracing::error!("Failed to start watcher for user {}: {}", user_name, e)
+                    }
                 }
 
                 // Spawn a ComfyUI worker for each existing user
@@ -275,11 +297,21 @@ async fn run_server() {
                 "Multi-user startup scan complete ({} user libraries)",
                 user_dirs.len()
             );
+
+            // Keep the per-user watchers alive until shutdown (dropping the
+            // handles stops watching). Reorganize scheduling is handled by
+            // the organizer workers.
+            let mut guard = lock.lock().unwrap();
+            while !*guard {
+                guard = cvar.wait(guard).unwrap();
+            }
+            drop(watcher_handles);
         })
     } else {
         // Single-user mode: scan the root library as before
         let scan_path = root_path.to_path_buf();
         let watcher_library_path = root_path.to_path_buf();
+        let bg_organizer = organizer.clone();
         tokio::task::spawn_blocking(move || {
             let (lock, cvar) = &*bg_shutdown;
             if *lock.lock().unwrap() {
@@ -307,34 +339,26 @@ async fn run_server() {
                 return;
             }
             // Reorganize files on disk to match clustering results.
-            if let Err(e) = import::run_reorganize(&scan_path, false) {
+            if let Err(e) = bg_organizer.run_now(&scan_path) {
                 tracing::error!("Post-scan reorganize failed: {}", e);
             }
 
             if *lock.lock().unwrap() {
                 return;
             }
+            // Debounced + periodic reorganize, independent of the watcher so
+            // it keeps running even if the watcher fails to start.
+            bg_organizer.watch(&scan_path);
+
             // Initial scan complete -- start watching for incremental changes.
-            match watcher::start_watcher(watcher_library_path, scanner.clone()) {
+            match watcher::start_watcher(watcher_library_path, scanner.clone(), bg_organizer) {
                 Ok(watcher_handle) => {
                     info!("File watcher active after initial scan");
-                    // Periodically re-run reorganize (every 30 minutes) until shutdown.
-                    let reorganize_interval = std::time::Duration::from_secs(30 * 60);
+                    // Keep the watcher alive until shutdown (dropping the
+                    // handle stops watching).
                     let mut guard = lock.lock().unwrap();
-                    loop {
-                        let (g, timeout) = cvar
-                            .wait_timeout_while(guard, reorganize_interval, |stopped| !*stopped)
-                            .unwrap();
-                        guard = g;
-                        if *guard {
-                            break;
-                        }
-                        if timeout.timed_out() {
-                            info!("Periodic reorganize triggered");
-                            if let Err(e) = import::run_reorganize(&scan_path, false) {
-                                tracing::error!("Periodic reorganize failed: {}", e);
-                            }
-                        }
+                    while !*guard {
+                        guard = cvar.wait(guard).unwrap();
                     }
                     info!("Shutdown signal received, stopping file watcher");
                     drop(watcher_handle);
@@ -518,6 +542,7 @@ async fn run_server() {
         *stopped = true;
         cvar.notify_all();
     }
+    organizer.shutdown();
     // Give it a moment to flush cleanly.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), bg_handle).await;
     info!("Shutdown complete");

@@ -766,12 +766,14 @@ impl Scanner {
         Ok(total_removed)
     }
 
+    /// Returns `true` if the file was newly indexed, `false` if it was
+    /// already known (same path or duplicate content).
     pub fn process_file(
         &self,
         conn: &mut SqliteConnection,
         path: &Path,
         dhash_cache: &std::sync::Mutex<Vec<DHashCacheEntry>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         // --- Phase 1: CPU-heavy work (no DB writes) ---
         let library_root = self.db_path.parent().unwrap();
         let relative_path = db::make_relative(library_root, path);
@@ -786,7 +788,7 @@ impl Scanner {
                 .ok();
             if existing.is_some() {
                 debug!("File already indexed at path {:?}, skipping", path);
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -809,7 +811,7 @@ impl Scanner {
                     existing_id,
                     path.display(),
                 );
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -1041,7 +1043,7 @@ impl Scanner {
                 }
 
                 info!("Indexed: {:?}", path);
-                Ok(())
+                Ok(true)
             }
             Err(e) => {
                 let _ = diesel::sql_query("ROLLBACK").execute(conn);

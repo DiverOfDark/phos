@@ -562,6 +562,8 @@ pub(super) async fn delete_shot(
     }
     let _ = crate::import::cleanup_empty_dirs(&state.library_root);
 
+    state.organizer.signal(&state.library_root);
+
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -675,6 +677,8 @@ pub(super) async fn update_shot(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
     }
+
+    state.organizer.signal(&state.library_root);
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
@@ -902,6 +906,8 @@ pub(super) async fn split_shot(
     )
     .set(shots::review_status.eq("pending"))
     .execute(&mut conn);
+
+    state.organizer.signal(&state.library_root);
 
     Ok(Json(
         serde_json::json!({"status": "ok", "new_shot_id": new_shot_id}),
@@ -1169,6 +1175,8 @@ pub(super) async fn merge_shots(
         tracing::error!("Failed to cleanup orphaned people after merge: {}", e);
     }
 
+    state.organizer.signal(&state.library_root);
+
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -1212,6 +1220,8 @@ pub(super) async fn batch_confirm(
             })?;
         updated_count += updated;
     }
+
+    state.organizer.signal(&state.library_root);
 
     Ok(Json(
         serde_json::json!({"status": "ok", "updated": updated_count}),
@@ -1308,6 +1318,8 @@ pub(super) async fn batch_reassign(
 
         updated_count += updated;
     }
+
+    state.organizer.signal(&state.library_root);
 
     Ok(Json(
         serde_json::json!({"status": "ok", "updated": updated_count}),

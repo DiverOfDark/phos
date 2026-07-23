@@ -84,6 +84,8 @@ pub(super) async fn upload_file_raw(
     // Index the file immediately (blocking -- runs face detection etc.)
     let scanner = state.scanner.clone();
     let target_path_owned = target_path.to_path_buf();
+    let organizer = state.organizer.clone();
+    let library_root = state.library_root.clone();
     tokio::task::spawn_blocking(move || {
         let mut conn = match scanner.open_db() {
             Ok(c) => c,
@@ -93,12 +95,14 @@ pub(super) async fn upload_file_raw(
             }
         };
         let dhash_cache = std::sync::Mutex::new(Vec::<crate::scanner::DHashCacheEntry>::new());
-        if let Err(e) = scanner.process_file(&mut conn, &target_path_owned, &dhash_cache) {
-            tracing::error!(
+        match scanner.process_file(&mut conn, &target_path_owned, &dhash_cache) {
+            Ok(true) => organizer.signal(&library_root),
+            Ok(false) => {}
+            Err(e) => tracing::error!(
                 "Failed to index uploaded file {:?}: {}",
                 target_path_owned,
                 e
-            );
+            ),
         }
     })
     .await
@@ -129,24 +133,16 @@ pub(super) async fn finalize_import(
 
     let library_root = state.library_root.clone();
     let caption_library_root = library_root.clone();
+    let organizer = state.organizer.clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        // 1. Run face clustering (drop connection before reorganize)
-        tracing::info!("Finalize: running face clustering...");
-        {
-            let mut conn = scanner
-                .open_db()
-                .map_err(|e| format!("Failed to open DB: {}", e))?;
-            scanner
-                .cluster_faces(&mut conn)
-                .map_err(|e| format!("Face clustering failed: {}", e))?;
-        }
-
-        // 2. Reorganize files to match clustering
-        tracing::info!("Finalize: reorganizing files...");
-        crate::import::run_reorganize(&library_root, false)
+        // 1. Cluster faces + reorganize files (run_reorganize does both),
+        // serialized against the background organizer worker.
+        tracing::info!("Finalize: clustering and reorganizing files...");
+        organizer
+            .run_now(&library_root)
             .map_err(|e| format!("Reorganize failed: {}", e))?;
 
-        // 3. Caption in background — don't block the finalize response
+        // 2. Caption in background — don't block the finalize response
         let caption_scanner = scanner.clone();
         tokio::task::spawn_blocking(move || {
             tracing::info!("Finalize: captioning shots in background...");

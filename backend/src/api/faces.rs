@@ -217,6 +217,8 @@ pub(super) async fn reassign_face(
         }
     }
 
+    state.organizer.signal(&state.library_root);
+
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -273,6 +275,8 @@ pub(super) async fn delete_face(
     if let Some(pid) = &old_person_id {
         super::cleanup_orphaned_person(&mut conn, pid)?;
     }
+
+    state.organizer.signal(&state.library_root);
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
@@ -525,6 +529,8 @@ pub(super) async fn add_manual_face(
         })?;
 
     super::recalculate_primary_person(&mut conn, &shot_id)?;
+
+    state.organizer.signal(&state.library_root);
 
     Ok(Json(serde_json::json!({"id": face_id})))
 }

@@ -186,6 +186,7 @@ pub struct AppState {
     pub multi_user: bool,
     pub user_pools: Arc<RwLock<HashMap<String, DbPool>>>,
     pub shutdown_flag: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    pub organizer: Arc<crate::organizer::Organizer>,
 }
 
 /// Per-request state extractor. In multi-user mode, resolves to the per-user
@@ -238,6 +239,7 @@ pub async fn resolve_user_db(
                 multi_user: state.multi_user,
                 user_pools: state.user_pools.clone(),
                 shutdown_flag: state.shutdown_flag.clone(),
+                organizer: state.organizer.clone(),
             }
         } else {
             state
@@ -277,6 +279,10 @@ async fn get_or_create_user_pool(
     })?;
     pools.insert(user_sub.to_string(), pool.clone());
     drop(pools);
+
+    // Give the new user's library periodic reorganize runs. (A file watcher
+    // is only attached at startup, so live watching begins after a restart.)
+    state.organizer.watch(&user_dir);
 
     // Spawn a ComfyUI enhancement worker for the new user
     if let Some(ref url) = state.comfyui_url {

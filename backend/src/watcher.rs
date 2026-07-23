@@ -1,3 +1,4 @@
+use crate::organizer::Organizer;
 use crate::scanner::{is_media_file, Scanner};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -32,6 +33,7 @@ const DEBOUNCE_DURATION: Duration = Duration::from_secs(2);
 pub fn start_watcher(
     library_path: PathBuf,
     scanner: Arc<Scanner>,
+    organizer: Arc<Organizer>,
 ) -> anyhow::Result<RecommendedWatcher> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
@@ -52,7 +54,7 @@ pub fn start_watcher(
     std::thread::Builder::new()
         .name("phos-file-watcher".into())
         .spawn(move || {
-            run_watcher_loop(rx, &scanner, &watcher_library_path);
+            run_watcher_loop(rx, &scanner, &watcher_library_path, &organizer);
         })?;
 
     Ok(watcher)
@@ -67,6 +69,7 @@ fn run_watcher_loop(
     rx: mpsc::Receiver<notify::Result<Event>>,
     scanner: &Scanner,
     library_path: &Path,
+    organizer: &Organizer,
 ) {
     // Maps each path to the action that should be taken and the instant of the
     // last event for that path.
@@ -90,7 +93,7 @@ fn run_watcher_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     // Flush remaining events before exiting.
                     if !pending.is_empty() {
-                        flush_pending(&mut pending, scanner, library_path);
+                        flush_pending(&mut pending, scanner, library_path, organizer);
                     }
                     info!("File watcher channel closed, shutting down watcher loop");
                     return;
@@ -111,11 +114,11 @@ fn run_watcher_loop(
                 .values()
                 .any(|(_, ts)| ts.elapsed() >= DEBOUNCE_DURATION);
             if should_flush {
-                flush_pending(&mut pending, scanner, library_path);
+                flush_pending(&mut pending, scanner, library_path, organizer);
             }
         } else {
             // Timeout fired -- flush all pending events.
-            flush_pending(&mut pending, scanner, library_path);
+            flush_pending(&mut pending, scanner, library_path, organizer);
         }
     }
 }
@@ -153,6 +156,7 @@ fn flush_pending(
     pending: &mut HashMap<PathBuf, (FileAction, Instant)>,
     scanner: &Scanner,
     library_path: &Path,
+    organizer: &Organizer,
 ) {
     if pending.is_empty() {
         return;
@@ -180,7 +184,11 @@ fn flush_pending(
         .map(|(path, (action, _))| (path, action))
         .collect();
 
-    let mut had_upserts = false;
+    // Only counts changes that actually touched the DB — files moved by the
+    // organizer itself re-appear here as no-op upserts (path already updated
+    // in the DB) and must not re-trigger it, or every reorganize would
+    // schedule another one.
+    let mut had_changes = false;
 
     for (path, action) in actions {
         match action {
@@ -191,25 +199,31 @@ fn flush_pending(
                     debug!("Watcher: path {:?} no longer exists, skipping", path);
                     continue;
                 }
-                if let Err(e) = scanner.process_file(&mut conn, &path, &dhash_cache) {
-                    error!("Watcher: failed to process {:?}: {}", path, e);
-                } else {
-                    had_upserts = true;
+                match scanner.process_file(&mut conn, &path, &dhash_cache) {
+                    Ok(indexed) => had_changes |= indexed,
+                    Err(e) => error!("Watcher: failed to process {:?}: {}", path, e),
                 }
             }
             FileAction::Remove => {
+                // Fails benignly for paths the organizer moved (the DB row
+                // already points at the new location).
                 if let Err(e) = scanner.remove_file(&mut conn, &path) {
                     warn!("Watcher: failed to remove {:?}: {}", path, e);
+                } else {
+                    had_changes = true;
                 }
             }
         }
     }
 
-    // Caption any newly added shots that don't have descriptions yet
-    if had_upserts {
+    if had_changes {
+        // Caption any newly added shots that don't have descriptions yet
         if let Err(e) = scanner.caption_shots(library_path) {
             error!("Watcher: captioning failed: {}", e);
         }
+        // New/removed files change clustering and folder layout — let the
+        // organizer move things into place after the dust settles.
+        organizer.signal(library_path);
     }
 }
 
@@ -297,7 +311,9 @@ mod tests {
         // Use a non-existent DB path -- flush should handle the error gracefully
         // and still clear the map.
         let scanner = Scanner::new(PathBuf::from("/tmp/nonexistent_test.db"), None);
-        flush_pending(&mut pending, &scanner, Path::new("/tmp"));
+        let organizer = Organizer::new();
+        flush_pending(&mut pending, &scanner, Path::new("/tmp"), &organizer);
+        organizer.shutdown();
         assert!(pending.is_empty());
     }
 }

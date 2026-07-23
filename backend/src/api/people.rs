@@ -353,6 +353,8 @@ pub(super) async fn merge_people(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    state.organizer.signal(&state.library_root);
+
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -555,6 +557,8 @@ pub(super) async fn delete_person(
     for shot_id in &affected_shot_ids {
         let _ = super::recalculate_primary_person(&mut conn, shot_id);
     }
+
+    state.organizer.signal(&state.library_root);
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }

@@ -128,8 +128,9 @@ pub(super) async fn get_organize_stats(UState(state): UState) -> Json<OrganizeSt
 )]
 pub(super) async fn trigger_reorganize(UState(state): UState) -> Json<serde_json::Value> {
     let library_root = state.library_root.clone();
+    let organizer = state.organizer.clone();
     std::thread::spawn(move || {
-        if let Err(e) = crate::import::run_reorganize(&library_root, false) {
+        if let Err(e) = organizer.run_now(&library_root) {
             tracing::error!("Background reorganize failed: {}", e);
         } else {
             tracing::info!("Background reorganize completed successfully");
