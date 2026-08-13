@@ -63,6 +63,28 @@ class ShotRepository @Inject constructor(
     }
 
     /**
+     * Takes the person off a shot, leaving it unassigned.
+     *
+     * The API spells this as an empty `primary_person_id`, which is the server's
+     * "nobody" rather than "don't change it" — the same thing the web's "mark
+     * unsorted" sends. It is the honest answer for a shot the reviewer cannot
+     * identify, and better than confirming a guess.
+     */
+    suspend fun markUnsorted(shotId: String) {
+        shotsApi.updateShot(shotId, UpdateShotPayload().primaryPersonId("")).awaitVoid()
+    }
+
+    /**
+     * Marks one shot reviewed.
+     *
+     * Routed through the batch endpoint with a single id, exactly as the web client
+     * does, so "confirmed" means the same thing on both.
+     */
+    suspend fun confirm(shotId: String) {
+        batchConfirm(listOf(shotId))
+    }
+
+    /**
      * Splits [fileIds] out of [shotId] into a new shot of their own.
      *
      * The server refuses to split out every file (that would leave an empty shot),

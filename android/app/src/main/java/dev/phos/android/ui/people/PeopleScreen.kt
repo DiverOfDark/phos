@@ -16,10 +16,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.RateReview
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -48,6 +51,7 @@ import dev.phos.android.ui.common.ShimmerBox
 fun PeopleScreen(
     onPersonClick: (String) -> Unit,
     onSettingsClick: () -> Unit,
+    onReviewClick: () -> Unit,
     onReLogin: () -> Unit,
     viewModel: PeopleViewModel = hiltViewModel(),
 ) {
@@ -61,6 +65,23 @@ fun PeopleScreen(
             TopAppBar(
                 title = { Text("Phos") },
                 actions = {
+                    // The badge is the point: a review queue nobody can see the size
+                    // of is a review queue nobody opens. The count comes from the
+                    // people list that is already loaded, so it costs no extra call.
+                    val pending = people.sumOf { it.pendingCount }
+                    if (pending > 0) {
+                        BadgedBox(
+                            badge = { Badge { Text(if (pending > 99) "99+" else "$pending") } },
+                        ) {
+                            IconButton(onClick = onReviewClick) {
+                                Icon(Icons.Default.RateReview, contentDescription = "Review pending shots")
+                            }
+                        }
+                    } else {
+                        IconButton(onClick = onReviewClick) {
+                            Icon(Icons.Default.RateReview, contentDescription = "Review pending shots")
+                        }
+                    }
                     IconButton(onClick = onSettingsClick) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }

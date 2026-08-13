@@ -6,6 +6,7 @@ import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import dev.phos.android.data.remote.api.AuthApi
 import dev.phos.android.data.remote.api.ClientApi
+import dev.phos.android.data.remote.api.FacesApi
 import dev.phos.android.data.remote.api.FilesApi
 import dev.phos.android.data.remote.api.PeopleApi
 import dev.phos.android.data.remote.api.ShotsApi
@@ -39,6 +40,10 @@ object ApiModule {
     @Provides
     @Singleton
     fun provideFilesApi(retrofit: Retrofit): FilesApi = retrofit.create(FilesApi::class.java)
+
+    @Provides
+    @Singleton
+    fun provideFacesApi(retrofit: Retrofit): FacesApi = retrofit.create(FacesApi::class.java)
 
     @Provides
     @Singleton

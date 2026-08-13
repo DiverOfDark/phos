@@ -26,6 +26,7 @@ import dev.phos.android.ui.auth.LoginScreen
 import dev.phos.android.ui.browser.BrowserScreen
 import dev.phos.android.ui.grid.PersonGridScreen
 import dev.phos.android.ui.people.PeopleScreen
+import dev.phos.android.ui.review.ReviewScreen
 import dev.phos.android.ui.settings.SettingsScreen
 
 object Routes {
@@ -33,6 +34,7 @@ object Routes {
     const val PEOPLE = "people"
     const val GRID = "grid/{personId}"
     const val BROWSER = "browser/{personId}?shot={shot}"
+    const val REVIEW = "review"
     const val SETTINGS = "settings"
 
     fun grid(personId: String) = "grid/$personId"
@@ -64,6 +66,9 @@ fun PhosNavigation() {
                 },
                 onSettingsClick = {
                     navController.navigate(Routes.SETTINGS)
+                },
+                onReviewClick = {
+                    navController.navigate(Routes.REVIEW)
                 },
                 onReLogin = {
                     navController.navigate(Routes.LOGIN) {
@@ -99,6 +104,10 @@ fun PhosNavigation() {
             BrowserScreen(
                 onBack = { navController.popBackStack() },
             )
+        }
+
+        composable(Routes.REVIEW) {
+            ReviewScreen(onBack = { navController.popBackStack() })
         }
 
         composable(Routes.SETTINGS) {
