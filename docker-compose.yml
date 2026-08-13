@@ -4,6 +4,11 @@ services:
       context: .
       args:
         PHOS_VERSION: "${PHOS_VERSION:-dev}"
+        # The Android versionCode the bundled APK is built with, and the number
+        # the in-app updater compares against. Left at the Dockerfile default of
+        # 1 it never increases, so a compose self-hoster would never be offered
+        # an update — silently. `git rev-list --count HEAD` is what CI uses.
+        PHOS_VERSION_CODE: "${PHOS_VERSION_CODE:-1}"
     ports:
       - "33000:33000"
     volumes:

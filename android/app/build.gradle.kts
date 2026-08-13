@@ -53,6 +53,11 @@ android {
 
     buildFeatures {
         compose = true
+        // AGP 8+ only generates BuildConfig on request. The in-app updater needs
+        // BuildConfig.VERSION_CODE to compare against the server's advertised build
+        // and BuildConfig.VERSION_NAME to show the user what they are running, so the
+        // values set in defaultConfig have to reach app code.
+        buildConfig = true
     }
 
     testOptions {
@@ -101,6 +106,13 @@ tasks.named("preBuild") {
 
 tasks.configureEach {
     if (name.startsWith("ksp") && name.endsWith("Kotlin")) {
+        dependsOn("openApiGenerate")
+    }
+    // UpdateRepositoryTest builds a GENERATED model (ClientVersionResponse), so
+    // unit-test compilation cannot start before the generator has run. `preBuild`
+    // already pulls it in via the app variants; saying so on the unit-test tasks
+    // themselves keeps `:app:testDebugUnitTest` correct in a clean tree.
+    if (name.startsWith("compile") && name.contains("UnitTest")) {
         dependsOn("openApiGenerate")
     }
 }
@@ -169,4 +181,5 @@ dependencies {
     // Testing
     testImplementation(libs.junit)
     testImplementation(libs.mockk)
+    testImplementation(libs.coroutines.test)
 }

@@ -393,6 +393,12 @@ async fn run_server() {
     let index_path = format!("{}/index.html", static_dir);
     let serve_static = ServeDir::new(&static_dir).not_found_service(ServeFile::new(index_path));
 
+    // Metadata for the APK this image bundles, read once: neither the APK nor
+    // its sidecar can change without a new image. Never fails — a build with no
+    // APK (or a broken sidecar) just advertises "nothing to offer".
+    let client_release = Arc::new(api::client::load_bundled_release(Path::new(&static_dir)));
+    let public_api = api::create_public_router(client_release);
+
     // WebDAV service — always available at /webdav/, returns 401/503 until
     // credentials are configured via the settings API.
     let webdav_service = webdav::WebDavService::new(root_path, multi_user, "/webdav");
@@ -459,6 +465,9 @@ async fn run_server() {
 
         Router::new()
             .merge(auth_router)
+            // Merged alongside — not inside — the protected API: a 401 here
+            // would break in-app updates exactly when someone is logged out.
+            .merge(public_api)
             .merge(protected_api)
             .nest_service("/webdav", webdav_service.clone())
             .route_service(&format!("/{}", s3::BUCKET_NAME), s3_service.clone())
@@ -476,6 +485,7 @@ async fn run_server() {
         info!("OIDC authentication disabled (set PHOS_OIDC_ISSUER to enable)");
         Router::new()
             .merge(api_router)
+            .merge(public_api)
             .nest_service("/webdav", webdav_service.clone())
             .route_service(&format!("/{}", s3::BUCKET_NAME), s3_service.clone())
             .route_service(&format!("/{}/", s3::BUCKET_NAME), s3_service.clone())

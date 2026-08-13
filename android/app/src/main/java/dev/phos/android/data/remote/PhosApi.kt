@@ -47,6 +47,15 @@ interface PhosApi {
 
     @GET("api/version")
     suspend fun getVersion(): VersionResponse
+
+    /**
+     * Metadata for the APK this server bundles — the in-app updater's only input.
+     *
+     * Unauthenticated on the server side, deliberately: an app whose session has
+     * lapsed still has to be able to discover a newer build.
+     */
+    @GET("api/client/version")
+    suspend fun getClientVersion(): dev.phos.android.data.remote.model.ClientVersionResponse
 }
 
 // Not in the OpenAPI spec (simple inline JSON)

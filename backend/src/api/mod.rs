@@ -1,3 +1,4 @@
+pub mod client;
 mod comfyui;
 mod faces;
 mod files;
@@ -78,6 +79,7 @@ use utoipa::OpenApi;
         stats::trigger_reorganize,
         stats::trigger_scan,
         stats::get_version,
+        client::client_version,
         // ComfyUI
         comfyui::comfyui_health,
         comfyui::comfyui_list_workflows,
@@ -142,6 +144,8 @@ use utoipa::OpenApi;
             stats::StatsResponse,
             stats::OrganizeStatsResponse,
             stats::ScanParams,
+            // Android client
+            client::ClientVersionResponse,
             // ComfyUI
             comfyui::ImportWorkflowPayload,
             comfyui::EnhancePayload,
@@ -386,6 +390,19 @@ pub(crate) fn cleanup_orphaned_person(conn: &mut diesel::SqliteConnection, perso
     }
 
     Ok(())
+}
+
+/// Routes that must answer without a session.
+///
+/// Merged *outside* [`crate::auth::require_auth`], so it is deliberately kept
+/// to endpoints that disclose nothing user-scoped. Today that is one: the
+/// bundled-APK advertisement, which describes a download (`/phos.apk`) that is
+/// already public — and which an app whose session has lapsed still has to be
+/// able to read, or it can never update itself back into working order.
+pub fn create_public_router(release: Arc<client::ClientVersionResponse>) -> Router {
+    Router::new()
+        .route("/api/client/version", get(client::client_version))
+        .with_state(release)
 }
 
 pub fn create_router(state: AppState) -> Router {
