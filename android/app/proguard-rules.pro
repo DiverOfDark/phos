@@ -13,10 +13,8 @@
     *;
 }
 
-# GitHub API models (Jackson deserialization)
--keepclassmembers class dev.phos.android.data.update.** {
-    *;
-}
+# (The updater's wire model is generated into data.remote.model, which the rule
+# above already covers; nothing in dev.phos.android.update is reflected on.)
 
 # Jackson TypeReference (used by reified readValue<T>) resolves its generic
 # supertype reflectively; keep subclasses so R8 retains their Signature

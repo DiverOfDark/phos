@@ -156,7 +156,7 @@
           "auth"
         ],
         "summary": "Refresh session JWT",
-        "description": "Accepts a currently-valid session (Authorization: Bearer header or session cookie) and issues a new session JWT with a fresh expiry. Expired or invalid sessions are rejected with 401 \u2014 this endpoint cannot resurrect an expired session. Cookie-authenticated callers also get the session cookie re-set.",
+        "description": "Accepts a currently-valid session (Authorization: Bearer header or session cookie) and issues a new session JWT with a fresh expiry. Expired or invalid sessions are rejected with 401 — this endpoint cannot resurrect an expired session. Cookie-authenticated callers also get the session cookie re-set.",
         "operationId": "refresh",
         "responses": {
           "200": {
@@ -217,6 +217,31 @@
             "description": "ID token verification failed"
           }
         }
+      }
+    },
+    "/api/client/version": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "summary": "Bundled Android client version",
+        "description": "Metadata for the APK this server ships, so the Android app can offer an in-app update. Unauthenticated, like the /phos.apk download it describes. Always 200: a server with no bundled APK answers `available: false` with `version_code: 0`, which the client reads as \"up to date\".",
+        "operationId": "client_version",
+        "responses": {
+          "200": {
+            "description": "The bundled APK, or `available: false` when there is none",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientVersionResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {}
+        ]
       }
     },
     "/api/comfyui/enhance": {
@@ -923,7 +948,7 @@
           "files"
         ],
         "summary": "Delete a file",
-        "description": "Delete a non-original file from a shot. The original file cannot be deleted directly \u2014 delete the shot instead.",
+        "description": "Delete a non-original file from a shot. The original file cannot be deleted directly — delete the shot instead.",
         "operationId": "delete_file",
         "parameters": [
           {
@@ -2267,6 +2292,46 @@
           }
         }
       },
+      "ClientVersionResponse": {
+        "type": "object",
+        "description": "`GET /api/client/version` response — the bundled Android build.\n\nEvery field is non-nullable, so a generated client needs no null-handling at\nall: \"no APK bundled\" is expressed by `available: false` with\n`version_code: 0`, not by absent fields and not by an error status.",
+        "required": [
+          "available",
+          "version_name",
+          "version_code",
+          "sha256",
+          "size_bytes",
+          "download_path"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "description": "Whether this server has an APK to offer at all.\n\n`false` for a backend-only build, for local development, and whenever\nthe bundled metadata is unusable. A client that only compares version\ncodes does not need to read this — it exists so a \"check for updates\"\nscreen can say \"this server does not ship an APK\" instead of the\nmisleading \"you are up to date\"."
+          },
+          "download_path": {
+            "type": "string",
+            "description": "Server-relative path the APK downloads from, always populated so the\nclient never hardcodes it."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Lowercase hex SHA-256 of the APK at `download_path`.\n\nEmpty when `available` is `false`. The client must verify the downloaded\nbytes against this before handing them to the installer."
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size of the APK in bytes, so a client can show download progress and\nreject an obviously truncated response early. `0` when unavailable."
+          },
+          "version_code": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`versionCode` of the bundled APK: the git commit count, monotonic on\nmaster.\n\n`0` when `available` is `false`. This is the only field an update\ndecision may be based on, and only as\n`version_code > BuildConfig.VERSION_CODE` — never `!=`, which would\noffer a downgrade after a rollback."
+          },
+          "version_name": {
+            "type": "string",
+            "description": "`versionName` of the bundled APK — a tag (`1.2.3`) or `master+<sha>`.\n\nEmpty when `available` is `false`. Display only: version *names* are not\nordered and must never be compared."
+          }
+        }
+      },
       "CreatePersonPayload": {
         "type": "object",
         "description": "Create a new person with a name",
@@ -2281,7 +2346,7 @@
       },
       "EnhancePayload": {
         "type": "object",
-        "description": "POST /api/comfyui/enhance \u2014 queue an enhancement task",
+        "description": "POST /api/comfyui/enhance — queue an enhancement task",
         "required": [
           "shot_id",
           "workflow_id"
@@ -2300,6 +2365,9 @@
           "text_overrides": {
             "type": "object",
             "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
               "type": "string"
             }
           },
@@ -2458,7 +2526,7 @@
       },
       "ImportWorkflowPayload": {
         "type": "object",
-        "description": "POST /api/comfyui/workflows \u2014 import a workflow template",
+        "description": "POST /api/comfyui/workflows — import a workflow template",
         "required": [
           "name",
           "workflow"
@@ -2679,6 +2747,9 @@
           "text_overrides": {
             "type": "object",
             "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
               "type": "string"
             }
           }

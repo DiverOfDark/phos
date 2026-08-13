@@ -16,10 +16,19 @@ import androidx.work.WorkerParameters
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import dev.phos.android.R
-import dev.phos.android.data.update.UpdateRepository
-import dev.phos.android.data.update.UpdateState
+import dev.phos.android.data.repository.UpdateRepository
+import dev.phos.android.update.UpdateState
 import java.util.concurrent.TimeUnit
 
+/**
+ * The background half of the in-app updater: notices a newer build on the configured
+ * server while the app is closed, and says so once.
+ *
+ * The foreground half lives in the settings screen, which reads the same
+ * [UpdateRepository] state. This worker only notifies — downloading and installing
+ * always needs a person, because Android's own install confirmation is part of the
+ * flow by design.
+ */
 @HiltWorker
 class UpdateCheckWorker @AssistedInject constructor(
     @Assisted private val appContext: Context,
@@ -28,24 +37,30 @@ class UpdateCheckWorker @AssistedInject constructor(
 ) : CoroutineWorker(appContext, workerParams) {
 
     override suspend fun doWork(): Result {
-        return when (val state = updateRepository.checkForUpdate()) {
+        // Before the first login there is nothing to ask; retrying would just burn
+        // wakeups until the user gets around to configuring a server.
+        if (!updateRepository.hasServer) return Result.success()
+
+        return when (val state = updateRepository.check()) {
             is UpdateState.Available -> {
-                showUpdateNotification(state.version)
+                showUpdateNotification(state.versionName)
                 Result.success()
             }
-            is UpdateState.Error -> Result.retry()
+            // A server that is briefly unreachable, or one whose advertisement this
+            // build can't verify, is worth one retry — not a notification.
+            is UpdateState.Failed -> Result.retry()
             else -> Result.success()
         }
     }
 
-    private fun showUpdateNotification(version: String) {
+    private fun showUpdateNotification(versionName: String) {
         val notificationManager =
             appContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
         val notification = NotificationCompat.Builder(appContext, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle("Phos update available")
-            .setContentText("Version $version is available. Open Settings to update.")
+            .setContentText("Version $versionName is on your server. Open Settings to install it.")
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setAutoCancel(true)
             .build()

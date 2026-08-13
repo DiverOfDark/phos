@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import dev.phos.android.data.remote.PhosApi
 import dev.phos.android.data.remote.VersionResponse
 import dev.phos.android.data.remote.model.AuthConfigResponse
+import dev.phos.android.data.remote.model.ClientVersionResponse
 import dev.phos.android.data.remote.model.PersonBrief
 import dev.phos.android.data.remote.model.PersonBrowseResponse
 import dev.phos.android.data.remote.model.TokenExchangeRequest
@@ -124,6 +125,7 @@ private class FakePhosApi(private val onRefresh: () -> TokenResponse) : PhosApi 
     override suspend fun exchangeToken(request: TokenExchangeRequest): TokenResponse = throw UnsupportedOperationException()
     override suspend fun getAuthConfig(): AuthConfigResponse = throw UnsupportedOperationException()
     override suspend fun getVersion(): VersionResponse = throw UnsupportedOperationException()
+    override suspend fun getClientVersion(): ClientVersionResponse = throw UnsupportedOperationException()
 }
 
 private class ImmediateCall<T>(private val supplier: () -> retrofit2.Response<T>) : retrofit2.Call<T> {
