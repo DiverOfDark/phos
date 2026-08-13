@@ -100,6 +100,14 @@ pub fn init_and_migrate<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
 /// - Dropping legacy tables
 /// - Orphaned people cleanup
 /// - VACUUM
+///
+/// Every step below rewrites data that predates the current schema, so a
+/// database with no schema at all has nothing for it to do. That is not a
+/// hypothetical: `main` calls this *before* the Diesel migrations (the
+/// photos -> shots rename has to happen while the legacy tables are still
+/// there), so on a brand-new library it opens a database whose tables do not
+/// exist yet — and every first run panicked with "no such table: files" until
+/// the guard below existed.
 pub fn init_db<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     info!("Running data migrations on database at {:?}", path.as_ref());
     let mut conn = open_diesel_connection(&path)?;
@@ -111,6 +119,21 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     .get_result::<CountResult>(&mut conn)
     .map(|r| r.cnt > 0)
     .unwrap_or(false);
+
+    // `files` is the oldest table name that has survived every schema this
+    // project has had, so "neither photos nor files" means the file was created
+    // moments ago by the connection above.
+    let has_files_table: bool = diesel::sql_query(
+        "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='table' AND name='files'",
+    )
+    .get_result::<CountResult>(&mut conn)
+    .map(|r| r.cnt > 0)
+    .unwrap_or(false);
+
+    if !has_photos_table && !has_files_table {
+        info!("New database — no data to migrate; Diesel migrations will create the schema");
+        return Ok(());
+    }
 
     let has_shots_table: bool = diesel::sql_query(
         "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='table' AND name='shots'",
@@ -358,4 +381,52 @@ struct CountResult {
 struct IdResult {
     #[diesel(sql_type = diesel::sql_types::Text)]
     id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact sequence `main` runs at startup, against a library directory
+    /// that has never been opened before.
+    ///
+    /// Data migrations deliberately come *first* — the legacy photos -> shots
+    /// rename has to happen before Diesel applies its baseline — which means
+    /// [`init_db`] is routinely handed a database with no tables in it. Every
+    /// first run of a fresh library used to die here with
+    /// "no such table: files".
+    #[test]
+    fn a_brand_new_library_survives_startup() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db_path = tmp.path().join(".phos.db");
+
+        init_db(&db_path).expect("data migrations on a fresh database must not fail");
+
+        let pool = establish_pool(&db_path).expect("pool");
+        run_migrations(&pool).expect("schema");
+
+        // Second startup: same call, now against the schema Diesel just created.
+        // This is the path every subsequent boot takes, and it has to stay quiet.
+        init_db(&db_path).expect("data migrations on a migrated database must not fail");
+    }
+
+    /// The guard keys off the schema, not off the file existing: an empty
+    /// database is left exactly as empty as it was found.
+    #[test]
+    fn nothing_is_created_before_the_schema_exists() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db_path = tmp.path().join(".phos.db");
+
+        init_db(&db_path).expect("fresh init");
+
+        let mut conn = open_diesel_connection(&db_path).expect("connection");
+        let tables: i64 = diesel::sql_query(
+            "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='table' \
+             AND name NOT LIKE 'sqlite_%'",
+        )
+        .get_result::<CountResult>(&mut conn)
+        .map(|r| r.cnt)
+        .expect("count tables");
+        assert_eq!(0, tables, "init_db must not invent a schema of its own");
+    }
 }
