@@ -4,7 +4,7 @@ import android.content.Context
 import android.os.Looper
 import android.util.Log
 import dagger.hilt.android.qualifiers.ApplicationContext
-import dev.phos.android.data.remote.PhosApi
+import dev.phos.android.data.remote.api.AuthApi
 import dev.phos.android.data.remote.model.TokenExchangeRequest
 import net.openid.appauth.AuthState
 import net.openid.appauth.AuthorizationService
@@ -26,8 +26,8 @@ import javax.inject.Singleton
 @Singleton
 class TokenRefreshManager @Inject constructor(
     private val authRepository: AuthRepository,
-    // Lazy breaks the Hilt cycle: Manager -> PhosApi -> OkHttp -> AuthInterceptor -> Manager
-    private val phosApi: dagger.Lazy<PhosApi>,
+    // Lazy breaks the Hilt cycle: Manager -> AuthApi -> OkHttp -> AuthInterceptor -> Manager
+    private val authApi: dagger.Lazy<AuthApi>,
     @ApplicationContext private val appContext: Context,
 ) {
     companion object {
@@ -98,7 +98,7 @@ class TokenRefreshManager @Inject constructor(
 
     private fun refreshViaBackend(): Boolean = runCatching {
         // AuthInterceptor attaches the (still valid) Bearer token to this call.
-        val response = phosApi.get().refreshTokenCall().execute()
+        val response = authApi.get().refresh().execute()
         val body = response.body()
         if (response.isSuccessful && body != null) {
             authRepository.saveToken(body.token, body.expiresIn)
@@ -139,8 +139,8 @@ class TokenRefreshManager @Inject constructor(
 
         val token = idToken ?: return false
         return runCatching {
-            val response = phosApi.get()
-                .exchangeTokenCall(TokenExchangeRequest().apply { this.idToken = token })
+            val response = authApi.get()
+                .tokenExchange(TokenExchangeRequest().apply { this.idToken = token })
                 .execute()
             val body = response.body()
             if (response.isSuccessful && body != null) {

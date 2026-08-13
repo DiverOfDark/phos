@@ -10,7 +10,8 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import dagger.hilt.android.lifecycle.HiltViewModel
-import dev.phos.android.data.remote.PhosApi
+import dev.phos.android.data.remote.api.AuthApi
+import dev.phos.android.data.remote.await
 import dev.phos.android.data.remote.model.AuthConfigResponse
 import dev.phos.android.data.remote.model.TokenExchangeRequest
 import dev.phos.android.data.repository.AuthRepository
@@ -48,7 +49,7 @@ private const val TAG = "LoginViewModel"
 class LoginViewModel @Inject constructor(
     private val authRepository: AuthRepository,
     private val okHttpClient: OkHttpClient,
-    private val phosApi: PhosApi,
+    private val authApi: AuthApi,
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
 
@@ -294,7 +295,7 @@ class LoginViewModel @Inject constructor(
             viewModelScope.launch {
                 try {
                     val request = TokenExchangeRequest().apply { this.idToken = idToken }
-                    val backendResponse = phosApi.exchangeToken(request)
+                    val backendResponse = authApi.tokenExchange(request).await()
                     authRepository.saveToken(backendResponse.token, backendResponse.expiresIn)
                     authRepository.saveAppAuthState(authState.jsonSerializeString())
                     _uiState.value = _uiState.value.copy(isLoading = false, isLoggedIn = true)

@@ -8,8 +8,11 @@ import coil3.request.ImageRequest
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.phos.android.data.repository.BrowseRepository
+import dev.phos.android.data.repository.ShotRepository
 import dev.phos.android.data.repository.ShotWithFiles
 import dev.phos.android.domain.model.MediaFile
+import dev.phos.android.domain.model.Person
+import dev.phos.android.domain.model.SimilarShot
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,12 +27,21 @@ data class BrowserUiState(
     val error: String? = null,
     val initialShotIndex: Int = 0,
     val initialFileIndex: Int = 0,
+    /** An organizing call is in flight; the sheets disable their buttons on it. */
+    val busy: Boolean = false,
+    /** One-shot text for the snackbar — both failures and confirmations. */
+    val message: String? = null,
+    val people: List<Person> = emptyList(),
+    val peopleLoading: Boolean = false,
+    val similar: List<SimilarShot> = emptyList(),
+    val similarLoading: Boolean = false,
 )
 
 @HiltViewModel
 class BrowserViewModel @Inject constructor(
     savedStateHandle: SavedStateHandle,
     private val browseRepository: BrowseRepository,
+    private val shotRepository: ShotRepository,
     private val okHttpClient: OkHttpClient,
     @ApplicationContext private val appContext: android.content.Context,
 ) : ViewModel() {
@@ -103,6 +115,10 @@ class BrowserViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Deletes the variant at [fileIndex]. The shot's original is not deletable this
+     * way — deleting that means deleting the shot.
+     */
     fun deleteFile(shotIndex: Int, fileIndex: Int) {
         val shots = _uiState.value.shots
         if (shotIndex !in shots.indices) return
@@ -111,18 +127,134 @@ class BrowserViewModel @Inject constructor(
         val file = shot.files[fileIndex]
         if (file.isOriginal) return
 
+        organize("Variant deleted") { browseRepository.deleteFile(file.id) }
+    }
+
+    // ---- organizing ------------------------------------------------------
+    //
+    // Every one of these follows the same shape: run, then re-read the list from
+    // the server. Local patching would be faster, but a merge or a split changes
+    // which shots this person even has, and a list that disagrees with the server
+    // is how you delete the wrong thing next.
+
+    /** Loads the people list for the reassign picker; cheap enough to re-ask each time. */
+    fun loadPeople() {
         viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(peopleLoading = true)
             try {
-                browseRepository.deleteFile(file.id)
-                val updatedFiles = shot.files.filterIndexed { i, _ -> i != fileIndex }
-                val updatedShots = shots.toMutableList()
-                updatedShots[shotIndex] = shot.copy(files = updatedFiles)
-                _uiState.value = _uiState.value.copy(shots = updatedShots)
+                _uiState.value = _uiState.value.copy(
+                    people = shotRepository.people(),
+                    peopleLoading = false,
+                )
             } catch (e: Exception) {
-                _uiState.value = _uiState.value.copy(error = "Failed to delete: ${e.message}")
+                _uiState.value = _uiState.value.copy(
+                    peopleLoading = false,
+                    message = "Couldn't load people: ${e.message}",
+                )
             }
         }
     }
+
+    /** Loads merge candidates for [shotId]. */
+    fun loadSimilar(shotId: String) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(similarLoading = true, similar = emptyList())
+            try {
+                _uiState.value = _uiState.value.copy(
+                    similar = shotRepository.similarShots(shotId),
+                    similarLoading = false,
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    similarLoading = false,
+                    message = "Couldn't look for similar shots: ${e.message}",
+                )
+            }
+        }
+    }
+
+    fun moveToPerson(shotId: String, personId: String, personName: String?) {
+        organize("Moved to ${personName ?: "another person"}") {
+            shotRepository.moveToPerson(shotId, personId)
+        }
+    }
+
+    /** Creates a person and moves the shot to them, as one action. */
+    fun createPersonAndMove(shotId: String, name: String) {
+        organize("Moved to $name") {
+            val personId = shotRepository.createPerson(name)
+            shotRepository.moveToPerson(shotId, personId)
+        }
+    }
+
+    fun splitShot(shotId: String, fileIds: List<String>) {
+        organize("Split ${fileIds.size} file(s) into a new shot") {
+            shotRepository.split(shotId, fileIds)
+        }
+    }
+
+    /** Folds [sourceShotId] into the shot on screen, which survives. */
+    fun mergeInto(targetShotId: String, sourceShotId: String) {
+        organize("Merged") {
+            shotRepository.merge(sourceId = sourceShotId, targetId = targetShotId)
+        }
+    }
+
+    fun deleteShot(shotId: String) {
+        organize("Shot deleted") {
+            shotRepository.deleteShot(shotId)
+        }
+    }
+
+    /**
+     * Runs one organizing call, then reloads.
+     *
+     * There is no offline queue and no retry: if the call fails the user is told
+     * what happened and nothing has changed, which is the honest outcome and the
+     * one they can act on.
+     */
+    private fun organize(successMessage: String, block: suspend () -> Unit) {
+        if (_uiState.value.busy) return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(busy = true)
+            try {
+                block()
+                reload(successMessage)
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    busy = false,
+                    message = "Failed: ${e.message}",
+                )
+            }
+        }
+    }
+
+    private suspend fun reload(message: String?) {
+        try {
+            val data = browseRepository.fetchBrowseData(personId)
+            _uiState.value = _uiState.value.copy(
+                personName = data.personName,
+                shots = data.shots,
+                busy = false,
+                message = message,
+            )
+        } catch (e: Exception) {
+            // The change itself went through — say so, and say that the screen is
+            // now the stale half of the story.
+            _uiState.value = _uiState.value.copy(
+                busy = false,
+                message = "Done, but reloading failed: ${e.message}",
+            )
+        }
+    }
+
+    /** Clears the snackbar text once it has been shown. */
+    fun consumeMessage() {
+        _uiState.value = _uiState.value.copy(message = null)
+    }
+
+    /** Absolute URL for a server-relative thumbnail path (merge candidates). */
+    fun absoluteUrl(path: String): String = browseRepository.absoluteUrl(path)
 
     fun buildThumbnailUrl(fileId: String, width: Int = 1080): String {
         return browseRepository.buildThumbnailUrl(fileId, width)

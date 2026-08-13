@@ -87,7 +87,24 @@ openApiGenerate {
     ))
     globalProperties.set(mapOf(
         "models" to "",
-        "apis" to "false",
+        // Generate the Retrofit interfaces too, not just the models — the API
+        // surface the app uses is no longer small enough to hand-maintain, and a
+        // hand-written method that drifts from the spec fails at runtime instead
+        // of at compile time.
+        //
+        // Filtered to the tags this app actually calls, capitalised — the filter
+        // matches the generated *class* prefix, not the lowercase tag in the spec,
+        // and an unmatched name silently generates nothing. ComfyUI, WebDAV/S3
+        // settings and import are web-only; generating them would compile dead
+        // code and let an unrelated backend endpoint break the Android build.
+        "apis" to "Shots,People,Files,Client,Auth",
+        // The generated interfaces `import ...CollectionFormats.*`, so that one
+        // supporting file has to come along. Naming it explicitly rather than
+        // generating all supporting files, which would drag in an ApiClient,
+        // server configuration and OAuth plumbing this app has no use for — it
+        // builds its own Retrofit with the app's OkHttp stack. (StringUtil is
+        // CollectionFormats' own dependency.)
+        "supportingFiles" to "CollectionFormats.java,StringUtil.java",
     ))
 }
 

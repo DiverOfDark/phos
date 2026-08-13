@@ -1,7 +1,10 @@
 package dev.phos.android.data.repository
 
 import android.content.Intent
-import dev.phos.android.data.remote.PhosApi
+import dev.phos.android.data.remote.api.ClientApi
+import dev.phos.android.data.remote.callOf
+import dev.phos.android.data.remote.errorCall
+import dev.phos.android.data.remote.failingCall
 import dev.phos.android.data.remote.model.ClientVersionResponse
 import dev.phos.android.update.ApkDownloader
 import dev.phos.android.update.ApkInstaller
@@ -13,20 +16,15 @@ import dev.phos.android.update.InstallOutcomes
 import dev.phos.android.update.InstallState
 import dev.phos.android.update.RunningVersion
 import dev.phos.android.update.UpdateState
-import io.mockk.coEvery
-import io.mockk.coVerify
+import io.mockk.verify
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
-import retrofit2.HttpException
-import retrofit2.Response
 import java.io.File
 import java.io.IOException
 import java.net.UnknownHostException
@@ -45,7 +43,7 @@ class UpdateRepositoryTest {
     @get:Rule
     val temp = TemporaryFolder()
 
-    private val api = mockk<PhosApi>()
+    private val api = mockk<ClientApi>()
     private val auth = mockk<AuthRepository>()
     private val running = RunningVersion(versionCode = 42, versionName = "master+b5fcc95")
     private val ourSigner = setOf("aa11")
@@ -101,7 +99,7 @@ class UpdateRepositoryTest {
 
     @Test
     fun `a strictly newer server build becomes Available`() = runTest {
-        coEvery { api.getClientVersion() } returns response(versionCode = 43)
+        every { api.clientVersion() } returns callOf(response(versionCode = 43))
         val (repo, _) = repository()
 
         val state = repo.check()
@@ -114,7 +112,7 @@ class UpdateRepositoryTest {
 
     @Test
     fun `the same build is up to date`() = runTest {
-        coEvery { api.getClientVersion() } returns response(versionCode = 42)
+        every { api.clientVersion() } returns callOf(response(versionCode = 42))
         val (repo, _) = repository()
         assertEquals(UpdateState.UpToDate, repo.check())
     }
@@ -122,12 +120,14 @@ class UpdateRepositoryTest {
     @Test
     fun `a backend-only deployment is up to date rather than an error`() = runTest {
         // The literal `available: false` payload the server sends when it bundles no APK.
-        coEvery { api.getClientVersion() } returns response(
-            available = false,
-            versionCode = 0,
-            versionName = "",
-            sha256 = "",
-            sizeBytes = 0L,
+        every { api.clientVersion() } returns callOf(
+            response(
+                available = false,
+                versionCode = 0,
+                versionName = "",
+                sha256 = "",
+                sizeBytes = 0L,
+            )
         )
         val (repo, _) = repository()
         assertEquals(UpdateState.UpToDate, repo.check())
@@ -135,16 +135,14 @@ class UpdateRepositoryTest {
 
     @Test
     fun `a server too old to have the endpoint is up to date, not a failure`() = runTest {
-        coEvery { api.getClientVersion() } throws HttpException(
-            Response.error<Unit>(404, "".toResponseBody("application/json".toMediaType()))
-        )
+        every { api.clientVersion() } returns errorCall(404)
         val (repo, _) = repository()
         assertEquals(UpdateState.UpToDate, repo.check())
     }
 
     @Test
     fun `an outage is a failure and never claims to be up to date`() = runTest {
-        coEvery { api.getClientVersion() } throws UnknownHostException("phos.example.com")
+        every { api.clientVersion() } returns failingCall(UnknownHostException("phos.example.com"))
         val (repo, _) = repository()
 
         val failed = repo.check() as? UpdateState.Failed ?: error("expected Failed")
@@ -153,9 +151,7 @@ class UpdateRepositoryTest {
 
     @Test
     fun `a 500 is a failure, not a silent up to date`() = runTest {
-        coEvery { api.getClientVersion() } throws HttpException(
-            Response.error<Unit>(500, "".toResponseBody("application/json".toMediaType()))
-        )
+        every { api.clientVersion() } returns errorCall(500)
         val (repo, _) = repository()
 
         val failed = repo.check() as? UpdateState.Failed ?: error("expected Failed")
@@ -176,7 +172,7 @@ class UpdateRepositoryTest {
 
     @Test
     fun `the app-start check does not re-ask the server within the throttle window`() = runTest {
-        coEvery { api.getClientVersion() } returns response(versionCode = 42)
+        every { api.clientVersion() } returns callOf(response(versionCode = 42))
         val (repo, _) = repository()
 
         repo.checkQuietly()
@@ -184,7 +180,7 @@ class UpdateRepositoryTest {
 
         // Second foregrounding a moment later: still the same answer, and cheap.
         repo.checkQuietly()
-        coVerify(exactly = 1) { api.getClientVersion() }
+        verify(exactly = 1) { api.clientVersion() }
     }
 
     // ---- verification gates the installer ---------------------------------

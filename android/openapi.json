@@ -1238,7 +1238,14 @@
         },
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "The created person",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedPerson"
+                }
+              }
+            }
           },
           "400": {
             "description": "Bad request"
@@ -2341,6 +2348,24 @@
         "properties": {
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "CreatedPerson": {
+        "type": "object",
+        "description": "The person that was just created.\n\nTyped rather than a bare `serde_json::Value`, because the id is the whole\npoint of the call: \"create this person and assign the shot to them\" is one\nuser action, and a client that cannot read the id back has to re-list every\nperson and match on the name to find what it just made.",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Generated person id, ready to be used as a `person_id` anywhere."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name as stored — trimmed, which may differ from what was sent."
           }
         }
       },

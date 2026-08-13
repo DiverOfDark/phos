@@ -1,7 +1,8 @@
 package dev.phos.android.data.repository
 
 import android.util.Log
-import dev.phos.android.data.remote.PhosApi
+import dev.phos.android.data.remote.api.ClientApi
+import dev.phos.android.data.remote.await
 import dev.phos.android.data.remote.model.ClientVersionResponse
 import dev.phos.android.update.ApkDownloader
 import dev.phos.android.update.ApkInstaller
@@ -44,7 +45,7 @@ import javax.inject.Singleton
  */
 @Singleton
 class UpdateRepository @Inject constructor(
-    private val api: PhosApi,
+    private val api: ClientApi,
     private val auth: AuthRepository,
     private val running: RunningVersion,
     private val downloader: ApkDownloader,
@@ -111,7 +112,7 @@ class UpdateRepository @Inject constructor(
     suspend fun check(): UpdateState {
         _state.value = UpdateState.Checking
         val result = try {
-            UpdateCheck.decide(running, advertised(api.getClientVersion()))
+            UpdateCheck.decide(running, advertised(api.clientVersion().await()))
         } catch (e: HttpException) {
             // 404 is the answer from a server predating this endpoint. "Your server is
             // too old to tell you about updates" is still "no update available", and

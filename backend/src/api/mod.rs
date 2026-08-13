@@ -130,6 +130,7 @@ use utoipa::OpenApi;
             people::PersonBrief,
             people::PersonFaceBrief,
             people::CreatePersonPayload,
+            people::CreatedPerson,
             people::RenamePersonPayload,
             people::MergePeoplePayload,
             people::PersonMeta,

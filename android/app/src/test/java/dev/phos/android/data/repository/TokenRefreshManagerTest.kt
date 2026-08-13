@@ -2,12 +2,10 @@ package dev.phos.android.data.repository
 
 import android.content.Context
 import android.content.SharedPreferences
-import dev.phos.android.data.remote.PhosApi
-import dev.phos.android.data.remote.VersionResponse
+import dev.phos.android.data.remote.ImmediateCall
+import dev.phos.android.data.remote.api.AuthApi
 import dev.phos.android.data.remote.model.AuthConfigResponse
-import dev.phos.android.data.remote.model.ClientVersionResponse
-import dev.phos.android.data.remote.model.PersonBrief
-import dev.phos.android.data.remote.model.PersonBrowseResponse
+import dev.phos.android.data.remote.model.SessionClaims
 import dev.phos.android.data.remote.model.TokenExchangeRequest
 import dev.phos.android.data.remote.model.TokenResponse
 import io.mockk.mockk
@@ -63,7 +61,7 @@ class TokenRefreshManagerTest {
         repo.saveToken("old-token", 1800)
 
         val refreshCalls = AtomicInteger(0)
-        val api = FakePhosApi(onRefresh = {
+        val api = FakeAuthApi(onRefresh = {
             refreshCalls.incrementAndGet()
             Thread.sleep(50) // widen the race window
             TokenResponse().token("new-token").expiresIn(14 * 24 * 3600L)
@@ -98,7 +96,7 @@ class TokenRefreshManagerTest {
         repo.saveToken("current-token", 14 * 24 * 3600L)
 
         val refreshCalls = AtomicInteger(0)
-        val api = FakePhosApi(onRefresh = {
+        val api = FakeAuthApi(onRefresh = {
             refreshCalls.incrementAndGet()
             TokenResponse().token("unexpected").expiresIn(3600L)
         })
@@ -111,36 +109,25 @@ class TokenRefreshManagerTest {
 
 // --- fakes ------------------------------------------------------------------
 
-private class FakePhosApi(private val onRefresh: () -> TokenResponse) : PhosApi {
-    override fun refreshTokenCall(): retrofit2.Call<TokenResponse> =
+private class FakeAuthApi(private val onRefresh: () -> TokenResponse) : AuthApi {
+    override fun refresh(): retrofit2.Call<TokenResponse> =
         ImmediateCall { retrofit2.Response.success(onRefresh()) }
 
-    override fun exchangeTokenCall(request: TokenExchangeRequest): retrofit2.Call<TokenResponse> =
+    override fun tokenExchange(request: TokenExchangeRequest): retrofit2.Call<TokenResponse> =
         throw UnsupportedOperationException()
 
-    override suspend fun getPeople(): List<PersonBrief> = throw UnsupportedOperationException()
-    override suspend fun getPersonBrowse(id: String): PersonBrowseResponse = throw UnsupportedOperationException()
-    override suspend fun getFileThumbnail(id: String, width: Int?): okhttp3.ResponseBody = throw UnsupportedOperationException()
-    override suspend fun deleteFile(id: String): okhttp3.ResponseBody = throw UnsupportedOperationException()
-    override suspend fun exchangeToken(request: TokenExchangeRequest): TokenResponse = throw UnsupportedOperationException()
-    override suspend fun getAuthConfig(): AuthConfigResponse = throw UnsupportedOperationException()
-    override suspend fun getVersion(): VersionResponse = throw UnsupportedOperationException()
-    override suspend fun getClientVersion(): ClientVersionResponse = throw UnsupportedOperationException()
-}
+    override fun authConfig(): retrofit2.Call<AuthConfigResponse> = throw UnsupportedOperationException()
 
-private class ImmediateCall<T>(private val supplier: () -> retrofit2.Response<T>) : retrofit2.Call<T> {
-    @Volatile private var executed = false
-    override fun execute(): retrofit2.Response<T> {
-        executed = true
-        return supplier()
-    }
-    override fun enqueue(callback: retrofit2.Callback<T>) = throw UnsupportedOperationException()
-    override fun isExecuted() = executed
-    override fun cancel() {}
-    override fun isCanceled() = false
-    override fun clone(): retrofit2.Call<T> = ImmediateCall(supplier)
-    override fun request(): okhttp3.Request = okhttp3.Request.Builder().url("http://localhost/").build()
-    override fun timeout(): okio.Timeout = okio.Timeout.NONE
+    override fun callback(
+        state: String?,
+        code: String?,
+        error: String?,
+        errorDescription: String?,
+    ): retrofit2.Call<Void> = throw UnsupportedOperationException()
+
+    override fun login(): retrofit2.Call<Void> = throw UnsupportedOperationException()
+    override fun logout(): retrofit2.Call<Void> = throw UnsupportedOperationException()
+    override fun me(): retrofit2.Call<SessionClaims> = throw UnsupportedOperationException()
 }
 
 private class FakeSharedPreferences : SharedPreferences {

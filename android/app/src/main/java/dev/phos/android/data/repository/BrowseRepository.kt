@@ -2,7 +2,10 @@ package dev.phos.android.data.repository
 
 import dev.phos.android.data.local.ViewPosition
 import dev.phos.android.data.local.ViewPositionStore
-import dev.phos.android.data.remote.PhosApi
+import dev.phos.android.data.remote.api.FilesApi
+import dev.phos.android.data.remote.api.PeopleApi
+import dev.phos.android.data.remote.await
+import dev.phos.android.data.remote.awaitVoid
 import dev.phos.android.data.remote.model.PersonBrowseResponse
 import dev.phos.android.domain.model.MediaFile
 import dev.phos.android.domain.model.Shot
@@ -21,12 +24,13 @@ data class ShotWithFiles(
 
 @Singleton
 class BrowseRepository @Inject constructor(
-    private val api: PhosApi,
+    private val peopleApi: PeopleApi,
+    private val filesApi: FilesApi,
     private val authRepository: AuthRepository,
     private val viewPositionStore: ViewPositionStore,
 ) {
     suspend fun fetchBrowseData(personId: String): BrowseData {
-        val response = api.getPersonBrowse(personId)
+        val response = peopleApi.getPersonBrowse(personId).await()
         return toBrowseData(personId, response)
     }
 
@@ -65,12 +69,21 @@ class BrowseRepository @Inject constructor(
     }
 
     suspend fun deleteFile(fileId: String) {
-        api.deleteFile(fileId)
+        filesApi.deleteFile(fileId).awaitVoid()
     }
 
     fun buildThumbnailUrl(fileId: String, width: Int = 1080): String {
         val baseUrl = authRepository.getServerUrl()?.trimEnd('/') ?: ""
         return "$baseUrl/api/files/$fileId/thumbnail?w=$width"
+    }
+
+    /**
+     * Turns a server-relative path (the API hands back things like
+     * `/api/files/<id>/thumbnail`) into something an image loader can fetch.
+     */
+    fun absoluteUrl(path: String): String {
+        val baseUrl = authRepository.getServerUrl()?.trimEnd('/') ?: ""
+        return if (path.startsWith("http")) path else baseUrl + path
     }
 
     fun buildOriginalUrl(fileId: String): String {

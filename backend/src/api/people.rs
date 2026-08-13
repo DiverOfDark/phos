@@ -102,6 +102,20 @@ pub(super) struct CreatePersonPayload {
     name: String,
 }
 
+/// The person that was just created.
+///
+/// Typed rather than a bare `serde_json::Value`, because the id is the whole
+/// point of the call: "create this person and assign the shot to them" is one
+/// user action, and a client that cannot read the id back has to re-list every
+/// person and match on the name to find what it just made.
+#[derive(Serialize, ToSchema)]
+pub(super) struct CreatedPerson {
+    /// Generated person id, ready to be used as a `person_id` anywhere.
+    id: String,
+    /// The name as stored — trimmed, which may differ from what was sent.
+    name: String,
+}
+
 #[utoipa::path(
     post,
     path = "/api/people",
@@ -110,7 +124,7 @@ pub(super) struct CreatePersonPayload {
     description = "Create a new named person record that faces can be assigned to.",
     request_body = CreatePersonPayload,
     responses(
-        (status = 200, description = "Success"),
+        (status = 200, description = "The created person", body = CreatedPerson),
         (status = 400, description = "Bad request"),
         (status = 500, description = "Internal server error")
     )
@@ -118,7 +132,7 @@ pub(super) struct CreatePersonPayload {
 pub(super) async fn create_person(
     UState(state): UState,
     Json(payload): Json<CreatePersonPayload>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<CreatedPerson>, StatusCode> {
     let name = payload.name.trim().to_string();
     if name.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -135,7 +149,7 @@ pub(super) async fn create_person(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok(Json(serde_json::json!({"id": id, "name": name})))
+    Ok(Json(CreatedPerson { id, name }))
 }
 
 #[utoipa::path(

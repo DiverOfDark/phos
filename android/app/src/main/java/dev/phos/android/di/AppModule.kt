@@ -9,7 +9,6 @@ import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import dev.phos.android.data.remote.AuthInterceptor
 import dev.phos.android.data.remote.BaseUrlInterceptor
-import dev.phos.android.data.remote.PhosApi
 import dev.phos.android.data.remote.PhosAuthenticator
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
@@ -58,11 +57,5 @@ object AppModule {
             .client(okHttpClient)
             .addConverterFactory(JacksonConverterFactory.create(objectMapper))
             .build()
-    }
-
-    @Provides
-    @Singleton
-    fun providePhosApi(retrofit: Retrofit): PhosApi {
-        return retrofit.create(PhosApi::class.java)
     }
 }
