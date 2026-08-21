@@ -68,10 +68,12 @@ import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
 import dev.phos.android.domain.model.MediaFile
 import dev.phos.android.ui.common.FullScreenLoading
+import dev.phos.android.ui.organize.FacesSheet
 import dev.phos.android.ui.organize.MergeSheet
 import dev.phos.android.ui.organize.PersonPickerSheet
 import dev.phos.android.ui.organize.ShotActionsSheet
 import dev.phos.android.ui.organize.SplitSheet
+import dev.phos.android.ui.review.FaceSheet
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import me.saket.telephoto.zoomable.coil3.ZoomableAsyncImage
@@ -81,7 +83,7 @@ import me.saket.telephoto.zoomable.rememberZoomableState
 import me.saket.telephoto.zoomable.zoomable
 
 /** Which organizing sheet the browser currently has open. */
-private enum class OrganizeSheet { None, Actions, Person, Split, Merge }
+private enum class OrganizeSheet { None, Actions, Person, Split, Merge, Faces, Face }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -326,6 +328,10 @@ fun BrowserScreen(
                         openSheet = OrganizeSheet.Person
                         viewModel.loadPeople()
                     },
+                    onFaces = {
+                        openSheet = OrganizeSheet.Faces
+                        viewModel.loadFaces(currentShot.shot.id)
+                    },
                     onSplit = { openSheet = OrganizeSheet.Split },
                     onMerge = {
                         openSheet = OrganizeSheet.Merge
@@ -370,6 +376,51 @@ fun BrowserScreen(
                         viewModel.splitShot(currentShot.shot.id, fileIds)
                     },
                 )
+
+                OrganizeSheet.Faces -> FacesSheet(
+                    faces = uiState.faces,
+                    isLoading = uiState.facesLoading,
+                    faceThumbnailUrl = { faceId -> viewModel.faceThumbnailUrl(faceId) },
+                    onDismiss = { openSheet = OrganizeSheet.None },
+                    onPick = { face ->
+                        // One sheet at a time: the faces list is swapped for the
+                        // "who is this?" sheet, and dismissing that returns here.
+                        openSheet = OrganizeSheet.Face
+                        viewModel.openFace(face)
+                    },
+                )
+
+                OrganizeSheet.Face -> {
+                    val face = uiState.activeFace
+                    if (face == null) {
+                        openSheet = OrganizeSheet.Faces
+                    } else {
+                        FaceSheet(
+                            face = face,
+                            suggestions = uiState.suggestions,
+                            suggestionsLoading = uiState.suggestionsLoading,
+                            people = uiState.people,
+                            peopleLoading = uiState.peopleLoading,
+                            thumbnailUrl = { path -> viewModel.absoluteUrl(path) },
+                            onDismiss = {
+                                viewModel.closeFace()
+                                openSheet = OrganizeSheet.Faces
+                            },
+                            onAssign = { personId, personName ->
+                                openSheet = OrganizeSheet.None
+                                viewModel.assignFace(personId, personName)
+                            },
+                            onCreate = { name ->
+                                openSheet = OrganizeSheet.None
+                                viewModel.createPersonAndAssignFace(name)
+                            },
+                            onDeleteFace = {
+                                openSheet = OrganizeSheet.None
+                                viewModel.deleteActiveFace()
+                            },
+                        )
+                    }
+                }
 
                 OrganizeSheet.Merge -> MergeSheet(
                     candidates = uiState.similar,

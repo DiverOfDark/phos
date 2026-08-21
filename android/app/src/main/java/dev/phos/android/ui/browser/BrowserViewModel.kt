@@ -8,8 +8,11 @@ import coil3.request.ImageRequest
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.phos.android.data.repository.BrowseRepository
+import dev.phos.android.data.repository.ReviewRepository
 import dev.phos.android.data.repository.ShotRepository
 import dev.phos.android.data.repository.ShotWithFiles
+import dev.phos.android.domain.model.Face
+import dev.phos.android.domain.model.FaceSuggestion
 import dev.phos.android.domain.model.MediaFile
 import dev.phos.android.domain.model.Person
 import dev.phos.android.domain.model.SimilarShot
@@ -35,6 +38,15 @@ data class BrowserUiState(
     val peopleLoading: Boolean = false,
     val similar: List<SimilarShot> = emptyList(),
     val similarLoading: Boolean = false,
+    /** Faces of the shot whose face sheet is open, empty until asked for. */
+    val faces: List<Face> = emptyList(),
+    /** Which shot [faces] belong to, so an edit can re-read the right list. */
+    val facesShotId: String? = null,
+    val facesLoading: Boolean = false,
+    /** The face the user tapped, i.e. the one the "who is this?" sheet is about. */
+    val activeFace: Face? = null,
+    val suggestions: List<FaceSuggestion> = emptyList(),
+    val suggestionsLoading: Boolean = false,
 )
 
 @HiltViewModel
@@ -42,6 +54,7 @@ class BrowserViewModel @Inject constructor(
     savedStateHandle: SavedStateHandle,
     private val browseRepository: BrowseRepository,
     private val shotRepository: ShotRepository,
+    private val reviewRepository: ReviewRepository,
     private val okHttpClient: OkHttpClient,
     @ApplicationContext private val appContext: android.content.Context,
 ) : ViewModel() {
@@ -173,6 +186,117 @@ class BrowserViewModel @Inject constructor(
         }
     }
 
+    // ---- faces -----------------------------------------------------------
+    //
+    // The browse endpoint returns no faces, so the face list is fetched per shot
+    // and only when the user asks for it — nobody swiping through a library wants
+    // an extra request per photo for a panel they never open.
+
+    /** Loads the faces detected in [shotId] for the faces sheet. */
+    fun loadFaces(shotId: String) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                facesLoading = true,
+                faces = emptyList(),
+                facesShotId = shotId,
+            )
+            try {
+                _uiState.value = _uiState.value.copy(
+                    faces = reviewRepository.shotDetail(shotId).faces,
+                    facesLoading = false,
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    facesLoading = false,
+                    message = "Couldn't load faces: ${e.message}",
+                )
+            }
+        }
+    }
+
+    /** Opens the "who is this?" sheet for one face and asks for its suggestions. */
+    fun openFace(face: Face) {
+        _uiState.value = _uiState.value.copy(
+            activeFace = face,
+            suggestions = emptyList(),
+            suggestionsLoading = true,
+        )
+        loadPeople()
+        viewModelScope.launch {
+            val suggestions = try {
+                reviewRepository.faceSuggestions(face.id)
+            } catch (e: Exception) {
+                emptyList()
+            }
+            // Only apply to the face still on screen: the user can close one sheet
+            // and open another while this is in flight.
+            if (_uiState.value.activeFace?.id == face.id) {
+                _uiState.value = _uiState.value.copy(
+                    suggestions = suggestions,
+                    suggestionsLoading = false,
+                )
+            }
+        }
+    }
+
+    fun closeFace() {
+        _uiState.value = _uiState.value.copy(
+            activeFace = null,
+            suggestions = emptyList(),
+            suggestionsLoading = false,
+        )
+    }
+
+    /**
+     * Says who a face is.
+     *
+     * The shot list is reloaded afterwards because the server recomputes the
+     * shot's primary person from its faces: naming a face can move the shot out
+     * of the person the user is currently browsing.
+     */
+    fun assignFace(personId: String, personName: String?) {
+        val face = _uiState.value.activeFace ?: return
+        closeFace()
+        faceEdit("Face is ${personName ?: "assigned"}") {
+            reviewRepository.reassignFace(face.id, personId)
+        }
+    }
+
+    /** Creates a person and pins the face on them in one action. */
+    fun createPersonAndAssignFace(name: String) {
+        val face = _uiState.value.activeFace ?: return
+        closeFace()
+        faceEdit("Face is $name") {
+            reviewRepository.reassignFace(face.id, shotRepository.createPerson(name))
+        }
+    }
+
+    /**
+     * Drops a face the detector got wrong — a face on a poster, a pattern on a
+     * shirt. The photo itself is untouched.
+     */
+    fun deleteActiveFace() {
+        val face = _uiState.value.activeFace ?: return
+        closeFace()
+        faceEdit("Face removed") { reviewRepository.deleteFace(face.id) }
+    }
+
+    /**
+     * One face edit, followed by a reload of both the shot list and the face list
+     * the sheet behind it is showing.
+     */
+    private fun faceEdit(successMessage: String, block: suspend () -> Unit) {
+        val shotId = _uiState.value.facesShotId
+        organize(successMessage) {
+            block()
+            if (shotId != null) {
+                _uiState.value = _uiState.value.copy(
+                    faces = reviewRepository.shotDetail(shotId).faces,
+                )
+            }
+        }
+    }
+
     fun moveToPerson(shotId: String, personId: String, personName: String?) {
         organize("Moved to ${personName ?: "another person"}") {
             shotRepository.moveToPerson(shotId, personId)
@@ -255,6 +379,10 @@ class BrowserViewModel @Inject constructor(
 
     /** Absolute URL for a server-relative thumbnail path (merge candidates). */
     fun absoluteUrl(path: String): String = browseRepository.absoluteUrl(path)
+
+    /** The cropped image of one face, for the faces sheet. */
+    fun faceThumbnailUrl(faceId: String): String =
+        browseRepository.absoluteUrl("/api/faces/$faceId/thumbnail")
 
     fun buildThumbnailUrl(fileId: String, width: Int = 1080): String {
         return browseRepository.buildThumbnailUrl(fileId, width)

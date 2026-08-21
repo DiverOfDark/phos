@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CallSplit
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.Merge
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -33,6 +34,7 @@ fun ShotActionsSheet(
     currentFileIsOriginal: Boolean,
     onDismiss: () -> Unit,
     onMoveToPerson: () -> Unit,
+    onFaces: () -> Unit,
     onSplit: () -> Unit,
     onMerge: () -> Unit,
     onDeleteVariant: () -> Unit,
@@ -50,6 +52,16 @@ fun ShotActionsSheet(
                 label = "Move to another person",
                 detail = "Reassign this shot. Its review status is left alone.",
                 onClick = onMoveToPerson,
+            )
+
+            // The face-level fix, which is the one that sticks: reassigning the
+            // shot moves this photo, correcting the face changes what the next
+            // scan clusters — and a box the detector got wrong can go entirely.
+            Action(
+                icon = Icons.Default.Face,
+                label = "Faces in this shot",
+                detail = "Say who a face is, or delete one the detector got wrong.",
+                onClick = onFaces,
             )
 
             // A one-file shot has nothing to split off, and the server would reject
