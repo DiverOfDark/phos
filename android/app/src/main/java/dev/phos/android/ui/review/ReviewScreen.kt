@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -161,6 +162,23 @@ fun ReviewScreen(
                 },
             )
         },
+        // The verdict buttons are the Scaffold's bottom bar, not the last row of
+        // the content: a snackbar hosted by the Scaffold is laid out above the
+        // bottom bar, and as content they sat under it — every "Moved to Anna"
+        // covered the three buttons the user was about to press again.
+        bottomBar = {
+            if (!uiState.isEmpty && uiState.error == null && !uiState.isLoading) {
+                ActionBar(
+                    busy = uiState.busy,
+                    onSkip = viewModel::skip,
+                    onMove = {
+                        showPersonPicker = true
+                        viewModel.loadPeople()
+                    },
+                    onConfirm = viewModel::confirm,
+                )
+            }
+        },
         snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { innerPadding ->
         Column(
@@ -208,18 +226,6 @@ fun ReviewScreen(
                     thumbnailUrl = { fileId -> viewModel.buildThumbnailUrl(fileId) },
                     onFaceTap = viewModel::openFace,
                     modifier = Modifier.weight(1f),
-                )
-            }
-
-            if (!uiState.isEmpty && uiState.error == null && !uiState.isLoading) {
-                ActionBar(
-                    busy = uiState.busy,
-                    onSkip = viewModel::skip,
-                    onMove = {
-                        showPersonPicker = true
-                        viewModel.loadPeople()
-                    },
-                    onConfirm = viewModel::confirm,
                 )
             }
         }
@@ -438,6 +444,9 @@ private fun ActionBar(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            // As a bottom bar it is placed against the screen edge, so the gesture
+            // bar inset is its own to add — the content padding no longer covers it.
+            .navigationBarsPadding()
             .padding(16.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
