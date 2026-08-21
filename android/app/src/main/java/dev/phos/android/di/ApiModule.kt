@@ -10,6 +10,7 @@ import dev.phos.android.data.remote.api.FacesApi
 import dev.phos.android.data.remote.api.FilesApi
 import dev.phos.android.data.remote.api.PeopleApi
 import dev.phos.android.data.remote.api.ShotsApi
+import dev.phos.android.data.remote.api.SystemApi
 import retrofit2.Retrofit
 import javax.inject.Singleton
 
@@ -19,7 +20,7 @@ import javax.inject.Singleton
  * Nothing here is hand-written on purpose: a hand-maintained Retrofit method that
  * drifts from the backend fails at runtime, on a device, with a 404 — where a
  * generated one fails at compile time the moment the spec is regenerated. The
- * interfaces are split by spec tag, which is why there are five of them.
+ * interfaces are split by spec tag, which is why there are several of them.
  */
 @Module
 @InstallIn(SingletonComponent::class)
@@ -48,4 +49,8 @@ object ApiModule {
     @Provides
     @Singleton
     fun provideClientApi(retrofit: Retrofit): ClientApi = retrofit.create(ClientApi::class.java)
+
+    @Provides
+    @Singleton
+    fun provideSystemApi(retrofit: Retrofit): SystemApi = retrofit.create(SystemApi::class.java)
 }

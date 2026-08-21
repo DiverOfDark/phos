@@ -1399,13 +1399,13 @@
           "people"
         ],
         "summary": "Get person browse graph",
-        "description": "Returns a complete person browse graph with all shots and their file variants in a single response. Designed for offline-first browsing clients.",
+        "description": "Returns a complete person browse graph with all shots and their file variants in a single response. Designed for offline-first browsing clients. The reserved id `unsorted` returns the shots that belong to nobody yet.",
         "operationId": "get_person_browse",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "Person ID",
+            "description": "Person ID, or `unsorted` for shots with no person",
             "required": true,
             "schema": {
               "type": "string"

@@ -24,6 +24,16 @@ class PeopleViewModel @Inject constructor(
     private val _isRefreshing = MutableStateFlow(false)
     val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
 
+    /**
+     * Shots with no person yet — the phone's copy of the web's "Unsorted" tile.
+     *
+     * Kept out of [people] because the server does not return it as a person; it
+     * is a filter over shots, and the card the screen draws for it navigates to
+     * the same grid with the reserved `unsorted` id.
+     */
+    private val _unsortedCount = MutableStateFlow(0)
+    val unsortedCount: StateFlow<Int> = _unsortedCount.asStateFlow()
+
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
@@ -42,9 +52,15 @@ class PeopleViewModel @Inject constructor(
             } catch (e: Exception) {
                 _people.value = emptyList()
                 _error.value = "Failed to refresh: ${e.message}"
-            } finally {
-                _isRefreshing.value = false
             }
+            // A stats call that fails does not cost the user the people list, so
+            // it gets its own try: the worst case is a missing Unsorted card.
+            try {
+                _unsortedCount.value = peopleRepository.fetchUnsortedCount()
+            } catch (e: Exception) {
+                _unsortedCount.value = 0
+            }
+            _isRefreshing.value = false
         }
     }
 

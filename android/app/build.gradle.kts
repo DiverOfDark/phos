@@ -97,7 +97,7 @@ openApiGenerate {
         // and an unmatched name silently generates nothing. ComfyUI, WebDAV/S3
         // settings and import are web-only; generating them would compile dead
         // code and let an unrelated backend endpoint break the Android build.
-        "apis" to "Shots,People,Files,Faces,Client,Auth",
+        "apis" to "Shots,People,Files,Faces,Client,Auth,System",
         // The generated interfaces `import ...CollectionFormats.*`, so that one
         // supporting file has to come along. Naming it explicitly rather than
         // generating all supporting files, which would drag in an ApiClient,

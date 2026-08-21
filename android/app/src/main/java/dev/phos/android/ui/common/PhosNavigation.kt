@@ -37,6 +37,14 @@ object Routes {
     const val REVIEW = "review"
     const val SETTINGS = "settings"
 
+    /**
+     * The server's reserved browse id for shots with no person.
+     *
+     * `/api/people/unsorted/browse` answers with them, so the unsorted pile
+     * reuses the person grid and browser as they are.
+     */
+    const val UNSORTED_PERSON_ID = "unsorted"
+
     fun grid(personId: String) = "grid/$personId"
     fun browser(personId: String, shotIndex: Int = -1) = "browser/$personId?shot=$shotIndex"
 }
@@ -63,6 +71,9 @@ fun PhosNavigation() {
             PeopleScreen(
                 onPersonClick = { personId ->
                     navController.navigate(Routes.grid(personId))
+                },
+                onUnsortedClick = {
+                    navController.navigate(Routes.grid(Routes.UNSORTED_PERSON_ID))
                 },
                 onSettingsClick = {
                     navController.navigate(Routes.SETTINGS)

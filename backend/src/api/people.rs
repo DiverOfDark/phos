@@ -372,6 +372,14 @@ pub(super) async fn merge_people(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
+/// The id a client passes to browse the shots nobody owns yet.
+///
+/// Person ids are UUIDs, so this cannot collide with a real one. Routing the
+/// unsorted pile through the same endpoint lets a client browse it with the
+/// same screens it uses for a person, instead of a parallel API that would
+/// have to be kept in step with this one.
+pub(super) const UNSORTED_BROWSE_ID: &str = "unsorted";
+
 /// Browse a person: returns person metadata + all shots + all files per shot.
 /// Solves the N+1 problem for the mobile client.
 #[derive(Serialize, ToSchema)]
@@ -408,9 +416,9 @@ pub(super) struct PersonBrowseResponse {
     path = "/api/people/{id}/browse",
     tag = "people",
     summary = "Get person browse graph",
-    description = "Returns a complete person browse graph with all shots and their file variants in a single response. Designed for offline-first browsing clients.",
+    description = "Returns a complete person browse graph with all shots and their file variants in a single response. Designed for offline-first browsing clients. The reserved id `unsorted` returns the shots that belong to nobody yet.",
     params(
-        ("id" = String, Path, description = "Person ID")
+        ("id" = String, Path, description = "Person ID, or `unsorted` for shots with no person")
     ),
     responses(
         (status = 200, description = "Person browse graph", body = PersonBrowseResponse),
@@ -423,35 +431,60 @@ pub(super) async fn get_person_browse(
     UState(state): UState,
 ) -> Result<Json<PersonBrowseResponse>, StatusCode> {
     let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    browse_graph(&mut conn, &id).map(Json)
+}
+
+/// The body of [`get_person_browse`], separated from the extractors so it can be
+/// tested against a database without standing up the whole app state.
+fn browse_graph(
+    conn: &mut diesel::SqliteConnection,
+    id: &str,
+) -> Result<PersonBrowseResponse, StatusCode> {
+    let unsorted = id == UNSORTED_BROWSE_ID;
 
     // Query 1: Get person info
-    let person_row: (String, Option<String>) = people::table
-        .filter(people::id.eq(&id))
-        .select((people::id, people::name))
-        .first(&mut conn)
-        .map_err(|e| match e {
-            diesel::result::Error::NotFound => StatusCode::NOT_FOUND,
-            _ => {
-                tracing::error!("Failed to query person {}: {}", id, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        })?;
+    let person = if unsorted {
+        PersonMeta {
+            id: UNSORTED_BROWSE_ID.to_string(),
+            name: Some("Unsorted".to_string()),
+        }
+    } else {
+        let person_row: (String, Option<String>) = people::table
+            .filter(people::id.eq(id))
+            .select((people::id, people::name))
+            .first(conn)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => StatusCode::NOT_FOUND,
+                _ => {
+                    tracing::error!("Failed to query person {}: {}", id, e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            })?;
 
-    let person = PersonMeta {
-        id: person_row.0,
-        name: person_row.1,
+        PersonMeta {
+            id: person_row.0,
+            name: person_row.1,
+        }
     };
 
     // Query 2: Get all shots with their files in one go
-    let rows: Vec<(String, Option<String>, Option<String>, String, Option<String>, Option<bool>, Option<i32>)> = shots::table
+    let mut query = shots::table
         .inner_join(files::table)
         .select((
             shots::id, shots::timestamp, shots::review_status,
             files::id, files::mime_type, files::is_original, files::file_size,
         ))
-        .filter(shots::primary_person_id.eq(&id))
+        .into_boxed();
+
+    query = if unsorted {
+        query.filter(shots::primary_person_id.is_null())
+    } else {
+        query.filter(shots::primary_person_id.eq(id.to_string()))
+    };
+
+    let rows: Vec<(String, Option<String>, Option<String>, String, Option<String>, Option<bool>, Option<i32>)> = query
         .order((shots::id.asc(), files::is_original.desc(), files::path.asc()))
-        .load(&mut conn)
+        .load(conn)
         .map_err(|e| {
             tracing::error!("Failed to execute browse query for person {}: {}", id, e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -488,7 +521,7 @@ pub(super) async fn get_person_browse(
     // Sort shots by timestamp (newest first) after grouping
     shots_vec.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
-    Ok(Json(PersonBrowseResponse { person, shots: shots_vec }))
+    Ok(PersonBrowseResponse { person, shots: shots_vec })
 }
 
 /// Delete a person and all their face records.
@@ -575,4 +608,76 @@ pub(super) async fn delete_person(
     state.organizer.signal(&state.library_root);
 
     Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::connection::SimpleConnection;
+
+    /// A library holding one shot that belongs to Alice and two that belong to
+    /// nobody — the state every scan leaves behind before anyone sorts anything.
+    fn library() -> (tempfile::TempDir, diesel::SqliteConnection) {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db_path = tmp.path().join(".phos.db");
+        crate::db::init_and_migrate(&db_path).expect("schema");
+        let mut conn = crate::db::open_diesel_connection(&db_path).expect("connection");
+
+        conn.batch_execute(
+            "INSERT INTO people (id, name) VALUES ('alice', 'Alice');
+             INSERT INTO shots (id, timestamp, primary_person_id) VALUES
+                ('shot-alice', '2026-01-01T00:00:00', 'alice'),
+                ('shot-loose-1', '2026-01-02T00:00:00', NULL),
+                ('shot-loose-2', '2026-01-03T00:00:00', NULL);
+             INSERT INTO files (id, shot_id, path, hash, is_original) VALUES
+                ('file-alice', 'shot-alice', 'a.jpg', 'h1', 1),
+                ('file-loose-1', 'shot-loose-1', 'b.jpg', 'h2', 1),
+                ('file-loose-1b', 'shot-loose-1', 'b.png', 'h3', 0),
+                ('file-loose-2', 'shot-loose-2', 'c.jpg', 'h4', 1);",
+        )
+        .expect("fixture");
+
+        (tmp, conn)
+    }
+
+    /// The phone's "Unsorted" tile browses through this endpoint, so the
+    /// reserved id has to answer with the shots nobody owns — and only those.
+    #[test]
+    fn the_unsorted_id_browses_shots_with_no_person() {
+        let (_tmp, mut conn) = library();
+
+        let graph = browse_graph(&mut conn, UNSORTED_BROWSE_ID).expect("browse");
+
+        assert_eq!(UNSORTED_BROWSE_ID, graph.person.id);
+        assert_eq!(Some("Unsorted".to_string()), graph.person.name);
+        let ids: Vec<&str> = graph.shots.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(vec!["shot-loose-2", "shot-loose-1"], ids, "newest first");
+        // Grouping still works: the two-file shot keeps both of its variants.
+        assert_eq!(2, graph.shots[1].files.len());
+    }
+
+    /// The reserved id must not leak into a real person's browse, and vice
+    /// versa: an unsorted shot has no person to show up under.
+    #[test]
+    fn a_persons_browse_is_unaffected() {
+        let (_tmp, mut conn) = library();
+
+        let graph = browse_graph(&mut conn, "alice").expect("browse");
+
+        assert_eq!(Some("Alice".to_string()), graph.person.name);
+        let ids: Vec<&str> = graph.shots.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(vec!["shot-alice"], ids);
+    }
+
+    /// Only the one reserved word is special; anything else is still a lookup
+    /// that can miss.
+    #[test]
+    fn an_unknown_person_is_still_a_404() {
+        let (_tmp, mut conn) = library();
+
+        assert_eq!(
+            Err(StatusCode::NOT_FOUND),
+            browse_graph(&mut conn, "nobody").map(|_| ())
+        );
+    }
 }
