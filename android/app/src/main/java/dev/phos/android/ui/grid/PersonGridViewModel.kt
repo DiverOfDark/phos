@@ -18,6 +18,14 @@ import javax.inject.Inject
 data class GridTile(
     val shot: Shot,
     val cover: MediaFile?,
+    /**
+     * How many files the shot holds.
+     *
+     * A tile is one *shot*, and a shot can hold several near-identical files —
+     * the scanner groups them. Without this the grid looks like it has lost the
+     * variants; with it the tile says how many are inside.
+     */
+    val fileCount: Int,
 )
 
 data class PersonGridUiState(
@@ -58,7 +66,9 @@ class PersonGridViewModel @Inject constructor(
             _uiState.value = _uiState.value.copy(isLoading = true, error = null)
             try {
                 val data = browseRepository.fetchBrowseData(personId)
-                val tiles = data.shots.map { s -> GridTile(shot = s.shot, cover = s.files.firstOrNull()) }
+                val tiles = data.shots.map { s ->
+                    GridTile(shot = s.shot, cover = s.files.firstOrNull(), fileCount = s.files.size)
+                }
                 val saved = browseRepository.getViewPosition(personId)
                 _uiState.value = PersonGridUiState(
                     personName = data.personName,
@@ -198,7 +208,9 @@ class PersonGridViewModel @Inject constructor(
             val data = browseRepository.fetchBrowseData(personId)
             _uiState.value = _uiState.value.copy(
                 personName = data.personName,
-                tiles = data.shots.map { GridTile(shot = it.shot, cover = it.files.firstOrNull()) },
+                tiles = data.shots.map {
+                    GridTile(shot = it.shot, cover = it.files.firstOrNull(), fileCount = it.files.size)
+                },
                 selected = emptySet(),
                 busy = false,
                 message = message,

@@ -78,32 +78,50 @@ pub(super) struct OrganizeStatsResponse {
 )]
 pub(super) async fn get_organize_stats(UState(state): UState) -> Json<OrganizeStatsResponse> {
     let mut conn = state.pool.get().unwrap();
+    Json(organize_stats(&mut conn))
+}
 
-    let total_shots: i64 = shots::table.count().get_result(&mut conn).unwrap_or(0);
-    let total_files: i64 = files::table.count().get_result(&mut conn).unwrap_or(0);
-    let total_people: i64 = people::table.count().get_result(&mut conn).unwrap_or(0);
+/// The body of [`get_organize_stats`], separated from the extractor so the
+/// counts can be tested against a database.
+pub(super) fn organize_stats(conn: &mut diesel::SqliteConnection) -> OrganizeStatsResponse {
+    let total_shots: i64 = shots::table.count().get_result(conn).unwrap_or(0);
+    let total_files: i64 = files::table.count().get_result(conn).unwrap_or(0);
+    let total_people: i64 = people::table.count().get_result(conn).unwrap_or(0);
     let pending_review: i64 = shots::table
         .filter(shots::review_status.eq("pending"))
         .count()
-        .get_result(&mut conn)
+        .get_result(conn)
         .unwrap_or(0);
     let confirmed: i64 = shots::table
         .filter(shots::review_status.eq("confirmed"))
         .count()
-        .get_result(&mut conn)
+        .get_result(conn)
         .unwrap_or(0);
+    // Same rule as the Unsorted browse and the web's unsorted list, so the number
+    // on the tile is the number of tiles behind it: owned by nobody — which
+    // includes pointing at a person row that is gone — and having something left
+    // to show.
     let unsorted: i64 = shots::table
-        .filter(shots::primary_person_id.is_null())
+        .filter(
+            shots::primary_person_id
+                .is_null()
+                .or(diesel::dsl::not(diesel::dsl::exists(
+                    people::table.filter(people::id.nullable().eq(shots::primary_person_id)),
+                ))),
+        )
+        .filter(diesel::dsl::exists(
+            files::table.filter(files::shot_id.eq(shots::id)),
+        ))
         .count()
-        .get_result(&mut conn)
+        .get_result(conn)
         .unwrap_or(0);
     let unnamed_people: i64 = people::table
         .filter(people::name.is_null().or(people::name.eq("")))
         .count()
-        .get_result(&mut conn)
+        .get_result(conn)
         .unwrap_or(0);
 
-    Json(OrganizeStatsResponse {
+    OrganizeStatsResponse {
         total_shots,
         total_files,
         total_people,
@@ -111,7 +129,7 @@ pub(super) async fn get_organize_stats(UState(state): UState) -> Json<OrganizeSt
         confirmed,
         unsorted,
         unnamed_people,
-    })
+    }
 }
 
 /// Trigger filesystem reorganization in a background thread
@@ -174,4 +192,62 @@ pub(super) async fn trigger_scan(
     });
 
     Json(serde_json::json!({"status": "started"}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::connection::SimpleConnection;
+
+    /// The same library the Unsorted browse is tested against: one sorted shot,
+    /// two loose ones, one left pointing at a person who was deleted, and one
+    /// whose files are gone.
+    fn library() -> (tempfile::TempDir, diesel::SqliteConnection) {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db_path = tmp.path().join(".phos.db");
+        crate::db::init_and_migrate(&db_path).expect("schema");
+        let mut conn = crate::db::open_diesel_connection(&db_path).expect("connection");
+
+        conn.batch_execute(
+            "INSERT INTO people (id, name) VALUES ('alice', 'Alice');
+             INSERT INTO shots (id, primary_person_id) VALUES
+                ('shot-alice', 'alice'),
+                ('shot-loose-1', NULL),
+                ('shot-loose-2', NULL),
+                ('shot-orphan', 'ghost'),
+                ('shot-fileless', NULL);
+             INSERT INTO files (id, shot_id, path, hash, is_original) VALUES
+                ('file-alice', 'shot-alice', 'a.jpg', 'h1', 1),
+                ('file-loose-1', 'shot-loose-1', 'b.jpg', 'h2', 1),
+                ('file-loose-2', 'shot-loose-2', 'c.jpg', 'h3', 1),
+                ('file-orphan', 'shot-orphan', 'd.jpg', 'h4', 1);",
+        )
+        .expect("fixture");
+
+        (tmp, conn)
+    }
+
+    /// The number on the Unsorted tile has to be the number of shots behind it,
+    /// or the phone reads as if it were hiding photos.
+    ///
+    /// Both edge cases are in the fixture: the shot whose person was deleted
+    /// counts (it is in nobody's grid), and the shot with no files does not
+    /// (there is nothing to open).
+    #[test]
+    fn the_unsorted_count_matches_what_the_unsorted_view_can_show() {
+        let (_tmp, mut conn) = library();
+
+        let stats = organize_stats(&mut conn);
+
+        let browsable = crate::api::people::browse_graph(
+            &mut conn,
+            crate::api::people::UNSORTED_BROWSE_ID,
+        )
+        .expect("browse")
+        .shots
+        .len();
+
+        assert_eq!(3, stats.unsorted);
+        assert_eq!(browsable as i64, stats.unsorted);
+    }
 }

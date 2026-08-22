@@ -408,7 +408,7 @@ pub(super) struct BrowseShotDetail {
 #[derive(Serialize, ToSchema)]
 pub(super) struct PersonBrowseResponse {
     person: PersonMeta,
-    shots: Vec<BrowseShotDetail>,
+    pub(super) shots: Vec<BrowseShotDetail>,
 }
 
 #[utoipa::path(
@@ -436,7 +436,7 @@ pub(super) async fn get_person_browse(
 
 /// The body of [`get_person_browse`], separated from the extractors so it can be
 /// tested against a database without standing up the whole app state.
-fn browse_graph(
+pub(super) fn browse_graph(
     conn: &mut diesel::SqliteConnection,
     id: &str,
 ) -> Result<PersonBrowseResponse, StatusCode> {
@@ -476,8 +476,21 @@ fn browse_graph(
         ))
         .into_boxed();
 
+    // What counts as unsorted: a shot nobody owns — which is not just
+    // `primary_person_id IS NULL`. Deleting a person clears their shots' person
+    // id in a statement separate from the delete itself, and SQLite is not
+    // running with foreign keys on, so a shot can be left pointing at a person
+    // row that no longer exists. Such a shot is in nobody's grid, and matching
+    // only on NULL left it out of Unsorted too — unreachable from every client.
+    // `stats` and `shots` spell out the same rule for the count and the web list.
     query = if unsorted {
-        query.filter(shots::primary_person_id.is_null())
+        query.filter(
+            shots::primary_person_id
+                .is_null()
+                .or(diesel::dsl::not(diesel::dsl::exists(
+                    people::table.filter(people::id.nullable().eq(shots::primary_person_id)),
+                ))),
+        )
     } else {
         query.filter(shots::primary_person_id.eq(id.to_string()))
     };
@@ -628,12 +641,20 @@ mod tests {
              INSERT INTO shots (id, timestamp, primary_person_id) VALUES
                 ('shot-alice', '2026-01-01T00:00:00', 'alice'),
                 ('shot-loose-1', '2026-01-02T00:00:00', NULL),
-                ('shot-loose-2', '2026-01-03T00:00:00', NULL);
+                ('shot-loose-2', '2026-01-03T00:00:00', NULL),
+                -- A shot pointing at a person row that is gone. SQLite does not
+                -- enforce foreign keys here, and the two statements that delete a
+                -- person and clear their shots are not one transaction.
+                ('shot-orphan', '2026-01-04T00:00:00', 'ghost'),
+                -- A shot whose files are all gone: counted as unsorted by the
+                -- stats, but there is nothing to put on screen for it.
+                ('shot-fileless', '2026-01-05T00:00:00', NULL);
              INSERT INTO files (id, shot_id, path, hash, is_original) VALUES
                 ('file-alice', 'shot-alice', 'a.jpg', 'h1', 1),
                 ('file-loose-1', 'shot-loose-1', 'b.jpg', 'h2', 1),
                 ('file-loose-1b', 'shot-loose-1', 'b.png', 'h3', 0),
-                ('file-loose-2', 'shot-loose-2', 'c.jpg', 'h4', 1);",
+                ('file-loose-2', 'shot-loose-2', 'c.jpg', 'h4', 1),
+                ('file-orphan', 'shot-orphan', 'd.jpg', 'h5', 1);",
         )
         .expect("fixture");
 
@@ -651,9 +672,13 @@ mod tests {
         assert_eq!(UNSORTED_BROWSE_ID, graph.person.id);
         assert_eq!(Some("Unsorted".to_string()), graph.person.name);
         let ids: Vec<&str> = graph.shots.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(vec!["shot-loose-2", "shot-loose-1"], ids, "newest first");
+        assert_eq!(
+            vec!["shot-orphan", "shot-loose-2", "shot-loose-1"],
+            ids,
+            "newest first"
+        );
         // Grouping still works: the two-file shot keeps both of its variants.
-        assert_eq!(2, graph.shots[1].files.len());
+        assert_eq!(2, graph.shots[2].files.len());
     }
 
     /// The reserved id must not leak into a real person's browse, and vice
@@ -667,6 +692,22 @@ mod tests {
         assert_eq!(Some("Alice".to_string()), graph.person.name);
         let ids: Vec<&str> = graph.shots.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(vec!["shot-alice"], ids);
+    }
+
+    /// A shot left pointing at a deleted person belongs in Unsorted.
+    ///
+    /// Nothing else lists it: its person is gone, so it is in nobody's grid, and
+    /// keying Unsorted off `primary_person_id IS NULL` alone left it in neither.
+    #[test]
+    fn a_shot_whose_person_no_longer_exists_is_unsorted() {
+        let (_tmp, mut conn) = library();
+
+        let graph = browse_graph(&mut conn, UNSORTED_BROWSE_ID).expect("browse");
+
+        assert!(
+            graph.shots.iter().any(|s| s.id == "shot-orphan"),
+            "a shot pointing at a missing person must not disappear",
+        );
     }
 
     /// Only the one reserved word is special; anything else is still a lookup

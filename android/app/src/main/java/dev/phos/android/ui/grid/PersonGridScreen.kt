@@ -10,11 +10,16 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
@@ -22,6 +27,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -178,6 +184,7 @@ fun PersonGridScreen(
                     itemsIndexed(uiState.tiles, key = { _, tile -> tile.shot.id }) { index, tile ->
                         GridTileView(
                             thumbnailUrl = tile.cover?.let { viewModel.buildThumbnailUrl(it.id) },
+                            fileCount = tile.fileCount,
                             isSelected = tile.shot.id in uiState.selected,
                             // In selection mode a tap toggles instead of opening —
                             // otherwise picking the second shot would launch the
@@ -247,6 +254,7 @@ fun PersonGridScreen(
 @Composable
 private fun GridTileView(
     thumbnailUrl: String?,
+    fileCount: Int,
     isSelected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
@@ -265,6 +273,32 @@ private fun GridTileView(
             )
         } else {
             ShimmerBox(modifier = Modifier.fillMaxSize())
+        }
+
+        // A shot with several files is one tile; saying so stops the grid from
+        // reading as if the other copies had gone missing.
+        if (fileCount > 1) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(4.dp)
+                    .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 4.dp, vertical = 1.dp),
+            ) {
+                Icon(
+                    Icons.Default.PhotoLibrary,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(12.dp),
+                )
+                Spacer(Modifier.width(2.dp))
+                Text(
+                    text = "$fileCount",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White,
+                )
+            }
         }
 
         if (isSelected) {

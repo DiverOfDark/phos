@@ -5,6 +5,7 @@ import dev.phos.android.data.repository.BrowseData
 import dev.phos.android.data.repository.BrowseRepository
 import dev.phos.android.data.repository.ShotRepository
 import dev.phos.android.data.repository.ShotWithFiles
+import dev.phos.android.domain.model.MediaFile
 import dev.phos.android.domain.model.Shot
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -53,6 +54,38 @@ class PersonGridSelectionTest {
     fun tearDown() {
         Dispatchers.resetMain()
     }
+
+    /** A tile is a shot, and the grid has to say when a shot holds more than one file. */
+    @Test
+    fun a_tile_carries_how_many_files_its_shot_holds() = runTest(dispatcher) {
+        coEvery { browseRepository.fetchBrowseData(any()) } returns BrowseData(
+            personName = "Anna",
+            shots = listOf(
+                shot("single"),
+                shot("burst").copy(
+                    files = listOf(file("burst-1"), file("burst-2"), file("burst-3")),
+                ),
+            ),
+        )
+
+        val vm = PersonGridViewModel(
+            SavedStateHandle(mapOf("personId" to "person-1")),
+            browseRepository,
+            shotRepository,
+        )
+        runCurrent()
+
+        assertEquals(listOf(0, 3), vm.uiState.value.tiles.map { it.fileCount })
+    }
+
+    private fun file(id: String) = MediaFile(
+        id = id,
+        shotId = "burst",
+        mimeType = "image/jpeg",
+        isOriginal = id.endsWith("1"),
+        fileSize = 1,
+        thumbnailUrl = null,
+    )
 
     private fun shot(id: String) = ShotWithFiles(
         shot = Shot(id = id, timestamp = null, primaryPersonId = "person-1", reviewStatus = "pending"),

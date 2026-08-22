@@ -90,7 +90,15 @@ pub(super) async fn get_shots(
 
     if let Some(ref status) = params.status {
         if status == "unsorted" {
-            conditions.push("s.primary_person_id IS NULL".to_string());
+            // A shot pointing at a person row that is gone is owned by nobody:
+            // it shows in no person's list, so it has to show in this one. Same
+            // rule as `people::browse_graph` and the organize stats.
+            conditions.push(
+                "(s.primary_person_id IS NULL OR NOT EXISTS \
+                 (SELECT 1 FROM people pu WHERE pu.id = s.primary_person_id)) \
+                 AND EXISTS (SELECT 1 FROM files fu WHERE fu.shot_id = s.id)"
+                    .to_string(),
+            );
         } else {
             bind_values.push(status.clone());
             conditions.push(format!("s.review_status = ?{}", bind_values.len()));
