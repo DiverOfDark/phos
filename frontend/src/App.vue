@@ -203,13 +203,7 @@ const handleImportScan = async () => {
 
     setTimeout(async () => {
       await fetchPendingCount()
-      const comp = routeComponentRef.value
-      if (comp) {
-        comp.loadData?.()
-        comp.fetchPhotos?.()
-        comp.fetchPeople?.()
-        comp.fetchShots?.()
-      }
+      refreshViews()
       isImporting.value = false
     }, 5000)
 
@@ -222,6 +216,56 @@ const handleImportScan = async () => {
 
 const uploadProgress = ref({ current: 0, total: 0 })
 const isUploading = ref(false)
+// Analysis (faces, thumbnails, embeddings) now happens on the server after the
+// upload responds, so the dialog reports it separately: uploading is over in
+// seconds, indexing is the part that takes minutes on a big drop.
+const analyzeProgress = ref({ remaining: 0, total: 0 })
+const isAnalyzing = ref(false)
+
+async function fetchIngestStatus() {
+  const res = await fetch('/api/import/status')
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return await res.json()
+}
+
+/**
+ * Poll the ingest queue until it drains, refreshing the views as it goes.
+ *
+ * The refresh mid-flight is the point: photos appear in the gallery as they are
+ * analyzed instead of all at once at the end, so a long import looks like
+ * progress rather than a stalled dialog.
+ */
+async function trackAnalysis() {
+  isAnalyzing.value = true
+  let peak = 0
+  try {
+    for (;;) {
+      const status = await fetchIngestStatus()
+      const remaining = (status.queued || 0) + (status.analyzing || 0)
+      peak = Math.max(peak, remaining)
+      analyzeProgress.value = { remaining, total: peak }
+      refreshViews()
+      if (remaining === 0) break
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+    }
+  } catch (e) {
+    // The files are uploaded either way; only the progress readout is lost.
+    console.error('Failed to poll import status:', e)
+  } finally {
+    isAnalyzing.value = false
+    analyzeProgress.value = { remaining: 0, total: 0 }
+  }
+}
+
+function refreshViews() {
+  const comp = routeComponentRef.value
+  if (comp) {
+    comp.loadData?.()
+    comp.fetchPhotos?.()
+    comp.fetchPeople?.()
+    comp.fetchShots?.()
+  }
+}
 
 const handleDrop = async (e) => {
   isDragging.value = false
@@ -256,21 +300,17 @@ const handleDrop = async (e) => {
   isUploading.value = false
   const succeeded = mediaFiles.length - failed
   if (failed === 0) {
-    importMessage.value = `Uploaded ${succeeded} file${succeeded === 1 ? '' : 's'} successfully.`
+    importMessage.value = `Uploaded ${succeeded} file${succeeded === 1 ? '' : 's'}. Indexing them in the background — you can close this.`
   } else {
-    importMessage.value = `Uploaded ${succeeded} of ${mediaFiles.length} files.`
+    importMessage.value = `Uploaded ${succeeded} of ${mediaFiles.length} files. Indexing them in the background.`
     importError.value = `${failed} file${failed === 1 ? '' : 's'} failed to upload.`
   }
 
   // Refresh UI
   await fetchPendingCount()
-  const comp = routeComponentRef.value
-  if (comp) {
-    comp.loadData?.()
-    comp.fetchPhotos?.()
-    comp.fetchPeople?.()
-    comp.fetchShots?.()
-  }
+  refreshViews()
+  await trackAnalysis()
+  await fetchPendingCount()
 }
 
 // --- Settings: Save library path ---
@@ -937,6 +977,15 @@ onMounted(() => {
                 <template v-if="isUploading">
                   <RefreshCw class="w-6 h-6 text-indigo-400 animate-spin mb-3" />
                   <p class="text-sm font-medium text-white">Uploading {{ uploadProgress.current }} / {{ uploadProgress.total }}</p>
+                </template>
+                <template v-else-if="isAnalyzing && analyzeProgress.remaining > 0">
+                  <RefreshCw class="w-6 h-6 text-indigo-400 animate-spin mb-3" />
+                  <p class="text-sm font-medium text-white">
+                    Indexing {{ analyzeProgress.total - analyzeProgress.remaining }} / {{ analyzeProgress.total }}
+                  </p>
+                  <p class="text-xs text-zinc-500 mt-1 text-center">
+                    Uploads are done. Faces are being detected in the background — you can close this and keep browsing.
+                  </p>
                 </template>
                 <template v-else>
                   <div class="w-12 h-12 rounded-full bg-zinc-800 flex items-center justify-center mb-4">

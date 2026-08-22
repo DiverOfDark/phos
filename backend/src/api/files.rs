@@ -25,11 +25,11 @@ pub(super) struct UploadQuery {
     path = "/api/import/upload",
     tag = "import",
     summary = "Upload a file",
-    description = "Upload a raw file for import. The file is written to the import staging area and indexed. Supports up to 1 GB files.",
+    description = "Upload a raw file for import. The file is written to the import staging area and queued for analysis, which runs in the background. Poll `/api/import/status` to see when it is done. Supports up to 1 GB files.",
     params(UploadQuery),
     request_body(content = Vec<u8>, content_type = "application/octet-stream", description = "Raw file bytes"),
     responses(
-        (status = 200, description = "File uploaded and indexed successfully"),
+        (status = 202, description = "File stored and queued for analysis"),
         (status = 400, description = "Invalid filename"),
         (status = 500, description = "Internal server error"),
     )
@@ -81,37 +81,35 @@ pub(super) async fn upload_file_raw(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Index the file immediately (blocking -- runs face detection etc.)
-    let scanner = state.scanner.clone();
-    let target_path_owned = target_path.to_path_buf();
-    let organizer = state.organizer.clone();
-    let library_root = state.library_root.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = match scanner.open_db() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Failed to open DB for upload scan: {}", e);
-                return;
-            }
-        };
-        let dhash_cache = std::sync::Mutex::new(Vec::<crate::scanner::DHashCacheEntry>::new());
-        match scanner.process_file(&mut conn, &target_path_owned, &dhash_cache) {
-            Ok(true) => organizer.signal(&library_root),
-            Ok(false) => {}
-            Err(e) => tracing::error!(
-                "Failed to index uploaded file {:?}: {}",
-                target_path_owned,
-                e
-            ),
-        }
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!("Upload scan task failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Analysis (face detection, thumbnails, embeddings) is minutes of work for a
+    // large drop and the caller has nothing to do with the result, so it is
+    // handed to the ingest worker and the response goes back now. The bytes are
+    // already on disk, which is the part the client cannot redo.
+    state.ingest.enqueue(
+        &state.library_root,
+        state.organizer.clone(),
+        state.scanner.clone(),
+        target_path,
+    );
 
-    Ok(StatusCode::OK)
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// GET /api/import/status -- how much of the uploaded backlog is still being analyzed.
+#[utoipa::path(
+    get,
+    path = "/api/import/status",
+    tag = "import",
+    summary = "Import analysis status",
+    description = "How many uploaded files are still queued for or undergoing analysis, plus totals since the server started. Clients poll this after uploading to know when the library is fully indexed.",
+    responses(
+        (status = 200, description = "Ingest queue status", body = crate::ingest::IngestStatus),
+    )
+)]
+pub(super) async fn import_status(
+    UState(state): UState,
+) -> Json<crate::ingest::IngestStatus> {
+    Json(state.ingest.status(&state.library_root))
 }
 
 /// POST /api/import/finalize -- run face clustering and reorganization after bulk upload.
@@ -134,7 +132,14 @@ pub(super) async fn finalize_import(
     let library_root = state.library_root.clone();
     let caption_library_root = library_root.clone();
     let organizer = state.organizer.clone();
+    let ingest = state.ingest.clone();
+    let ingest_library_root = library_root.clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
+        // 0. Let the upload backlog finish first. Clustering half an import
+        // creates people that the rest of the import then has to be merged into.
+        tracing::info!("Finalize: waiting for queued uploads to be analyzed...");
+        ingest.wait_until_idle(&ingest_library_root);
+
         // 1. Cluster faces + reorganize files (run_reorganize does both),
         // serialized against the background organizer worker.
         tracing::info!("Finalize: clustering and reorganizing files...");

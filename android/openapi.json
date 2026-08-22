@@ -1120,13 +1120,35 @@
         }
       }
     },
+    "/api/import/status": {
+      "get": {
+        "tags": [
+          "import"
+        ],
+        "summary": "Import analysis status",
+        "description": "How many uploaded files are still queued for or undergoing analysis, plus totals since the server started. Clients poll this after uploading to know when the library is fully indexed.",
+        "operationId": "import_status",
+        "responses": {
+          "200": {
+            "description": "Ingest queue status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/import/upload": {
       "put": {
         "tags": [
           "import"
         ],
         "summary": "Upload a file",
-        "description": "Upload a raw file for import. The file is written to the import staging area and indexed. Supports up to 1 GB files.",
+        "description": "Upload a raw file for import. The file is written to the import staging area and queued for analysis, which runs in the background. Poll `/api/import/status` to see when it is done. Supports up to 1 GB files.",
         "operationId": "upload_file_raw",
         "parameters": [
           {
@@ -1155,8 +1177,8 @@
           "required": true
         },
         "responses": {
-          "200": {
-            "description": "File uploaded and indexed successfully"
+          "202": {
+            "description": "File stored and queued for analysis"
           },
           "400": {
             "description": "Invalid filename"
@@ -2567,6 +2589,40 @@
             "type": "string"
           },
           "workflow": {}
+        }
+      },
+      "IngestStatus": {
+        "type": "object",
+        "description": "What the queue is doing for one library, for the import UI to poll.\n\n[`completed`] and [`failed`] count since the server started, not since the\ncurrent upload: the client knows how many files it sent, and the pair of\nnumbers it cares about — how many are still coming and whether any broke —\nare both derivable from these without the server tracking upload sessions.",
+        "required": [
+          "queued",
+          "analyzing",
+          "completed",
+          "failed"
+        ],
+        "properties": {
+          "analyzing": {
+            "type": "integer",
+            "description": "Files being analyzed right now (0 or 1 — one worker per library).",
+            "minimum": 0
+          },
+          "completed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files analyzed since startup.",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Files whose analysis failed since startup. They stay on disk.",
+            "minimum": 0
+          },
+          "queued": {
+            "type": "integer",
+            "description": "Files waiting for the worker.",
+            "minimum": 0
+          }
         }
       },
       "MergePeoplePayload": {

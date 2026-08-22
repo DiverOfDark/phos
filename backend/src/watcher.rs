@@ -1,3 +1,4 @@
+use crate::ingest::IngestQueue;
 use crate::organizer::Organizer;
 use crate::scanner::{is_media_file, Scanner};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -34,6 +35,7 @@ pub fn start_watcher(
     library_path: PathBuf,
     scanner: Arc<Scanner>,
     organizer: Arc<Organizer>,
+    ingest: Arc<IngestQueue>,
 ) -> anyhow::Result<RecommendedWatcher> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
@@ -50,11 +52,14 @@ pub fn start_watcher(
     info!("File watcher started on {:?}", library_path);
 
     let watcher_library_path = library_path.clone();
+    // Uploads land in the watched directory, so the ingest worker and this
+    // thread meet on the same files; they take turns through this lock.
+    let analysis = ingest.analysis_lock(&library_path);
     // Spawn the debounce + processing thread.
     std::thread::Builder::new()
         .name("phos-file-watcher".into())
         .spawn(move || {
-            run_watcher_loop(rx, &scanner, &watcher_library_path, &organizer);
+            run_watcher_loop(rx, &scanner, &watcher_library_path, &organizer, &analysis);
         })?;
 
     Ok(watcher)
@@ -70,6 +75,7 @@ fn run_watcher_loop(
     scanner: &Scanner,
     library_path: &Path,
     organizer: &Organizer,
+    analysis: &std::sync::Mutex<()>,
 ) {
     // Maps each path to the action that should be taken and the instant of the
     // last event for that path.
@@ -93,7 +99,7 @@ fn run_watcher_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     // Flush remaining events before exiting.
                     if !pending.is_empty() {
-                        flush_pending(&mut pending, scanner, library_path, organizer);
+                        flush_pending(&mut pending, scanner, library_path, organizer, analysis);
                     }
                     info!("File watcher channel closed, shutting down watcher loop");
                     return;
@@ -114,11 +120,11 @@ fn run_watcher_loop(
                 .values()
                 .any(|(_, ts)| ts.elapsed() >= DEBOUNCE_DURATION);
             if should_flush {
-                flush_pending(&mut pending, scanner, library_path, organizer);
+                flush_pending(&mut pending, scanner, library_path, organizer, analysis);
             }
         } else {
             // Timeout fired -- flush all pending events.
-            flush_pending(&mut pending, scanner, library_path, organizer);
+            flush_pending(&mut pending, scanner, library_path, organizer, analysis);
         }
     }
 }
@@ -157,6 +163,7 @@ fn flush_pending(
     scanner: &Scanner,
     library_path: &Path,
     organizer: &Organizer,
+    analysis: &std::sync::Mutex<()>,
 ) {
     if pending.is_empty() {
         return;
@@ -199,7 +206,13 @@ fn flush_pending(
                     debug!("Watcher: path {:?} no longer exists, skipping", path);
                     continue;
                 }
-                match scanner.process_file(&mut conn, &path, &dhash_cache) {
+                // Per file, not per batch: an upload burst should not wait
+                // for a whole watcher flush to finish before it is indexed.
+                let result = {
+                    let _analysis = analysis.lock().unwrap_or_else(|e| e.into_inner());
+                    scanner.process_file(&mut conn, &path, &dhash_cache)
+                };
+                match result {
                     Ok(indexed) => had_changes |= indexed,
                     Err(e) => error!("Watcher: failed to process {:?}: {}", path, e),
                 }
@@ -207,7 +220,11 @@ fn flush_pending(
             FileAction::Remove => {
                 // Fails benignly for paths the organizer moved (the DB row
                 // already points at the new location).
-                if let Err(e) = scanner.remove_file(&mut conn, &path) {
+                let removed = {
+                    let _analysis = analysis.lock().unwrap_or_else(|e| e.into_inner());
+                    scanner.remove_file(&mut conn, &path)
+                };
+                if let Err(e) = removed {
                     warn!("Watcher: failed to remove {:?}: {}", path, e);
                 } else {
                     had_changes = true;
@@ -312,7 +329,13 @@ mod tests {
         // and still clear the map.
         let scanner = Scanner::new(PathBuf::from("/tmp/nonexistent_test.db"), None);
         let organizer = Organizer::new();
-        flush_pending(&mut pending, &scanner, Path::new("/tmp"), &organizer);
+        flush_pending(
+            &mut pending,
+            &scanner,
+            Path::new("/tmp"),
+            &organizer,
+            &std::sync::Mutex::new(()),
+        );
         organizer.shutdown();
         assert!(pending.is_empty());
     }

@@ -73,6 +73,7 @@ use utoipa::OpenApi;
         files::set_file_original,
         files::upload_file_raw,
         files::finalize_import,
+        files::import_status,
         // System
         stats::get_stats,
         stats::get_organize_stats,
@@ -141,6 +142,8 @@ use utoipa::OpenApi;
             faces::FaceSuggestion,
             faces::ReassignFacePayload,
             faces::AddManualFacePayload,
+            // Import
+            crate::ingest::IngestStatus,
             // Stats
             stats::StatsResponse,
             stats::OrganizeStatsResponse,
@@ -192,6 +195,7 @@ pub struct AppState {
     pub user_pools: Arc<RwLock<HashMap<String, DbPool>>>,
     pub shutdown_flag: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     pub organizer: Arc<crate::organizer::Organizer>,
+    pub ingest: Arc<crate::ingest::IngestQueue>,
 }
 
 /// Per-request state extractor. In multi-user mode, resolves to the per-user
@@ -245,6 +249,7 @@ pub async fn resolve_user_db(
                 user_pools: state.user_pools.clone(),
                 shutdown_flag: state.shutdown_flag.clone(),
                 organizer: state.organizer.clone(),
+                ingest: state.ingest.clone(),
             }
         } else {
             state
@@ -468,6 +473,7 @@ pub fn create_router(state: AppState) -> Router {
             put(files::upload_file_raw).layer(DefaultBodyLimit::max(1024 * 1024 * 1024)), // 1 GB
         )
         .route("/api/import/finalize", post(files::finalize_import))
+        .route("/api/import/status", get(files::import_status))
         // ComfyUI integration
         .route("/api/comfyui/health", get(comfyui::comfyui_health))
         .route(

@@ -79,6 +79,8 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - `GET /api/people` — List detected people/face clusters
 - `GET /api/people/:id` — Photos of a specific person
 - `POST /api/scan` — Trigger a library scan
+- `PUT /api/import/upload` — Store an uploaded file and queue it for analysis (`202`; the analysis runs on the per-library ingest worker, not on the request)
+- `GET /api/import/status` — Ingest queue depth for the caller's library, polled by the import UI
 - `GET /api/client/version` — Bundled Android APK metadata for the in-app updater (no auth)
 
 ## AI Models

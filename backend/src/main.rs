@@ -10,6 +10,7 @@ mod comfyui;
 mod db;
 mod embedding;
 mod import;
+mod ingest;
 mod models;
 mod organizer;
 mod s3;
@@ -187,6 +188,9 @@ async fn run_server() {
     // files) instead of only at startup.
     let organizer = organizer::Organizer::new();
 
+    // Uploaded files are analyzed here, off the request that delivered them.
+    let ingest = ingest::IngestQueue::new();
+
     let state = api::AppState {
         pool,
         scanner: scanner.clone(),
@@ -196,6 +200,7 @@ async fn run_server() {
         user_pools: Arc::new(RwLock::new(HashMap::new())),
         shutdown_flag: shutdown_flag.clone(),
         organizer: organizer.clone(),
+        ingest: ingest.clone(),
     };
 
     let bg_shutdown = shutdown_flag.clone();
@@ -207,6 +212,7 @@ async fn run_server() {
         let comfyui_url_bg = comfyui_url.clone();
         let comfyui_shutdown = shutdown_flag.clone();
         let bg_organizer = organizer.clone();
+        let bg_ingest = ingest.clone();
         tokio::task::spawn_blocking(move || {
             let (lock, cvar) = &*bg_shutdown;
             if *lock.lock().unwrap() {
@@ -276,6 +282,7 @@ async fn run_server() {
                     user_dir.clone(),
                     user_scanner.clone(),
                     bg_organizer.clone(),
+                    bg_ingest.clone(),
                 ) {
                     Ok(handle) => watcher_handles.push(handle),
                     Err(e) => {
@@ -312,6 +319,7 @@ async fn run_server() {
         let scan_path = root_path.to_path_buf();
         let watcher_library_path = root_path.to_path_buf();
         let bg_organizer = organizer.clone();
+        let bg_ingest = ingest.clone();
         tokio::task::spawn_blocking(move || {
             let (lock, cvar) = &*bg_shutdown;
             if *lock.lock().unwrap() {
@@ -351,7 +359,12 @@ async fn run_server() {
             bg_organizer.watch(&scan_path);
 
             // Initial scan complete -- start watching for incremental changes.
-            match watcher::start_watcher(watcher_library_path, scanner.clone(), bg_organizer) {
+            match watcher::start_watcher(
+                watcher_library_path,
+                scanner.clone(),
+                bg_organizer,
+                bg_ingest,
+            ) {
                 Ok(watcher_handle) => {
                     info!("File watcher active after initial scan");
                     // Keep the watcher alive until shutdown (dropping the
@@ -553,6 +566,7 @@ async fn run_server() {
         cvar.notify_all();
     }
     organizer.shutdown();
+    ingest.shutdown();
     // Give it a moment to flush cleanly.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), bg_handle).await;
     info!("Shutdown complete");
