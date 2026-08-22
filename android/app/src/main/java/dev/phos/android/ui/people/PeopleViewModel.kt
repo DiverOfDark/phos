@@ -48,7 +48,11 @@ class PeopleViewModel @Inject constructor(
             _isRefreshing.value = true
             _error.value = null
             try {
-                _people.value = peopleRepository.fetchPeople()
+                // People with nothing left in them are dropped rather than shown
+                // as empty tiles: the server keeps a person around after their
+                // last shot is moved or deleted, and a grid of names that open
+                // onto nothing is worse than a shorter grid.
+                _people.value = peopleRepository.fetchPeople().filter { it.shotCount > 0 }
             } catch (e: Exception) {
                 _people.value = emptyList()
                 _error.value = "Failed to refresh: ${e.message}"
