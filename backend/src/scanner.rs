@@ -1804,7 +1804,7 @@ pub fn calculate_hash(path: &Path) -> io::Result<String> {
         hasher.update(&buffer[..count]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]

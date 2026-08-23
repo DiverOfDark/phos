@@ -892,7 +892,7 @@ fn download_and_save_output(
     // Compute hash before writing to disk so we can check for duplicates
     let mut hasher = Sha256::new();
     hasher.update(&data);
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = hex::encode(hasher.finalize());
 
     let file_size = data.len() as i64;
 

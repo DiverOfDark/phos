@@ -373,7 +373,7 @@ fn check_basic_auth(
     }
 
     let expected_hash = stored_password_hash.unwrap();
-    let input_hash = format!("{:x}", Sha256::digest(password.as_bytes()));
+    let input_hash = hex::encode(Sha256::digest(password.as_bytes()));
 
     if input_hash != expected_hash {
         tracing::warn!("WebDAV: wrong password for user {:?}", username);

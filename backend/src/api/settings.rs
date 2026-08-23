@@ -82,7 +82,7 @@ pub async fn set_webdav_settings(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let password_hash = format!("{:x}", Sha256::digest(creds.password.as_bytes()));
+    let password_hash = hex::encode(Sha256::digest(creds.password.as_bytes()));
 
     let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     diesel::insert_into(settings::table)
