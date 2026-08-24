@@ -85,6 +85,36 @@ jobs:
           path: android/app/build/outputs/apk/release/phos-release.apk
           retention-days: 30
 
+  backend-test:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -C target-cpu=x86-64-v2
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev libavutil-dev libavformat-dev libavcodec-dev libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev nasm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Backend Tests
+        run: |
+          cd backend
+          cargo test
   docker:
     runs-on: ubuntu-latest
     permissions:
