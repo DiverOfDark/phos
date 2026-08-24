@@ -24,7 +24,7 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 uuid = { version = "1.22", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
-ffmpeg-next = { version = "8", features = ["build"] }
+ffmpeg-next = "8"
 ndarray = "0.17"
 hf-hub = "0.5"
 kamadak-exif = "0.6"

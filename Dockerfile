@@ -36,6 +36,10 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked
 WORKDIR /app/backend
+COPY backend/Cargo.toml backend/Cargo.lock ./
+COPY backend/build.rs ./
+# Keep codegen conservative so the runtime works on older x86-64 CPUs too.
+ENV RUSTFLAGS="-C target-cpu=x86-64-v2"
 
 # Stage 2b: Generate dependency recipe
 FROM chef AS planner
