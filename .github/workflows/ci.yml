@@ -88,7 +88,7 @@ jobs:
   backend-test:
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -C target-cpu=x86-64-v2
+      RUSTFLAGS: -C target-cpu=x86-64
     steps:
       - uses: actions/checkout@v6
 

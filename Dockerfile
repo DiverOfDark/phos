@@ -39,7 +39,7 @@ WORKDIR /app/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
 COPY backend/build.rs ./
 # Keep codegen conservative so the runtime works on older x86-64 CPUs too.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v2"
+ENV RUSTFLAGS="-C target-cpu=x86-64"
 
 # Stage 2b: Generate dependency recipe
 FROM chef AS planner
