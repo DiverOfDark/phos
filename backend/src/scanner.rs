@@ -667,11 +667,29 @@ impl Scanner {
 
     /// Remove overlapping duplicate face detections from files whose shot has not
     /// yet been reviewed (`review_status` is `pending` or NULL). Confirmed shots
-    /// are left untouched. Uses the same embedding-aware suppression as the
-    /// insert-time path (see [`cluster_duplicate_faces`]). When a kept face has no
-    /// person assigned but one of its duplicates does, the label is preserved.
-    /// Returns the number of faces removed.
+    /// are left untouched.
+    ///
+    /// Boxes are judged with [`DedupPolicy::LabelAware`]: overlap is enough,
+    /// except that two boxes assigned to different people are never collapsed.
+    /// When a kept face has no person assigned but one of its duplicates does,
+    /// the label moves to the keeper. Returns the number of faces removed.
     pub fn dedupe_overlapping_faces(&self, conn: &mut SqliteConnection) -> anyhow::Result<usize> {
+        self.dedupe_overlapping_faces_inner(conn, false)
+    }
+
+    /// What [`Self::dedupe_overlapping_faces`] would remove, without removing it.
+    ///
+    /// Deleting a face cannot be undone, so the clients offer this first and show
+    /// the number before anything is touched.
+    pub fn count_overlapping_faces(&self, conn: &mut SqliteConnection) -> anyhow::Result<usize> {
+        self.dedupe_overlapping_faces_inner(conn, true)
+    }
+
+    fn dedupe_overlapping_faces_inner(
+        &self,
+        conn: &mut SqliteConnection,
+        dry_run: bool,
+    ) -> anyhow::Result<usize> {
         // Files belonging to not-yet-reviewed shots.
         let file_ids: Vec<String> = files::table
             .inner_join(shots::table.on(files::shot_id.eq(shots::id)))
@@ -727,11 +745,19 @@ impl Scanner {
                         .as_ref()
                         .and_then(|b| crate::embedding::decode_embedding(b))
                         .unwrap_or_default(),
+                    person_id: r.1.clone(),
                 })
                 .collect();
 
-            for (keeper, suppressed) in cluster_duplicate_faces(&views) {
+            for (keeper, suppressed) in
+                cluster_duplicate_faces(&views, DedupPolicy::LabelAware)
+            {
                 if suppressed.is_empty() {
+                    continue;
+                }
+
+                if dry_run {
+                    total_removed += suppressed.len();
                     continue;
                 }
 
@@ -760,7 +786,15 @@ impl Scanner {
             }
         }
 
+        if dry_run {
+            return Ok(total_removed);
+        }
+
         if total_removed > 0 {
+            // Dropping a face can change which face is the largest in a shot, and
+            // a shot's person is derived from exactly that. Leaving it stale would
+            // hand photos to the wrong person on the next reorganize.
+            assign_primary_persons(conn)?;
             info!("Removed {} overlapping duplicate faces", total_removed);
         }
         Ok(total_removed)
@@ -1373,11 +1407,19 @@ struct KeyframeResult {
 // keyframes (one per few seconds), so the same person standing still yields many
 // near-identical boxes. Re-scans and manual additions can also leave overlaps.
 //
-// We collapse such duplicates with *embedding-aware* greedy suppression: two
-// boxes are merged only when they are BOTH spatially coincident AND share an
-// identity (high embedding similarity). The identity guard is the crucial part —
-// two genuinely different people standing cheek-to-cheek can produce boxes with
-// high IoU, and pure spatial NMS would wrongly delete the second person.
+// Duplicates are collapsed with greedy suppression, but *what counts as the same
+// identity* depends on when we look:
+//
+// - At insert time ([`DedupPolicy::EmbeddingGuarded`]) nothing is labelled yet, so
+//   identity can only come from the embeddings. The guard matters most for video:
+//   the pooled keyframes span minutes, and two different people can walk through
+//   the same spot, producing boxes with high IoU that must not be collapsed.
+// - Over stored faces ([`DedupPolicy::LabelAware`]) the user's own labels are the
+//   better signal. Two boxes assigned to different people are never merged — the
+//   user has said they are different — and anything else that overlaps is a
+//   duplicate box, embeddings or not. Two crops of one face routinely disagree by
+//   more than the cosine threshold, which is exactly the case that used to be left
+//   on screen for the reviewer to delete by hand.
 
 /// Min IoU for two boxes to be considered the same location.
 const DEDUP_IOU_THRESHOLD: f32 = 0.5;
@@ -1387,6 +1429,15 @@ const DEDUP_CONTAINMENT_THRESHOLD: f32 = 0.7;
 /// Min cosine similarity for two faces to be treated as the same identity.
 const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.5;
 
+/// How two overlapping boxes are judged to be the same face.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DedupPolicy {
+    /// Fresh detections, before anything is labelled: the embeddings decide.
+    EmbeddingGuarded,
+    /// Stored faces: the labels decide, and overlap alone is enough otherwise.
+    LabelAware,
+}
+
 /// A minimal face view for overlap dedup.
 struct DedupFace {
     x1: f32,
@@ -1395,6 +1446,9 @@ struct DedupFace {
     y2: f32,
     score: f32,
     embedding: Vec<f32>,
+    /// Who this face is assigned to, when it is a stored face. Always `None` for
+    /// freshly detected ones, which is why they fall back to embeddings.
+    person_id: Option<String>,
 }
 
 impl DedupFace {
@@ -1403,9 +1457,9 @@ impl DedupFace {
     }
 }
 
-/// True when two faces are spatially coincident AND share an identity, i.e. they
-/// are duplicate detections of the same physical face.
-fn faces_are_duplicate(a: &DedupFace, b: &DedupFace) -> bool {
+/// True when two faces are duplicate detections of the same physical face:
+/// spatially coincident, and not known to be two different people.
+fn faces_are_duplicate(a: &DedupFace, b: &DedupFace, policy: DedupPolicy) -> bool {
     let inter_w = (a.x2.min(b.x2) - a.x1.max(b.x1)).max(0.0);
     let inter_h = (a.y2.min(b.y2) - a.y1.max(b.y1)).max(0.0);
     let inter = inter_w * inter_h;
@@ -1421,6 +1475,16 @@ fn faces_are_duplicate(a: &DedupFace, b: &DedupFace) -> bool {
         return false;
     }
 
+    if policy == DedupPolicy::LabelAware {
+        // The one thing overlap must never override: the user has named these two
+        // boxes as different people. Everything else that overlaps this much is a
+        // duplicate box of one face — same person, or nobody yet.
+        return match (&a.person_id, &b.person_id) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        };
+    }
+
     // Identity guard: only collapse if the embeddings agree. When an embedding is
     // missing we fall back to spatial-only (still very likely a duplicate box).
     if a.embedding.is_empty() || b.embedding.is_empty() || a.embedding.len() != b.embedding.len() {
@@ -1434,7 +1498,7 @@ fn faces_are_duplicate(a: &DedupFace, b: &DedupFace) -> bool {
 /// Returns clusters as `(keeper_index, suppressed_indices)`, where the keeper is
 /// the highest-confidence (then largest) detection and the suppressed entries are
 /// its duplicates. Indices refer to positions in `faces`.
-fn cluster_duplicate_faces(faces: &[DedupFace]) -> Vec<(usize, Vec<usize>)> {
+fn cluster_duplicate_faces(faces: &[DedupFace], policy: DedupPolicy) -> Vec<(usize, Vec<usize>)> {
     let mut order: Vec<usize> = (0..faces.len()).collect();
     order.sort_by(|&a, &b| {
         faces[b]
@@ -1460,7 +1524,7 @@ fn cluster_duplicate_faces(faces: &[DedupFace]) -> Vec<(usize, Vec<usize>)> {
             if j == i || suppressed[j] {
                 continue;
             }
-            if faces_are_duplicate(&faces[i], &faces[j]) {
+            if faces_are_duplicate(&faces[i], &faces[j], policy) {
                 suppressed[j] = true;
                 members.push(j);
             }
@@ -1485,10 +1549,11 @@ fn dedup_face_results(faces: Vec<FaceResult>) -> Vec<FaceResult> {
             y2: f.box_y2,
             score: f.score,
             embedding: crate::embedding::decode_embedding(&f.embedding_blob).unwrap_or_default(),
+            person_id: None,
         })
         .collect();
 
-    let keep: HashSet<usize> = cluster_duplicate_faces(&views)
+    let keep: HashSet<usize> = cluster_duplicate_faces(&views, DedupPolicy::EmbeddingGuarded)
         .into_iter()
         .map(|(keeper, _)| keeper)
         .collect();
@@ -1821,6 +1886,23 @@ mod tests {
             y2,
             score,
             embedding: emb.to_vec(),
+            person_id: None,
+        }
+    }
+
+    /// The same box, but already assigned to somebody — what the stored-face
+    /// sweep sees and the insert-time path never does.
+    fn labelled_face(
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        score: f32,
+        person: Option<&str>,
+    ) -> DedupFace {
+        DedupFace {
+            person_id: person.map(str::to_string),
+            ..dedup_face(x1, y1, x2, y2, score, &[])
         }
     }
 
@@ -1831,7 +1913,7 @@ mod tests {
             dedup_face(0.0, 0.0, 100.0, 100.0, 0.9, &[1.0, 0.0, 0.0]),
             dedup_face(2.0, 2.0, 102.0, 102.0, 0.8, &[0.99, 0.01, 0.0]),
         ];
-        let clusters = cluster_duplicate_faces(&faces);
+        let clusters = cluster_duplicate_faces(&faces, DedupPolicy::EmbeddingGuarded);
         assert_eq!(clusters.len(), 1);
         // Highest score is the keeper.
         assert_eq!(clusters[0].0, 0);
@@ -1845,7 +1927,7 @@ mod tests {
             dedup_face(0.0, 0.0, 100.0, 100.0, 0.9, &[1.0, 0.0, 0.0]),
             dedup_face(10.0, 10.0, 110.0, 110.0, 0.8, &[0.0, 1.0, 0.0]),
         ];
-        let clusters = cluster_duplicate_faces(&faces);
+        let clusters = cluster_duplicate_faces(&faces, DedupPolicy::EmbeddingGuarded);
         assert_eq!(clusters.len(), 2, "different identities must not be merged");
     }
 
@@ -1856,7 +1938,7 @@ mod tests {
             dedup_face(0.0, 0.0, 50.0, 50.0, 0.9, &[1.0, 0.0, 0.0]),
             dedup_face(500.0, 500.0, 550.0, 550.0, 0.8, &[1.0, 0.0, 0.0]),
         ];
-        let clusters = cluster_duplicate_faces(&faces);
+        let clusters = cluster_duplicate_faces(&faces, DedupPolicy::EmbeddingGuarded);
         assert_eq!(clusters.len(), 2);
     }
 
@@ -1869,7 +1951,7 @@ mod tests {
             dedup_face(10.0, 10.0, 60.0, 60.0, 0.8, &[1.0, 0.0, 0.0]),
         ];
         // IoU = 2500/10000 = 0.25 (below 0.5) but containment = 2500/2500 = 1.0.
-        let clusters = cluster_duplicate_faces(&faces);
+        let clusters = cluster_duplicate_faces(&faces, DedupPolicy::EmbeddingGuarded);
         assert_eq!(clusters.len(), 1);
     }
 
@@ -1880,8 +1962,76 @@ mod tests {
             dedup_face(0.0, 0.0, 100.0, 100.0, 0.9, &[]),
             dedup_face(2.0, 2.0, 102.0, 102.0, 0.8, &[]),
         ];
-        let clusters = cluster_duplicate_faces(&faces);
+        let clusters = cluster_duplicate_faces(&faces, DedupPolicy::EmbeddingGuarded);
         assert_eq!(clusters.len(), 1);
+    }
+
+    /// The label the user gave is the one thing overlap cannot override.
+    #[test]
+    fn label_aware_dedup_never_merges_two_named_people() {
+        let faces = vec![
+            labelled_face(0.0, 0.0, 100.0, 100.0, 0.9, Some("anna")),
+            labelled_face(2.0, 2.0, 102.0, 102.0, 0.8, Some("bea")),
+        ];
+        let clusters = cluster_duplicate_faces(&faces, DedupPolicy::LabelAware);
+        assert_eq!(2, clusters.len(), "two named people must both survive");
+    }
+
+    /// Same person, two boxes: geometry alone settles it. Two crops of one face
+    /// routinely disagree by more than the cosine threshold, and those are exactly
+    /// the ones the reviewer was deleting by hand.
+    #[test]
+    fn label_aware_dedup_merges_two_boxes_of_one_person() {
+        let faces = vec![
+            labelled_face(0.0, 0.0, 100.0, 100.0, 0.9, Some("anna")),
+            labelled_face(2.0, 2.0, 102.0, 102.0, 0.8, Some("anna")),
+        ];
+        let clusters = cluster_duplicate_faces(&faces, DedupPolicy::LabelAware);
+        assert_eq!(1, clusters.len());
+        assert_eq!(0, clusters[0].0, "the higher-scoring box is the keeper");
+    }
+
+    /// Unassigned boxes merge on overlap too — no embedding has to agree.
+    #[test]
+    fn label_aware_dedup_merges_unassigned_boxes() {
+        let faces = vec![
+            labelled_face(0.0, 0.0, 100.0, 100.0, 0.9, None),
+            labelled_face(2.0, 2.0, 102.0, 102.0, 0.8, None),
+            // One named box overlapping an unnamed one: still a duplicate, and
+            // the label survives on whichever box wins.
+            labelled_face(500.0, 500.0, 600.0, 600.0, 0.7, Some("anna")),
+            labelled_face(502.0, 502.0, 602.0, 602.0, 0.6, None),
+        ];
+        let clusters = cluster_duplicate_faces(&faces, DedupPolicy::LabelAware);
+        assert_eq!(2, clusters.len());
+    }
+
+    /// Distance still wins: two people in different corners are not duplicates,
+    /// however unlabelled they are.
+    #[test]
+    fn label_aware_dedup_keeps_boxes_that_do_not_overlap() {
+        let faces = vec![
+            labelled_face(0.0, 0.0, 50.0, 50.0, 0.9, None),
+            labelled_face(500.0, 500.0, 550.0, 550.0, 0.8, None),
+        ];
+        let clusters = cluster_duplicate_faces(&faces, DedupPolicy::LabelAware);
+        assert_eq!(2, clusters.len());
+    }
+
+    /// Insert time is unchanged: nothing is labelled yet, so a video's pooled
+    /// keyframes still need the embeddings to agree before boxes collapse.
+    #[test]
+    fn insert_time_dedup_still_needs_the_embeddings_to_agree() {
+        let faces = vec![
+            dedup_face(0.0, 0.0, 100.0, 100.0, 0.9, &[1.0, 0.0, 0.0]),
+            dedup_face(2.0, 2.0, 102.0, 102.0, 0.8, &[0.0, 1.0, 0.0]),
+        ];
+        let clusters = cluster_duplicate_faces(&faces, DedupPolicy::EmbeddingGuarded);
+        assert_eq!(
+            2,
+            clusters.len(),
+            "two people crossing the same spot across keyframes must both survive",
+        );
     }
 
     #[test]
@@ -1889,6 +2039,100 @@ mod tests {
         assert!(is_media_file(Path::new("test.jpg")));
         assert!(is_media_file(Path::new("test.PNG")));
         assert!(!is_media_file(Path::new("test.txt")));
+    }
+
+    /// A library with one file holding three boxes on two faces, plus a
+    /// confirmed shot holding two boxes on one face.
+    fn library_with_duplicate_boxes() -> (tempfile::TempDir, PathBuf) {
+        use diesel::connection::SimpleConnection;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join(".phos.db");
+        crate::db::init_and_migrate(&db_path).unwrap();
+        let mut conn = db::open_diesel_connection(&db_path).unwrap();
+
+        conn.batch_execute(
+            "INSERT INTO people (id, name) VALUES ('anna','Anna'), ('bea','Bea');
+             INSERT INTO shots (id, review_status) VALUES
+                ('shot-pending', 'pending'),
+                ('shot-confirmed', 'confirmed');
+             INSERT INTO files (id, shot_id, path, hash, is_original) VALUES
+                ('file-pending', 'shot-pending', 'a.jpg', 'h1', 1),
+                ('file-confirmed', 'shot-confirmed', 'b.jpg', 'h2', 1);
+             INSERT INTO faces (id, file_id, person_id, box_x1, box_y1, box_x2, box_y2, score)
+             VALUES
+                -- Anna, boxed twice. No embeddings at all: the label decides.
+                ('f-anna-1', 'file-pending', 'anna', 0, 0, 100, 100, 0.9),
+                ('f-anna-2', 'file-pending', NULL, 4, 4, 104, 104, 0.8),
+                -- Bea, right next to Anna but not overlapping her.
+                ('f-bea', 'file-pending', 'bea', 400, 0, 500, 100, 0.9),
+                -- Two boxes on one face in a shot the user already reviewed.
+                ('f-conf-1', 'file-confirmed', NULL, 0, 0, 100, 100, 0.9),
+                ('f-conf-2', 'file-confirmed', NULL, 3, 3, 103, 103, 0.7);",
+        )
+        .unwrap();
+
+        (dir, db_path)
+    }
+
+    /// The sweep the reviewer no longer has to do by hand.
+    #[test]
+    fn the_sweep_collapses_duplicate_boxes_and_keeps_the_label() {
+        let (_dir, db_path) = library_with_duplicate_boxes();
+        let scanner = Scanner::new(db_path.clone(), None);
+        let mut conn = scanner.open_db().unwrap();
+
+        let removed = scanner.dedupe_overlapping_faces(&mut conn).unwrap();
+
+        assert_eq!(1, removed, "only Anna's second box goes");
+        let left: Vec<String> = faces::table
+            .filter(faces::file_id.eq("file-pending"))
+            .select(faces::id)
+            .order(faces::id.asc())
+            .load(&mut conn)
+            .unwrap();
+        assert_eq!(vec!["f-anna-1", "f-bea"], left, "Bea must survive");
+        let anna: Option<String> = faces::table
+            .filter(faces::id.eq("f-anna-1"))
+            .select(faces::person_id)
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(Some("anna".to_string()), anna, "the label stays on the keeper");
+    }
+
+    /// A shot the user has already reviewed is theirs; the sweep does not
+    /// second-guess it.
+    #[test]
+    fn the_sweep_leaves_confirmed_shots_alone() {
+        let (_dir, db_path) = library_with_duplicate_boxes();
+        let scanner = Scanner::new(db_path.clone(), None);
+        let mut conn = scanner.open_db().unwrap();
+
+        scanner.dedupe_overlapping_faces(&mut conn).unwrap();
+
+        let confirmed: i64 = faces::table
+            .filter(faces::file_id.eq("file-confirmed"))
+            .count()
+            .get_result(&mut conn)
+            .unwrap();
+        assert_eq!(2, confirmed);
+    }
+
+    /// The dry run is what the clients show before deleting anything, so it has
+    /// to report the same number and touch nothing.
+    #[test]
+    fn a_dry_run_counts_without_deleting() {
+        let (_dir, db_path) = library_with_duplicate_boxes();
+        let scanner = Scanner::new(db_path.clone(), None);
+        let mut conn = scanner.open_db().unwrap();
+
+        let would_remove = scanner.count_overlapping_faces(&mut conn).unwrap();
+        let before: i64 = faces::table.count().get_result(&mut conn).unwrap();
+        let removed = scanner.dedupe_overlapping_faces(&mut conn).unwrap();
+
+        assert_eq!(1, would_remove);
+        assert_eq!(5, before, "the dry run must not have deleted anything");
+        assert_eq!(would_remove, removed);
     }
 
     #[test]

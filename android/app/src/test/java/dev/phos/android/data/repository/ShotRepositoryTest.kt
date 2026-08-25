@@ -1,5 +1,6 @@
 package dev.phos.android.data.repository
 
+import dev.phos.android.data.remote.api.FacesApi
 import dev.phos.android.data.remote.api.FilesApi
 import dev.phos.android.data.remote.api.PeopleApi
 import dev.phos.android.data.remote.api.ShotsApi
@@ -36,8 +37,9 @@ class ShotRepositoryTest {
     private val shotsApi = mockk<ShotsApi>()
     private val peopleApi = mockk<PeopleApi>()
     private val filesApi = mockk<FilesApi>()
+    private val facesApi = mockk<FacesApi>()
 
-    private val repository = ShotRepository(shotsApi, peopleApi, filesApi)
+    private val repository = ShotRepository(shotsApi, peopleApi, filesApi, facesApi)
 
     // ---- reassignment -----------------------------------------------------
 

@@ -263,6 +263,10 @@ async fn run_server() {
                 if let Err(e) = user_scanner.rehash_files() {
                     tracing::error!("Rehash failed for user {}: {}", user_name, e);
                 }
+                // Before the scan, not only inside it: a library indexed by an
+                // older build carries duplicate boxes the reviewer would
+                // otherwise keep deleting by hand until the scan finishes.
+                dedupe_faces_at_startup(&user_scanner, &user_name);
                 if let Err(e) = user_scanner.scan(user_dir) {
                     tracing::error!("Scan failed for user {}: {}", user_name, e);
                 }
@@ -332,6 +336,10 @@ async fn run_server() {
             if *lock.lock().unwrap() {
                 return;
             }
+            // Before the scan, not only inside it: a library indexed by an older
+            // build carries duplicate boxes the reviewer would otherwise keep
+            // deleting by hand until the scan finishes.
+            dedupe_faces_at_startup(&scanner, "library");
             if let Err(e) = scanner.scan(&scan_path) {
                 tracing::error!("Scan failed: {}", e);
             }
@@ -570,6 +578,25 @@ async fn run_server() {
     // Give it a moment to flush cleanly.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), bg_handle).await;
     info!("Shutdown complete");
+}
+
+/// Collapse overlapping duplicate face boxes for one library at startup.
+///
+/// Best-effort: a failure costs the reviewer some manual deletes, so it is
+/// logged and boot carries on.
+fn dedupe_faces_at_startup(scanner: &scanner::Scanner, label: &str) {
+    let mut conn = match scanner.open_db() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Startup dedupe: cannot open DB for {}: {}", label, e);
+            return;
+        }
+    };
+    match scanner.dedupe_overlapping_faces(&mut conn) {
+        Ok(0) => {}
+        Ok(n) => info!("Startup: removed {} duplicate face box(es) for {}", n, label),
+        Err(e) => tracing::error!("Startup dedupe failed for {}: {}", label, e),
+    }
 }
 
 /// Wait for SIGTERM or Ctrl-C.

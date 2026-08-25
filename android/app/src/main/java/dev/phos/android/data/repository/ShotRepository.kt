@@ -1,5 +1,6 @@
 package dev.phos.android.data.repository
 
+import dev.phos.android.data.remote.api.FacesApi
 import dev.phos.android.data.remote.api.FilesApi
 import dev.phos.android.data.remote.api.PeopleApi
 import dev.phos.android.data.remote.api.ShotsApi
@@ -39,6 +40,7 @@ class ShotRepository @Inject constructor(
     private val shotsApi: ShotsApi,
     private val peopleApi: PeopleApi,
     private val filesApi: FilesApi,
+    private val facesApi: FacesApi,
 ) {
 
     /** Deletes a shot and every file in it. Irreversible, server-side. */
@@ -182,6 +184,15 @@ class ShotRepository @Inject constructor(
                 coverShotThumbnailUrl = brief.coverShotThumbnailUrl,
             )
         }
+
+    /**
+     * Collapses overlapping boxes drawn on the same face, library-wide.
+     *
+     * [dryRun] answers "how many would go" without deleting anything — deleting a
+     * face cannot be undone, so the user sees the number before they agree to it.
+     */
+    suspend fun dedupeFaces(dryRun: Boolean): Int =
+        facesApi.dedupeFaces(dryRun).await().removed.toInt()
 
     /**
      * Creates a person and returns their id, so "new person" and "assign to them"

@@ -208,15 +208,48 @@ fn run_worker_loop(worker: &Worker) {
 
         let analyzed = analyze(worker, &job);
 
-        let mut state = worker.state.lock().unwrap();
-        state.analyzing -= 1;
-        if analyzed {
-            state.completed += 1;
-        } else {
-            state.failed += 1;
+        let drained = {
+            let mut state = worker.state.lock().unwrap();
+            state.analyzing -= 1;
+            if analyzed {
+                state.completed += 1;
+            } else {
+                state.failed += 1;
+            }
+            // Wakes both the next `wait_until_idle` and anything waiting to enqueue.
+            worker.cvar.notify_all();
+            state.jobs.is_empty()
+        };
+
+        // Once the burst is over, clean up the boxes it produced. Detection can
+        // put two rectangles on one face, and finding them by hand in the review
+        // queue is the job nobody wants; doing it per file instead would mean
+        // re-running the sweep dozens of times during one upload.
+        if drained {
+            dedupe_faces(worker, &job);
         }
-        // Wakes both the next `wait_until_idle` and anything waiting to enqueue.
-        worker.cvar.notify_all();
+    }
+}
+
+/// Collapse overlapping duplicate face boxes across the library.
+///
+/// Best-effort: a failure here costs the user a manual delete during review, not
+/// their photos, so it is logged and the worker carries on.
+fn dedupe_faces(worker: &Worker, job: &Job) {
+    // Same lock the analysis takes: this deletes face rows that a watcher-driven
+    // `process_file` may be inserting right now.
+    let _analysis = worker.analysis.lock().unwrap_or_else(|e| e.into_inner());
+    let mut conn = match job.scanner.open_db() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Ingest: failed to open DB for face dedupe: {}", e);
+            return;
+        }
+    };
+    match job.scanner.dedupe_overlapping_faces(&mut conn) {
+        Ok(0) => {}
+        Ok(n) => info!("Ingest: removed {} duplicate face box(es)", n),
+        Err(e) => error!("Ingest: face dedupe failed: {}", e),
     }
 }
 

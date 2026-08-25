@@ -758,6 +758,42 @@
         }
       }
     },
+    "/api/faces/dedupe": {
+      "post": {
+        "tags": [
+          "faces"
+        ],
+        "summary": "Remove duplicate face boxes",
+        "description": "Collapse overlapping face detections of the same face across the library, so reviewers do not have to delete them by hand. Two boxes assigned to different people are never merged, and shots already marked reviewed are left alone. Pass `dry_run=true` to get the count without deleting anything.",
+        "operationId": "dedupe_faces",
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "description": "Report what would go without deleting anything. Defaults to `false`.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sweep result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DedupeFacesResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
     "/api/faces/{id}": {
       "delete": {
         "tags": [
@@ -2388,6 +2424,25 @@
           "name": {
             "type": "string",
             "description": "The name as stored — trimmed, which may differ from what was sent."
+          }
+        }
+      },
+      "DedupeFacesResponse": {
+        "type": "object",
+        "description": "Result of a duplicate-box sweep.",
+        "required": [
+          "removed",
+          "dry_run"
+        ],
+        "properties": {
+          "dry_run": {
+            "type": "boolean",
+            "description": "Whether anything was actually deleted."
+          },
+          "removed": {
+            "type": "integer",
+            "description": "Faces removed — or, for a dry run, faces that would be removed.",
+            "minimum": 0
           }
         }
       },

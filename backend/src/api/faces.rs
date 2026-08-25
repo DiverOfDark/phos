@@ -1,5 +1,5 @@
 use axum::{
-    extract::Path,
+    extract::{Path, Query},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
@@ -220,6 +220,71 @@ pub(super) async fn reassign_face(
     state.organizer.signal(&state.library_root);
 
     Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+/// Result of a duplicate-box sweep.
+#[derive(Serialize, ToSchema)]
+pub(super) struct DedupeFacesResponse {
+    /// Faces removed — or, for a dry run, faces that would be removed.
+    removed: usize,
+    /// Whether anything was actually deleted.
+    dry_run: bool,
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+pub(super) struct DedupeQuery {
+    /// Report what would go without deleting anything. Defaults to `false`.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// POST /api/faces/dedupe — collapse overlapping boxes of one face.
+#[utoipa::path(
+    post,
+    path = "/api/faces/dedupe",
+    tag = "faces",
+    summary = "Remove duplicate face boxes",
+    description = "Collapse overlapping face detections of the same face across the library, so reviewers do not have to delete them by hand. Two boxes assigned to different people are never merged, and shots already marked reviewed are left alone. Pass `dry_run=true` to get the count without deleting anything.",
+    params(DedupeQuery),
+    responses(
+        (status = 200, description = "Sweep result", body = DedupeFacesResponse),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub(super) async fn dedupe_faces(
+    UState(state): UState,
+    Query(query): Query<DedupeQuery>,
+) -> Result<Json<DedupeFacesResponse>, StatusCode> {
+    let scanner = state.scanner.clone();
+    // Shares the ingest worker's lock: this rewrites the same face rows a file
+    // being analyzed is inserting, and the two must not interleave.
+    let analysis = state.ingest.analysis_lock(&state.library_root);
+    let dry_run = query.dry_run;
+
+    let removed = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+        let _guard = analysis.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = scanner.open_db()?;
+        if dry_run {
+            scanner.count_overlapping_faces(&mut conn)
+        } else {
+            scanner.dedupe_overlapping_faces(&mut conn)
+        }
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Dedupe task panicked: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .map_err(|e| {
+        tracing::error!("Dedupe failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if removed > 0 && !dry_run {
+        state.organizer.signal(&state.library_root);
+    }
+
+    Ok(Json(DedupeFacesResponse { removed, dry_run }))
 }
 
 /// Delete a face detection (remove false positive / irrelevant face)

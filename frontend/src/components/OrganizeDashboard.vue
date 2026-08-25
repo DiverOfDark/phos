@@ -15,6 +15,7 @@ import {
   ArrowRight,
   UserPlus,
   ScanLine,
+  Scissors,
   Check,
   AlertCircle,
 } from 'lucide-vue-next'
@@ -43,6 +44,38 @@ const libraryPath = ref(localStorage.getItem('phos_library_path') || '/mnt/photo
 
 // PersonNamer dialog
 const showNamer = ref(false)
+
+// Duplicate face boxes
+//
+// Two-step on purpose: deleting a face cannot be undone, so the first click only
+// counts and the second one confirms that exact number.
+const dedupeBusy = ref(false)
+const dedupePending = ref(0)
+const dedupeMessage = ref('')
+const dedupeError = ref('')
+
+async function dedupeFaces(dryRun) {
+  dedupeBusy.value = true
+  dedupeError.value = ''
+  dedupeMessage.value = ''
+  try {
+    const res = await fetch(`/api/faces/dedupe?dry_run=${dryRun}`, { method: 'POST' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const result = await res.json()
+    if (dryRun) {
+      dedupePending.value = result.removed
+      if (result.removed === 0) dedupeMessage.value = 'No duplicate boxes found.'
+    } else {
+      dedupePending.value = 0
+      dedupeMessage.value = `Removed ${result.removed} duplicate box${result.removed === 1 ? '' : 'es'}.`
+      await loadData()
+    }
+  } catch (e) {
+    dedupeError.value = e.message || 'Failed to check for duplicate boxes.'
+  } finally {
+    dedupeBusy.value = false
+  }
+}
 
 const progressPercent = computed(() => {
   const total = stats.value.total_shots
@@ -330,6 +363,56 @@ defineExpose({ loadData, fetchPeople })
         <div v-if="scanError" class="flex items-start gap-2 p-2 rounded-lg bg-red-500/10 border border-red-500/20">
           <AlertCircle class="w-3.5 h-3.5 text-red-500 mt-0.5 shrink-0" />
           <p class="text-xs text-red-400">{{ scanError }}</p>
+        </div>
+      </div>
+
+      <!-- Duplicate face boxes -->
+      <div class="mb-8 p-4 rounded-xl bg-zinc-900/40 border border-white/5">
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <h3 class="text-sm font-semibold text-white">Duplicate Face Boxes</h3>
+            <p class="text-xs text-zinc-500 mt-0.5">
+              Collapse overlapping rectangles drawn on the same face. Two boxes assigned
+              to different people are never merged, and reviewed shots are left alone.
+            </p>
+          </div>
+          <div class="flex gap-2">
+            <Button
+              v-if="dedupePending > 0"
+              :disabled="dedupeBusy"
+              class="bg-red-600 hover:bg-red-500 text-white gap-2"
+              @click="dedupeFaces(false)"
+            >
+              <RefreshCw v-if="dedupeBusy" class="w-4 h-4 animate-spin" />
+              <Scissors v-else class="w-4 h-4" />
+              Remove {{ dedupePending }}
+            </Button>
+            <Button
+              :disabled="dedupeBusy"
+              variant="outline"
+              class="border-white/10 text-zinc-300 hover:text-white gap-2"
+              @click="dedupeFaces(true)"
+            >
+              <RefreshCw v-if="dedupeBusy" class="w-4 h-4 animate-spin" />
+              <Scissors v-else class="w-4 h-4" />
+              {{ dedupePending > 0 ? 'Re-check' : 'Find duplicates' }}
+            </Button>
+          </div>
+        </div>
+
+        <div v-if="dedupePending > 0" class="flex items-start gap-2 p-2 rounded-lg bg-yellow-500/10 border border-yellow-500/20">
+          <AlertTriangle class="w-3.5 h-3.5 text-yellow-500 mt-0.5 shrink-0" />
+          <p class="text-xs text-yellow-400">
+            {{ dedupePending }} duplicate box{{ dedupePending === 1 ? '' : 'es' }} found. Removing them can't be undone.
+          </p>
+        </div>
+        <div v-if="dedupeMessage" class="flex items-start gap-2 p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
+          <Check class="w-3.5 h-3.5 text-emerald-500 mt-0.5 shrink-0" />
+          <p class="text-xs text-emerald-400">{{ dedupeMessage }}</p>
+        </div>
+        <div v-if="dedupeError" class="flex items-start gap-2 p-2 rounded-lg bg-red-500/10 border border-red-500/20">
+          <AlertCircle class="w-3.5 h-3.5 text-red-500 mt-0.5 shrink-0" />
+          <p class="text-xs text-red-400">{{ dedupeError }}</p>
         </div>
       </div>
 

@@ -82,6 +82,48 @@ fun SettingsScreen(
 
             HorizontalDivider()
 
+            // Two taps, because the delete cannot be undone: the first counts the
+            // duplicate boxes, the second removes exactly that many.
+            ListItem(
+                headlineContent = { Text("Duplicate face boxes") },
+                supportingContent = {
+                    Text(
+                        uiState.dedupeMessage
+                            ?: when {
+                                uiState.dedupePending > 0 ->
+                                    "${uiState.dedupePending} found — tap again to remove. " +
+                                        "This can't be undone."
+                                else ->
+                                    "Collapse overlapping rectangles on one face. Boxes " +
+                                        "assigned to different people are never merged, and " +
+                                        "reviewed shots are left alone."
+                            },
+                        color = if (uiState.dedupePending > 0) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                },
+                trailingContent = {
+                    if (uiState.dedupeBusy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.padding(8.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    }
+                },
+                modifier = Modifier.clickable(enabled = !uiState.dedupeBusy) {
+                    if (uiState.dedupePending > 0) {
+                        viewModel.removeDuplicateFaces()
+                    } else {
+                        viewModel.findDuplicateFaces()
+                    }
+                },
+            )
+
+            HorizontalDivider()
+
             ListItem(
                 headlineContent = {
                     Text(

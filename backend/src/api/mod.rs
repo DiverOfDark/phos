@@ -64,6 +64,7 @@ use utoipa::OpenApi;
         faces::get_face_thumbnail,
         faces::reassign_face,
         faces::get_face_suggestions,
+        faces::dedupe_faces,
         faces::delete_face,
         faces::add_manual_face,
         // Files
@@ -140,6 +141,7 @@ use utoipa::OpenApi;
             people::PersonBrowseResponse,
             // Faces
             faces::FaceSuggestion,
+            faces::DedupeFacesResponse,
             faces::ReassignFacePayload,
             faces::AddManualFacePayload,
             // Import
@@ -454,6 +456,7 @@ pub fn create_router(state: AppState) -> Router {
             get(faces::get_face_suggestions),
         )
         .route("/api/faces/{id}", delete(faces::delete_face))
+        .route("/api/faces/dedupe", post(faces::dedupe_faces))
         // Files
         .route(
             "/api/files/{id}",

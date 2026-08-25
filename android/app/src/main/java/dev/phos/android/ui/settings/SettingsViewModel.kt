@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.phos.android.data.repository.AuthRepository
+import dev.phos.android.data.repository.ShotRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -17,11 +18,20 @@ data class SettingsUiState(
     val serverUrl: String = "",
     val cacheSize: String = "Calculating...",
     val isClearing: Boolean = false,
+    /** A duplicate-box sweep is in flight. */
+    val dedupeBusy: Boolean = false,
+    /**
+     * How many duplicate boxes the last dry run found, and so how many the
+     * confirm button is about to delete. Zero means nothing is pending.
+     */
+    val dedupePending: Int = 0,
+    val dedupeMessage: String? = null,
 )
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val authRepository: AuthRepository,
+    private val shotRepository: ShotRepository,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
 
@@ -53,6 +63,44 @@ class SettingsViewModel @Inject constructor(
                 cacheDir.deleteRecursively()
             }
             _uiState.value = _uiState.value.copy(isClearing = false, cacheSize = "0 B")
+        }
+    }
+
+    /**
+     * Finds duplicate face boxes, then — on a second tap — removes them.
+     *
+     * Two steps because the delete is irreversible: the first tap only counts, and
+     * the button that follows names the exact number it will remove.
+     */
+    fun findDuplicateFaces() = dedupe(dryRun = true)
+
+    fun removeDuplicateFaces() = dedupe(dryRun = false)
+
+    private fun dedupe(dryRun: Boolean) {
+        if (_uiState.value.dedupeBusy) return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(dedupeBusy = true, dedupeMessage = null)
+            _uiState.value = try {
+                val count = shotRepository.dedupeFaces(dryRun)
+                if (dryRun) {
+                    _uiState.value.copy(
+                        dedupeBusy = false,
+                        dedupePending = count,
+                        dedupeMessage = if (count == 0) "No duplicate boxes found." else null,
+                    )
+                } else {
+                    _uiState.value.copy(
+                        dedupeBusy = false,
+                        dedupePending = 0,
+                        dedupeMessage = "Removed $count duplicate box(es).",
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.value.copy(
+                    dedupeBusy = false,
+                    dedupeMessage = "Failed: ${e.message}",
+                )
+            }
         }
     }
 
