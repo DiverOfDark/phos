@@ -14,6 +14,7 @@ use crate::comfyui::history::{execution_error_traceback, interpret_history, Hist
 use crate::comfyui::outputs::{fallback_output_candidates, OutputRef};
 use crate::comfyui::policy::{decide_settle, settle_budget, FailureSite, SettleDecision};
 use crate::comfyui::timestamp::{format_ts, parse_ts};
+use crate::comfyui::workflow::expected_output_suffixes;
 use crate::comfyui::STATUS_AWAITING_OUTPUT;
 use crate::schema::{comfyui_workflows, enhancement_tasks};
 use diesel::prelude::*;
@@ -293,9 +294,11 @@ fn settle_task(
     let workflow: Value = serde_json::from_str(&task.workflow_json).unwrap_or(Value::Null);
 
     // The file may already be on disk under the deterministic prefix even though
-    // history is silent about it. One hit finishes the task.
+    // history is silent about it. One hit finishes the task. Only the names this
+    // graph's savers could have written are worth asking for.
     if let Some(prefix) = task.output_prefix.as_deref() {
-        for candidate in fallback_output_candidates(prefix) {
+        let suffixes = expected_output_suffixes(&workflow);
+        for candidate in fallback_output_candidates(prefix, &suffixes) {
             // A miss is the normal case for most candidates — only the right
             // extension exists — so this is not worth logging per file.
             if download_and_save_output(conn, client, task, &candidate, library_root).is_ok() {

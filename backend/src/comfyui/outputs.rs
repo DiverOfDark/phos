@@ -107,27 +107,24 @@ fn collect_output_refs_into(value: &Value, depth: u8, found: &mut Vec<OutputRef>
 }
 
 /// Where ComfyUI would have put a task's files, given the prefix it was told to
-/// use. Probed when history names nothing — a file on disk beats a silent
-/// history entry.
+/// use and the suffixes its savers produce. Probed when history names nothing —
+/// a file on disk beats a silent history entry.
 ///
-/// The suffixes are the ones ComfyUI's own savers produce: `SaveImage` and
-/// friends append `_00001_`, the video combiners append `_00001`.
-pub(crate) fn fallback_output_candidates(output_prefix: &str) -> Vec<OutputRef> {
+/// Get `suffixes` from [`super::workflow::expected_output_suffixes`], which
+/// reads them off the graph rather than guessing every combination.
+pub(crate) fn fallback_output_candidates(output_prefix: &str, suffixes: &[&str]) -> Vec<OutputRef> {
     let (subfolder, stem) = match output_prefix.rsplit_once('/') {
-        Some((dir, stem)) => (dir.to_string(), stem.to_string()),
-        None => (String::new(), output_prefix.to_string()),
+        Some((dir, stem)) => (dir, stem),
+        None => ("", output_prefix),
     };
-    let mut out = Vec::new();
-    for counter in ["_00001_", "_00001"] {
-        for ext in ["png", "webp", "jpg", "mp4", "webm", "gif", "flac", "mp3"] {
-            out.push(OutputRef {
-                filename: format!("{}{}.{}", stem, counter, ext),
-                subfolder: subfolder.clone(),
-                output_type: "output".to_string(),
-            });
-        }
-    }
-    out
+    suffixes
+        .iter()
+        .map(|suffix| OutputRef {
+            filename: format!("{}{}", stem, suffix),
+            subfolder: subfolder.to_string(),
+            output_type: "output".to_string(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -136,7 +133,8 @@ mod tests {
 
     #[test]
     fn scope_a_candidate_names_match_what_comfyui_writes() {
-        let candidates = fallback_output_candidates("phos/task-1234");
+        let candidates =
+            fallback_output_candidates("phos/task-1234", &["_00001_.png", "_00001.mp4"]);
         // SaveImage writes <prefix>_00001_.png into output/phos/.
         assert!(candidates.contains(&OutputRef {
             filename: "task-1234_00001_.png".to_string(),
@@ -154,10 +152,18 @@ mod tests {
 
     #[test]
     fn scope_a_candidates_survive_a_prefix_without_a_subfolder() {
-        let candidates = fallback_output_candidates("task-1234");
+        let candidates = fallback_output_candidates("task-1234", &["_00001_.png"]);
         assert!(candidates.iter().all(|c| c.subfolder.is_empty()));
         assert!(candidates
             .iter()
             .any(|c| c.filename == "task-1234_00001_.png"));
+    }
+
+    #[test]
+    fn only_the_named_suffixes_are_probed() {
+        // Every extra candidate is a `/view` request that can only 404, and the
+        // settle loop repeats them for as long as fifteen minutes.
+        let candidates = fallback_output_candidates("phos/t", &["_00001_.png", "_00001_.webp"]);
+        assert_eq!(candidates.len(), 2);
     }
 }

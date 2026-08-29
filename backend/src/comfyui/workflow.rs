@@ -136,13 +136,72 @@ fn is_output_node(class_type: &str, node: &Value) -> bool {
         .is_some_and(|v| v.is_string())
 }
 
+/// What a saver node writes. The distinction earns its keep twice: everything
+/// but a plain image is muxed or encoded after the graph finishes (so the
+/// settle budget is long), and the counter suffix differs — the video
+/// combiners append `_00001`, everything else `_00001_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaverKind {
+    Image,
+    Animated,
+    Video,
+    Audio,
+}
+
+fn saver_kind(node_type: &str) -> SaverKind {
+    let t = node_type.to_ascii_lowercase();
+    if t.contains("video") || t.contains("webm") {
+        SaverKind::Video
+    } else if t.contains("animated") {
+        SaverKind::Animated
+    } else if t.contains("audio") {
+        SaverKind::Audio
+    } else {
+        SaverKind::Image
+    }
+}
+
 /// Does this workflow save something that is muxed or encoded after the graph
 /// finishes? Those are the runs worth waiting a quarter of an hour for.
 pub(crate) fn has_slow_output(workflow: &Value) -> bool {
-    detect_outputs(workflow).iter().any(|o| {
-        let t = o.node_type.to_ascii_lowercase();
-        t.contains("video") || t.contains("webm") || t.contains("animated") || t.contains("audio")
-    })
+    detect_outputs(workflow)
+        .iter()
+        .any(|o| saver_kind(&o.node_type) != SaverKind::Image)
+}
+
+/// Filename suffixes this workflow's savers could produce, most likely first.
+///
+/// The graph already says which handful of names are possible, so probing
+/// `/view` for the full cross-product of counters and extensions was sixteen
+/// requests per re-check, at least twelve of which could never hit. This is
+/// only a backstop in any case — the primary path reads the filenames out of
+/// history, whatever key they are published under.
+pub(crate) fn expected_output_suffixes(workflow: &Value) -> Vec<&'static str> {
+    let mut suffixes: Vec<&'static str> = Vec::new();
+    for output in detect_outputs(workflow) {
+        for suffix in suffixes_for(saver_kind(&output.node_type)) {
+            if !suffixes.contains(suffix) {
+                suffixes.push(suffix);
+            }
+        }
+    }
+    if suffixes.is_empty() {
+        // No recognisable saver — an unparseable graph, or one whose output
+        // node we could not classify. Guess the common few rather than nothing.
+        suffixes.extend_from_slice(&["_00001_.png", "_00001_.webp", "_00001.mp4"]);
+    }
+    suffixes
+}
+
+fn suffixes_for(kind: SaverKind) -> &'static [&'static str] {
+    match kind {
+        SaverKind::Image => &["_00001_.png", "_00001_.webp", "_00001_.jpg"],
+        SaverKind::Animated => &["_00001_.webp", "_00001_.png", "_00001_.gif"],
+        // VHS_VideoCombine drops the trailing underscore, and can be configured
+        // to emit a gif or an animated webp instead of a video.
+        SaverKind::Video => &["_00001.mp4", "_00001.webm", "_00001.gif", "_00001_.webp"],
+        SaverKind::Audio => &["_00001_.flac", "_00001_.mp3"],
+    }
 }
 
 /// Substitute inputs into a workflow copy: set LoadImage.image to the uploaded
@@ -230,6 +289,60 @@ mod tests {
     }
 
     // === Scope A — deterministic filenames ===================================
+    #[test]
+    fn the_graph_says_which_filenames_are_worth_probing() {
+        let images = json!({
+            "9": { "class_type": "SaveImage", "inputs": { "filename_prefix": "ComfyUI" } }
+        });
+        // An image workflow can only have written an image.
+        let suffixes = expected_output_suffixes(&images);
+        assert_eq!(suffixes, ["_00001_.png", "_00001_.webp", "_00001_.jpg"]);
+        assert!(!suffixes.iter().any(|s| s.ends_with(".mp4")));
+
+        // The video combiners drop the trailing underscore.
+        let video = json!({
+            "12": { "class_type": "VHS_VideoCombine",
+                    "inputs": { "filename_prefix": "AnimateDiff" } }
+        });
+        assert!(expected_output_suffixes(&video).contains(&"_00001.mp4"));
+        assert!(!expected_output_suffixes(&video).contains(&"_00001_.jpg"));
+
+        // Core SaveVideo and SaveAudio are classified by name too.
+        let audio = json!({
+            "3": { "class_type": "SaveAudio", "inputs": { "filename_prefix": "audio/x" } }
+        });
+        assert_eq!(
+            expected_output_suffixes(&audio),
+            ["_00001_.flac", "_00001_.mp3"]
+        );
+    }
+
+    #[test]
+    fn a_graph_with_two_savers_probes_for_both_without_repeating() {
+        let mixed = json!({
+            "9":  { "class_type": "SaveImage", "inputs": { "filename_prefix": "a" } },
+            "10": { "class_type": "PreviewImage", "inputs": {} },
+            "12": { "class_type": "SaveVideo", "inputs": { "filename_prefix": "b" } },
+        });
+        let suffixes = expected_output_suffixes(&mixed);
+        assert!(suffixes.contains(&"_00001_.png"));
+        assert!(suffixes.contains(&"_00001.mp4"));
+        let mut deduped = suffixes.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            suffixes.len(),
+            "{:?} repeats itself",
+            suffixes
+        );
+    }
+
+    #[test]
+    fn a_graph_with_no_recognisable_saver_still_guesses_something() {
+        assert!(!expected_output_suffixes(&Value::Null).is_empty());
+    }
+
     #[test]
     fn scope_a_pins_every_savers_filename_prefix() {
         let wf = json!({

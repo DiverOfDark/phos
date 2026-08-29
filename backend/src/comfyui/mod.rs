@@ -109,9 +109,12 @@ mod tests {
             super::workflow::output_prefix_for_task("task-1234"),
             "phos/task-1234"
         );
-        assert!(super::outputs::fallback_output_candidates("phos/task-1234")
-            .iter()
-            .any(|c| c.filename == "task-1234_00001.mp4" && c.subfolder == "phos"));
+        let suffixes = super::workflow::expected_output_suffixes(&wf);
+        assert!(
+            super::outputs::fallback_output_candidates("phos/task-1234", &suffixes)
+                .iter()
+                .any(|c| c.filename == "task-1234_00001.mp4" && c.subfolder == "phos")
+        );
 
         // Step 4: when it does show up under a key nobody enumerated, it counts.
         let late = history(
