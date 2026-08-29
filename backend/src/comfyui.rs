@@ -9,9 +9,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+/// One client id for the whole process, so ComfyUI can attribute our prompts to
+/// us. Sent on `/prompt`; it is also the id a future `/ws` listener would
+/// subscribe with, which is why it has to be stable rather than per-request.
+fn client_id() -> &'static str {
+    static CLIENT_ID: OnceLock<String> = OnceLock::new();
+    CLIENT_ID.get_or_init(|| format!("phos-{}", Uuid::new_v4().simple()))
+}
 
 // ---------------------------------------------------------------------------
 // ComfyUI HTTP client
@@ -81,39 +90,52 @@ impl ComfyUiClient {
 
     /// Queue a prompt (workflow JSON) on ComfyUI.
     pub fn queue_prompt(&self, workflow: &Value) -> anyhow::Result<String> {
-        let payload = serde_json::json!({ "prompt": workflow });
+        let payload = serde_json::json!({ "prompt": workflow, "client_id": client_id() });
         let url = format!("{}/prompt", self.base_url);
 
         let bytes = serde_json::to_vec(&payload)?;
-        let mut resp = match ureq::post(&url)
+        // Read the body ourselves rather than letting ureq turn a 4xx into a bare
+        // status: ComfyUI answers 400 with JSON naming the offending node, and
+        // that JSON is the only thing that tells the user what to fix.
+        let mut resp = ureq::post(&url)
             .header("Content-Type", "application/json")
+            .config()
+            .http_status_as_error(false)
+            .build()
             .send(bytes.as_slice())
-        {
-            Ok(resp) => resp,
-            Err(ureq::Error::StatusCode(status)) => {
-                // ComfyUI returns 400 with JSON body for validation errors (bad prompts, missing nodes, etc.)
-                anyhow::bail!("Queue prompt rejected by ComfyUI (HTTP {})", status);
-            }
-            Err(e) => {
-                anyhow::bail!("Queue prompt failed: {}", e);
-            }
-        };
+            .map_err(|e| anyhow::anyhow!("Queue prompt failed: {}", e))?;
 
-        let json: Value = resp.body_mut().read_json()?;
+        let status = resp.status().as_u16();
+        let json: Value = resp.body_mut().read_json().unwrap_or(Value::Null);
 
-        // Check for error field in response (ComfyUI may return 200 with error details)
-        if let Some(error) = json.get("error") {
-            let error_msg = error
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown prompt validation error");
-            let node_errors = json.get("node_errors")
+        // A prompt ComfyUI refuses is refused for good — a bad graph does not
+        // become good on the third try — so this is reported as a validation
+        // error, which `classify_failure` reads as permanent.
+        if status >= 400 || json.get("error").is_some() {
+            let error_msg = json
+                .get("error")
+                .and_then(|e| {
+                    e.get("message")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| format!("HTTP {}", status));
+            let node_errors = json
+                .get("node_errors")
+                .filter(|v| {
+                    !matches!(v, Value::Null) && v.as_object().is_none_or(|o| !o.is_empty())
+                })
                 .map(|v| serde_json::to_string(v).unwrap_or_default())
                 .unwrap_or_default();
             if node_errors.is_empty() {
-                anyhow::bail!("ComfyUI prompt error: {}", error_msg);
+                anyhow::bail!("{}: {}", PROMPT_REJECTED, error_msg);
             } else {
-                anyhow::bail!("ComfyUI prompt error: {}. Node errors: {}", error_msg, node_errors);
+                anyhow::bail!(
+                    "{}: {}. Node errors: {}",
+                    PROMPT_REJECTED,
+                    error_msg,
+                    node_errors
+                );
             }
         }
 
@@ -121,6 +143,39 @@ impl ComfyUiClient {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("No 'prompt_id' in queue response: {}", json))?;
         Ok(prompt_id.to_string())
+    }
+
+    /// Ask ComfyUI to stop whatever it is executing right now.
+    pub fn interrupt(&self) -> anyhow::Result<()> {
+        let url = format!("{}/interrupt", self.base_url);
+        ureq::post(&url)
+            .header("Content-Type", "application/json")
+            .send(b"{}".as_slice())
+            .map_err(|e| anyhow::anyhow!("Interrupt failed: {}", e))?;
+        Ok(())
+    }
+
+    /// Drop a prompt from ComfyUI's pending queue. A no-op if it already ran.
+    pub fn delete_queued(&self, prompt_id: &str) -> anyhow::Result<()> {
+        let url = format!("{}/queue", self.base_url);
+        let payload = serde_json::json!({ "delete": [prompt_id] });
+        let bytes = serde_json::to_vec(&payload)?;
+        ureq::post(&url)
+            .header("Content-Type", "application/json")
+            .send(bytes.as_slice())
+            .map_err(|e| anyhow::anyhow!("Queue delete failed: {}", e))?;
+        Ok(())
+    }
+
+    /// Is this prompt the one ComfyUI is executing right now (as opposed to
+    /// merely queued)? Only the running one is worth an `/interrupt`.
+    pub fn is_prompt_running(&self, prompt_id: &str) -> anyhow::Result<bool> {
+        let url = format!("{}/queue", self.base_url);
+        let mut resp = ureq::get(&url)
+            .call()
+            .map_err(|e| anyhow::anyhow!("Queue fetch failed: {}", e))?;
+        let json: Value = resp.body_mut().read_json()?;
+        Ok(queue_contains(&json, "queue_running", prompt_id))
     }
 
     /// Get execution history for a prompt.
@@ -144,40 +199,498 @@ impl ComfyUiClient {
             .call()
             .map_err(|e| anyhow::anyhow!("Queue fetch failed: {}", e))?;
         let json: Value = resp.body_mut().read_json()?;
-        // queue_running and queue_pending are arrays of [number, prompt_id, ...]
-        for key in &["queue_running", "queue_pending"] {
-            if let Some(items) = json.get(*key).and_then(|v| v.as_array()) {
-                for item in items {
-                    if let Some(arr) = item.as_array() {
-                        if arr.get(1).and_then(|v| v.as_str()) == Some(prompt_id) {
-                            return Ok(true);
-                        }
-                    }
+        Ok(queue_contains(&json, "queue_running", prompt_id)
+            || queue_contains(&json, "queue_pending", prompt_id))
+    }
+
+    /// Download an output file from ComfyUI.
+    ///
+    /// Errors name the status, the file and the URL. The old message said only
+    /// "Download failed", and the caller then reported "no output images found",
+    /// which pointed the user at their workflow when the real answer was a 404.
+    pub fn download_output(&self, out: &OutputRef) -> anyhow::Result<Vec<u8>> {
+        let url = self.view_url(out);
+        let mut resp = ureq::get(&url).call().map_err(|e| match e {
+            ureq::Error::StatusCode(status) => anyhow::anyhow!(
+                "ComfyUI /view returned HTTP {} for {} ({})",
+                status,
+                out.describe(),
+                url
+            ),
+            other => anyhow::anyhow!("Download of {} failed: {}", out.describe(), other),
+        })?;
+        let bytes = resp.body_mut().read_to_vec()?;
+        // A zero-byte answer means the file exists but is still being written;
+        // treat it as a miss so the settle loop keeps waiting instead of saving
+        // an empty file over the user's library.
+        if bytes.is_empty() {
+            anyhow::bail!("ComfyUI returned an empty body for {}", out.describe());
+        }
+        Ok(bytes)
+    }
+
+    fn view_url(&self, out: &OutputRef) -> String {
+        format!(
+            "{}/view?filename={}&subfolder={}&type={}",
+            self.base_url,
+            urlencoding::encode(&out.filename),
+            urlencoding::encode(&out.subfolder),
+            urlencoding::encode(&out.output_type),
+        )
+    }
+}
+
+/// `queue_running`/`queue_pending` are arrays of `[number, prompt_id, ...]`.
+fn queue_contains(queue: &Value, key: &str, prompt_id: &str) -> bool {
+    queue
+        .get(key)
+        .and_then(|v| v.as_array())
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.as_array()
+                    .and_then(|arr| arr.get(1))
+                    .and_then(|v| v.as_str())
+                    == Some(prompt_id)
+            })
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Reading what ComfyUI said
+//
+// Everything below is a pure function over `serde_json::Value` so the whole
+// completion path can be exercised against recorded `/history` payloads without
+// a live ComfyUI. The HTTP calls stay on `ComfyUiClient`.
+// ---------------------------------------------------------------------------
+
+/// Marker in the message of a prompt ComfyUI refused. A refused graph is
+/// refused for good, so `classify_failure` reads this as permanent.
+pub const PROMPT_REJECTED: &str = "ComfyUI rejected the prompt";
+
+/// The timestamp format every column in this table uses.
+const TS_FMT: &str = "%Y-%m-%d %H:%M:%S";
+
+fn format_ts(dt: chrono::NaiveDateTime) -> String {
+    dt.format(TS_FMT).to_string()
+}
+
+fn parse_ts(raw: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(raw.trim(), TS_FMT)
+        .ok()
+        // Sqlite's CURRENT_TIMESTAMP and chrono both round-trip this, but a row
+        // written with sub-second precision should not derail the settle clock.
+        .or_else(|| chrono::NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M:%S%.f").ok())
+}
+
+/// One file ComfyUI says it wrote, in the terms `/view` wants.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OutputRef {
+    pub filename: String,
+    pub subfolder: String,
+    pub output_type: String,
+}
+
+impl OutputRef {
+    /// Read one entry of an output array. `subfolder` and `type` default the way
+    /// ComfyUI defaults them.
+    fn from_value(value: &Value) -> Option<Self> {
+        let obj = value.as_object()?;
+        let filename = obj.get("filename")?.as_str()?;
+        if filename.is_empty() {
+            return None;
+        }
+        Some(Self {
+            filename: filename.to_string(),
+            subfolder: obj
+                .get("subfolder")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            output_type: obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("output")
+                .to_string(),
+        })
+    }
+
+    /// How this file is named in an error message.
+    pub fn describe(&self) -> String {
+        if self.subfolder.is_empty() {
+            format!("{} (type={})", self.filename, self.output_type)
+        } else {
+            format!(
+                "{}/{} (type={})",
+                self.subfolder, self.filename, self.output_type
+            )
+        }
+    }
+}
+
+/// Every downloadable file named anywhere in a history entry's `outputs`.
+///
+/// Deliberately blind to the key a node publishes under: core `SaveImage` uses
+/// `images`, `VHS_VideoCombine` uses `gifs`, core `SaveVideo` uses `videos`,
+/// `SaveAudio` uses `audio`, and a custom node uses whatever its author chose.
+/// Anything shaped like `[{ "filename": ... }]` counts.
+pub fn collect_output_refs(outputs: Option<&Value>) -> Vec<OutputRef> {
+    let mut found = Vec::new();
+    if let Some(outputs) = outputs {
+        collect_output_refs_into(outputs, 0, &mut found);
+    }
+    // Two nodes can name the same file (a preview beside a save); fetch it once.
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|r| seen.insert(r.clone()));
+    found
+}
+
+fn collect_output_refs_into(value: &Value, depth: u8, found: &mut Vec<OutputRef>) {
+    if depth > 6 {
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                match OutputRef::from_value(item) {
+                    Some(r) => found.push(r),
+                    None => collect_output_refs_into(item, depth + 1, found),
                 }
             }
         }
-        Ok(false)
+        Value::Object(map) => {
+            // A node output object never carries a bare `filename`, so a match
+            // here is a custom node wrapping its file in an object rather than
+            // an array.
+            if depth > 0 {
+                if let Some(r) = OutputRef::from_value(value) {
+                    found.push(r);
+                    return;
+                }
+            }
+            for v in map.values() {
+                collect_output_refs_into(v, depth + 1, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What a `/history/{prompt_id}` entry means for the task that queued it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HistoryVerdict {
+    /// Still executing; nothing to decide yet.
+    Running,
+    /// Finished, and named these files.
+    Outputs(Vec<OutputRef>),
+    /// Finished, but named no files (yet). Caller decides whether to keep
+    /// waiting — this is a state, not a verdict.
+    NoOutputs,
+    /// A node raised or the prompt was rejected. Never worth another attempt.
+    Failed(String),
+}
+
+/// Read a history entry without touching the network.
+///
+/// Errors are checked before completion, because ComfyUI has shipped builds that
+/// set `completed: true` alongside an `execution_error` message.
+pub fn interpret_history(entry: &Value) -> HistoryVerdict {
+    let status = entry.get("status");
+
+    if let Some(err) = execution_error_detail(entry) {
+        return HistoryVerdict::Failed(err);
     }
 
-    /// Download an output image from ComfyUI.
-    pub fn download_output(
-        &self,
-        filename: &str,
-        subfolder: &str,
-        output_type: &str,
-    ) -> anyhow::Result<Vec<u8>> {
-        let url = format!(
-            "{}/view?filename={}&subfolder={}&type={}",
-            self.base_url,
-            urlencoding::encode(filename),
-            urlencoding::encode(subfolder),
-            urlencoding::encode(output_type),
-        );
-        let mut resp = ureq::get(&url)
-            .call()
-            .map_err(|e| anyhow::anyhow!("Download failed: {}", e))?;
-        let bytes = resp.body_mut().read_to_vec()?;
-        Ok(bytes)
+    if let Some(status) = status {
+        if status.get("status_str").and_then(|v| v.as_str()) == Some("error") {
+            return HistoryVerdict::Failed(format!(
+                "ComfyUI reported status 'error'. Status details: {}",
+                serde_json::to_string(status).unwrap_or_else(|_| "N/A".to_string())
+            ));
+        }
+        let completed = status
+            .get("completed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !completed {
+            return HistoryVerdict::Running;
+        }
+    }
+
+    let refs = collect_output_refs(entry.get("outputs"));
+    if refs.is_empty() {
+        HistoryVerdict::NoOutputs
+    } else {
+        HistoryVerdict::Outputs(refs)
+    }
+}
+
+/// The user-facing message for an `execution_error` in `status.messages`.
+fn execution_error_detail(entry: &Value) -> Option<String> {
+    let data = execution_error_data(entry)?;
+    let exception_msg = data
+        .get("exception_message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown error");
+    let node_type = data
+        .get("node_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let node_id = data
+        .get("node_id")
+        .map(|v| match v.as_str() {
+            Some(s) => s.to_string(),
+            None => v.to_string(),
+        })
+        .unwrap_or_else(|| "?".to_string());
+    Some(format!(
+        "ComfyUI execution error in node {} ({}): {}",
+        node_id, node_type, exception_msg
+    ))
+}
+
+fn execution_error_data(entry: &Value) -> Option<&Value> {
+    entry
+        .get("status")?
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .find_map(|msg| {
+            let arr = msg.as_array()?;
+            (arr.first()?.as_str()? == "execution_error").then(|| arr.get(1))?
+        })
+}
+
+/// The traceback ComfyUI attached to a failing node, for the log.
+pub fn execution_error_traceback(entry: &Value) -> Option<String> {
+    let tb = execution_error_data(entry)?
+        .get("traceback")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    (!tb.is_empty()).then_some(tb)
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic output names
+// ---------------------------------------------------------------------------
+
+/// The subfolder every Phos-queued workflow is made to write into.
+pub const OUTPUT_SUBFOLDER: &str = "phos";
+
+/// The `filename_prefix` a task's output nodes are rewritten to. Knowing this
+/// before the run starts is what lets Phos find a file when history is empty,
+/// unhelpful, or gone with a ComfyUI restart.
+pub fn output_prefix_for_task(task_id: &str) -> String {
+    format!("{}/{}", OUTPUT_SUBFOLDER, task_id)
+}
+
+/// Where ComfyUI would have put a task's files, given the prefix it was told to
+/// use. Probed when history names nothing — a file on disk beats a silent
+/// history entry.
+///
+/// The suffixes are the ones ComfyUI's own savers produce: `SaveImage` and
+/// friends append `_00001_`, the video combiners append `_00001`.
+pub fn fallback_output_candidates(output_prefix: &str) -> Vec<OutputRef> {
+    let (subfolder, stem) = match output_prefix.rsplit_once('/') {
+        Some((dir, stem)) => (dir.to_string(), stem.to_string()),
+        None => (String::new(), output_prefix.to_string()),
+    };
+    let mut out = Vec::new();
+    for counter in ["_00001_", "_00001"] {
+        for ext in ["png", "webp", "jpg", "mp4", "webm", "gif", "flac", "mp3"] {
+            out.push(OutputRef {
+                filename: format!("{}{}.{}", stem, counter, ext),
+                subfolder: subfolder.clone(),
+                output_type: "output".to_string(),
+            });
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Settling: "no files yet" is a state, not a verdict
+// ---------------------------------------------------------------------------
+
+/// Budget for an image-only workflow. Files are closed by the time the history
+/// entry lands; this only covers the write-then-publish gap.
+pub const SETTLE_BUDGET_IMAGE: Duration = Duration::from_secs(60);
+
+/// Budget for a workflow with a video output. `VHS_VideoCombine` shells out to
+/// ffmpeg, so a large mp4 can be in history minutes before it is on disk.
+pub const SETTLE_BUDGET_VIDEO: Duration = Duration::from_secs(15 * 60);
+
+/// How long a completed-but-empty prompt is given to publish its files.
+pub fn settle_budget(workflow: &Value) -> Duration {
+    if workflow_has_slow_output(workflow) {
+        SETTLE_BUDGET_VIDEO
+    } else {
+        SETTLE_BUDGET_IMAGE
+    }
+}
+
+/// Does this workflow save something that is muxed or encoded after the graph
+/// finishes? Those are the runs worth waiting a quarter of an hour for.
+pub fn workflow_has_slow_output(workflow: &Value) -> bool {
+    detect_outputs(workflow).iter().any(|o| {
+        let t = o.node_type.to_ascii_lowercase();
+        t.contains("video") || t.contains("webm") || t.contains("animated") || t.contains("audio")
+    })
+}
+
+/// Re-check spacing while settling: tight at first, because most runs settle in
+/// a second or two, then backing off so a 15-minute video wait is not 300 polls.
+pub fn settle_recheck_delay(elapsed: Duration) -> Duration {
+    match elapsed.as_secs() {
+        0..=9 => Duration::from_secs(2),
+        10..=59 => Duration::from_secs(5),
+        60..=299 => Duration::from_secs(15),
+        _ => Duration::from_secs(30),
+    }
+}
+
+/// What to do with a task whose prompt finished without naming a file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettleDecision {
+    /// First sighting — start the clock and come back at `recheck_at`.
+    Start {
+        deadline: chrono::NaiveDateTime,
+        recheck_at: chrono::NaiveDateTime,
+    },
+    /// Inside the budget — probe the deterministic names, then come back.
+    Wait { recheck_at: chrono::NaiveDateTime },
+    /// The budget is spent. Probe once more, then give up.
+    Expired,
+}
+
+pub fn decide_settle(
+    now: chrono::NaiveDateTime,
+    settle_until: Option<chrono::NaiveDateTime>,
+    budget: Duration,
+) -> SettleDecision {
+    let budget_secs = budget.as_secs() as i64;
+    match settle_until {
+        None => SettleDecision::Start {
+            deadline: now + chrono::Duration::seconds(budget_secs),
+            recheck_at: now
+                + chrono::Duration::seconds(settle_recheck_delay(Duration::ZERO).as_secs() as i64),
+        },
+        Some(deadline) if now < deadline => {
+            let remaining = (deadline - now).num_seconds().max(0);
+            let elapsed = Duration::from_secs((budget_secs - remaining).max(0) as u64);
+            SettleDecision::Wait {
+                recheck_at: now
+                    + chrono::Duration::seconds(settle_recheck_delay(elapsed).as_secs() as i64),
+            }
+        }
+        Some(_) => SettleDecision::Expired,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transient vs permanent failure
+// ---------------------------------------------------------------------------
+
+/// Total attempts a transient failure gets, the first one included.
+pub const MAX_ATTEMPTS: i32 = 4;
+
+/// Where a task fell over. The site decides whether trying again can possibly
+/// help — a missing source file will still be missing, a dropped connection
+/// probably will not be dropped again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureSite {
+    /// Could not read/decode the library file being enhanced.
+    SourceImage,
+    /// Could not push the source image to ComfyUI.
+    Upload,
+    /// The stored workflow is not valid JSON.
+    WorkflowJson,
+    /// `/prompt` did not accept the graph.
+    Queue,
+    /// `/history` could not be read, or the prompt vanished from both history
+    /// and queue.
+    History,
+    /// A node raised during execution.
+    Execution,
+    /// `/view` refused or truncated a file history had named.
+    Download,
+    /// The settle budget ran out with nothing on disk.
+    Settle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    Permanent,
+    Transient,
+}
+
+pub fn classify_failure(site: FailureSite, message: &str) -> FailureKind {
+    match site {
+        // Bad input, bad graph, or a node that raised: identical next time.
+        FailureSite::SourceImage
+        | FailureSite::WorkflowJson
+        | FailureSite::Execution
+        | FailureSite::Settle => FailureKind::Permanent,
+        // A rejected prompt is a validation failure; anything else on /prompt is
+        // transport.
+        FailureSite::Queue => {
+            if message.contains(PROMPT_REJECTED) {
+                FailureKind::Permanent
+            } else {
+                FailureKind::Transient
+            }
+        }
+        FailureSite::Upload | FailureSite::History | FailureSite::Download => {
+            FailureKind::Transient
+        }
+    }
+}
+
+/// What to do about a failure, given how many attempts this task has already had.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FailureAction {
+    /// Give up, recording this message.
+    Fail(String),
+    /// Queue attempt `attempt` of [`MAX_ATTEMPTS`] after `delay`.
+    Retry {
+        attempt: i32,
+        delay: Duration,
+        message: String,
+    },
+}
+
+/// After a transient failure, is the ComfyUI prompt still worth going back to?
+///
+/// A prompt that already ran does not need to run again — re-polling it is
+/// cheaper and far likelier to work than re-executing the graph. Only failures
+/// that happened before the prompt was accepted start over.
+pub fn retry_resumes_prompt(site: FailureSite) -> bool {
+    matches!(site, FailureSite::History | FailureSite::Download)
+}
+
+/// Backoff before the next attempt: 5s, 15s, 45s.
+pub fn retry_backoff(retry_count: i32) -> Duration {
+    let step = retry_count.clamp(0, 4) as u32;
+    Duration::from_secs(5 * 3u64.pow(step))
+}
+
+/// Decide between another attempt and a final failure. `retry_count` is what the
+/// row already records, so the first failure arrives with 0.
+pub fn plan_failure(site: FailureSite, message: &str, retry_count: i32) -> FailureAction {
+    let attempts_made = retry_count + 1;
+    if classify_failure(site, message) == FailureKind::Transient && attempts_made < MAX_ATTEMPTS {
+        FailureAction::Retry {
+            attempt: attempts_made + 1,
+            delay: retry_backoff(retry_count),
+            message: message.to_string(),
+        }
+    } else if attempts_made > 1 {
+        FailureAction::Fail(format!("{} (after {} attempts)", message, attempts_made))
+    } else {
+        FailureAction::Fail(message.to_string())
     }
 }
 
@@ -264,7 +777,12 @@ pub fn detect_inputs(workflow: &Value) -> Vec<WorkflowInput> {
     inputs
 }
 
-/// Detect output nodes (SaveImage, VHS_VideoCombine, etc.).
+/// Detect output nodes (SaveImage, SaveVideo, VHS_VideoCombine, etc.).
+///
+/// Recognised by shape rather than by a fixed list: anything named `Save*` or
+/// `Preview*`, plus anything carrying a `filename_prefix` input, which is how
+/// every saver in the ecosystem is told where to write. A hardcoded list missed
+/// core `SaveVideo` and every custom saver.
 pub fn detect_outputs(workflow: &Value) -> Vec<WorkflowOutput> {
     let mut outputs = Vec::new();
     if let Some(nodes) = workflow.as_object() {
@@ -273,27 +791,42 @@ pub fn detect_outputs(workflow: &Value) -> Vec<WorkflowOutput> {
                 .get("class_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            match class_type {
-                "SaveImage" | "PreviewImage" | "VHS_VideoCombine" | "SaveAnimatedWEBP"
-                | "SaveAnimatedPNG" => {
-                    outputs.push(WorkflowOutput {
-                        node_id: node_id.clone(),
-                        node_type: class_type.to_string(),
-                    });
-                }
-                _ => {}
+            if is_output_node(class_type, node) {
+                outputs.push(WorkflowOutput {
+                    node_id: node_id.clone(),
+                    node_type: class_type.to_string(),
+                });
             }
         }
     }
+    outputs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
     outputs
 }
 
-/// Substitute inputs into a workflow copy: set LoadImage.image to the uploaded filename,
-/// and apply any text overrides.
+fn is_output_node(class_type: &str, node: &Value) -> bool {
+    if class_type.starts_with("Save")
+        || class_type.starts_with("Preview")
+        || class_type.contains("VideoCombine")
+    {
+        return true;
+    }
+    node.get("inputs")
+        .and_then(|i| i.get("filename_prefix"))
+        .is_some_and(|v| v.is_string())
+}
+
+/// Substitute inputs into a workflow copy: set LoadImage.image to the uploaded
+/// filename, apply any text overrides, and pin every saver's `filename_prefix`
+/// to `output_prefix`.
+///
+/// Pinning the prefix is what turns a lost history entry from a dead end into a
+/// lookup: Phos knows the filename before the run starts, so it can ask `/view`
+/// directly instead of depending on ComfyUI to tell it what it wrote.
 pub fn prepare_workflow(
     workflow: &Value,
     uploaded_filename: &str,
     text_overrides: &std::collections::HashMap<String, String>,
+    output_prefix: Option<&str>,
 ) -> Value {
     let mut wf = workflow.clone();
     if let Some(nodes) = wf.as_object_mut() {
@@ -323,6 +856,20 @@ pub fn prepare_workflow(
                     }
                 }
             }
+
+            // Every saver in the ecosystem takes `filename_prefix`; overwrite it
+            // wherever it is a literal. A prefix wired from another node is left
+            // alone — rewriting it would break the link.
+            if let Some(prefix) = output_prefix {
+                if let Some(existing) = node
+                    .get_mut("inputs")
+                    .and_then(|i| i.get_mut("filename_prefix"))
+                {
+                    if existing.is_string() {
+                        *existing = Value::String(prefix.to_string());
+                    }
+                }
+            }
         }
     }
     wf
@@ -336,24 +883,39 @@ pub fn prepare_workflow(
 /// If `source_file_id` is provided, uses that specific file; otherwise falls back to the original.
 /// For images: reads the file directly.
 /// For videos: extracts the first frame.
-fn get_source_image(conn: &mut SqliteConnection, shot_id: &str, source_file_id: Option<&str>, library_root: &Path) -> anyhow::Result<(Vec<u8>, String)> {
+fn get_source_image(
+    conn: &mut SqliteConnection,
+    shot_id: &str,
+    source_file_id: Option<&str>,
+    library_root: &Path,
+) -> anyhow::Result<(Vec<u8>, String)> {
     // If a specific source file is requested, use it; otherwise fall back to the original
-    let (file_id_used, file_path, mime_type): (String, String, String) = if let Some(file_id) = source_file_id {
-        let (fp, mt) = files::table
-            .filter(files::id.eq(file_id).and(files::shot_id.eq(shot_id)))
-            .select((files::path, diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(mime_type, '')")))
-            .first::<(String, String)>(conn)
-            .map_err(|_| anyhow::anyhow!("Source file {} not found for shot {}", file_id, shot_id))?;
-        (file_id.to_string(), fp, mt)
-    } else {
-        let (fid, fp, mt) = files::table
-            .filter(files::shot_id.eq(shot_id).and(files::is_original.eq(true)))
-            .order(files::created_at.asc())
-            .select((files::id, files::path, diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(mime_type, '')")))
-            .first::<(String, String, String)>(conn)
-            .map_err(|_| anyhow::anyhow!("No original file found for shot {}", shot_id))?;
-        (fid, fp, mt)
-    };
+    let (file_id_used, file_path, mime_type): (String, String, String) =
+        if let Some(file_id) = source_file_id {
+            let (fp, mt) = files::table
+                .filter(files::id.eq(file_id).and(files::shot_id.eq(shot_id)))
+                .select((
+                    files::path,
+                    diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(mime_type, '')"),
+                ))
+                .first::<(String, String)>(conn)
+                .map_err(|_| {
+                    anyhow::anyhow!("Source file {} not found for shot {}", file_id, shot_id)
+                })?;
+            (file_id.to_string(), fp, mt)
+        } else {
+            let (fid, fp, mt) = files::table
+                .filter(files::shot_id.eq(shot_id).and(files::is_original.eq(true)))
+                .order(files::created_at.asc())
+                .select((
+                    files::id,
+                    files::path,
+                    diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(mime_type, '')"),
+                ))
+                .first::<(String, String, String)>(conn)
+                .map_err(|_| anyhow::anyhow!("No original file found for shot {}", shot_id))?;
+            (fid, fp, mt)
+        };
 
     let path = db::resolve_path(library_root, &file_path);
     if !path.exists() {
@@ -372,7 +934,11 @@ fn get_source_image(conn: &mut SqliteConnection, shot_id: &str, source_file_id: 
     img.write_to(&mut cursor, image::ImageFormat::Png)?;
 
     // Include file ID in the upload name so ComfyUI doesn't reuse a cached image from a different variant
-    let upload_name = format!("phos_{}_{}.png", &shot_id[..8.min(shot_id.len())], &file_id_used[..8.min(file_id_used.len())]);
+    let upload_name = format!(
+        "phos_{}_{}.png",
+        &shot_id[..8.min(shot_id.len())],
+        &file_id_used[..8.min(file_id_used.len())]
+    );
     Ok((buf, upload_name))
 }
 
@@ -423,28 +989,79 @@ pub fn spawn_enhancement_worker(
     })
 }
 
-/// Mark any tasks that were in intermediate states as needing retry.
+/// Re-attach tasks that were mid-flight when we last shut down.
+///
+/// A task that already has a ComfyUI prompt id is *not* restarted: the prompt
+/// may well have run, or still be running, while Phos was down. Restarting it
+/// re-does the work and, worse, was one way a finished job came back as a
+/// failure. Those go back to `processing` so the poller re-reads history (and,
+/// if history is gone, probes the deterministic filenames). A task still
+/// settling stays settling.
 fn recover_interrupted_tasks(conn: &mut SqliteConnection) {
-    let intermediate_states = ["uploading", "queued", "processing", "downloading"];
+    // Had a prompt on ComfyUI: resume polling it rather than re-running it.
     if let Err(e) = diesel::update(
-        enhancement_tasks::table
-            .filter(enhancement_tasks::status.eq_any(&intermediate_states)),
+        enhancement_tasks::table.filter(
+            enhancement_tasks::status
+                .eq_any(&["queued", "processing", "downloading"])
+                .and(enhancement_tasks::comfyui_prompt_id.is_not_null()),
+        ),
+    )
+    .set(enhancement_tasks::status.eq("processing"))
+    .execute(conn)
+    {
+        warn!("Failed to re-attach in-flight tasks: {}", e);
+    }
+
+    // Never reached ComfyUI: start over.
+    if let Err(e) = diesel::update(
+        enhancement_tasks::table.filter(
+            enhancement_tasks::status
+                .eq_any(&["uploading", "queued", "processing", "downloading"])
+                .and(enhancement_tasks::comfyui_prompt_id.is_null()),
+        ),
     )
     .set((
         enhancement_tasks::status.eq("pending"),
         enhancement_tasks::error_message.eq("Recovered after restart"),
+        enhancement_tasks::next_attempt_at.eq(None::<String>),
     ))
     .execute(conn)
     {
         warn!("Failed to recover interrupted tasks: {}", e);
     }
+
+    // `awaiting_output` is left exactly as it is — its deadline is still valid
+    // and the poller picks it up — but the re-check clock is cleared so it is
+    // looked at immediately rather than after a stale backoff.
+    if let Err(e) = diesel::update(
+        enhancement_tasks::table.filter(enhancement_tasks::status.eq(STATUS_AWAITING_OUTPUT)),
+    )
+    .set(enhancement_tasks::next_attempt_at.eq(None::<String>))
+    .execute(conn)
+    {
+        warn!("Failed to resume settling tasks: {}", e);
+    }
 }
 
 /// Pick up pending tasks and start processing them.
 fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, library_root: &Path) {
-    let tasks: Vec<(String, String, String, String, String, Option<String>)> = match enhancement_tasks::table
-        .inner_join(comfyui_workflows::table.on(comfyui_workflows::id.eq(enhancement_tasks::workflow_id)))
-        .filter(enhancement_tasks::status.eq("pending"))
+    let now_dt = chrono::Utc::now().naive_utc();
+    let now = format_ts(now_dt);
+
+    type PendingRow = (String, String, String, String, String, Option<String>, i32);
+    let tasks: Vec<PendingRow> = match enhancement_tasks::table
+        .inner_join(
+            comfyui_workflows::table.on(comfyui_workflows::id.eq(enhancement_tasks::workflow_id)),
+        )
+        .filter(
+            enhancement_tasks::status.eq("pending").and(
+                // A transient failure is re-queued with a backoff; do not pick it
+                // up before that time.
+                enhancement_tasks::next_attempt_at
+                    .is_null()
+                    .or(enhancement_tasks::next_attempt_at.le(&now)),
+            ),
+        )
         .order(enhancement_tasks::created_at.asc())
         .limit(5)
         .select((
@@ -452,10 +1069,15 @@ fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, li
             enhancement_tasks::shot_id,
             enhancement_tasks::workflow_id,
             comfyui_workflows::workflow_json,
-            diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(enhancement_tasks.text_overrides, '{}')"),
+            diesel::dsl::sql::<diesel::sql_types::Text>(
+                "COALESCE(enhancement_tasks.text_overrides, '{}')",
+            ),
             enhancement_tasks::source_file_id,
+            diesel::dsl::sql::<diesel::sql_types::Integer>(
+                "COALESCE(enhancement_tasks.retry_count, 0)",
+            ),
         ))
-        .load::<(String, String, String, String, String, Option<String>)>(conn)
+        .load::<PendingRow>(conn)
     {
         Ok(rows) => rows,
         Err(e) => {
@@ -464,35 +1086,52 @@ fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, li
         }
     };
 
-    let now = chrono::Utc::now().naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
-
-    for (task_id, shot_id, _workflow_id, workflow_json_str, text_overrides_str, source_file_id) in tasks {
+    for (
+        task_id,
+        shot_id,
+        _workflow_id,
+        workflow_json_str,
+        text_overrides_str,
+        source_file_id,
+        retry_count,
+    ) in tasks
+    {
         // Set uploading
         let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task_id)))
             .set((
                 enhancement_tasks::status.eq("uploading"),
                 enhancement_tasks::started_at.eq(&now),
+                enhancement_tasks::next_attempt_at.eq(None::<String>),
             ))
             .execute(conn);
 
         // 1. Get source image (use specific file if provided, otherwise original)
-        let (image_data, upload_name) = match get_source_image(conn, &shot_id, source_file_id.as_deref(), library_root) {
-            Ok(v) => v,
-            Err(e) => {
-                mark_failed(
-                    conn,
-                    &task_id,
-                    &format!("Source image extraction failed: {}", e),
-                );
-                continue;
-            }
-        };
+        let (image_data, upload_name) =
+            match get_source_image(conn, &shot_id, source_file_id.as_deref(), library_root) {
+                Ok(v) => v,
+                Err(e) => {
+                    handle_failure(
+                        conn,
+                        &task_id,
+                        FailureSite::SourceImage,
+                        &format!("Source image extraction failed: {}", e),
+                        retry_count,
+                    );
+                    continue;
+                }
+            };
 
         // 2. Upload to ComfyUI
         let uploaded_name = match client.upload_image(&upload_name, &image_data) {
             Ok(name) => name,
             Err(e) => {
-                mark_failed(conn, &task_id, &format!("Upload failed: {}", e));
+                handle_failure(
+                    conn,
+                    &task_id,
+                    FailureSite::Upload,
+                    &format!("Upload failed: {}", e),
+                    retry_count,
+                );
                 continue;
             }
         };
@@ -501,10 +1140,12 @@ fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, li
         let workflow: Value = match serde_json::from_str(&workflow_json_str) {
             Ok(v) => v,
             Err(e) => {
-                mark_failed(
+                handle_failure(
                     conn,
                     &task_id,
+                    FailureSite::WorkflowJson,
                     &format!("Invalid workflow JSON: {}", e),
+                    retry_count,
                 );
                 continue;
             }
@@ -513,13 +1154,27 @@ fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, li
         let text_overrides: std::collections::HashMap<String, String> =
             serde_json::from_str(&text_overrides_str).unwrap_or_default();
 
-        let prepared = prepare_workflow(&workflow, &uploaded_name, &text_overrides);
+        // Pin the output names before the run starts, and record the prefix so a
+        // later poll can find the files even if history never mentions them.
+        let output_prefix = output_prefix_for_task(&task_id);
+        let prepared = prepare_workflow(
+            &workflow,
+            &uploaded_name,
+            &text_overrides,
+            Some(&output_prefix),
+        );
 
         // 4. Queue prompt
         let prompt_id = match client.queue_prompt(&prepared) {
             Ok(id) => id,
             Err(e) => {
-                mark_failed(conn, &task_id, &format!("Queue failed: {}", e));
+                handle_failure(
+                    conn,
+                    &task_id,
+                    FailureSite::Queue,
+                    &format!("Queue failed: {}", e),
+                    retry_count,
+                );
                 continue;
             }
         };
@@ -529,28 +1184,87 @@ fn process_pending_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, li
             .set((
                 enhancement_tasks::status.eq("queued"),
                 enhancement_tasks::comfyui_prompt_id.eq(&prompt_id),
+                enhancement_tasks::output_prefix.eq(&output_prefix),
+                enhancement_tasks::settle_until.eq(None::<String>),
             ))
             .execute(conn);
 
-        info!("Task {} queued as ComfyUI prompt {}", task_id, prompt_id);
+        info!(
+            "Task {} queued as ComfyUI prompt {} (output prefix {})",
+            task_id, prompt_id, output_prefix
+        );
     }
 }
 
-/// Poll tasks that are queued/processing against ComfyUI history.
+/// Statuses the poller owns.
+pub const STATUS_AWAITING_OUTPUT: &str = "awaiting_output";
+pub const STATUS_CANCELLED: &str = "cancelled";
+
+/// A task the poller is following, with everything it needs to decide.
+struct ActiveTask {
+    id: String,
+    shot_id: String,
+    prompt_id: String,
+    workflow_id: String,
+    workflow_json: String,
+    text_overrides: String,
+    status: String,
+    output_prefix: Option<String>,
+    settle_until: Option<String>,
+    retry_count: i32,
+}
+
+type ActiveTaskRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i32,
+);
+
+/// Poll tasks that are queued/processing/settling against ComfyUI history.
 fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, library_root: &Path) {
-    let tasks: Vec<(String, String, String, String, String)> = match enhancement_tasks::table
+    let now_dt = chrono::Utc::now().naive_utc();
+    let now = format_ts(now_dt);
+
+    let rows: Vec<ActiveTaskRow> = match enhancement_tasks::table
+        .inner_join(
+            comfyui_workflows::table.on(comfyui_workflows::id.eq(enhancement_tasks::workflow_id)),
+        )
         .filter(
-            enhancement_tasks::status.eq_any(&["queued", "processing"])
-                .and(enhancement_tasks::comfyui_prompt_id.is_not_null()),
+            enhancement_tasks::status
+                .eq_any(&["queued", "processing", STATUS_AWAITING_OUTPUT])
+                .and(enhancement_tasks::comfyui_prompt_id.is_not_null())
+                // A settling task sets its own re-check time; leave it alone
+                // until then.
+                .and(
+                    enhancement_tasks::next_attempt_at
+                        .is_null()
+                        .or(enhancement_tasks::next_attempt_at.le(&now)),
+                ),
         )
         .select((
             enhancement_tasks::id,
             enhancement_tasks::shot_id,
             enhancement_tasks::comfyui_prompt_id.assume_not_null(),
             enhancement_tasks::workflow_id,
-            diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(text_overrides, '{}')"),
+            comfyui_workflows::workflow_json,
+            diesel::dsl::sql::<diesel::sql_types::Text>(
+                "COALESCE(enhancement_tasks.text_overrides, '{}')",
+            ),
+            enhancement_tasks::status,
+            enhancement_tasks::output_prefix,
+            enhancement_tasks::settle_until,
+            diesel::dsl::sql::<diesel::sql_types::Integer>(
+                "COALESCE(enhancement_tasks.retry_count, 0)",
+            ),
         ))
-        .load::<(String, String, String, String, String)>(conn)
+        .load::<ActiveTaskRow>(conn)
     {
         Ok(rows) => rows,
         Err(e) => {
@@ -559,313 +1273,331 @@ fn poll_active_tasks(conn: &mut SqliteConnection, client: &ComfyUiClient, librar
         }
     };
 
-    for (task_id, shot_id, prompt_id, workflow_id, text_overrides_str) in tasks {
-        // Update to processing if still queued
+    for row in rows {
+        let task = ActiveTask {
+            id: row.0,
+            shot_id: row.1,
+            prompt_id: row.2,
+            workflow_id: row.3,
+            workflow_json: row.4,
+            text_overrides: row.5,
+            status: row.6,
+            output_prefix: row.7,
+            settle_until: row.8,
+            retry_count: row.9,
+        };
+        poll_one_task(conn, client, library_root, &task, now_dt);
+    }
+}
+
+fn poll_one_task(
+    conn: &mut SqliteConnection,
+    client: &ComfyUiClient,
+    library_root: &Path,
+    task: &ActiveTask,
+    now_dt: chrono::NaiveDateTime,
+) {
+    // Move out of `queued` as soon as we start watching it.
+    if task.status == "queued" {
         let _ = diesel::update(
             enhancement_tasks::table.filter(
-                enhancement_tasks::id.eq(&task_id).and(enhancement_tasks::status.eq("queued")),
+                enhancement_tasks::id
+                    .eq(&task.id)
+                    .and(enhancement_tasks::status.eq("queued")),
             ),
         )
         .set(enhancement_tasks::status.eq("processing"))
         .execute(conn);
+    }
 
-        // Check ComfyUI history
-        let history = match client.get_history(&prompt_id) {
-            Ok(Some(h)) => h,
-            Ok(None) => {
-                // Not in history yet — check if still queued/running in ComfyUI
-                match client.is_prompt_in_queue(&prompt_id) {
-                    Ok(true) => continue, // Still pending/running, check again next cycle
-                    Ok(false) => {
-                        mark_failed(conn, &task_id, &format!(
-                            "Prompt {} not found in ComfyUI history or queue (job lost)", prompt_id
-                        ));
-                    }
-                    Err(e) => {
-                        warn!("Failed to check queue for prompt {}: {}", prompt_id, e);
-                    }
+    let settling = task.status == STATUS_AWAITING_OUTPUT;
+
+    let history = match client.get_history(&task.prompt_id) {
+        Ok(Some(h)) => Some(h),
+        Ok(None) => {
+            // Not in history. Still queued or running? Then just wait.
+            match client.is_prompt_in_queue(&task.prompt_id) {
+                Ok(true) => return,
+                Ok(false) => {
+                    // The prompt is in neither history nor queue. It may have run
+                    // and been lost to a ComfyUI restart, which clears history but
+                    // not the output directory — so look on disk before calling it
+                    // lost. This is why the prefix is pinned up front.
+                    None
                 }
-                continue;
-            }
-            Err(e) => {
-                warn!("Failed to get history for prompt {}: {}", prompt_id, e);
-                continue;
-            }
-        };
-
-        // Check for execution error
-        if let Some(status) = history.get("status") {
-            let completed = status.get("completed").and_then(|v| v.as_bool()).unwrap_or(false);
-            if !completed {
-                // Look for explicit error messages
-                let mut found_error = false;
-                if let Some(msgs) = status.get("messages").and_then(|v| v.as_array()) {
-                    for msg in msgs {
-                        if let Some(arr) = msg.as_array() {
-                            if arr.first().and_then(|v| v.as_str()) == Some("execution_error") {
-                                let err_data = arr.get(1);
-                                let exception_msg = err_data
-                                    .and_then(|v| v.get("exception_message"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("Unknown error");
-                                let node_type = err_data
-                                    .and_then(|v| v.get("node_type"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                let node_id = err_data
-                                    .and_then(|v| v.get("node_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let traceback = err_data
-                                    .and_then(|v| v.get("traceback"))
-                                    .and_then(|v| v.as_array())
-                                    .map(|tb| tb.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(""))
-                                    .unwrap_or_default();
-
-                                let err_detail = format!(
-                                    "ComfyUI execution error in node {} ({}): {}",
-                                    node_id, node_type, exception_msg
-                                );
-                                if !traceback.is_empty() {
-                                    error!("Task {} traceback:\n{}", task_id, traceback);
-                                }
-                                mark_failed(conn, &task_id, &err_detail);
-                                found_error = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if found_error {
-                    continue;
-                }
-
-                // Check if status_str indicates a non-success state
-                let status_str = status.get("status_str").and_then(|v| v.as_str()).unwrap_or("");
-                if status_str == "error" {
-                    let err_msg = format!(
-                        "ComfyUI prompt failed with status '{}'. Status details: {}",
-                        status_str,
-                        serde_json::to_string(status).unwrap_or_else(|_| "N/A".to_string())
-                    );
-                    mark_failed(conn, &task_id, &err_msg);
-                    continue;
-                }
-
-                // Not completed and no error — still running
-                continue;
-            }
-        }
-
-        // Try to extract output images from history.
-        // ComfyUI has a race condition where the history endpoint can report
-        // completion before outputs are fully populated. If completed but outputs
-        // are empty, re-fetch history a few times before giving up.
-        let history = if !outputs_has_downloadable_items(history.get("outputs")) {
-            const EMPTY_OUTPUT_RETRIES: u32 = 5;
-            const EMPTY_OUTPUT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
-
-            let mut resolved_history = None;
-            for attempt in 1..=EMPTY_OUTPUT_RETRIES {
-                info!(
-                    "Task {} completed but outputs empty, re-fetching history (attempt {}/{})",
-                    task_id, attempt, EMPTY_OUTPUT_RETRIES
-                );
-                std::thread::sleep(EMPTY_OUTPUT_DELAY);
-
-                match client.get_history(&prompt_id) {
-                    Ok(Some(h)) => {
-                        if outputs_has_downloadable_items(h.get("outputs")) {
-                            info!("Task {} outputs became available on retry {}", task_id, attempt);
-                            resolved_history = Some(h);
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        warn!("Task {} history entry disappeared on retry {}", task_id, attempt);
-                    }
-                    Err(e) => {
-                        warn!("Task {} history re-fetch failed on retry {}: {}", task_id, attempt, e);
-                    }
-                }
-            }
-
-            match resolved_history {
-                Some(h) => h,
-                None => {
-                    // If outputs was truly absent/null, continue polling on next cycle
-                    let original_outputs = history.get("outputs");
-                    if original_outputs.is_none()
-                        || original_outputs.map(|v| v.is_null()).unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    // Outputs present but empty — fall through to failure path
-                    history
-                }
-            }
-        } else {
-            history
-        };
-
-        // Set downloading
-        let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task_id)))
-            .set(enhancement_tasks::status.eq("downloading"))
-            .execute(conn);
-
-        // Find output images in any node's output
-        let outputs = history.get("outputs");
-        let mut downloaded = false;
-        if let Some(outputs) = outputs.and_then(|v| v.as_object()) {
-            for (_node_id, node_output) in outputs {
-                let images = node_output.get("images").and_then(|v| v.as_array());
-                if let Some(images) = images {
-                    for img_info in images {
-                        let filename = img_info.get("filename").and_then(|v| v.as_str());
-                        let subfolder = img_info
-                            .get("subfolder")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let out_type = img_info
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("output");
-
-                        if let Some(filename) = filename {
-                            match download_and_save_output(
-                                conn, client, &task_id, &shot_id, filename, subfolder, out_type, library_root, &workflow_id, &text_overrides_str,
-                            ) {
-                                Ok(_) => {
-                                    downloaded = true;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to download output {} for task {}: {}",
-                                        filename, task_id, e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                // Also check for gifs/videos
-                let gifs = node_output.get("gifs").and_then(|v| v.as_array());
-                if let Some(gifs) = gifs {
-                    for gif_info in gifs {
-                        let filename = gif_info.get("filename").and_then(|v| v.as_str());
-                        let subfolder = gif_info
-                            .get("subfolder")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let out_type = gif_info
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("output");
-
-                        if let Some(filename) = filename {
-                            match download_and_save_output(
-                                conn, client, &task_id, &shot_id, filename, subfolder, out_type, library_root, &workflow_id, &text_overrides_str,
-                            ) {
-                                Ok(_) => {
-                                    downloaded = true;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to download gif output {} for task {}: {}",
-                                        filename, task_id, e
-                                    );
-                                }
-                            }
-                        }
-                    }
+                Err(e) => {
+                    warn!("Failed to check queue for prompt {}: {}", task.prompt_id, e);
+                    return;
                 }
             }
         }
+        Err(e) => {
+            // History is unreadable — a transport problem, not a workflow
+            // problem. Keep the task alive; only give up after MAX_ATTEMPTS.
+            handle_failure(
+                conn,
+                &task.id,
+                FailureSite::History,
+                &format!("History fetch failed for prompt {}: {}", task.prompt_id, e),
+                task.retry_count,
+            );
+            return;
+        }
+    };
 
-        if !downloaded {
-            // Check if a previous attempt already saved an output file for this task
-            let has_existing_output: bool = enhancement_tasks::table
-                .filter(
-                    enhancement_tasks::id.eq(&task_id)
-                        .and(enhancement_tasks::output_file_id.is_not_null()),
+    let verdict = match history.as_ref() {
+        Some(h) => interpret_history(h),
+        // No history entry at all: treat it as "finished, named nothing" so the
+        // settle path gets its chance to find the file by name.
+        None => HistoryVerdict::NoOutputs,
+    };
+
+    match verdict {
+        HistoryVerdict::Running => {
+            // Still executing. If we were settling, ComfyUI re-queued the prompt;
+            // drop back to processing and let the run finish.
+            if settling {
+                let _ = diesel::update(
+                    enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)),
                 )
-                .count()
-                .get_result::<i64>(conn)
-                .map(|c| c > 0)
-                .unwrap_or(false);
-            if has_existing_output {
-                downloaded = true;
-                info!("Task {} has output from a previous attempt, marking as completed", task_id);
-            }
-        }
-
-        let now = chrono::Utc::now().naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
-
-        if downloaded {
-            let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task_id)))
                 .set((
-                    enhancement_tasks::status.eq("completed"),
-                    enhancement_tasks::completed_at.eq(&now),
+                    enhancement_tasks::status.eq("processing"),
+                    enhancement_tasks::next_attempt_at.eq(None::<String>),
                 ))
                 .execute(conn);
-            info!("Task {} completed successfully", task_id);
-        } else {
-            // Log the full outputs for debugging
-            let outputs_debug = history.get("outputs")
-                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "N/A".to_string()))
-                .unwrap_or_else(|| "null".to_string());
-            let status_debug = history.get("status")
-                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "N/A".to_string()))
-                .unwrap_or_else(|| "null".to_string());
-            error!(
-                "Task {} produced no downloadable outputs. Status: {}, Outputs: {}",
-                task_id, status_debug, outputs_debug
-            );
-            mark_failed(
+            }
+        }
+        HistoryVerdict::Failed(message) => {
+            // A node raised. Nothing about retrying changes that, so report the
+            // real message and stop.
+            if let Some(tb) = history.as_ref().and_then(execution_error_traceback) {
+                error!("Task {} traceback:\n{}", task.id, tb);
+            }
+            handle_failure(
                 conn,
-                &task_id,
-                "No output images found in ComfyUI response (workflow completed but produced no downloadable files)",
+                &task.id,
+                FailureSite::Execution,
+                &message,
+                task.retry_count,
+            );
+        }
+        HistoryVerdict::Outputs(refs) => {
+            download_all(conn, client, library_root, task, &refs);
+        }
+        HistoryVerdict::NoOutputs => {
+            settle_task(conn, client, library_root, task, now_dt, history.as_ref());
+        }
+    }
+}
+
+/// Download everything history named. Succeeding on any one file completes the
+/// task; failing on all of them is transient, because a 404 from `/view` is very
+/// often a file that is written but not yet closed.
+fn download_all(
+    conn: &mut SqliteConnection,
+    client: &ComfyUiClient,
+    library_root: &Path,
+    task: &ActiveTask,
+    refs: &[OutputRef],
+) {
+    let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)))
+        .set(enhancement_tasks::status.eq("downloading"))
+        .execute(conn);
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut downloaded = false;
+    for out in refs {
+        match download_and_save_output(conn, client, task, out, library_root) {
+            Ok(_) => downloaded = true,
+            Err(e) => {
+                error!(
+                    "Failed to download output {} for task {}: {}",
+                    out.describe(),
+                    task.id,
+                    e
+                );
+                errors.push(e.to_string());
+            }
+        }
+    }
+
+    if downloaded || task_has_output(conn, &task.id) {
+        mark_completed(conn, &task.id);
+        return;
+    }
+
+    // Say what actually went wrong. The old message ("No output images found in
+    // ComfyUI response") blamed the workflow for what was usually a 404.
+    let detail = errors
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "no reason reported".to_string());
+    let message = format!(
+        "ComfyUI named {} output file(s) but none could be downloaded. First error: {}",
+        refs.len(),
+        detail
+    );
+    handle_failure(
+        conn,
+        &task.id,
+        FailureSite::Download,
+        &message,
+        task.retry_count,
+    );
+}
+
+/// ComfyUI says it is done but has named no file. That is a state, not a
+/// verdict: wait, and meanwhile look for the file under the name we pinned.
+fn settle_task(
+    conn: &mut SqliteConnection,
+    client: &ComfyUiClient,
+    library_root: &Path,
+    task: &ActiveTask,
+    now_dt: chrono::NaiveDateTime,
+    history: Option<&Value>,
+) {
+    // The file may already be on disk under the deterministic prefix even though
+    // history is silent about it. One hit finishes the task.
+    if let Some(prefix) = task.output_prefix.as_deref() {
+        for candidate in fallback_output_candidates(prefix) {
+            match download_and_save_output(conn, client, task, &candidate, library_root) {
+                Ok(_) => {
+                    info!(
+                        "Task {} recovered output {} by name; history never listed it",
+                        task.id,
+                        candidate.describe()
+                    );
+                    mark_completed(conn, &task.id);
+                    return;
+                }
+                // A miss is the normal case for most candidates — only the right
+                // extension exists — so this is not worth logging per file.
+                Err(_) => continue,
+            }
+        }
+    }
+
+    if task_has_output(conn, &task.id) {
+        mark_completed(conn, &task.id);
+        return;
+    }
+
+    let workflow: Value = serde_json::from_str(&task.workflow_json).unwrap_or(Value::Null);
+    let budget = settle_budget(&workflow);
+    let settle_until = task.settle_until.as_deref().and_then(parse_ts);
+
+    match decide_settle(now_dt, settle_until, budget) {
+        SettleDecision::Start {
+            deadline,
+            recheck_at,
+        } => {
+            info!(
+                "Task {} finished with no files listed; waiting up to {}s for them",
+                task.id,
+                budget.as_secs()
+            );
+            let _ =
+                diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)))
+                    .set((
+                        enhancement_tasks::status.eq(STATUS_AWAITING_OUTPUT),
+                        enhancement_tasks::settle_until.eq(format_ts(deadline)),
+                        enhancement_tasks::next_attempt_at.eq(format_ts(recheck_at)),
+                        enhancement_tasks::error_message.eq(None::<String>),
+                    ))
+                    .execute(conn);
+        }
+        SettleDecision::Wait { recheck_at } => {
+            let _ =
+                diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)))
+                    .set((
+                        enhancement_tasks::status.eq(STATUS_AWAITING_OUTPUT),
+                        enhancement_tasks::next_attempt_at.eq(format_ts(recheck_at)),
+                    ))
+                    .execute(conn);
+        }
+        SettleDecision::Expired => {
+            let prefix = task.output_prefix.as_deref().unwrap_or("(none)");
+            // "Finished but silent" and "vanished from ComfyUI entirely" are
+            // different problems, and the user needs to be told which one.
+            let message = match history {
+                Some(h) => {
+                    let outputs_debug = h
+                        .get("outputs")
+                        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "N/A".to_string()))
+                        .unwrap_or_else(|| "null".to_string());
+                    format!(
+                        "ComfyUI reported prompt {} finished but published no file within {}s, \
+                         and nothing was found under the pinned prefix {}. Outputs: {}",
+                        task.prompt_id,
+                        budget.as_secs(),
+                        prefix,
+                        outputs_debug
+                    )
+                }
+                None => format!(
+                    "Prompt {} is in neither ComfyUI's history nor its queue, and no file \
+                     appeared under the pinned prefix {} within {}s (job lost, most likely a \
+                     ComfyUI restart)",
+                    task.prompt_id,
+                    prefix,
+                    budget.as_secs()
+                ),
+            };
+            error!("Task {} gave up settling: {}", task.id, message);
+            handle_failure(
+                conn,
+                &task.id,
+                FailureSite::Settle,
+                &message,
+                task.retry_count,
             );
         }
     }
 }
 
-/// Check whether a history response's `outputs` contains any downloadable items
-/// (images or gifs with a filename in any node's output).
-fn outputs_has_downloadable_items(outputs: Option<&Value>) -> bool {
-    let obj = match outputs.and_then(|v| v.as_object()) {
-        Some(o) if !o.is_empty() => o,
-        _ => return false,
-    };
-    for (_node_id, node_output) in obj {
-        if let Some(images) = node_output.get("images").and_then(|v| v.as_array()) {
-            if images.iter().any(|img| img.get("filename").and_then(|v| v.as_str()).is_some()) {
-                return true;
-            }
-        }
-        if let Some(gifs) = node_output.get("gifs").and_then(|v| v.as_array()) {
-            if gifs.iter().any(|g| g.get("filename").and_then(|v| v.as_str()).is_some()) {
-                return true;
-            }
-        }
-    }
-    false
+/// Did an earlier attempt already save a file for this task?
+fn task_has_output(conn: &mut SqliteConnection, task_id: &str) -> bool {
+    enhancement_tasks::table
+        .filter(
+            enhancement_tasks::id
+                .eq(task_id)
+                .and(enhancement_tasks::output_file_id.is_not_null()),
+        )
+        .count()
+        .get_result::<i64>(conn)
+        .map(|c| c > 0)
+        .unwrap_or(false)
+}
+
+fn mark_completed(conn: &mut SqliteConnection, task_id: &str) {
+    let now = format_ts(chrono::Utc::now().naive_utc());
+    let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id)))
+        .set((
+            enhancement_tasks::status.eq("completed"),
+            enhancement_tasks::completed_at.eq(&now),
+            enhancement_tasks::error_message.eq(None::<String>),
+            enhancement_tasks::next_attempt_at.eq(None::<String>),
+            enhancement_tasks::settle_until.eq(None::<String>),
+        ))
+        .execute(conn);
+    info!("Task {} completed successfully", task_id);
 }
 
 /// Download an output file from ComfyUI and save it alongside the original.
 fn download_and_save_output(
     conn: &mut SqliteConnection,
     client: &ComfyUiClient,
-    task_id: &str,
-    shot_id: &str,
-    filename: &str,
-    subfolder: &str,
-    output_type: &str,
+    task: &ActiveTask,
+    out: &OutputRef,
     library_root: &Path,
-    workflow_id: &str,
-    text_overrides_json: &str,
 ) -> anyhow::Result<()> {
-    let data = client.download_output(filename, subfolder, output_type)?;
+    let task_id = task.id.as_str();
+    let shot_id = task.shot_id.as_str();
+    let workflow_id = task.workflow_id.as_str();
+    let text_overrides_json = task.text_overrides.as_str();
+    let filename = out.filename.as_str();
+
+    let data = client.download_output(out)?;
 
     // Get the original file path to determine where to save
     let original_path_str: String = files::table
@@ -922,7 +1654,10 @@ fn download_and_save_output(
     let actual_file_id: String = match existing {
         Some((existing_id, existing_hash)) if existing_hash == hash => {
             // Same content already saved — nothing to do
-            info!("Task {} output already exists with same hash, skipping write", task_id);
+            info!(
+                "Task {} output already exists with same hash, skipping write",
+                task_id
+            );
             existing_id
         }
         Some(_) => {
@@ -984,6 +1719,68 @@ fn download_and_save_output(
     Ok(())
 }
 
+/// Record a failure, retrying it if the site says another attempt could help.
+///
+/// This is where `retry_count` finally earns its column: a transport hiccup used
+/// to be as terminal as a broken graph, which is why a working workflow could
+/// need several manual reruns.
+fn handle_failure(
+    conn: &mut SqliteConnection,
+    task_id: &str,
+    site: FailureSite,
+    message: &str,
+    retry_count: i32,
+) {
+    match plan_failure(site, message, retry_count) {
+        FailureAction::Retry {
+            attempt,
+            delay,
+            message,
+        } => {
+            let retry_at = format_ts(
+                chrono::Utc::now().naive_utc() + chrono::Duration::seconds(delay.as_secs() as i64),
+            );
+            warn!(
+                "Task {} hit a transient failure, attempt {}/{} in {}s: {}",
+                task_id,
+                attempt,
+                MAX_ATTEMPTS,
+                delay.as_secs(),
+                message
+            );
+            let note = format!(
+                "Retrying (attempt {}/{}): {}",
+                attempt, MAX_ATTEMPTS, message
+            );
+            let filter = enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id));
+            let _ = if retry_resumes_prompt(site) {
+                // The prompt already reached ComfyUI; go back to watching it
+                // rather than paying for the whole graph a second time.
+                diesel::update(filter)
+                    .set((
+                        enhancement_tasks::status.eq("processing"),
+                        enhancement_tasks::retry_count.eq(retry_count + 1),
+                        enhancement_tasks::next_attempt_at.eq(&retry_at),
+                        enhancement_tasks::error_message.eq(&note),
+                    ))
+                    .execute(conn)
+            } else {
+                diesel::update(filter)
+                    .set((
+                        enhancement_tasks::status.eq("pending"),
+                        enhancement_tasks::retry_count.eq(retry_count + 1),
+                        enhancement_tasks::next_attempt_at.eq(&retry_at),
+                        enhancement_tasks::settle_until.eq(None::<String>),
+                        enhancement_tasks::comfyui_prompt_id.eq(None::<String>),
+                        enhancement_tasks::error_message.eq(&note),
+                    ))
+                    .execute(conn)
+            };
+        }
+        FailureAction::Fail(message) => mark_failed(conn, task_id, &message),
+    }
+}
+
 /// Mark a task as failed with an error message.
 fn mark_failed(conn: &mut SqliteConnection, task_id: &str, error_msg: &str) {
     error!("Task {} failed: {}", task_id, error_msg);
@@ -991,6 +1788,7 @@ fn mark_failed(conn: &mut SqliteConnection, task_id: &str, error_msg: &str) {
         .set((
             enhancement_tasks::status.eq("failed"),
             enhancement_tasks::error_message.eq(error_msg),
+            enhancement_tasks::next_attempt_at.eq(None::<String>),
         ))
         .execute(conn);
 }
@@ -1013,5 +1811,605 @@ fn cleanup_completed_tasks(conn: &mut SqliteConnection) {
         Ok(n) if n > 0 => info!("Cleaned up {} completed enhancement tasks", n),
         Err(e) => warn!("Failed to clean up completed tasks: {}", e),
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// Fixtures are shaped like real `/history/{prompt_id}` payloads, because the bug
+// these cover is entirely about reading that payload correctly. Each test names
+// the defect it pins.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn dt(s: &str) -> chrono::NaiveDateTime {
+        parse_ts(s).expect("fixture timestamp")
+    }
+
+    /// A history entry the way ComfyUI writes one.
+    fn history(outputs: Value, completed: bool) -> Value {
+        json!({
+            "prompt": [0, "abc", {}, {}, []],
+            "outputs": outputs,
+            "status": {
+                "status_str": if completed { "success" } else { "running" },
+                "completed": completed,
+                "messages": [
+                    ["execution_start", { "prompt_id": "abc" }],
+                    ["execution_cached", { "nodes": ["4", "6"], "prompt_id": "abc" }],
+                ],
+            },
+        })
+    }
+
+    fn file(name: &str) -> Value {
+        json!({ "filename": name, "subfolder": "", "type": "output" })
+    }
+
+    // === Defect 1 / scope B — outputs must be found under any key ============
+
+    #[test]
+    fn defect_1_finds_outputs_under_any_key() {
+        // Every one of these is a real publisher: SaveImage -> images,
+        // VHS_VideoCombine -> gifs, core SaveVideo -> videos, SaveAudio -> audio,
+        // and a custom node under whatever key its author picked.
+        for (key, name) in [
+            ("images", "phos_00001_.png"),
+            ("gifs", "phos_00001.gif"),
+            ("videos", "phos_00001.mp4"),
+            ("audio", "phos_00001.flac"),
+            ("my_custom_saver", "phos_00001.exr"),
+            ("result", "phos_00001.webp"),
+        ] {
+            let entry = history(json!({ "9": { key: [file(name)] } }), true);
+            assert_eq!(
+                interpret_history(&entry),
+                HistoryVerdict::Outputs(vec![OutputRef {
+                    filename: name.to_string(),
+                    subfolder: String::new(),
+                    output_type: "output".to_string(),
+                }]),
+                "output key {:?} was not recognised",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn defect_1_carries_subfolder_and_type() {
+        let entry = history(
+            json!({ "12": { "videos": [
+                { "filename": "a.mp4", "subfolder": "phos", "type": "output" }
+            ] } }),
+            true,
+        );
+        assert_eq!(
+            interpret_history(&entry),
+            HistoryVerdict::Outputs(vec![OutputRef {
+                filename: "a.mp4".to_string(),
+                subfolder: "phos".to_string(),
+                output_type: "output".to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn defect_1_defaults_subfolder_and_type_the_way_comfyui_does() {
+        let entry = history(
+            json!({ "9": { "images": [ { "filename": "a.png" } ] } }),
+            true,
+        );
+        assert_eq!(
+            interpret_history(&entry),
+            HistoryVerdict::Outputs(vec![OutputRef {
+                filename: "a.png".to_string(),
+                subfolder: String::new(),
+                output_type: "output".to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn defect_1_collects_from_several_nodes_and_keys_at_once() {
+        let entry = history(
+            json!({
+                "9":  { "images": [file("a.png"), file("b.png")] },
+                "12": { "gifs": [file("c.mp4")] },
+                "15": { "videos": [file("d.webm")], "animated": [true] },
+            }),
+            true,
+        );
+        match interpret_history(&entry) {
+            HistoryVerdict::Outputs(refs) => {
+                // Node ids arrive in whatever order serde_json's map yields, and
+                // download order does not matter; every file being named does.
+                let mut names: Vec<&str> = refs.iter().map(|r| r.filename.as_str()).collect();
+                names.sort_unstable();
+                assert_eq!(names, ["a.png", "b.png", "c.mp4", "d.webm"]);
+            }
+            other => panic!("expected outputs, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn defect_1_ignores_arrays_that_name_no_file() {
+        // `animated` is an array of bools; `text` an array of strings. Neither is
+        // downloadable, and mistaking them for files would be worse than missing
+        // them.
+        let entry = history(
+            json!({ "9": { "animated": [false], "text": ["a caption"] } }),
+            true,
+        );
+        assert_eq!(interpret_history(&entry), HistoryVerdict::NoOutputs);
+    }
+
+    #[test]
+    fn defect_1_names_the_same_file_once() {
+        let entry = history(
+            json!({
+                "9":  { "images": [file("a.png")] },
+                "10": { "images": [file("a.png")] },
+            }),
+            true,
+        );
+        assert_eq!(
+            interpret_history(&entry),
+            HistoryVerdict::Outputs(vec![OutputRef {
+                filename: "a.png".to_string(),
+                subfolder: String::new(),
+                output_type: "output".to_string(),
+            }])
+        );
+    }
+
+    // === Defect 2 / scope C — empty outputs are a state, not a verdict =======
+
+    #[test]
+    fn defect_2_empty_outputs_is_not_a_failure() {
+        assert_eq!(
+            interpret_history(&history(json!({}), true)),
+            HistoryVerdict::NoOutputs
+        );
+    }
+
+    #[test]
+    fn defect_2_null_outputs_is_not_a_failure() {
+        assert_eq!(
+            interpret_history(&history(Value::Null, true)),
+            HistoryVerdict::NoOutputs
+        );
+    }
+
+    #[test]
+    fn defect_2_incomplete_run_is_still_running() {
+        assert_eq!(
+            interpret_history(&history(json!({}), false)),
+            HistoryVerdict::Running
+        );
+    }
+
+    #[test]
+    fn defect_2_video_workflows_get_the_long_budget() {
+        let video = json!({
+            "12": { "class_type": "VHS_VideoCombine",
+                    "inputs": { "filename_prefix": "AnimateDiff" } }
+        });
+        let images = json!({
+            "9": { "class_type": "SaveImage", "inputs": { "filename_prefix": "ComfyUI" } }
+        });
+        assert_eq!(settle_budget(&video), SETTLE_BUDGET_VIDEO);
+        assert_eq!(settle_budget(&images), SETTLE_BUDGET_IMAGE);
+        // 10s of budget was never going to cover an ffmpeg mux.
+        assert!(SETTLE_BUDGET_VIDEO > Duration::from_secs(10 * 60));
+    }
+
+    #[test]
+    fn defect_2_core_save_video_is_an_output_node() {
+        let wf = json!({
+            "12": { "class_type": "SaveVideo", "inputs": { "filename_prefix": "video/ComfyUI" } }
+        });
+        assert_eq!(detect_outputs(&wf).len(), 1);
+        assert!(workflow_has_slow_output(&wf));
+    }
+
+    #[test]
+    fn defect_2_custom_saver_is_an_output_node() {
+        // Recognised by its `filename_prefix` input, not by a name we knew.
+        let wf = json!({
+            "20": { "class_type": "ImageWriterXL",
+                    "inputs": { "filename_prefix": "out", "images": ["19", 0] } }
+        });
+        assert_eq!(detect_outputs(&wf).len(), 1);
+    }
+
+    #[test]
+    fn defect_2_settle_starts_a_clock_then_expires() {
+        let now = dt("2026-08-30 12:00:00");
+        let budget = Duration::from_secs(60);
+
+        // First sighting: start the clock, come back shortly.
+        let SettleDecision::Start {
+            deadline,
+            recheck_at,
+        } = decide_settle(now, None, budget)
+        else {
+            panic!("first sighting should start the clock");
+        };
+        assert_eq!(deadline, dt("2026-08-30 12:01:00"));
+        assert_eq!(recheck_at, dt("2026-08-30 12:00:02"));
+
+        // Inside the budget: keep waiting, with a widening gap.
+        assert_eq!(
+            decide_settle(dt("2026-08-30 12:00:30"), Some(deadline), budget),
+            SettleDecision::Wait {
+                recheck_at: dt("2026-08-30 12:00:35")
+            }
+        );
+
+        // Past the deadline: only now is it a failure.
+        assert_eq!(
+            decide_settle(dt("2026-08-30 12:01:01"), Some(deadline), budget),
+            SettleDecision::Expired
+        );
+    }
+
+    #[test]
+    fn defect_2_settle_backoff_widens_with_elapsed_time() {
+        assert_eq!(settle_recheck_delay(Duration::ZERO), Duration::from_secs(2));
+        assert_eq!(
+            settle_recheck_delay(Duration::from_secs(30)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            settle_recheck_delay(Duration::from_secs(120)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            settle_recheck_delay(Duration::from_secs(600)),
+            Duration::from_secs(30)
+        );
+    }
+
+    // === Defect 3 / scope D — transient vs permanent =========================
+
+    #[test]
+    fn defect_3_transient_failures_are_retried() {
+        for site in [
+            FailureSite::Upload,
+            FailureSite::History,
+            FailureSite::Download,
+        ] {
+            assert_eq!(
+                classify_failure(site, "connection reset"),
+                FailureKind::Transient,
+                "{:?} should be retryable",
+                site
+            );
+        }
+    }
+
+    #[test]
+    fn defect_3_permanent_failures_are_not_retried() {
+        for site in [
+            FailureSite::SourceImage,
+            FailureSite::WorkflowJson,
+            FailureSite::Execution,
+            FailureSite::Settle,
+        ] {
+            assert_eq!(
+                classify_failure(site, "whatever"),
+                FailureKind::Permanent,
+                "{:?} should be terminal",
+                site
+            );
+        }
+    }
+
+    #[test]
+    fn defect_3_a_rejected_prompt_is_permanent_but_a_dropped_connection_is_not() {
+        let rejected = format!(
+            "Queue failed: {}: required input is missing",
+            PROMPT_REJECTED
+        );
+        assert_eq!(
+            classify_failure(FailureSite::Queue, &rejected),
+            FailureKind::Permanent
+        );
+        assert_eq!(
+            classify_failure(FailureSite::Queue, "Queue failed: connection refused"),
+            FailureKind::Transient
+        );
+    }
+
+    #[test]
+    fn defect_3_retry_count_is_spent_then_the_real_error_stands() {
+        let msg = "ComfyUI /view returned HTTP 404 for phos/x_00001_.png";
+        // Attempts 1..3 come back for another go, with a widening delay.
+        let mut delays = Vec::new();
+        for retry_count in 0..MAX_ATTEMPTS - 1 {
+            match plan_failure(FailureSite::Download, msg, retry_count) {
+                FailureAction::Retry {
+                    attempt,
+                    delay,
+                    message,
+                } => {
+                    assert_eq!(attempt, retry_count + 2);
+                    assert_eq!(message, msg);
+                    delays.push(delay);
+                }
+                other => panic!("attempt {} should retry, got {:?}", retry_count, other),
+            }
+        }
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(15),
+                Duration::from_secs(45)
+            ]
+        );
+
+        // The last one keeps the real error rather than inventing a new one.
+        match plan_failure(FailureSite::Download, msg, MAX_ATTEMPTS - 1) {
+            FailureAction::Fail(text) => {
+                assert!(text.starts_with(msg), "lost the real error: {}", text);
+                assert!(text.contains("after 4 attempts"), "{}", text);
+            }
+            other => panic!("budget was spent, expected a failure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn defect_3_a_retry_after_queueing_resumes_the_prompt() {
+        // A prompt that already ran should be re-polled, not re-executed —
+        // re-running it is expensive and can duplicate the output.
+        assert!(retry_resumes_prompt(FailureSite::History));
+        assert!(retry_resumes_prompt(FailureSite::Download));
+        // Nothing reached ComfyUI yet, so these start over.
+        assert!(!retry_resumes_prompt(FailureSite::Upload));
+        assert!(!retry_resumes_prompt(FailureSite::Queue));
+    }
+
+    #[test]
+    fn defect_3_a_permanent_failure_does_not_burn_attempts() {
+        match plan_failure(FailureSite::Execution, "node blew up", 0) {
+            FailureAction::Fail(text) => assert_eq!(text, "node blew up"),
+            other => panic!("expected an immediate failure, got {:?}", other),
+        }
+    }
+
+    // === Defect 4 / scope E — error fidelity =================================
+
+    #[test]
+    fn defect_4_execution_errors_report_the_node_and_message() {
+        let entry = json!({
+            "outputs": {},
+            "status": {
+                "status_str": "error",
+                "completed": false,
+                "messages": [
+                    ["execution_start", { "prompt_id": "abc" }],
+                    ["execution_error", {
+                        "node_id": "14",
+                        "node_type": "KSampler",
+                        "exception_message": "CUDA out of memory",
+                        "traceback": ["Traceback...\n", "  line 1\n"],
+                    }],
+                ],
+            },
+        });
+        assert_eq!(
+            interpret_history(&entry),
+            HistoryVerdict::Failed(
+                "ComfyUI execution error in node 14 (KSampler): CUDA out of memory".to_string()
+            )
+        );
+        assert!(execution_error_traceback(&entry)
+            .unwrap()
+            .contains("Traceback"));
+    }
+
+    #[test]
+    fn defect_4_an_error_wins_over_a_completed_flag() {
+        // Some builds set completed:true beside an execution_error. Reading the
+        // flag first turns a real error into "no output images found".
+        let entry = json!({
+            "outputs": {},
+            "status": {
+                "status_str": "success",
+                "completed": true,
+                "messages": [
+                    ["execution_error", {
+                        "node_id": 14,
+                        "node_type": "VHS_VideoCombine",
+                        "exception_message": "ffmpeg exited with code 1",
+                    }],
+                ],
+            },
+        });
+        assert_eq!(
+            interpret_history(&entry),
+            HistoryVerdict::Failed(
+                "ComfyUI execution error in node 14 (VHS_VideoCombine): ffmpeg exited with code 1"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn defect_4_a_status_of_error_fails_even_without_a_message() {
+        let entry = json!({
+            "outputs": {},
+            "status": { "status_str": "error", "completed": false, "messages": [] },
+        });
+        match interpret_history(&entry) {
+            HistoryVerdict::Failed(msg) => assert!(msg.contains("status 'error'"), "{}", msg),
+            other => panic!("expected a failure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn defect_4_a_cached_run_is_a_success_not_an_error() {
+        // `execution_cached` sits in the same messages array as
+        // `execution_error`; only the latter means trouble.
+        let entry = history(json!({ "9": { "images": [file("a.png")] } }), true);
+        assert!(matches!(
+            interpret_history(&entry),
+            HistoryVerdict::Outputs(_)
+        ));
+    }
+
+    // === Scope A — deterministic filenames ===================================
+
+    #[test]
+    fn scope_a_pins_every_savers_filename_prefix() {
+        let wf = json!({
+            "9":  { "class_type": "SaveImage", "inputs": { "filename_prefix": "ComfyUI" } },
+            "12": { "class_type": "VHS_VideoCombine",
+                    "inputs": { "filename_prefix": "AnimateDiff", "frame_rate": 8 } },
+            "20": { "class_type": "MysterySaver", "inputs": { "filename_prefix": "whatever" } },
+            "4":  { "class_type": "LoadImage", "inputs": { "image": "old.png" } },
+        });
+        let prefix = output_prefix_for_task("task-1234");
+        assert_eq!(prefix, "phos/task-1234");
+
+        let prepared = prepare_workflow(
+            &wf,
+            "uploaded.png",
+            &std::collections::HashMap::new(),
+            Some(&prefix),
+        );
+        for node in ["9", "12", "20"] {
+            assert_eq!(
+                prepared[node]["inputs"]["filename_prefix"].as_str(),
+                Some("phos/task-1234"),
+                "node {} kept its own prefix",
+                node
+            );
+        }
+        // The rest of prepare_workflow still does its job.
+        assert_eq!(
+            prepared["4"]["inputs"]["image"].as_str(),
+            Some("uploaded.png")
+        );
+        assert_eq!(prepared["12"]["inputs"]["frame_rate"].as_i64(), Some(8));
+    }
+
+    #[test]
+    fn scope_a_leaves_a_linked_prefix_alone() {
+        // A prefix wired from another node is a link, not a literal; rewriting it
+        // would break the graph.
+        let wf = json!({
+            "9": { "class_type": "SaveImage", "inputs": { "filename_prefix": ["8", 0] } }
+        });
+        let prepared = prepare_workflow(
+            &wf,
+            "uploaded.png",
+            &std::collections::HashMap::new(),
+            Some("phos/task-1234"),
+        );
+        assert_eq!(prepared["9"]["inputs"]["filename_prefix"], json!(["8", 0]));
+    }
+
+    #[test]
+    fn scope_a_candidate_names_match_what_comfyui_writes() {
+        let candidates = fallback_output_candidates("phos/task-1234");
+        // SaveImage writes <prefix>_00001_.png into output/phos/.
+        assert!(candidates.contains(&OutputRef {
+            filename: "task-1234_00001_.png".to_string(),
+            subfolder: "phos".to_string(),
+            output_type: "output".to_string(),
+        }));
+        // VHS_VideoCombine writes <prefix>_00001.mp4 — no trailing underscore.
+        assert!(candidates.contains(&OutputRef {
+            filename: "task-1234_00001.mp4".to_string(),
+            subfolder: "phos".to_string(),
+            output_type: "output".to_string(),
+        }));
+        assert!(candidates.iter().all(|c| c.subfolder == "phos"));
+    }
+
+    #[test]
+    fn scope_a_candidates_survive_a_prefix_without_a_subfolder() {
+        let candidates = fallback_output_candidates("task-1234");
+        assert!(candidates.iter().all(|c| c.subfolder.is_empty()));
+        assert!(candidates
+            .iter()
+            .any(|c| c.filename == "task-1234_00001_.png"));
+    }
+
+    // === Defect 5 — the /prompt payload carries a client_id ==================
+
+    #[test]
+    fn defect_5_client_id_is_stable_within_the_process() {
+        let first = client_id();
+        assert!(first.starts_with("phos-"), "{}", first);
+        assert_eq!(first, client_id(), "client id must not change per call");
+    }
+
+    // === Defect 6 / scope F — cancelling needs to find the running prompt ====
+
+    #[test]
+    fn defect_6_only_the_running_prompt_is_interruptible() {
+        let queue = json!({
+            "queue_running": [[0, "running-id", {}, {}, []]],
+            "queue_pending": [[1, "pending-id", {}, {}, []]],
+        });
+        assert!(queue_contains(&queue, "queue_running", "running-id"));
+        assert!(!queue_contains(&queue, "queue_running", "pending-id"));
+        assert!(queue_contains(&queue, "queue_pending", "pending-id"));
+        assert!(!queue_contains(&queue, "queue_pending", "absent-id"));
+    }
+
+    // === The reported symptom, end to end ====================================
+
+    #[test]
+    fn the_reported_symptom_no_longer_reads_as_a_failure() {
+        // "the workflow is done but the result file is not in the response":
+        // a completed VHS_VideoCombine run whose file has not been published yet.
+        let wf = json!({
+            "12": { "class_type": "VHS_VideoCombine",
+                    "inputs": { "filename_prefix": "AnimateDiff" } }
+        });
+        let entry = history(json!({}), true);
+
+        // Step 1: reading history says "nothing yet", not "failed".
+        assert_eq!(interpret_history(&entry), HistoryVerdict::NoOutputs);
+
+        // Step 2: the task settles, with fifteen minutes rather than ten seconds.
+        let now = dt("2026-08-30 12:00:00");
+        let budget = settle_budget(&wf);
+        assert_eq!(budget, SETTLE_BUDGET_VIDEO);
+        let SettleDecision::Start { deadline, .. } = decide_settle(now, None, budget) else {
+            panic!("should have started settling");
+        };
+        assert_eq!(deadline, dt("2026-08-30 12:15:00"));
+
+        // Step 3: meanwhile the file is findable by the name we pinned, even
+        // though history never mentioned it.
+        assert!(fallback_output_candidates("phos/task-1234")
+            .iter()
+            .any(|c| c.filename == "task-1234_00001.mp4" && c.subfolder == "phos"));
+
+        // Step 4: when it does show up under a key nobody enumerated, it counts.
+        let late = history(
+            json!({ "12": { "gifs": [
+                { "filename": "task-1234_00001.mp4", "subfolder": "phos", "type": "output" }
+            ] } }),
+            true,
+        );
+        assert_eq!(
+            interpret_history(&late),
+            HistoryVerdict::Outputs(vec![OutputRef {
+                filename: "task-1234_00001.mp4".to_string(),
+                subfolder: "phos".to_string(),
+                output_type: "output".to_string(),
+            }])
+        );
     }
 }

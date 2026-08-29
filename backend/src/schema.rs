@@ -27,6 +27,9 @@ diesel::table! {
         created_at -> Nullable<Timestamp>,
         started_at -> Nullable<Timestamp>,
         completed_at -> Nullable<Timestamp>,
+        output_prefix -> Nullable<Text>,
+        settle_until -> Nullable<Timestamp>,
+        next_attempt_at -> Nullable<Timestamp>,
     }
 }
 
