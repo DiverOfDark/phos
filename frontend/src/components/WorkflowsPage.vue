@@ -289,9 +289,7 @@ function onTaskListScroll(event) {
   }
 }
 
-const hasActiveTasks = computed(() =>
-  tasks.value.some(t => t.status === 'pending' || t.status === 'running')
-)
+const hasActiveTasks = computed(() => tasks.value.some(t => isInFlight(t.status)))
 
 function startTaskPolling() {
   stopTaskPolling()
@@ -337,14 +335,37 @@ async function deleteTask(taskId) {
   }
 }
 
+/**
+ * The statuses the backend actually writes: pending → uploading → queued →
+ * processing → downloading → completed, with awaiting_output when ComfyUI says
+ * the run finished but has not published the file yet, and failed / cancelled
+ * as the two ways it ends early.
+ */
 function statusColor(status) {
   switch (status) {
     case 'completed': return 'var(--status-ready)'
     case 'failed': return 'var(--status-error)'
-    case 'running': return 'var(--status-building)'
     case 'cancelled': return 'var(--status-stopped)'
-    default: return 'var(--status-degraded)'
+    case 'uploading':
+    case 'queued':
+    case 'processing':
+    case 'downloading': return 'var(--status-building)'
+    // Done executing, still waiting on the file. Not an error, not finished.
+    case 'awaiting_output': return 'var(--status-degraded)'
+    default: return 'var(--status-pending)'
   }
+}
+
+/** Statuses the worker is still moving through. */
+const IN_FLIGHT = ['pending', 'uploading', 'queued', 'processing', 'downloading', 'awaiting_output']
+
+function isInFlight(status) {
+  return IN_FLIGHT.includes(status)
+}
+
+/** `awaiting_output` reads better as two words in the schedule register. */
+function statusLabel(status) {
+  return String(status || '').replace(/_/g, ' ')
 }
 
 /** Task ids are long; the queue shows the first 7, like a commit. */
@@ -742,11 +763,11 @@ defineExpose({ loadData: fetchWorkflows })
             >
               <span
                 class="signal-dot"
-                :class="{ 'signal-pulse': task.status === 'running' || task.status === 'pending' }"
+                :class="{ 'signal-pulse': isInFlight(task.status) }"
                 style="width:6px;height:6px"
                 :style="{ background: statusColor(task.status) }"
               ></span>
-              {{ task.status }}
+              {{ statusLabel(task.status) }}
             </span>
             <span v-if="task.retry_count > 0" class="font-mono text-[10px] text-ink-tertiary">
               {{ task.retry_count }} {{ task.retry_count === 1 ? 'retry' : 'retries' }}
@@ -754,14 +775,14 @@ defineExpose({ loadData: fetchWorkflows })
           </span>
 
           <span class="flex gap-3 justify-end">
-            <template v-if="task.status === 'pending' || task.status === 'running'">
+            <template v-if="isInFlight(task.status)">
               <button
                 class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
                 @click="cancelTask(task.id)"
               >cancel</button>
             </template>
-            <template v-else-if="task.status === 'failed'">
-              <!-- A failed job is worth both verbs: run it again, or clear it out. -->
+            <template v-else-if="task.status === 'failed' || task.status === 'cancelled'">
+              <!-- A stopped job is worth both verbs: run it again, or clear it out. -->
               <button
                 class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
                 @click="retryTask(task.id)"

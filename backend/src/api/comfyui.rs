@@ -743,15 +743,20 @@ pub(super) async fn comfyui_retry_task(
         .first(&mut conn)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    if status != "failed" {
+    if status != "failed" && status != crate::comfyui::STATUS_CANCELLED {
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // A hand-driven retry starts from scratch: clear the automatic retry budget,
+    // the settle clock, the backoff, and the old prompt id.
     diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&id)))
         .set((
             enhancement_tasks::status.eq("pending"),
             enhancement_tasks::error_message.eq(None::<String>),
             enhancement_tasks::retry_count.eq(0),
+            enhancement_tasks::settle_until.eq(None::<String>),
+            enhancement_tasks::next_attempt_at.eq(None::<String>),
+            enhancement_tasks::comfyui_prompt_id.eq(None::<String>),
         ))
         .execute(&mut conn)
         .map_err(|e| {
@@ -760,6 +765,98 @@ pub(super) async fn comfyui_retry_task(
         })?;
 
     Ok(Json(serde_json::json!({"status": "pending"})))
+}
+
+/// POST /api/comfyui/tasks/:id/cancel — stop a task, on both sides
+#[utoipa::path(
+    post,
+    path = "/api/comfyui/tasks/{id}/cancel",
+    tag = "comfyui",
+    summary = "Cancel enhancement task",
+    description = "Stop an in-flight enhancement task: interrupt it on ComfyUI if it is the \
+                   running prompt, drop it from ComfyUI's pending queue, and mark the task \
+                   cancelled.",
+    params(("id" = String, Path, description = "Enhancement task ID to cancel")),
+    responses(
+        (status = 200, description = "Task cancelled"),
+        (status = 400, description = "Task has already finished"),
+        (status = 404, description = "Task not found"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
+pub(super) async fn comfyui_cancel_task(
+    Path(id): Path<String>,
+    UState(state): UState,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let url = require_comfyui(&state)?;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let (status, prompt_id): (String, Option<String>) = enhancement_tasks::table
+        .filter(enhancement_tasks::id.eq(&id))
+        .select((
+            enhancement_tasks::status,
+            enhancement_tasks::comfyui_prompt_id,
+        ))
+        .first(&mut conn)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // Nothing to stop once it has landed.
+    if matches!(
+        status.as_str(),
+        "completed" | "failed" | crate::comfyui::STATUS_CANCELLED
+    ) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Tell ComfyUI first, then record it. A task that never reached ComfyUI has
+    // no prompt id and only needs the local row updated.
+    if let Some(prompt_id) = prompt_id {
+        let _ = tokio::task::spawn_blocking(move || {
+            let client = crate::comfyui::ComfyUiClient::new(&url);
+            // Only the running prompt is worth interrupting — /interrupt stops
+            // whatever is executing, so firing it for a merely-queued prompt
+            // would kill somebody else's job.
+            match client.is_prompt_running(&prompt_id) {
+                Ok(true) => {
+                    if let Err(e) = client.interrupt() {
+                        tracing::warn!("Interrupt for prompt {} failed: {}", prompt_id, e);
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!("Could not read ComfyUI queue: {}", e),
+            }
+            if let Err(e) = client.delete_queued(&prompt_id) {
+                tracing::warn!("Dropping prompt {} from the queue failed: {}", prompt_id, e);
+            }
+        })
+        .await;
+    }
+
+    let now = chrono::Utc::now()
+        .naive_utc()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&id)))
+        .set((
+            enhancement_tasks::status.eq(crate::comfyui::STATUS_CANCELLED),
+            enhancement_tasks::error_message.eq("Cancelled"),
+            enhancement_tasks::completed_at.eq(&now),
+            enhancement_tasks::settle_until.eq(None::<String>),
+            enhancement_tasks::next_attempt_at.eq(None::<String>),
+        ))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to cancel task: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(
+        serde_json::json!({"status": crate::comfyui::STATUS_CANCELLED}),
+    ))
 }
 
 // ===== Shot Generations =====
@@ -1091,7 +1188,10 @@ pub(super) async fn comfyui_delete_task(
         .first(&mut conn)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    if status != "failed" && status != "completed" {
+    if !matches!(
+        status.as_str(),
+        "failed" | "completed" | crate::comfyui::STATUS_CANCELLED
+    ) {
         return Err(StatusCode::BAD_REQUEST);
     }
 

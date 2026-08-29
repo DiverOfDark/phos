@@ -461,6 +461,44 @@
         }
       }
     },
+    "/api/comfyui/tasks/{id}/cancel": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Cancel enhancement task",
+        "description": "Stop an in-flight enhancement task: interrupt it on ComfyUI if it is the running prompt, drop it from ComfyUI's pending queue, and mark the task cancelled.",
+        "operationId": "comfyui_cancel_task",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Enhancement task ID to cancel",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Task cancelled"
+          },
+          "400": {
+            "description": "Task has already finished"
+          },
+          "404": {
+            "description": "Task not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
     "/api/comfyui/tasks/{id}/retry": {
       "post": {
         "tags": [
@@ -574,6 +612,41 @@
         "responses": {
           "200": {
             "description": "Workflow deleted successfully"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/workflows/{id}/graph": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Get a workflow's node graph",
+        "description": "Return the stored ComfyUI API-format graph for one workflow, alongside the inputs and outputs detected at import time.",
+        "operationId": "comfyui_workflow_graph",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Workflow ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow graph"
           },
           "404": {
             "description": "Workflow not found"
