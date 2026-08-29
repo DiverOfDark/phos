@@ -543,6 +543,17 @@ function onTaskCreated(task) {
   startTaskPolling()
 }
 
+/** Clear a finished or failed run off the shot. The output file, if any, stays. */
+async function deleteTask(taskId) {
+  try {
+    const res = await fetch(`/api/comfyui/tasks/${taskId}`, { method: 'DELETE' })
+    if (!res.ok) throw new Error()
+    await fetchShotTasks()
+  } catch (e) {
+    console.error('Failed to delete task', e)
+  }
+}
+
 async function retryTask(taskId) {
   try {
     const res = await fetch(`/api/comfyui/tasks/${taskId}/retry`, { method: 'POST' })
@@ -950,23 +961,36 @@ watch(() => route.params.id, () => {
                 <div
                   v-for="task in shotTasks"
                   :key="task.id"
-                  class="flex items-center gap-2 px-3 py-2 border-b border-line"
+                  class="px-3 py-2 border-b border-line"
                 >
-                  <span
-                    class="signal-dot"
-                    :class="{ 'signal-pulse': task.status === 'running' || task.status === 'pending' }"
-                    :style="{ background: taskStatusColor(task.status), width: '6px', height: '6px' }"
-                  ></span>
-                  <span class="flex-1 font-mono text-xs text-ink truncate">{{ task.workflow_name || task.workflow_id }}</span>
-                  <span
-                    class="font-mono text-[11px] tracking-[0.08em] uppercase"
-                    :style="{ color: taskStatusColor(task.status) }"
-                  >{{ task.status }}</span>
-                  <button
-                    v-if="task.status === 'failed'"
-                    class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
-                    @click="retryTask(task.id)"
-                  >retry</button>
+                  <div class="flex items-center gap-2">
+                    <span
+                      class="signal-dot"
+                      :class="{ 'signal-pulse': task.status === 'running' || task.status === 'pending' }"
+                      :style="{ background: taskStatusColor(task.status), width: '6px', height: '6px' }"
+                    ></span>
+                    <span class="flex-1 font-mono text-xs text-ink truncate">{{ task.workflow_name || task.workflow_id }}</span>
+                    <span
+                      class="font-mono text-[11px] tracking-[0.08em] uppercase"
+                      :style="{ color: taskStatusColor(task.status) }"
+                    >{{ task.status }}</span>
+                    <template v-if="task.status === 'failed'">
+                      <button
+                        class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+                        @click="retryTask(task.id)"
+                      >retry</button>
+                      <button
+                        class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
+                        @click="deleteTask(task.id)"
+                      >delete</button>
+                    </template>
+                  </div>
+                  <!-- A run that failed without saying why is just a red dot. -->
+                  <div
+                    v-if="task.error_message"
+                    class="font-mono text-[11px] mt-1 break-all"
+                    style="color: var(--status-error)"
+                  >{{ task.error_message }}</div>
                 </div>
               </div>
             </div>

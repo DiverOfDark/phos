@@ -8,7 +8,7 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use crate::models::{NewComfyuiWorkflow, NewEnhancementTask, NewWorkflowPreset};
-use crate::schema::{comfyui_workflows, enhancement_tasks, files, shots, workflow_presets};
+use crate::schema::{comfyui_workflows, enhancement_tasks, files, people, shots, workflow_presets};
 
 use super::{AppState, UState};
 
@@ -427,6 +427,9 @@ struct TaskRow {
     completed_at: Option<String>,
     source_file_id: Option<String>,
     main_file_id: Option<String>,
+    /// Who the source shot belongs to, and the file the thumbnail shows.
+    person_name: Option<String>,
+    source_name: Option<String>,
 }
 
 type TaskTuple = (
@@ -436,7 +439,12 @@ type TaskTuple = (
     Option<String>,
 );
 
-fn task_tuple_to_row(t: TaskTuple, main_file_id: Option<String>) -> TaskRow {
+fn task_tuple_to_row(
+    t: TaskTuple,
+    main_file_id: Option<String>,
+    person_name: Option<String>,
+    source_name: Option<String>,
+) -> TaskRow {
     TaskRow {
         id: t.0,
         shot_id: t.1,
@@ -451,6 +459,8 @@ fn task_tuple_to_row(t: TaskTuple, main_file_id: Option<String>) -> TaskRow {
         completed_at: t.10,
         source_file_id: t.11,
         main_file_id,
+        person_name,
+        source_name,
     }
 }
 
@@ -472,6 +482,8 @@ fn task_row_to_json(row: TaskRow) -> serde_json::Value {
         "started_at": row.started_at,
         "completed_at": row.completed_at,
         "thumbnail_url": thumbnail_url,
+        "person_name": row.person_name,
+        "source_name": row.source_name,
     })
 }
 
@@ -526,13 +538,57 @@ fn query_tasks(
         tuples.truncate(limit as usize);
     }
 
-    // Batch-fetch shot main_file_ids
+    // Batch-fetch what the queue needs to name its rows: the shot's main file
+    // (for a thumbnail when the task recorded no source), who the shot belongs
+    // to, and the filename being enhanced. Three batched lookups rather than
+    // three per task, because a queue page is fifty rows.
     let shot_ids: Vec<&str> = tuples.iter().map(|t| t.1.as_str()).collect();
-    let shot_main_files: std::collections::HashMap<String, Option<String>> = if !shot_ids.is_empty() {
+    let shot_rows: Vec<(String, Option<String>, Option<String>)> = if !shot_ids.is_empty() {
         shots::table
             .filter(shots::id.eq_any(&shot_ids))
-            .select((shots::id, shots::main_file_id))
-            .load::<(String, Option<String>)>(conn)
+            .select((shots::id, shots::main_file_id, shots::primary_person_id))
+            .load(conn)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let shot_main_files: std::collections::HashMap<String, Option<String>> = shot_rows
+        .iter()
+        .map(|(id, fid, _)| (id.clone(), fid.clone()))
+        .collect();
+    let shot_people: std::collections::HashMap<String, Option<String>> = shot_rows
+        .iter()
+        .map(|(id, _, pid)| (id.clone(), pid.clone()))
+        .collect();
+
+    let person_ids: Vec<String> = shot_rows.iter().filter_map(|(_, _, pid)| pid.clone()).collect();
+    let person_names: std::collections::HashMap<String, Option<String>> = if !person_ids.is_empty() {
+        people::table
+            .filter(people::id.eq_any(&person_ids))
+            .select((people::id, people::name))
+            .load(conn)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // The filename shown is the one the thumbnail points at: the task's own
+    // source file when it has one, otherwise the shot's main file.
+    let file_ids: Vec<String> = tuples
+        .iter()
+        .filter_map(|t| {
+            t.11.clone()
+                .or_else(|| shot_main_files.get(&t.1).cloned().flatten())
+        })
+        .collect();
+    let file_paths: std::collections::HashMap<String, String> = if !file_ids.is_empty() {
+        files::table
+            .filter(files::id.eq_any(&file_ids))
+            .select((files::id, files::path))
+            .load::<(String, String)>(conn)
             .unwrap_or_default()
             .into_iter()
             .collect()
@@ -544,7 +600,18 @@ fn query_tasks(
         .into_iter()
         .map(|t| {
             let main_fid = shot_main_files.get(&t.1).cloned().flatten();
-            task_tuple_to_row(t, main_fid)
+            let person_name = shot_people
+                .get(&t.1)
+                .cloned()
+                .flatten()
+                .and_then(|pid| person_names.get(&pid).cloned().flatten());
+            let source_name = t
+                .11
+                .clone()
+                .or_else(|| main_fid.clone())
+                .and_then(|fid| file_paths.get(&fid).cloned())
+                .and_then(|path| path.rsplit('/').next().map(|s| s.to_string()));
+            task_tuple_to_row(t, main_fid, person_name, source_name)
         })
         .collect();
 
@@ -607,14 +674,40 @@ pub(super) async fn comfyui_get_task(
         .first(&mut conn)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    let main_fid: Option<String> = shots::table
-        .select(shots::main_file_id)
+    let (main_fid, person_id): (Option<String>, Option<String>) = shots::table
+        .select((shots::main_file_id, shots::primary_person_id))
         .filter(shots::id.eq(&tuple.1))
-        .first::<Option<String>>(&mut conn)
-        .ok()
-        .flatten();
+        .first(&mut conn)
+        .unwrap_or((None, None));
 
-    Ok(Json(task_row_to_json(task_tuple_to_row(tuple, main_fid))))
+    let person_name: Option<String> = person_id.and_then(|pid| {
+        people::table
+            .select(people::name)
+            .filter(people::id.eq(pid))
+            .first::<Option<String>>(&mut conn)
+            .ok()
+            .flatten()
+    });
+
+    let source_name: Option<String> = tuple
+        .11
+        .clone()
+        .or_else(|| main_fid.clone())
+        .and_then(|fid| {
+            files::table
+                .select(files::path)
+                .filter(files::id.eq(fid))
+                .first::<String>(&mut conn)
+                .ok()
+        })
+        .and_then(|path| path.rsplit('/').next().map(|s| s.to_string()));
+
+    Ok(Json(task_row_to_json(task_tuple_to_row(
+        tuple,
+        main_fid,
+        person_name,
+        source_name,
+    ))))
 }
 
 /// POST /api/comfyui/tasks/:id/retry — retry a failed task

@@ -675,62 +675,113 @@ defineExpose({ loadData: fetchWorkflows })
     <div v-else class="flex flex-col gap-2">
       <div class="card-ab overflow-hidden overflow-x-auto" ref="taskListRef" @scroll="onTaskListScroll">
         <div
-          class="grid gap-2 px-4 py-2 border-b min-w-[720px]"
-          style="grid-template-columns: 72px 128px 128px minmax(0,1fr) 104px 72px; border-color: var(--border-strong)"
+          class="grid gap-3 px-4 py-2 border-b min-w-[760px]"
+          style="grid-template-columns: 52px minmax(0,1fr) 140px 76px 108px 108px; border-color: var(--border-strong)"
         >
-          <span class="label">Time</span>
-          <span class="label">Workflow</span>
+          <span></span>
           <span class="label">Source</span>
-          <span class="label">Detail</span>
+          <span class="label">Workflow</span>
+          <span class="label">Time</span>
           <span class="label">Status</span>
           <span></span>
         </div>
         <div
           v-for="task in tasks"
           :key="task.id"
-          class="grid gap-2 items-center px-4 py-2 border-b border-line hover:bg-raised transition-colors min-w-[720px]"
-          style="grid-template-columns: 72px 128px 128px minmax(0,1fr) 104px 72px"
+          class="grid gap-3 items-center px-4 py-2 border-b border-line hover:bg-raised transition-colors min-w-[760px]"
+          style="grid-template-columns: 52px minmax(0,1fr) 140px 76px 108px 108px"
         >
-          <span class="font-mono text-xs text-ink-tertiary">{{ formatRelativeTime(task.created_at) }}</span>
-          <span class="font-mono text-xs text-ink truncate">{{ task.workflow_name || task.workflow_id }}</span>
+          <!-- What is being enhanced. A queue of ids tells you nothing about
+               which photo is stuck; the frame does. -->
           <router-link
             v-if="task.shot_id"
             :to="{ name: 'shot-detail', params: { id: task.shot_id } }"
-            class="font-mono text-xs text-ink-secondary truncate hover:text-signal"
-          >shot/{{ shortId(task.shot_id) }}</router-link>
-          <span v-else class="font-mono text-xs text-ink-tertiary">—</span>
-          <span
-            class="font-mono text-xs truncate min-w-0"
-            :style="{ color: task.status === 'failed' ? 'var(--status-error)' : 'var(--text-secondary)' }"
-          >{{ task.error || task.detail || '' }}</span>
-          <span
-            class="flex items-center gap-1.5 font-mono text-[11px] tracking-[0.08em] uppercase"
-            :style="{ color: statusColor(task.status) }"
+            class="block w-[52px] h-10 rounded-sm bg-raised border border-line overflow-hidden hover:border-signal transition-colors"
+            :title="task.source_name || `shot/${shortId(task.shot_id)}`"
           >
+            <img
+              v-if="task.thumbnail_url"
+              :src="task.thumbnail_url"
+              class="w-full h-full object-cover"
+              loading="lazy"
+            />
+            <span v-else class="w-full h-full flex items-center justify-center font-mono text-[10px] text-ink-tertiary">—</span>
+          </router-link>
+          <span v-else class="w-[52px] h-10 rounded-sm bg-raised border border-line"></span>
+
+          <span class="min-w-0">
+            <router-link
+              v-if="task.shot_id"
+              :to="{ name: 'shot-detail', params: { id: task.shot_id } }"
+              class="block text-[13px] truncate hover:text-signal transition-colors"
+              :class="task.person_name ? 'text-ink' : 'text-ink-tertiary'"
+            >{{ task.person_name || 'unsorted' }}</router-link>
+            <span v-else class="block text-[13px] text-ink-tertiary">shot deleted</span>
+            <span class="block font-mono text-[11px] text-ink-tertiary truncate">
+              {{ task.source_name || `shot/${shortId(task.shot_id)}` }}
+            </span>
+            <!-- Why it failed, said once, where the failure is. -->
             <span
-              class="signal-dot"
-              :class="{ 'signal-pulse': task.status === 'running' || task.status === 'pending' }"
-              style="width:6px;height:6px"
-              :style="{ background: statusColor(task.status) }"
-            ></span>
-            {{ task.status }}
+              v-if="task.error_message"
+              class="block font-mono text-[11px] truncate"
+              style="color: var(--status-error)"
+              :title="task.error_message"
+            >{{ task.error_message }}</span>
           </span>
-          <span class="flex gap-2 justify-end">
-            <button
-              v-if="task.status === 'failed'"
-              class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
-              @click="retryTask(task.id)"
-            >retry</button>
-            <button
-              v-else-if="task.status === 'pending' || task.status === 'running'"
-              class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
-              @click="cancelTask(task.id)"
-            >cancel</button>
-            <button
-              v-else
-              class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
-              @click="deleteTask(task.id)"
-            >remove</button>
+
+          <span class="font-mono text-xs text-ink truncate">{{ task.workflow_name || task.workflow_id }}</span>
+
+          <span class="font-mono text-xs text-ink-tertiary">
+            {{ formatRelativeTime(task.created_at) }}
+          </span>
+
+          <span class="flex flex-col gap-0.5">
+            <span
+              class="flex items-center gap-1.5 font-mono text-[11px] tracking-[0.08em] uppercase"
+              :style="{ color: statusColor(task.status) }"
+            >
+              <span
+                class="signal-dot"
+                :class="{ 'signal-pulse': task.status === 'running' || task.status === 'pending' }"
+                style="width:6px;height:6px"
+                :style="{ background: statusColor(task.status) }"
+              ></span>
+              {{ task.status }}
+            </span>
+            <span v-if="task.retry_count > 0" class="font-mono text-[10px] text-ink-tertiary">
+              {{ task.retry_count }} {{ task.retry_count === 1 ? 'retry' : 'retries' }}
+            </span>
+          </span>
+
+          <span class="flex gap-3 justify-end">
+            <template v-if="task.status === 'pending' || task.status === 'running'">
+              <button
+                class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
+                @click="cancelTask(task.id)"
+              >cancel</button>
+            </template>
+            <template v-else-if="task.status === 'failed'">
+              <!-- A failed job is worth both verbs: run it again, or clear it out. -->
+              <button
+                class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+                @click="retryTask(task.id)"
+              >retry</button>
+              <button
+                class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
+                @click="deleteTask(task.id)"
+              >delete</button>
+            </template>
+            <template v-else>
+              <router-link
+                v-if="task.status === 'completed' && task.shot_id"
+                :to="{ name: 'shot-detail', params: { id: task.shot_id } }"
+                class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+              >open</router-link>
+              <button
+                class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
+                @click="deleteTask(task.id)"
+              >remove</button>
+            </template>
           </span>
         </div>
 
