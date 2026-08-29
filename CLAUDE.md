@@ -58,6 +58,7 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
+- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying) and `workflow.rs` (graph analysis and rewriting) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `worker/` holds the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine
 
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`

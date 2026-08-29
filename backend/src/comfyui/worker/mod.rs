@@ -1,0 +1,148 @@
+//! The background worker: the only part of this module that touches the
+//! database or the network.
+//!
+//! One blocking thread per library, waking every three seconds to move tasks
+//! along two paths:
+//!
+//! * [`dispatch`] takes a `pending` task through `uploading` to `queued` — read
+//!   the source image, push it to ComfyUI, pin the output prefix, queue the
+//!   prompt.
+//! * [`complete`] follows a queued prompt through `processing`, possibly
+//!   `awaiting_output`, to `completed` — or to `failed`, but only once the
+//!   settle budget is spent and a retry could not help.
+//!
+//! The decisions both paths make are pure functions in [`super::policy`] and
+//! [`super::history`]; what is left here is the IO around them.
+
+mod complete;
+mod dispatch;
+mod status;
+mod store;
+
+use super::client::ComfyUiClient;
+use super::STATUS_AWAITING_OUTPUT;
+use crate::db;
+use crate::schema::enhancement_tasks;
+use diesel::prelude::*;
+use diesel::sqlite::SqliteConnection;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tracing::{error, info, warn};
+
+/// Spawn the enhancement worker. Returns a JoinHandle.
+/// Follows the scanner.rs pattern: uses `spawn_blocking` with its own DB connection.
+pub fn spawn_enhancement_worker(
+    db_path: PathBuf,
+    comfyui_url: String,
+    shutdown: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let library_root = db_path.parent().unwrap().to_path_buf();
+        let mut conn = match db::open_diesel_connection(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("ComfyUI worker: failed to open DB: {}", e);
+                return;
+            }
+        };
+        let client = ComfyUiClient::new(&comfyui_url);
+        info!("ComfyUI enhancement worker started (url: {})", comfyui_url);
+
+        // Recover tasks that were mid-processing when we last shut down
+        recover_interrupted_tasks(&mut conn);
+
+        let (lock, cvar) = &*shutdown;
+        loop {
+            // Check shutdown
+            if *lock.lock().unwrap() {
+                info!("ComfyUI worker shutting down");
+                break;
+            }
+
+            dispatch::process_pending_tasks(&mut conn, &client, &library_root);
+            complete::poll_active_tasks(&mut conn, &client, &library_root);
+            cleanup_completed_tasks(&mut conn);
+
+            // Sleep 3 seconds or until shutdown
+            let guard = lock.lock().unwrap();
+            let _ = cvar
+                .wait_timeout(guard, std::time::Duration::from_secs(3))
+                .unwrap();
+        }
+    })
+}
+
+/// Re-attach tasks that were mid-flight when we last shut down.
+///
+/// A task that already has a ComfyUI prompt id is *not* restarted: the prompt
+/// may well have run, or still be running, while Phos was down. Restarting it
+/// re-does the work and, worse, was one way a finished job came back as a
+/// failure. Those go back to `processing` so the poller re-reads history (and,
+/// if history is gone, probes the deterministic filenames). A task still
+/// settling stays settling.
+fn recover_interrupted_tasks(conn: &mut SqliteConnection) {
+    // Had a prompt on ComfyUI: resume polling it rather than re-running it.
+    if let Err(e) = diesel::update(
+        enhancement_tasks::table.filter(
+            enhancement_tasks::status
+                .eq_any(&["queued", "processing", "downloading"])
+                .and(enhancement_tasks::comfyui_prompt_id.is_not_null()),
+        ),
+    )
+    .set(enhancement_tasks::status.eq("processing"))
+    .execute(conn)
+    {
+        warn!("Failed to re-attach in-flight tasks: {}", e);
+    }
+
+    // Never reached ComfyUI: start over.
+    if let Err(e) = diesel::update(
+        enhancement_tasks::table.filter(
+            enhancement_tasks::status
+                .eq_any(&["uploading", "queued", "processing", "downloading"])
+                .and(enhancement_tasks::comfyui_prompt_id.is_null()),
+        ),
+    )
+    .set((
+        enhancement_tasks::status.eq("pending"),
+        enhancement_tasks::error_message.eq("Recovered after restart"),
+        enhancement_tasks::next_attempt_at.eq(None::<String>),
+    ))
+    .execute(conn)
+    {
+        warn!("Failed to recover interrupted tasks: {}", e);
+    }
+
+    // `awaiting_output` is left exactly as it is — its deadline is still valid
+    // and the poller picks it up — but the re-check clock is cleared so it is
+    // looked at immediately rather than after a stale backoff.
+    if let Err(e) = diesel::update(
+        enhancement_tasks::table.filter(enhancement_tasks::status.eq(STATUS_AWAITING_OUTPUT)),
+    )
+    .set(enhancement_tasks::next_attempt_at.eq(None::<String>))
+    .execute(conn)
+    {
+        warn!("Failed to resume settling tasks: {}", e);
+    }
+}
+
+/// Remove completed tasks older than 5 minutes.
+fn cleanup_completed_tasks(conn: &mut SqliteConnection) {
+    let cutoff = (chrono::Utc::now().naive_utc() - chrono::Duration::seconds(300))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    match diesel::delete(
+        enhancement_tasks::table.filter(
+            enhancement_tasks::status
+                .eq("completed")
+                .and(enhancement_tasks::completed_at.is_not_null())
+                .and(enhancement_tasks::completed_at.lt(&cutoff)),
+        ),
+    )
+    .execute(conn)
+    {
+        Ok(n) if n > 0 => info!("Cleaned up {} completed enhancement tasks", n),
+        Err(e) => warn!("Failed to clean up completed tasks: {}", e),
+        _ => {}
+    }
+}
