@@ -1,30 +1,20 @@
 package dev.phos.android.ui.organize
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CallSplit
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Face
-import androidx.compose.material.icons.filled.Merge
-import androidx.compose.material.icons.filled.Person
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.ListItem
-import androidx.compose.material3.ListItemDefaults
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import dev.phos.android.ui.common.PhosColors
+import dev.phos.android.ui.common.PhosSheet
+import dev.phos.android.ui.common.PhosSheetHeader
+import dev.phos.android.ui.common.PhosSheetRow
 
 /** What the user can do to the shot they are looking at. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -40,7 +30,11 @@ fun ShotActionsSheet(
     onDeleteVariant: () -> Unit,
     onDeleteShot: () -> Unit,
 ) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    val c = PhosColors.current
+
+    PhosSheet(onDismiss = onDismiss) {
+        PhosSheetHeader(title = "Shot actions", onDismiss = onDismiss)
+
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -48,7 +42,6 @@ fun ShotActionsSheet(
                 .padding(bottom = 8.dp),
         ) {
             Action(
-                icon = Icons.Default.Person,
                 label = "Move to another person",
                 detail = "Reassign this shot. Its review status is left alone.",
                 onClick = onMoveToPerson,
@@ -58,7 +51,6 @@ fun ShotActionsSheet(
             // shot moves this photo, correcting the face changes what the next
             // scan clusters — and a box the detector got wrong can go entirely.
             Action(
-                icon = Icons.Default.Face,
                 label = "Faces in this shot",
                 detail = "Say who a face is, or delete one the detector got wrong.",
                 onClick = onFaces,
@@ -69,7 +61,6 @@ fun ShotActionsSheet(
             // and then refused.
             if (fileCount > 1) {
                 Action(
-                    icon = Icons.Default.CallSplit,
                     label = "Split shot",
                     detail = "Move some of the $fileCount files into a shot of their own.",
                     onClick = onSplit,
@@ -77,35 +68,30 @@ fun ShotActionsSheet(
             }
 
             Action(
-                icon = Icons.Default.Merge,
                 label = "Merge with a similar shot",
                 detail = "Absorb a duplicate into this one.",
                 onClick = onMerge,
             )
 
-            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-
             // Only the non-original copies can go individually; deleting the original
             // means deleting the shot, which is the action below.
             if (fileCount > 1 && !currentFileIsOriginal) {
                 Action(
-                    icon = Icons.Default.Delete,
                     label = "Delete this variant",
                     detail = "Removes the file you are looking at, keeps the shot.",
-                    destructive = true,
+                    color = c.error,
                     onClick = onDeleteVariant,
                 )
             }
 
             Action(
-                icon = Icons.Default.Delete,
                 label = "Delete shot",
                 detail = if (fileCount > 1) {
                     "Deletes all $fileCount files. Can't be undone."
                 } else {
                     "Deletes the file. Can't be undone."
                 },
-                destructive = true,
+                color = c.error,
                 onClick = onDeleteShot,
             )
 
@@ -114,20 +100,24 @@ fun ShotActionsSheet(
     }
 }
 
+/** One action: the verb, and one line saying exactly what it does to the data. */
 @Composable
 private fun Action(
-    icon: ImageVector,
     label: String,
     detail: String,
-    destructive: Boolean = false,
     onClick: () -> Unit,
+    color: Color? = null,
 ) {
-    val tint = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
-    ListItem(
-        leadingContent = { Icon(icon, contentDescription = null, tint = tint) },
-        headlineContent = { Text(label, color = tint) },
-        supportingContent = { Text(detail, style = MaterialTheme.typography.bodySmall) },
-        colors = ListItemDefaults.colors(),
-        modifier = Modifier.clickable(onClick = onClick),
+    val c = PhosColors.current
+    PhosSheetRow(
+        label = label,
+        labelColor = color ?: c.textPrimary,
+        onClick = onClick,
+    )
+    androidx.compose.material3.Text(
+        text = detail,
+        style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+        color = c.textSecondary,
+        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 12.dp),
     )
 }

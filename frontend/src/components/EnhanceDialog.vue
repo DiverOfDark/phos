@@ -1,25 +1,10 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
-import { Button } from '@/components/ui/button'
-import { Label } from '@/components/ui/label'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
-import {
-  Wand2,
-  RefreshCw,
-  Check,
-  AlertCircle,
-  Copy,
-} from 'lucide-vue-next'
 
 const props = defineProps({
   open: Boolean,
   shotId: [String, Number],
+  shotLabel: { type: String, default: '' },
   fileId: String,
 })
 
@@ -233,133 +218,123 @@ async function enhance() {
 </script>
 
 <template>
-  <Dialog v-model:open="dialogOpen">
-    <DialogContent class="sm:max-w-[500px]">
-      <DialogHeader>
-        <DialogTitle class="flex items-center gap-2">
-          <Wand2 class="w-5 h-5 text-indigo-400" />
-          Enhance with AI
-        </DialogTitle>
-        <DialogDescription>
-          Select a ComfyUI workflow and customize inputs to enhance this shot.
-        </DialogDescription>
-      </DialogHeader>
-
-      <div class="mt-4 space-y-4">
-        <!-- Workflow selector (chips) -->
-        <div class="space-y-2">
-          <Label>Workflow</Label>
-          <div v-if="loadingWorkflows" class="text-sm text-zinc-500">Loading workflows...</div>
-          <div v-else-if="workflows.length" class="flex flex-wrap gap-2">
-            <button
-              v-for="wf in workflows"
-              :key="wf.id"
-              class="relative px-3 py-1.5 rounded-lg text-sm font-medium border transition-all"
-              :class="selectedWorkflowId === wf.id
-                ? 'bg-indigo-600/20 text-indigo-300 border-indigo-500/30'
-                : 'bg-zinc-800/50 text-zinc-400 border-white/10 hover:border-white/20 hover:text-zinc-200'"
-              @click="selectWorkflow(wf.id)"
-            >
-              {{ wf.name }}
-              <span
-                v-if="workflowHasGeneration(wf.id)"
-                class="ml-1.5 inline-flex items-center"
-                title="This shot already has variations from this workflow"
-              >
-                <Copy class="w-3 h-3 text-emerald-400" />
-              </span>
-            </button>
-          </div>
-          <div v-else class="text-sm text-zinc-500">No workflows available</div>
+  <div
+    v-if="dialogOpen"
+    class="fixed inset-0 z-50 flex items-center justify-center p-4"
+    style="background: var(--scrim)"
+    @click="dialogOpen = false"
+  >
+    <div
+      class="w-[480px] max-w-full max-h-[calc(100vh-64px)] bg-overlay border border-line-strong rounded shadow-lg flex flex-col overflow-hidden"
+      @click.stop
+    >
+      <div class="flex items-center justify-between px-6 py-4 border-b border-line">
+        <div class="font-heading text-base font-semibold text-ink">
+          Enhance <span class="font-mono font-medium text-ink-secondary">{{ shotLabel }}</span>
         </div>
-
-        <!-- Output type indicator -->
-        <div v-if="outputType" class="flex items-center gap-2">
-          <span class="text-xs text-zinc-500">Output:</span>
-          <span class="px-2 py-0.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-xs font-medium text-indigo-400">
-            {{ outputType }}
-          </span>
-        </div>
-
-        <!-- Preset chips -->
-        <div v-if="presets.length && selectedWorkflow" class="space-y-2">
-          <Label class="text-zinc-400">Presets</Label>
-          <div class="flex flex-wrap gap-2">
-            <button
-              v-for="preset in presets"
-              :key="preset.id"
-              class="relative px-3 py-1.5 rounded-lg text-sm font-medium border transition-all"
-              :class="[
-                selectedPresetId === preset.id
-                  ? 'bg-amber-600/20 text-amber-300 border-amber-500/30'
-                  : 'bg-zinc-800/50 text-zinc-400 border-white/10 hover:border-white/20 hover:text-zinc-200',
-                presetHasGeneration(preset) ? 'ring-1 ring-emerald-500/30' : '',
-              ]"
-              @click="selectPreset(preset)"
-            >
-              {{ preset.name }}
-              <span
-                v-if="presetHasGeneration(preset)"
-                class="ml-1.5 inline-flex items-center"
-                title="Already generated with this preset"
-              >
-                <Check class="w-3 h-3 text-emerald-400" />
-              </span>
-            </button>
-          </div>
-        </div>
-
-        <!-- Text input overrides -->
-        <div v-if="textInputs.length" class="space-y-3">
-          <Label class="text-zinc-400">Input Overrides</Label>
-          <div v-for="input in textInputs" :key="`${input.node_id}.${input.field_name}`" class="space-y-1.5">
-            <label class="text-xs font-medium text-zinc-400">
-              {{ input.field_name }} <span class="text-zinc-600">({{ input.node_type }}, node {{ input.node_id }})</span>
-            </label>
-            <textarea
-              v-model="textOverrides[`${input.node_id}.${input.field_name}`]"
-              rows="2"
-              class="flex w-full rounded-lg border border-white/10 bg-zinc-800/50 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 focus-visible:ring-offset-0 resize-y"
-              :placeholder="typeof input.current_value === 'string' ? input.current_value : 'Enter value...'"
-              @input="selectedPresetId = null"
-            />
-          </div>
-        </div>
-
-        <!-- Already generated warning -->
-        <div v-if="currentMatchesGeneration" class="flex items-start gap-2 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20">
-          <Copy class="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
-          <p class="text-sm text-amber-300">This shot already has a variation with this workflow and prompts.</p>
-        </div>
-
-        <!-- No workflows message -->
-        <div v-if="!loadingWorkflows && workflows.length === 0" class="text-center py-6">
-          <Wand2 class="w-8 h-8 text-zinc-600 mx-auto mb-2" />
-          <p class="text-sm text-zinc-400">No workflows available</p>
-          <p class="text-xs text-zinc-500 mt-1">Import a workflow in the Workflows page first.</p>
-        </div>
-
-        <!-- Feedback -->
-        <div v-if="submitError" class="flex items-start gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/20">
-          <AlertCircle class="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
-          <p class="text-sm text-red-400">{{ submitError }}</p>
-        </div>
-        <div v-if="submitSuccess" class="flex items-start gap-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
-          <Check class="w-4 h-4 text-emerald-500 mt-0.5 shrink-0" />
-          <p class="text-sm text-emerald-400">Enhancement queued successfully!</p>
-        </div>
-
-        <!-- Enhance button -->
-        <Button
-          class="w-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/20 gap-2"
-          :disabled="!selectedWorkflowId || submitting || submitSuccess"
-          @click="enhance"
-        >
-          <RefreshCw v-if="submitting" class="w-4 h-4 animate-spin" />
-          <Wand2 v-else class="w-4 h-4" />
-          {{ submitting ? 'Enhancing...' : 'Enhance' }}
-        </Button>
+        <button class="font-mono text-[13px] text-ink-tertiary hover:text-signal" @click="dialogOpen = false">✕</button>
       </div>
-    </DialogContent>
-  </Dialog>
+
+      <div class="p-6 flex flex-col gap-6 overflow-y-auto overflow-x-hidden min-h-0">
+        <div v-if="loadingWorkflows" class="font-mono text-xs text-ink-tertiary">loading workflows…</div>
+
+        <div v-else-if="workflows.length === 0" class="flex flex-col gap-2">
+          <div class="font-mono text-xs text-ink-tertiary">no workflows imported</div>
+          <div class="text-xs font-light text-ink-secondary">
+            Import a ComfyUI workflow first — Workflows › Import workflow.
+          </div>
+        </div>
+
+        <template v-else>
+          <!-- Workflow -->
+          <div class="flex flex-col gap-2">
+            <div class="label">Workflow</div>
+            <div class="flex flex-wrap gap-2">
+              <button
+                v-for="wf in workflows"
+                :key="wf.id"
+                class="flex items-center gap-1.5 whitespace-nowrap border rounded px-3 py-1.5 font-mono text-xs transition-colors"
+                :class="selectedWorkflowId === wf.id
+                  ? 'border-signal bg-surface text-signal'
+                  : 'border-line text-ink-secondary hover:bg-raised'"
+                @click="selectWorkflow(wf.id)"
+              >
+                {{ wf.name }}
+                <span
+                  v-if="workflowHasGeneration(wf.id)"
+                  title="This shot already has a variation from this workflow"
+                  class="w-1.5 h-1.5 rounded-full"
+                  style="background: var(--status-ready)"
+                ></span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Preset -->
+          <div v-if="presets.length" class="flex flex-col gap-2">
+            <div class="label">Preset</div>
+            <div class="flex flex-wrap gap-2">
+              <button
+                v-for="preset in presets"
+                :key="preset.id"
+                class="whitespace-nowrap border rounded px-3 py-1.5 text-xs transition-colors"
+                :class="selectedPresetId === preset.id
+                  ? 'border-signal bg-surface text-signal'
+                  : 'border-line text-ink-secondary hover:bg-raised'"
+                @click="selectPreset(preset)"
+              >
+                {{ preset.name }}
+                <span
+                  v-if="presetHasGeneration(preset)"
+                  class="ml-1 w-1.5 h-1.5 rounded-full inline-block align-middle"
+                  style="background: var(--status-ready)"
+                ></span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Input overrides -->
+          <div v-if="textInputs.length" class="flex flex-col gap-2">
+            <div class="label">Input overrides</div>
+            <div v-for="input in textInputs" :key="`${input.node_id}.${input.field_name}`" class="flex flex-col gap-1">
+              <span class="font-mono text-[11px] text-ink-tertiary">
+                {{ input.node_id }} · {{ input.node_type }} · {{ input.field_name }}
+              </span>
+              <textarea
+                v-model="textOverrides[`${input.node_id}.${input.field_name}`]"
+                rows="2"
+                spellcheck="false"
+                class="w-full bg-base border border-line rounded-sm px-3 py-2 font-mono text-xs text-ink"
+                @input="selectedPresetId = null"
+              ></textarea>
+            </div>
+          </div>
+
+          <div
+            v-if="currentMatchesGeneration"
+            class="flex items-center gap-2 px-3 py-2 border rounded font-mono text-xs"
+            style="border-color: var(--status-degraded); color: var(--status-degraded)"
+          >
+            <span class="signal-dot" style="width:6px;height:6px;background:var(--status-degraded)"></span>
+            shot already has a variation from this workflow
+          </div>
+
+          <div v-if="submitError" class="font-mono text-xs text-error">{{ submitError }}</div>
+        </template>
+      </div>
+
+      <div class="border-t border-line px-6 py-4 flex items-center gap-4 flex-none">
+        <button
+          class="bg-signal text-signal-fg rounded px-6 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors disabled:opacity-50"
+          :disabled="submitting || !selectedWorkflowId"
+          @click="enhance"
+        >{{ submitting ? 'Queuing…' : 'Enhance' }}</button>
+        <span v-if="submitSuccess" class="font-mono text-xs text-ready">task queued — see Workflows › Queue</span>
+        <span class="flex-1"></span>
+        <span class="font-mono text-[11px] text-ink-tertiary whitespace-nowrap">
+          output attaches as a new file<template v-if="outputType"> · {{ outputType }}</template>
+        </span>
+      </div>
+    </div>
+  </div>
 </template>

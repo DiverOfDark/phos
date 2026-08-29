@@ -66,6 +66,12 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import dev.phos.android.ui.common.MonoBody
+import dev.phos.android.ui.common.MonoSmall
+import dev.phos.android.ui.common.PhosColors
+import dev.phos.android.ui.common.SignalDot
 import dev.phos.android.domain.model.MediaFile
 import dev.phos.android.ui.common.FullScreenLoading
 import dev.phos.android.ui.organize.FacesSheet
@@ -94,7 +100,7 @@ fun BrowserScreen(
     val uiState by viewModel.uiState.collectAsState()
 
     if (uiState.isLoading) {
-        FullScreenLoading("Loading shots...")
+        FullScreenLoading("loading shots…")
         return
     }
 
@@ -103,13 +109,23 @@ fun BrowserScreen(
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center,
         ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("No shots found", style = MaterialTheme.typography.titleMedium)
-                Spacer(modifier = Modifier.height(8.dp))
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                SignalDot(
+                    color = if (uiState.error != null) PhosColors.current.error else PhosColors.current.stopped,
+                    size = 10.dp,
+                )
                 Text(
-                    uiState.error ?: "This person has no photos or videos.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    text = "No shots here",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = PhosColors.current.textPrimary,
+                )
+                Text(
+                    text = uiState.error ?: "This person has no photos or videos.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = PhosColors.current.textSecondary,
                 )
             }
         }
@@ -155,7 +171,7 @@ fun BrowserScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black),
+            .background(PhosColors.current.base),
     ) {
         // Vertical pager (shots)
         VerticalPager(
@@ -170,7 +186,7 @@ fun BrowserScreen(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Text("No files", color = Color.White)
+                    Text("no files", style = MonoBody, color = PhosColors.current.textTertiary)
                 }
             } else {
                 val horizontalPagerState = rememberPagerState(
@@ -229,9 +245,9 @@ fun BrowserScreen(
                                         .padding(2.dp)
                                         .background(
                                             if (index == horizontalPagerState.currentPage)
-                                                Color.White
-                                            else Color.White.copy(alpha = 0.5f),
-                                            shape = MaterialTheme.shapes.small,
+                                                PhosColors.current.signal
+                                            else Color.White.copy(alpha = 0.4f),
+                                            shape = RoundedCornerShape(2.dp),
                                         )
                                 )
                             }
@@ -264,6 +280,7 @@ fun BrowserScreen(
         if (showDeleteConfirm) {
             AlertDialog(
                 onDismissRequest = { showDeleteConfirm = false },
+                containerColor = PhosColors.current.overlay,
                 title = { Text("Delete variant?") },
                 text = { Text("This will permanently delete this file variant from the server.") },
                 confirmButton = {
@@ -271,7 +288,7 @@ fun BrowserScreen(
                         showDeleteConfirm = false
                         viewModel.deleteFile(verticalPagerState.currentPage, currentFileIndex)
                     }) {
-                        Text("Delete", color = MaterialTheme.colorScheme.error)
+                        Text("Delete", color = PhosColors.current.error)
                     }
                 },
                 dismissButton = {
@@ -286,6 +303,7 @@ fun BrowserScreen(
             val fileCount = currentShot.files.size
             AlertDialog(
                 onDismissRequest = { showDeleteShotConfirm = false },
+                containerColor = PhosColors.current.overlay,
                 title = { Text("Delete shot?") },
                 text = {
                     Text(
@@ -302,7 +320,7 @@ fun BrowserScreen(
                         showDeleteShotConfirm = false
                         viewModel.deleteShot(currentShot.shot.id)
                     }) {
-                        Text("Delete", color = MaterialTheme.colorScheme.error)
+                        Text("Delete", color = PhosColors.current.error)
                     }
                 },
                 dismissButton = {
@@ -605,11 +623,7 @@ private fun VideoPage(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(
-                            Brush.verticalGradient(
-                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.6f)),
-                            )
-                        )
+                        .background(Color.Black.copy(alpha = 0.65f))
                         .navigationBarsPadding()
                         .padding(horizontal = 4.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -628,7 +642,7 @@ private fun VideoPage(
                     Text(
                         text = formatDuration(currentPosition),
                         color = Color.White,
-                        style = MaterialTheme.typography.bodySmall,
+                        style = MonoSmall,
                     )
 
                     Slider(
@@ -646,8 +660,8 @@ private fun VideoPage(
                             .weight(1f)
                             .padding(horizontal = 4.dp),
                         colors = SliderDefaults.colors(
-                            thumbColor = Color.White,
-                            activeTrackColor = Color.White,
+                            thumbColor = PhosColors.current.signal,
+                            activeTrackColor = PhosColors.current.signal,
                             inactiveTrackColor = Color.White.copy(alpha = 0.3f),
                         ),
                     )
@@ -655,7 +669,7 @@ private fun VideoPage(
                     Text(
                         text = formatDuration(duration),
                         color = Color.White,
-                        style = MaterialTheme.typography.bodySmall,
+                        style = MonoSmall,
                     )
                 }
             }
@@ -679,16 +693,12 @@ private fun VideoPage(
 
                 Box(
                     modifier = Modifier
-                        .size(64.dp)
-                        .background(Color.Black.copy(alpha = 0.5f), MaterialTheme.shapes.extraLarge),
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(Color.Black.copy(alpha = 0.5f))
+                        .padding(horizontal = 20.dp, vertical = 10.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.PlayArrow,
-                        contentDescription = "Play video",
-                        tint = Color.White,
-                        modifier = Modifier.size(40.dp),
-                    )
+                    Text(text = "▶ play", style = MonoBody, color = Color.White)
                 }
             }
         }
@@ -715,95 +725,83 @@ private fun MediaOverlay(
     onDeleteVariant: () -> Unit,
     onActions: () -> Unit,
 ) {
+    val c = PhosColors.current
     Box(modifier = Modifier.fillMaxSize()) {
-        // Top gradient + info
-        Box(
+        // No protection gradient: the design system does not have one. Each control
+        // carries its own small solid ground instead, so the photo stays uncovered.
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(
-                    Brush.verticalGradient(
-                        colors = listOf(Color.Black.copy(alpha = 0.6f), Color.Transparent),
-                    )
-                )
                 .statusBarsPadding()
-                .padding(8.dp),
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                IconButton(onClick = onBack) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "Back",
-                        tint = Color.White,
-                    )
-                }
+            OverlayChip(text = "←", onClick = onBack)
 
-                Spacer(modifier = Modifier.width(8.dp))
-
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = personName ?: "Unknown",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = Color.White,
-                    )
-                    Text(
-                        text = "${shotIndex + 1} / $shotCount",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.White.copy(alpha = 0.8f),
-                    )
-                }
-
-                if (fileCount > 1) {
-                    Text(
-                        text = "Variant ${fileIndex + 1}/$fileCount",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.White.copy(alpha = 0.8f),
-                        modifier = Modifier.padding(end = 8.dp),
-                    )
-                }
-
-                if (!isOriginal) {
-                    IconButton(onClick = onDeleteVariant) {
-                        Icon(
-                            Icons.Default.Delete,
-                            contentDescription = "Delete variant",
-                            tint = Color.White.copy(alpha = 0.8f),
-                        )
-                    }
-                }
-
-                IconButton(onClick = onActions) {
-                    Icon(
-                        Icons.Default.MoreVert,
-                        contentDescription = "Organize this shot",
-                        tint = Color.White,
-                    )
-                }
-            }
-        }
-
-        // Bottom gradient + timestamp
-        if (timestamp != null) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .align(Alignment.BottomCenter)
-                    .background(
-                        Brush.verticalGradient(
-                            colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.6f)),
-                        )
-                    )
-                    .navigationBarsPadding()
-                    .padding(16.dp),
-            ) {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = timestamp,
-                    style = MaterialTheme.typography.bodySmall,
+                    text = personName ?: "Unsorted",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = Color.White,
+                )
+                Text(
+                    text = buildString {
+                        append("shot ")
+                        append(shotIndex + 1)
+                        append(" / ")
+                        append(shotCount)
+                        if (fileCount > 1) {
+                            append(" · variant ")
+                            append(fileIndex + 1)
+                            append(" / ")
+                            append(fileCount)
+                        }
+                    },
+                    style = MonoSmall,
                     color = Color.White.copy(alpha = 0.8f),
                 )
             }
+
+            if (!isOriginal) {
+                OverlayChip(text = "del", onClick = onDeleteVariant, color = c.error)
+            }
+            OverlayChip(text = "⋮", onClick = onActions)
         }
+
+        if (timestamp != null) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .navigationBarsPadding()
+                    .padding(16.dp)
+                    .background(Color.Black.copy(alpha = 0.4f), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                Text(text = timestamp, style = MonoSmall, color = Color.White.copy(alpha = 0.8f))
+            }
+        }
+    }
+}
+
+/**
+ * A control on top of a photo: a small solid ground rather than a gradient over
+ * the whole edge, so the picture keeps its corners.
+ */
+@Composable
+private fun OverlayChip(
+    text: String,
+    onClick: () -> Unit,
+    color: Color = Color.White,
+) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .background(Color.Black.copy(alpha = 0.4f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(text = text, style = MonoSmall, color = color)
     }
 }

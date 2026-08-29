@@ -1,7 +1,13 @@
 <script setup>
+/**
+ * Duplicates lane — one group at a time: a primary shot and the near-duplicates
+ * the similarity search paired with it. Selected candidates merge into the
+ * primary; unselected pairs are remembered as deliberately distinct.
+ */
 import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { Check, X, Merge, Layers } from 'lucide-vue-next'
+
+const emit = defineEmits(['changed'])
 
 const router = useRouter()
 const groups = ref([])
@@ -10,8 +16,8 @@ const loading = ref(true)
 const totalGroups = ref(0)
 const pageOffset = ref(0)
 const pageLimit = 50
+const handled = ref(0)
 
-// For the current group, track which candidates are selected for merge
 const selectedCandidates = ref(new Set())
 
 const currentGroup = computed(() => groups.value[currentIndex.value] || null)
@@ -60,11 +66,12 @@ function toggleCandidate(id) {
   } else {
     selectedCandidates.value.add(id)
   }
+  // Set mutations are not reactive on their own.
+  selectedCandidates.value = new Set(selectedCandidates.value)
 }
 
 function setAsPrimary(candidate) {
   if (!currentGroup.value) return
-  // Move current primary to candidates
   const oldPrimary = currentGroup.value.primary
   currentGroup.value.primary = candidate
   currentGroup.value.candidates = currentGroup.value.candidates.filter(c => c.id !== candidate.id)
@@ -75,8 +82,7 @@ function setAsPrimary(candidate) {
 async function handleMerge() {
   if (!currentGroup.value) return
   const primaryId = currentGroup.value.primary.id
-  
-  // Merge selected
+
   for (const c of currentGroup.value.candidates) {
     if (selectedCandidates.value.has(c.id)) {
       await fetch('/api/shots/merge', {
@@ -85,7 +91,6 @@ async function handleMerge() {
         body: JSON.stringify({ source_id: c.id, target_id: primaryId })
       })
     } else {
-      // Ignore unselected
       await fetch('/api/shots/merge/ignore', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -93,6 +98,7 @@ async function handleMerge() {
       })
     }
   }
+  emit('changed')
   nextGroup()
 }
 
@@ -106,15 +112,17 @@ async function handleIgnoreAll() {
       body: JSON.stringify({ shot_id_1: primaryId, shot_id_2: c.id })
     })
   }
+  emit('changed')
   nextGroup()
 }
 
 function nextGroup() {
+  handled.value++
   currentIndex.value++
   initSelection()
   if (currentIndex.value >= groups.value.length) {
     if (pageOffset.value < totalGroups.value) {
-      fetchGroups(true) // fetch next batch, appending
+      fetchGroups(true)
     }
   }
 }
@@ -129,88 +137,93 @@ function handleKeydown(e) {
 }
 
 function viewShot(id) {
-  window.open(`/shot/${id}`, '_blank')
+  router.push(`/shot/${id}`)
 }
+
+defineExpose({ loadData: () => fetchGroups() })
 </script>
 
 <template>
-  <div class="h-full flex flex-col bg-black text-white">
-    <header class="h-14 border-b border-white/10 flex items-center justify-between px-6 shrink-0">
-      <div class="flex items-center gap-4">
-        <h1 class="text-lg font-medium tracking-tight">Variations Queue</h1>
-        <span v-if="!loading && groups.length > 0" class="text-sm text-zinc-500">
-          Group {{ currentIndex + 1 }} of {{ totalGroups }}
-        </span>
-      </div>
-      <div class="flex items-center gap-3 text-sm text-zinc-400">
-        <span class="flex items-center gap-1"><kbd class="bg-zinc-800 px-1.5 py-0.5 rounded text-xs border border-zinc-700">Enter</kbd> Merge Selected</span>
-        <span class="flex items-center gap-1"><kbd class="bg-zinc-800 px-1.5 py-0.5 rounded text-xs border border-zinc-700">Esc</kbd> Ignore All</span>
-      </div>
-    </header>
+  <div class="flex flex-col flex-1 min-h-0 overflow-y-auto">
+    <div v-if="loading" class="flex-1 flex items-center justify-center py-16">
+      <span class="font-mono text-xs text-ink-tertiary">
+        finding similar shots <span class="text-building signal-pulse">●</span>
+      </span>
+    </div>
 
-    <div class="flex-1 flex flex-col min-h-0">
-      <div v-if="loading" class="flex flex-1 items-center justify-center text-zinc-500">
-        Finding similar shots...
+    <div v-else-if="!currentGroup" class="flex-1 flex flex-col items-center justify-center gap-2 p-16 text-center">
+      <span class="signal-dot" style="width:10px;height:10px;background:var(--status-ready)"></span>
+      <div class="font-heading text-base font-semibold text-ink">No duplicate groups left</div>
+      <div class="text-[13px] font-light text-ink-secondary">Similarity search runs after every scan.</div>
+    </div>
+
+    <div v-else class="flex-1 p-4 md:p-8 flex flex-col gap-6 max-w-[1040px] w-full mx-auto">
+      <div class="flex items-baseline justify-between gap-4">
+        <div class="text-[13px] font-light text-ink-secondary">
+          Selected shots merge into the primary; unselected pairs are remembered as distinct.
+        </div>
+        <div class="font-mono text-xs text-ink-tertiary whitespace-nowrap">
+          group {{ currentIndex + 1 }} / {{ totalGroups }}
+        </div>
       </div>
-      <div v-else-if="groups.length === 0" class="flex flex-col flex-1 items-center justify-center text-zinc-500 gap-4">
-        <Layers class="w-12 h-12 text-zinc-700" />
-        <p>No similar groups found.</p>
-        <button @click="router.push('/')" class="text-indigo-400 hover:text-indigo-300">Back to Library</button>
-      </div>
-      <template v-else-if="currentGroup">
-        <!-- Primary + actions bar -->
-        <div class="shrink-0 flex items-center gap-6 px-6 py-4 border-b border-white/10">
-          <div class="relative rounded-lg overflow-hidden border border-indigo-500/50 shadow-[0_0_15px_rgba(99,102,241,0.2)] bg-zinc-900 cursor-pointer shrink-0" @click="viewShot(currentGroup.primary.id)">
-            <img :src="currentGroup.primary.thumbnail_url" class="h-32 object-contain" />
-            <div class="absolute top-2 left-2 bg-indigo-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shadow flex items-center gap-1">
-              <Layers class="w-3 h-3" />
-              Primary
-            </div>
-          </div>
-          <div class="flex flex-col gap-2">
-            <span class="text-sm text-zinc-400">{{ currentGroup.primary.file_count }} files</span>
-            <button @click="handleMerge" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-lg shadow transition-colors flex items-center gap-2">
-              <Merge class="w-4 h-4" />
-              Merge {{ selectedCandidates.size }} into Primary
-            </button>
-            <button @click="handleIgnoreAll" class="text-xs text-zinc-500 hover:text-zinc-300 transition-colors text-left">
-              Keep All Separate
-            </button>
-          </div>
+
+      <div class="flex flex-col md:flex-row gap-6 items-start">
+        <div class="flex-none flex flex-col gap-2">
+          <button
+            class="w-[280px] max-w-full aspect-[4/3] bg-surface border rounded overflow-hidden flex items-center justify-center relative p-0"
+            style="border-color: var(--accent-muted)"
+            @click="viewShot(currentGroup.primary.id)"
+          >
+            <img :src="currentGroup.primary.thumbnail_url" class="w-full h-full object-contain" />
+            <span class="tag absolute top-2 left-2 bg-base" style="color: var(--accent); border-color: var(--accent-muted)">Primary</span>
+          </button>
+          <div class="font-mono text-[11px] text-ink-tertiary">{{ currentGroup.primary.file_count }} files</div>
         </div>
 
-        <!-- Candidates grid — takes all remaining space and scrolls -->
-        <div class="flex-1 min-h-0 overflow-y-auto p-6">
-          <div class="grid gap-4" style="grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));">
-            <div
-              v-for="candidate in currentGroup.candidates"
-              :key="candidate.id"
-              class="relative rounded-lg border transition-all duration-200 cursor-pointer bg-zinc-900 flex flex-col"
-              :class="selectedCandidates.has(candidate.id) ? 'border-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.3)]' : 'border-white/10 opacity-60 hover:opacity-100'"
+        <div class="flex-1 grid gap-4 w-full" style="grid-template-columns: repeat(auto-fill, minmax(160px, 1fr))">
+          <div v-for="candidate in currentGroup.candidates" :key="candidate.id" class="flex flex-col gap-1">
+            <button
+              class="aspect-[4/3] bg-surface border rounded overflow-hidden flex items-center justify-center relative p-0 transition-opacity"
+              :class="selectedCandidates.has(candidate.id) ? 'border-signal opacity-100' : 'border-line opacity-50'"
               @click="toggleCandidate(candidate.id)"
             >
-              <div class="overflow-hidden rounded-t-lg">
-                <img :src="candidate.thumbnail_url" class="w-full aspect-[4/3] object-cover" />
-              </div>
-
-              <div class="absolute top-2 left-2 flex items-center justify-center w-6 h-6 rounded-full border-2"
-                   :class="selectedCandidates.has(candidate.id) ? 'bg-indigo-500 border-indigo-500 text-white' : 'bg-black/50 border-white/30 text-transparent'">
-                <Check class="w-4 h-4" v-if="selectedCandidates.has(candidate.id)" />
-              </div>
-
-              <div class="p-2.5 border-t border-white/10 text-xs flex justify-between items-center gap-2">
-                <span class="text-zinc-400 whitespace-nowrap">{{ candidate.file_count }} files</span>
-                <button
-                  @click.stop="setAsPrimary(candidate)"
-                  class="text-indigo-400 hover:text-indigo-300 font-medium whitespace-nowrap"
-                >
-                  Make Primary
-                </button>
-              </div>
+              <img :src="candidate.thumbnail_url" class="w-full h-full object-cover" />
+              <span
+                class="absolute top-2 left-2 w-3.5 h-3.5 rounded-sm border flex items-center justify-center text-[10px]"
+                :class="selectedCandidates.has(candidate.id)
+                  ? 'bg-signal border-signal text-signal-fg'
+                  : 'bg-base border-line-strong text-transparent'"
+              >✓</span>
+            </button>
+            <div class="flex justify-between items-center gap-2">
+              <span class="font-mono text-[11px] text-ink-tertiary">{{ candidate.file_count }} files</span>
+              <button
+                class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+                @click.stop="setAsPrimary(candidate)"
+              >make primary</button>
             </div>
           </div>
         </div>
-      </template>
+      </div>
+
+      <div class="flex flex-wrap gap-2 border-t border-line pt-4">
+        <button
+          class="bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors"
+          @click="handleMerge"
+        >
+          Merge {{ selectedCandidates.size }} into primary
+          <kbd class="ml-1 font-mono text-[10px] border rounded-sm px-1" style="border-color: oklch(15% 0.01 80 / .3)">⏎</kbd>
+        </button>
+        <button
+          class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors"
+          @click="handleIgnoreAll"
+        >
+          Keep all separate
+          <kbd class="ml-1 kbd-ab">esc</kbd>
+        </button>
+        <span class="flex-1"></span>
+        <span v-if="handled" class="font-mono text-[11px] text-ink-tertiary self-center">{{ handled }} groups handled this session</span>
+      </div>
     </div>
   </div>
 </template>

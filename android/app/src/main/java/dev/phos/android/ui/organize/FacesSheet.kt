@@ -1,23 +1,17 @@
 package dev.phos.android.ui.organize
 
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ListItem
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -25,6 +19,10 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
 import dev.phos.android.domain.model.Face
+import dev.phos.android.ui.common.PhosColors
+import dev.phos.android.ui.common.PhosSheet
+import dev.phos.android.ui.common.PhosSheetHeader
+import dev.phos.android.ui.common.PhosSheetRow
 
 /**
  * The faces detected in the shot on screen.
@@ -44,67 +42,49 @@ fun FacesSheet(
     onDismiss: () -> Unit,
     onPick: (Face) -> Unit,
 ) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    val c = PhosColors.current
+
+    PhosSheet(onDismiss = onDismiss) {
+        PhosSheetHeader(
+            title = when {
+                isLoading -> "Faces"
+                faces.isEmpty() -> "No faces here"
+                faces.size == 1 -> "1 face in this shot"
+                else -> "${faces.size} faces in this shot"
+            },
+            subtitle = if (faces.isEmpty() && !isLoading) {
+                "The detector found nobody in this shot."
+            } else {
+                "Tap a face to say who it is, or to drop a wrong detection."
+            },
+            onDismiss = onDismiss,
+        )
+
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .navigationBarsPadding()
-                .padding(horizontal = 16.dp),
+                .navigationBarsPadding(),
         ) {
-            Text(
-                text = when {
-                    isLoading -> "Faces"
-                    faces.isEmpty() -> "No faces here"
-                    faces.size == 1 -> "1 face in this shot"
-                    else -> "${faces.size} faces in this shot"
-                },
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                text = if (faces.isEmpty() && !isLoading) {
-                    "The detector found nobody in this shot."
-                } else {
-                    "Tap a face to say who it is, or to drop a wrong detection."
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(8.dp))
-
-            if (isLoading) {
-                ListItem(
-                    leadingContent = {
-                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                    },
-                    headlineContent = { Text("Looking for faces…") },
-                )
-            }
+            if (isLoading) CenteredNotice("looking for faces…")
 
             LazyColumn(modifier = Modifier.heightIn(max = 400.dp)) {
                 items(faces, key = { it.id }) { face ->
-                    ListItem(
-                        leadingContent = {
+                    PhosSheetRow(
+                        label = face.personName ?: "unassigned",
+                        labelColor = if (face.personId == null) c.signal else c.textPrimary,
+                        meta = if (face.personId == null) "unknown" else "tap to correct",
+                        leading = {
                             AsyncImage(
                                 model = faceThumbnailUrl(face.id),
                                 contentDescription = null,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier
-                                    .size(48.dp)
-                                    .clip(RoundedCornerShape(8.dp)),
+                                    .size(40.dp)
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .border(1.dp, c.line, RoundedCornerShape(4.dp)),
                             )
                         },
-                        headlineContent = { Text(face.personName ?: "Unassigned") },
-                        supportingContent = {
-                            Text(
-                                if (face.personId == null) {
-                                    "Nobody claimed this face yet"
-                                } else {
-                                    "Tap to correct or remove"
-                                }
-                            )
-                        },
-                        modifier = Modifier.clickable { onPick(face) },
+                        onClick = { onPick(face) },
                     )
                 }
             }

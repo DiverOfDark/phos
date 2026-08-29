@@ -20,28 +20,16 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -57,8 +45,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import coil3.compose.AsyncImage
+import androidx.compose.ui.draw.clip
 import dev.phos.android.domain.model.Face
 import dev.phos.android.domain.model.ShotDetail
+import dev.phos.android.ui.common.MonoSmall
+import dev.phos.android.ui.common.PhosColors
+import dev.phos.android.ui.common.PhosDivider
+import dev.phos.android.ui.common.PhosMonoText
+import dev.phos.android.ui.common.PhosOutlinedButton
+import dev.phos.android.ui.common.PhosPrimaryButton
+import dev.phos.android.ui.common.PhosTag
+import dev.phos.android.ui.common.PhosTopBar
+import dev.phos.android.ui.common.SignalDot
 import dev.phos.android.ui.organize.PersonPickerSheet
 import dev.phos.android.ui.organize.SplitSheet
 
@@ -93,74 +91,86 @@ fun ReviewScreen(
         viewModel.consumeMessage()
     }
 
+    val c = PhosColors.current
+
     Scaffold(
+        containerColor = c.base,
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("Review")
+            Box {
+                PhosTopBar {
+                    Text(
+                        text = "←",
+                        style = MonoSmall,
+                        color = c.textSecondary,
+                        modifier = Modifier
+                            .clickable(onClick = onBack)
+                            .padding(8.dp),
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Review",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = c.textPrimary,
+                        )
                         if (!uiState.isLoading) {
-                            Text(
+                            PhosMonoText(
                                 text = if (uiState.isEmpty) {
-                                    "Nothing pending"
+                                    "nothing pending"
                                 } else {
                                     "${uiState.remaining} left" +
                                         if (uiState.reviewed > 0) " · ${uiState.reviewed} done" else ""
                                 },
-                                style = MaterialTheme.typography.bodySmall,
                             )
                         }
                     }
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                    }
-                },
-                actions = {
                     if (!uiState.isEmpty) {
-                        IconButton(onClick = { showOverflow = true }, enabled = !uiState.busy) {
-                            Icon(Icons.Default.MoreVert, contentDescription = "More actions")
-                        }
-                        DropdownMenu(
-                            expanded = showOverflow,
-                            onDismissRequest = { showOverflow = false },
-                        ) {
-                            DropdownMenuItem(
-                                text = { Text("Previous shot") },
-                                onClick = {
-                                    showOverflow = false
-                                    viewModel.previous()
-                                },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Leave unsorted") },
-                                onClick = {
-                                    showOverflow = false
-                                    viewModel.markUnsorted()
-                                },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Split shot") },
-                                enabled = (uiState.detail?.files?.size ?: 0) > 1,
-                                onClick = {
-                                    showOverflow = false
-                                    showSplit = true
-                                },
-                            )
-                            DropdownMenuItem(
-                                text = {
-                                    Text("Delete shot", color = MaterialTheme.colorScheme.error)
-                                },
-                                onClick = {
-                                    showOverflow = false
-                                    showDeleteConfirm = true
-                                },
-                            )
-                        }
+                        Text(
+                            text = "⋮",
+                            style = MonoSmall,
+                            color = c.textSecondary,
+                            modifier = Modifier
+                                .clickable(enabled = !uiState.busy) { showOverflow = true }
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                        )
                     }
-                },
-            )
+                }
+                DropdownMenu(
+                    expanded = showOverflow,
+                    onDismissRequest = { showOverflow = false },
+                    modifier = Modifier.align(Alignment.TopEnd),
+                    containerColor = c.overlay,
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Previous shot", color = c.textPrimary) },
+                        onClick = {
+                            showOverflow = false
+                            viewModel.previous()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Leave unsorted", color = c.textPrimary) },
+                        onClick = {
+                            showOverflow = false
+                            viewModel.markUnsorted()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Split shot", color = c.textPrimary) },
+                        enabled = (uiState.detail?.files?.size ?: 0) > 1,
+                        onClick = {
+                            showOverflow = false
+                            showSplit = true
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Delete shot", color = c.error) },
+                        onClick = {
+                            showOverflow = false
+                            showDeleteConfirm = true
+                        },
+                    )
+                }
+            }
         },
         // The verdict buttons are the Scaffold's bottom bar, not the last row of
         // the content: a snackbar hosted by the Scaffold is laid out above the
@@ -186,36 +196,68 @@ fun ReviewScreen(
                 .fillMaxSize()
                 .padding(innerPadding),
         ) {
-            if (uiState.busy) {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-            }
+            // A hairline that fills while work is in flight — the design's one
+            // progress affordance, and it never moves the layout.
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(if (uiState.busy) c.signal else c.line),
+            )
 
             when {
-                uiState.isLoading -> Centered { CircularProgressIndicator() }
+                uiState.isLoading -> Centered {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        SignalDot(color = c.building, size = 6.dp, pulsing = true)
+                        PhosMonoText("loading queue…", color = c.textSecondary)
+                    }
+                }
 
                 uiState.error != null -> Centered {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(uiState.error!!, style = MaterialTheme.typography.bodyMedium)
-                        Spacer(Modifier.height(12.dp))
-                        OutlinedButton(onClick = viewModel::load) { Text("Try again") }
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        SignalDot(color = c.error, size = 10.dp)
+                        Text(
+                            text = "Could not load the queue",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = c.textPrimary,
+                        )
+                        PhosMonoText(uiState.error!!, color = c.error, maxLines = 3)
+                        PhosOutlinedButton(onClick = viewModel::load) {
+                            Text("Try again", style = MaterialTheme.typography.bodySmall, color = c.textSecondary)
+                        }
                     }
                 }
 
                 uiState.isEmpty -> Centered {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("Everything is reviewed.", style = MaterialTheme.typography.titleMedium)
-                        Spacer(Modifier.height(4.dp))
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(32.dp),
+                    ) {
+                        SignalDot(color = c.ready, size = 10.dp)
                         Text(
-                            if (uiState.reviewed > 0) {
-                                "You cleared ${uiState.reviewed} shot(s) this session."
+                            text = "Everything is reviewed",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = c.textPrimary,
+                        )
+                        Text(
+                            text = if (uiState.reviewed > 0) {
+                                "${uiState.reviewed} shots cleared this session."
                             } else {
                                 "Nothing is waiting on you."
                             },
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = c.textSecondary,
                         )
-                        Spacer(Modifier.height(12.dp))
-                        OutlinedButton(onClick = viewModel::load) { Text("Check again") }
+                        PhosOutlinedButton(onClick = viewModel::load) {
+                            Text("Check again", style = MaterialTheme.typography.bodySmall, color = c.textSecondary)
+                        }
                     }
                 }
 
@@ -285,12 +327,13 @@ fun ReviewScreen(
                 onDismissRequest = { showDeleteConfirm = false },
                 title = { Text("Delete shot?") },
                 text = { Text("Every file in it is deleted from the server. Can't be undone.") },
+                containerColor = c.overlay,
                 confirmButton = {
                     TextButton(onClick = {
                         showDeleteConfirm = false
                         viewModel.deleteShot()
                     }) {
-                        Text("Delete", color = MaterialTheme.colorScheme.error)
+                        Text("Delete", color = c.error)
                     }
                 },
                 dismissButton = {
@@ -310,27 +353,32 @@ private fun ReviewBody(
     onFaceTap: (Face) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val c = PhosColors.current
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp),
+            .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Spacer(Modifier.height(8.dp))
-
         // The shot's own file, not the queue thumbnail: the face boxes are in this
         // image's coordinates and have to land on the picture the user is judging.
         val file = detail?.files?.firstOrNull { it.isOriginal } ?: detail?.files?.firstOrNull()
+        val isVideo = file?.mimeType?.startsWith("video/") == true
 
-        Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(4.dp))
+                .background(c.surface)
+                .border(1.dp, c.line, RoundedCornerShape(4.dp)),
+            contentAlignment = Alignment.Center,
+        ) {
             when {
-                isLoadingDetail && detail == null -> CircularProgressIndicator()
+                isLoadingDetail && detail == null -> PhosMonoText("loading shot…", color = c.textTertiary)
 
-                file == null -> Text(
-                    "This shot has no files.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                file == null -> PhosMonoText("this shot has no files", color = c.textTertiary)
 
                 else -> {
                     val faces = detail!!.faces.filter { it.fileId == file.id }
@@ -373,33 +421,43 @@ private fun ReviewBody(
                     }
                 }
             }
+
+            if (isVideo) {
+                PhosTag(
+                    text = "Video",
+                    color = c.building,
+                    background = c.base,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(8.dp),
+                )
+            }
         }
 
-        Spacer(Modifier.height(8.dp))
-
-        Text(
-            text = detail?.primaryPersonName ?: guessedName ?: "Unassigned",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Medium,
-        )
-        Text(
-            text = buildString {
-                append(if (detail?.faces.isNullOrEmpty()) "No faces detected" else "${detail?.faces?.size} face(s)")
-                val extra = detail?.alsoContains.orEmpty()
-                if (extra.isNotEmpty()) append(" · also ${extra.joinToString()}")
-                if ((detail?.files?.size ?: 0) > 1) append(" · ${detail?.files?.size} files")
-            },
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        if (detail != null && detail.faces.isNotEmpty()) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
-                "Tap a face to say who it is.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                text = detail?.primaryPersonName ?: guessedName ?: "Unsorted",
+                style = MaterialTheme.typography.titleSmall,
+                color = c.textPrimary,
             )
+            PhosMonoText(
+                text = buildString {
+                    append(if (detail?.faces.isNullOrEmpty()) "no faces detected" else "${detail?.faces?.size} face(s)")
+                    val extra = detail?.alsoContains.orEmpty()
+                    if (extra.isNotEmpty()) append(" · also ${extra.joinToString()}")
+                    if ((detail?.files?.size ?: 0) > 1) append(" · ${detail?.files?.size} files")
+                },
+                modifier = Modifier.padding(top = 2.dp),
+            )
+            if (detail != null && detail.faces.isNotEmpty()) {
+                Text(
+                    text = "Tap a face to say who it is.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = c.textSecondary,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
         }
-        Spacer(Modifier.height(8.dp))
     }
 }
 
@@ -409,27 +467,23 @@ private fun FaceBox(
     onTap: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val c = PhosColors.current
     // Assigned faces are outlined quietly; an unassigned one is the thing the
-    // reviewer is here to fix, so it gets the accent colour.
-    val color = if (face.personId == null) {
-        MaterialTheme.colorScheme.tertiary
-    } else {
-        Color.White
-    }
+    // reviewer is here to fix, so it gets the signal colour.
+    val color = if (face.personId == null) c.signal else Color.White.copy(alpha = 0.7f)
     Box(
         modifier = modifier
             .border(BorderStroke(2.dp, color), RoundedCornerShape(4.dp))
             .clickable(onClick = onTap),
         contentAlignment = Alignment.BottomStart,
     ) {
-        val label = face.personName ?: "?"
         Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            color = Color.White,
+            text = face.personName ?: "?",
+            style = MonoSmall,
+            color = c.textPrimary,
             modifier = Modifier
-                .background(Color.Black.copy(alpha = 0.55f))
-                .padding(horizontal = 4.dp),
+                .background(Color.Black.copy(alpha = 0.6f))
+                .padding(horizontal = 4.dp, vertical = 1.dp),
         )
     }
 }
@@ -441,28 +495,33 @@ private fun ActionBar(
     onMove: () -> Unit,
     onConfirm: () -> Unit,
 ) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            // As a bottom bar it is placed against the screen edge, so the gesture
-            // bar inset is its own to add — the content padding no longer covers it.
-            .navigationBarsPadding()
-            .padding(16.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        OutlinedButton(onClick = onSkip, enabled = !busy) {
-            Icon(Icons.Default.SkipNext, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(4.dp))
-            Text("Skip")
-        }
-        OutlinedButton(onClick = onMove, enabled = !busy, modifier = Modifier.weight(1f)) {
-            Text("Someone else")
-        }
-        Button(onClick = onConfirm, enabled = !busy, modifier = Modifier.weight(1f)) {
-            Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(4.dp))
-            Text("Correct")
+    val c = PhosColors.current
+    Column {
+        PhosDivider()
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(c.base)
+                // As a bottom bar it is placed against the screen edge, so the gesture
+                // bar inset is its own to add — the content padding no longer covers it.
+                .navigationBarsPadding()
+                .padding(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            PhosOutlinedButton(onClick = onSkip, enabled = !busy) {
+                Text("Skip", style = MaterialTheme.typography.bodySmall, color = c.textSecondary)
+            }
+            PhosOutlinedButton(onClick = onMove, enabled = !busy, modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Someone else",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = c.textSecondary,
+                )
+            }
+            PhosPrimaryButton(onClick = onConfirm, enabled = !busy, modifier = Modifier.weight(1f)) {
+                Text("Correct", style = MaterialTheme.typography.labelLarge, color = c.signalFg)
+            }
         }
     }
 }

@@ -2,9 +2,8 @@
 import { ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAuth } from '@/composables/useAuth'
-import { Button } from '@/components/ui/button'
-import { LogIn, AlertCircle } from 'lucide-vue-next'
 
+const version = __PHOS_VERSION__
 const route = useRoute()
 const { login } = useAuth()
 
@@ -12,38 +11,38 @@ const error = ref(route.query.error || '')
 </script>
 
 <template>
-  <div class="min-h-screen bg-zinc-950 flex items-center justify-center p-4">
-    <div class="w-full max-w-sm space-y-8 text-center">
-      <!-- Logo -->
-      <div class="flex flex-col items-center gap-3">
-        <div class="w-16 h-16 bg-indigo-600 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
-          <span class="text-white font-black text-3xl">P</span>
+  <div class="min-h-screen flex items-center justify-center p-4 bg-base">
+    <div class="w-[360px] max-w-full flex flex-col gap-6">
+      <div class="flex items-center gap-4">
+        <img src="/phos.svg" alt="Phos" class="w-10 h-10 rounded" />
+        <div>
+          <div class="font-heading text-[22px] font-bold tracking-[-0.01em] text-ink">Phos</div>
+          <div class="font-mono text-xs text-ink-tertiary">media console</div>
         </div>
-        <h1 class="text-2xl font-bold text-white tracking-tight">Phos</h1>
-        <p class="text-sm text-zinc-500">Sign in to access your photo library</p>
       </div>
 
-      <!-- Error -->
-      <div
-        v-if="error"
-        class="flex items-start gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-left"
-      >
-        <AlertCircle class="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
-        <p class="text-sm text-red-400">{{ error }}</p>
+      <div class="card-ab p-6 flex flex-col gap-4">
+        <div class="text-[13px] font-light text-ink-secondary">
+          Sign in to your library. Authentication is handled by your identity provider.
+        </div>
+
+        <div v-if="error" class="flex items-center gap-2 font-mono text-xs text-error">
+          <span class="signal-dot" style="width:6px;height:6px;background:var(--status-error)"></span>
+          {{ error }}
+        </div>
+
+        <button
+          class="bg-signal text-signal-fg rounded px-4 py-2.5 text-sm font-medium hover:bg-signal-hover transition-colors"
+          @click="login"
+        >Continue with SSO</button>
+
+        <div class="flex items-center gap-2 font-mono text-xs text-ink-tertiary">
+          <span class="signal-dot" style="width:6px;height:6px;background:var(--status-ready)"></span>
+          oidc
+        </div>
       </div>
 
-      <!-- Sign in button -->
-      <Button
-        class="w-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/20 rounded-xl gap-2 h-12 text-base"
-        @click="login"
-      >
-        <LogIn class="w-5 h-5" />
-        Sign in with SSO
-      </Button>
-
-      <p class="text-[10px] text-zinc-600 font-bold tracking-[0.2em] uppercase">
-        Phos v0.1.0-alpha
-      </p>
+      <div class="font-mono text-xs text-ink-tertiary">phos {{ version }} · self-hosted</div>
     </div>
   </div>
 </template>

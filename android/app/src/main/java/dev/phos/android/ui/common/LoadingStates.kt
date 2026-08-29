@@ -6,7 +6,9 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -43,11 +45,10 @@ fun ShimmerBox(
         label = "shimmer_translate",
     )
 
-    val shimmerColors = listOf(
-        Color.LightGray.copy(alpha = 0.6f),
-        Color.LightGray.copy(alpha = 0.2f),
-        Color.LightGray.copy(alpha = 0.6f),
-    )
+    // A placeholder is a surface, not a highlight: it stays inside the
+    // background stack so a loading grid reads as empty, not as lit up.
+    val c = PhosColors.current
+    val shimmerColors = listOf(c.surface, c.raised, c.surface)
 
     val brush = Brush.linearGradient(
         colors = shimmerColors,
@@ -57,21 +58,24 @@ fun ShimmerBox(
 
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
+            .clip(RoundedCornerShape(4.dp))
             .background(brush)
     )
 }
 
 @Composable
-fun FullScreenLoading(message: String = "Loading...") {
+fun FullScreenLoading(message: String = "loading…") {
+    val c = PhosColors.current
     Box(
         modifier = Modifier.fillMaxSize(),
         contentAlignment = Alignment.Center,
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CircularProgressIndicator()
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(text = message, style = MaterialTheme.typography.bodyMedium)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            SignalDot(color = c.building, size = 6.dp, pulsing = true)
+            Text(text = message, style = MonoBody, color = c.textSecondary)
         }
     }
 }
@@ -81,16 +85,24 @@ fun ErrorBanner(
     message: String,
     modifier: Modifier = Modifier,
 ) {
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.errorContainer)
-            .padding(12.dp),
-    ) {
-        Text(
-            text = message,
-            color = MaterialTheme.colorScheme.onErrorContainer,
-            style = MaterialTheme.typography.bodySmall,
+    val c = PhosColors.current
+    Column(modifier = modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(c.surface)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            SignalDot(color = c.error, size = 6.dp)
+            Text(text = message, color = c.error, style = MaterialTheme.typography.bodySmall)
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(c.error),
         )
     }
 }

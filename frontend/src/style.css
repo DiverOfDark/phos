@@ -1,120 +1,303 @@
 @import "tailwindcss";
 @plugin "tailwindcss-animate";
 
+/* AppBahn Design System — Bauhaus Engineering.
+   Dark is the default; light is supported via data-theme="light".
+   Everything below is a remap of Tailwind's scale onto the AppBahn tokens, so
+   existing utility classes render in the system instead of the stock palette. */
+
 @custom-variant dark (&:is(.dark *));
 
-@theme {
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-card: var(--card);
-  --color-card-foreground: var(--card-foreground);
-  --color-popover: var(--popover);
-  --color-popover-foreground: var(--popover-foreground);
-  --color-primary: var(--primary);
-  --color-primary-foreground: var(--primary-foreground);
-  --color-secondary: var(--secondary);
-  --color-secondary-foreground: var(--secondary-foreground);
-  --color-muted: var(--muted);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-accent: var(--accent);
-  --color-accent-foreground: var(--accent-foreground);
-  --color-destructive: var(--destructive);
+:root,
+:root[data-theme="dark"] {
+  --bg-base:      oklch(13% 0.01 260);
+  --bg-surface:   oklch(17% 0.008 260);
+  --bg-raised:    oklch(22% 0.008 80);
+  --bg-overlay:   oklch(25% 0.01 260);
+
+  --text-primary:   oklch(93% 0.005 80);
+  --text-secondary: oklch(65% 0.01 260);
+  --text-tertiary:  oklch(50% 0.01 260);
+
+  --accent:       oklch(80% 0.16 80);
+  --accent-hover: oklch(85% 0.18 80);
+  --accent-muted: oklch(45% 0.08 80);
+  --accent-fg:    oklch(15% 0.01 80);
+
+  --status-ready:    oklch(70% 0.14 145);
+  --status-degraded: oklch(75% 0.14 80);
+  --status-error:    oklch(65% 0.18 25);
+  --status-pending:  oklch(65% 0.10 260);
+  --status-stopped:  oklch(50% 0.01 260);
+  --status-building: oklch(70% 0.12 260);
+
+  --border:        oklch(25% 0.005 260);
+  --border-strong: oklch(35% 0.005 260);
+
+  --shadow-float: 0 8px 24px -4px oklch(0% 0 0 / 0.45),
+                  0 2px 6px -2px oklch(0% 0 0 / 0.35);
+
+  --scrim: oklch(0% 0 0 / 0.5);
+}
+
+:root[data-theme="light"] {
+  --bg-base:      oklch(97% 0.005 80);
+  --bg-surface:   oklch(95% 0.005 80);
+  --bg-raised:    oklch(92% 0.008 80);
+  --bg-overlay:   oklch(100% 0 0);
+
+  --text-primary:   oklch(20% 0.01 260);
+  --text-secondary: oklch(40% 0.01 260);
+  --text-tertiary:  oklch(55% 0.01 260);
+
+  --accent:       oklch(65% 0.16 80);
+  --accent-hover: oklch(60% 0.18 80);
+  --accent-muted: oklch(88% 0.06 80);
+  --accent-fg:    oklch(98% 0 0);
+
+  --border:        oklch(88% 0.005 260);
+  --border-strong: oklch(75% 0.005 260);
+
+  --shadow-float: 0 8px 24px -4px oklch(0% 0 0 / 0.12),
+                  0 2px 6px -2px oklch(0% 0 0 / 0.08);
+
+  --scrim: oklch(0% 0 0 / 0.25);
+}
+
+@theme inline {
+  /* Type — Geist headings, Inter body, JetBrains Mono for data */
+  --font-sans:    'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-heading: 'Geist Variable', 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono:    'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* Radii — nothing above 4px; inputs 2px. rounded-full stays for status dots. */
+  --radius-xs:   2px;
+  --radius-sm:   2px;
+  --radius-md:   4px;
+  --radius-lg:   4px;
+  --radius-xl:   4px;
+  --radius-2xl:  4px;
+  --radius-3xl:  4px;
+  --radius-4xl:  4px;
+
+  /* Shadows — one float style, used only on floating surfaces. */
+  --shadow-2xs: none;
+  --shadow-xs:  none;
+  --shadow-sm:  none;
+  --shadow-md:  none;
+  --shadow-lg:  var(--shadow-float);
+  --shadow-xl:  var(--shadow-float);
+  --shadow-2xl: var(--shadow-float);
+
+  /* Neutrals map onto the 4-layer background stack + 3-step text ramp. */
+  --color-zinc-950: var(--bg-base);
+  --color-zinc-900: var(--bg-surface);
+  --color-zinc-800: var(--bg-raised);
+  --color-zinc-700: var(--border-strong);
+  --color-zinc-600: var(--text-tertiary);
+  --color-zinc-500: var(--text-tertiary);
+  --color-zinc-400: var(--text-secondary);
+  --color-zinc-300: var(--text-secondary);
+  --color-zinc-200: var(--text-primary);
+  --color-zinc-100: var(--text-primary);
+  --color-zinc-50:  var(--text-primary);
+  --color-white:    var(--text-primary);
+  --color-black:    oklch(0% 0 0);
+
+  /* Accent — signal amber. */
+  --color-indigo-300: var(--accent-hover);
+  --color-indigo-400: var(--accent);
+  --color-indigo-500: var(--accent);
+  --color-indigo-600: var(--accent);
+  --color-indigo-700: var(--accent-muted);
+  --color-indigo-900: var(--accent-muted);
+  --color-violet-400: var(--accent);
+  --color-violet-500: var(--accent);
+
+  /* Status — the only other colors in the system. */
+  --color-emerald-300: var(--status-ready);
+  --color-emerald-400: var(--status-ready);
+  --color-emerald-500: var(--status-ready);
+  --color-emerald-600: var(--status-ready);
+  --color-green-400:   var(--status-ready);
+  --color-green-500:   var(--status-ready);
+
+  --color-red-300: var(--status-error);
+  --color-red-400: var(--status-error);
+  --color-red-500: var(--status-error);
+  --color-red-600: var(--status-error);
+  --color-red-700: var(--status-error);
+  --color-rose-400: var(--status-error);
+  --color-rose-500: var(--status-error);
+
+  --color-yellow-300: var(--status-degraded);
+  --color-yellow-400: var(--status-degraded);
+  --color-yellow-500: var(--status-degraded);
+  --color-amber-300:  var(--status-degraded);
+  --color-amber-400:  var(--status-degraded);
+  --color-amber-500:  var(--status-degraded);
+  --color-orange-400: var(--status-degraded);
+  --color-orange-500: var(--status-degraded);
+
+  --color-blue-400:   var(--status-building);
+  --color-blue-500:   var(--status-building);
+  --color-sky-400:    var(--status-building);
+  --color-cyan-400:   var(--status-building);
+  --color-purple-300: var(--status-building);
+  --color-purple-400: var(--status-building);
+  --color-purple-500: var(--status-building);
+  --color-fuchsia-400: var(--status-building);
+  --color-pink-400:   var(--status-building);
+
+  /* Semantic aliases used by the shadcn primitives. */
+  --color-background: var(--bg-base);
+  --color-foreground: var(--text-primary);
+  --color-card: var(--bg-surface);
+  --color-card-foreground: var(--text-primary);
+  --color-popover: var(--bg-overlay);
+  --color-popover-foreground: var(--text-primary);
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--accent-fg);
+  --color-secondary: var(--bg-raised);
+  --color-secondary-foreground: var(--text-primary);
+  --color-muted: var(--bg-raised);
+  --color-muted-foreground: var(--text-secondary);
+  --color-accent: var(--bg-raised);
+  --color-accent-foreground: var(--text-primary);
+  --color-destructive: var(--status-error);
+  --color-destructive-foreground: var(--text-primary);
   --color-border: var(--border);
-  --color-input: var(--input);
-  --color-ring: var(--ring);
-  --color-chart-1: var(--chart-1);
-  --color-chart-2: var(--chart-2);
-  --color-chart-3: var(--chart-3);
-  --color-chart-4: var(--chart-4);
-  --color-chart-5: var(--chart-5);
-  --color-sidebar: var(--sidebar);
-  --color-sidebar-foreground: var(--sidebar-foreground);
-  --color-sidebar-primary: var(--sidebar-primary);
-  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
-  --color-sidebar-accent: var(--sidebar-accent);
-  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
-  --color-sidebar-border: var(--sidebar-border);
-  --color-sidebar-ring: var(--sidebar-ring);
-}
+  --color-input: var(--border);
+  --color-ring: var(--accent);
+  --color-sidebar: var(--bg-surface);
+  --color-sidebar-foreground: var(--text-primary);
+  --color-sidebar-primary: var(--accent);
+  --color-sidebar-primary-foreground: var(--accent-fg);
+  --color-sidebar-accent: var(--bg-raised);
+  --color-sidebar-accent-foreground: var(--text-primary);
+  --color-sidebar-border: var(--border);
+  --color-sidebar-ring: var(--accent);
 
-:root {
-  --radius: 0.625rem;
-  --background: 255 255 255;
-  --foreground: 37 37 37;
-  --card: 255 255 255;
-  --card-foreground: 37 37 37;
-  --popover: 255 255 255;
-  --popover-foreground: 37 37 37;
-  --primary: 52 52 52;
-  --primary-foreground: 251 251 251;
-  --secondary: 247 247 247;
-  --secondary-foreground: 52 52 52;
-  --muted: 247 247 247;
-  --muted-foreground: 142 142 142;
-  --accent: 247 247 247;
-  --accent-foreground: 52 52 52;
-  --destructive: 239 68 68;
-  --border: 235 235 235;
-  --input: 235 235 235;
-  --ring: 180 180 180;
-  --chart-1: 231 111 81;
-  --chart-2: 42 157 143;
-  --chart-3: 38 70 83;
-  --chart-4: 233 196 106;
-  --chart-5: 244 162 97;
-  --sidebar: 251 251 251;
-  --sidebar-foreground: 37 37 37;
-  --sidebar-primary: 52 52 52;
-  --sidebar-primary-foreground: 251 251 251;
-  --sidebar-accent: 247 247 247;
-  --sidebar-accent-foreground: 52 52 52;
-  --sidebar-border: 235 235 235;
-  --sidebar-ring: 180 180 180;
-}
-
-.dark {
-  --background: 37 37 37;
-  --foreground: 251 251 251;
-  --card: 52 52 52;
-  --card-foreground: 251 251 251;
-  --popover: 52 52 52;
-  --popover-foreground: 251 251 251;
-  --primary: 235 235 235;
-  --primary-foreground: 52 52 52;
-  --secondary: 68 68 68;
-  --secondary-foreground: 251 251 251;
-  --muted: 68 68 68;
-  --muted-foreground: 180 180 180;
-  --accent: 68 68 68;
-  --accent-foreground: 251 251 251;
-  --destructive: 239 68 68;
-  --border: 255 255 255 / 0.1;
-  --input: 255 255 255 / 0.15;
-  --ring: 142 142 142;
-  --chart-1: 38 70 83;
-  --chart-2: 42 157 143;
-  --chart-3: 233 196 106;
-  --chart-4: 244 162 97;
-  --chart-5: 231 111 81;
-  --sidebar: 52 52 52;
-  --sidebar-foreground: 251 251 251;
-  --sidebar-primary: 38 70 83;
-  --sidebar-primary-foreground: 251 251 251;
-  --sidebar-accent: 68 68 68;
-  --sidebar-accent-foreground: 251 251 251;
-  --sidebar-border: 255 255 255 / 0.1;
-  --sidebar-ring: 142 142 142;
+  --color-signal:          var(--accent);
+  --color-signal-hover:    var(--accent-hover);
+  --color-signal-muted:    var(--accent-muted);
+  --color-signal-fg:       var(--accent-fg);
+  --color-base:            var(--bg-base);
+  --color-surface:         var(--bg-surface);
+  --color-raised:          var(--bg-raised);
+  --color-overlay:         var(--bg-overlay);
+  --color-ink:             var(--text-primary);
+  --color-ink-secondary:   var(--text-secondary);
+  --color-ink-tertiary:    var(--text-tertiary);
+  --color-line:            var(--border);
+  --color-line-strong:     var(--border-strong);
+  --color-ready:           var(--status-ready);
+  --color-degraded:        var(--status-degraded);
+  --color-error:           var(--status-error);
+  --color-pending:         var(--status-pending);
+  --color-stopped:         var(--status-stopped);
+  --color-building:        var(--status-building);
 }
 
 @layer base {
   * {
-    @apply border-border outline-ring/50;
+    border-color: var(--border);
   }
-  body {
-    @apply bg-background text-foreground;
+  html, body {
+    background: var(--bg-base);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    font-weight: 400;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
+  h1, h2, h3, h4, h5 {
+    font-family: var(--font-heading);
+    line-height: 1.2;
+    color: var(--text-primary);
+  }
+  h1 { letter-spacing: -0.02em }
+  h2 { letter-spacing: -0.015em }
+  h3 { letter-spacing: -0.01em }
+  /* Tailwind v4 dropped Preflight's `button { cursor: pointer }`, so every
+     button in the app inherits the arrow. Anything that acts on a click says so
+     under the pointer; anything switched off says that too. */
+  button,
+  summary,
+  label[for],
+  [role="button"],
+  [role="tab"],
+  [role="option"] {
+    cursor: pointer;
+  }
+  button:disabled,
+  [aria-disabled="true"],
+  [role="button"]:disabled {
+    cursor: not-allowed;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  ::selection { background: var(--accent-muted) }
+  input, textarea, select, button { font-family: inherit }
+  input::placeholder, textarea::placeholder { color: var(--text-tertiary) }
+}
+
+@layer components {
+  /* Railway-schedule register: uppercase mono labels. */
+  .label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  /* A status tag: UPPERCASE mono in an outlined 2px box. */
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    border: 1px solid currentColor;
+    border-radius: 2px;
+    padding: 1px 6px;
+    line-height: 1.4;
+  }
+  /* The whole card recipe: 1px border, 4px radius, surface fill, no shadow. */
+  .card-ab {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+  .signal-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: none;
+    display: inline-block;
+  }
+  /* Signal analog: "this is waiting". The only animation besides 120ms hovers. */
+  .signal-pulse { animation: ab-pulse 1.4s ease infinite }
+  .kbd-ab {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 2px;
+    padding: 0 5px;
+    background: var(--bg-base);
+    color: var(--text-tertiary);
+  }
+}
+
+@keyframes ab-pulse {
+  0%, 100% { opacity: 1 }
+  50%      { opacity: .35 }
 }

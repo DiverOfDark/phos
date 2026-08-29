@@ -1,19 +1,14 @@
 <script setup>
-import { ref, computed, watch } from 'vue'
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from '@/components/ui/dialog'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import { Check, SkipForward, Search } from 'lucide-vue-next'
+/**
+ * Faces lane — name an unnamed cluster, or merge it into a person who already
+ * has a name. Renders inline inside the Review Desk; the dialog form is kept for
+ * callers that still open it as a modal.
+ */
+import { ref, computed, watch, onMounted } from 'vue'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
+  inline: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['update:open', 'changed'])
@@ -32,6 +27,7 @@ const newName = ref('')
 const mergeFilter = ref('')
 const loading = ref(false)
 const done = ref(false)
+const handled = ref(0)
 
 const currentPerson = computed(() => unnamedPeople.value[currentIndex.value] || null)
 
@@ -47,19 +43,25 @@ const filteredNamedPeople = computed(() => {
   return namedPeople.value.filter((p) => p.name && p.name.toLowerCase().includes(q))
 })
 
-watch(dialogOpen, async (isOpen) => {
-  if (isOpen) {
-    currentIndex.value = 0
-    done.value = false
-    newName.value = ''
-    mergeFilter.value = ''
-    await fetchPeople()
-    if (unnamedPeople.value.length > 0) {
-      await fetchFaces(unnamedPeople.value[0].id)
-    } else {
-      done.value = true
-    }
+async function start() {
+  currentIndex.value = 0
+  done.value = false
+  newName.value = ''
+  mergeFilter.value = ''
+  await fetchPeople()
+  if (unnamedPeople.value.length > 0) {
+    await fetchFaces(unnamedPeople.value[0].id)
+  } else {
+    done.value = true
   }
+}
+
+watch(dialogOpen, async (isOpen) => {
+  if (isOpen) await start()
+})
+
+onMounted(() => {
+  if (props.inline) start()
 })
 
 async function fetchPeople() {
@@ -100,9 +102,9 @@ async function namePerson() {
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
 
-    // Add to named list
     namedPeople.value.push({ ...currentPerson.value, name })
     newName.value = ''
+    handled.value++
     emit('changed')
     await advance()
   } catch (e) {
@@ -124,11 +126,11 @@ async function mergePerson(targetId) {
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
 
-    // Remove merged person from unnamed list
     unnamedPeople.value.splice(currentIndex.value, 1)
+    handled.value++
     emit('changed')
 
-    // Don't advance index since we removed the current item
+    // The splice already moved the next cluster into this index.
     if (currentIndex.value >= unnamedPeople.value.length) {
       done.value = true
     } else {
@@ -153,129 +155,184 @@ async function advance() {
     await fetchFaces(unnamedPeople.value[nextIdx].id)
   }
 }
+
+defineExpose({ loadData: start })
 </script>
 
 <template>
-  <Dialog v-model:open="dialogOpen">
-    <DialogContent class="sm:max-w-[520px] max-h-[85vh] overflow-hidden flex flex-col">
-      <DialogHeader>
-        <DialogTitle>Name People</DialogTitle>
-        <DialogDescription>
-          Identify detected faces by naming them or merging with existing people.
-        </DialogDescription>
-      </DialogHeader>
+  <!-- Inline: the Review Desk's Faces lane -->
+  <div v-if="inline" class="flex flex-col flex-1 min-h-0 overflow-y-auto">
+    <div v-if="loading" class="flex-1 flex items-center justify-center py-16">
+      <span class="font-mono text-xs text-ink-tertiary">loading clusters…</span>
+    </div>
 
-      <!-- Done state -->
-      <div v-if="done" class="flex flex-col items-center justify-center py-12 space-y-4">
-        <div class="w-16 h-16 rounded-full bg-emerald-500/10 flex items-center justify-center">
-          <Check class="w-8 h-8 text-emerald-500" />
+    <div v-else-if="done" class="flex-1 flex flex-col items-center justify-center gap-2 p-16 text-center">
+      <span class="signal-dot" style="width:10px;height:10px;background:var(--status-ready)"></span>
+      <div class="font-heading text-base font-semibold text-ink">Every cluster has a name</div>
+      <div class="text-[13px] font-light text-ink-secondary">
+        New clusters appear here when unknown faces are detected.
+      </div>
+    </div>
+
+    <div v-else-if="currentPerson" class="flex-1 p-4 md:p-8 flex flex-col gap-6 max-w-[800px] w-full mx-auto">
+      <div class="flex items-baseline justify-between gap-4">
+        <div class="text-[13px] font-light text-ink-secondary">
+          Name this cluster, or merge it into an existing person if it is the same face.
         </div>
-        <p class="text-lg font-semibold text-white">All done!</p>
-        <p class="text-sm text-zinc-400">All people have been reviewed.</p>
-        <Button @click="dialogOpen = false" class="bg-indigo-600 hover:bg-indigo-500 text-white">
-          Close
-        </Button>
+        <div class="font-mono text-xs text-ink-tertiary whitespace-nowrap">
+          cluster/{{ currentPerson.id }} · {{ faces.length }} faces
+        </div>
       </div>
 
-      <!-- Loading -->
-      <div v-else-if="loading" class="flex items-center justify-center py-12">
-        <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+      <div class="flex flex-wrap gap-2">
+        <div
+          v-for="face in faces"
+          :key="face.id"
+          class="w-[72px] h-[72px] rounded bg-raised border border-line overflow-hidden flex items-center justify-center"
+        >
+          <img :src="face.thumbnail_url" class="w-full h-full object-cover" loading="lazy" />
+        </div>
+        <div v-if="faces.length === 0" class="font-mono text-xs text-ink-tertiary py-4">
+          no face thumbnails available
+        </div>
       </div>
 
-      <!-- Wizard content -->
-      <div v-else-if="currentPerson" class="flex flex-col gap-4 min-h-0">
-        <!-- Progress -->
-        <div class="flex items-center justify-between text-sm">
-          <span class="text-zinc-400">
-            {{ progress.current }} of {{ progress.total }} unnamed people
-          </span>
-          <Button variant="ghost" size="sm" class="text-zinc-400 hover:text-white gap-1" @click="skip">
-            <SkipForward class="w-3.5 h-3.5" />
-            Skip
-          </Button>
-        </div>
-        <div class="w-full bg-zinc-800 h-1 rounded-full overflow-hidden">
-          <div
-            class="bg-indigo-500 h-full transition-all duration-300"
-            :style="{ width: `${(progress.current / progress.total) * 100}%` }"
-          ></div>
-        </div>
+      <div class="flex gap-2">
+        <input
+          v-model="newName"
+          placeholder="Type a name…"
+          spellcheck="false"
+          class="flex-1 bg-surface border border-line rounded-sm px-3 py-2.5 text-sm text-ink"
+          @keydown.enter="namePerson"
+        />
+        <button
+          class="bg-signal text-signal-fg rounded px-6 py-2.5 text-sm font-medium hover:bg-signal-hover transition-colors disabled:opacity-40"
+          :disabled="!newName.trim()"
+          @click="namePerson"
+        >Name</button>
+        <button
+          class="border border-line-strong rounded px-4 py-2.5 text-[13px] text-ink-secondary hover:text-signal transition-colors"
+          @click="skip"
+        >Skip</button>
+      </div>
 
-        <!-- Face thumbnails -->
-        <div class="flex flex-wrap gap-2 justify-center">
+      <div v-if="namedPeople.length > 0" class="flex flex-col gap-2">
+        <div class="label">Same person as</div>
+        <input
+          v-model="mergeFilter"
+          placeholder="Search people…"
+          spellcheck="false"
+          class="bg-base border border-line rounded-sm px-3 py-2 text-[13px] text-ink"
+        />
+        <div class="card-ab overflow-hidden">
+          <button
+            v-for="person in filteredNamedPeople"
+            :key="person.id"
+            class="flex items-center gap-2 w-full px-4 py-2 border-b border-line hover:bg-raised transition-colors text-left"
+            @click="mergePerson(person.id)"
+          >
+            <span class="w-6 h-6 rounded bg-raised border border-line overflow-hidden flex items-center justify-center font-mono text-[11px] text-ink-tertiary shrink-0">
+              <img v-if="person.thumbnail_url" :src="person.thumbnail_url" class="w-full h-full object-cover" />
+              <template v-else>{{ (person.name || '?')[0] }}</template>
+            </span>
+            <span class="flex-1 text-[13px] text-ink truncate">{{ person.name }}</span>
+            <span class="font-mono text-[11px] text-ink-tertiary">{{ person.face_count }} faces</span>
+          </button>
+          <p v-if="filteredNamedPeople.length === 0" class="font-mono text-[11px] text-ink-tertiary text-center py-3">
+            no matching people
+          </p>
+        </div>
+      </div>
+
+      <div class="font-mono text-[11px] text-ink-tertiary">
+        {{ progress.current }} / {{ progress.total }} unnamed clusters<span v-if="handled"> · {{ handled }} handled this session</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal form, for callers that still open this as a dialog -->
+  <div
+    v-else-if="dialogOpen"
+    class="fixed inset-0 z-50 flex items-center justify-center p-4"
+    style="background: var(--scrim)"
+    @click="dialogOpen = false"
+  >
+    <div
+      class="w-[520px] max-w-full max-h-[85vh] bg-overlay border border-line-strong rounded shadow-lg flex flex-col overflow-hidden"
+      @click.stop
+    >
+      <div class="flex items-center justify-between px-6 py-4 border-b border-line">
+        <div class="font-heading text-base font-semibold text-ink">Name face clusters</div>
+        <button class="font-mono text-[13px] text-ink-tertiary hover:text-signal" @click="dialogOpen = false">✕</button>
+      </div>
+
+      <div v-if="done" class="flex flex-col items-center justify-center gap-2 py-12 px-6 text-center">
+        <span class="signal-dot" style="width:10px;height:10px;background:var(--status-ready)"></span>
+        <div class="font-heading text-base font-semibold text-ink">Every cluster has a name</div>
+        <button
+          class="mt-2 bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors"
+          @click="dialogOpen = false"
+        >Close</button>
+      </div>
+
+      <div v-else-if="loading" class="py-12 text-center font-mono text-xs text-ink-tertiary">loading clusters…</div>
+
+      <div v-else-if="currentPerson" class="p-6 flex flex-col gap-4 overflow-y-auto min-h-0">
+        <div class="font-mono text-[11px] text-ink-tertiary">
+          {{ progress.current }} / {{ progress.total }} unnamed clusters
+        </div>
+        <div class="flex flex-wrap gap-2">
           <div
             v-for="face in faces"
             :key="face.id"
-            class="w-16 h-16 rounded-lg overflow-hidden border border-white/10 bg-zinc-800"
+            class="w-16 h-16 rounded bg-raised border border-line overflow-hidden"
           >
-            <img
-              :src="face.thumbnail_url"
-              class="w-full h-full object-cover"
-              loading="lazy"
-            />
-          </div>
-          <div
-            v-if="faces.length === 0"
-            class="text-sm text-zinc-500 py-4"
-          >
-            No face thumbnails available
+            <img :src="face.thumbnail_url" class="w-full h-full object-cover" loading="lazy" />
           </div>
         </div>
-
-        <!-- Name input -->
         <div class="flex gap-2">
-          <Input
+          <input
             v-model="newName"
-            placeholder="Type a name..."
-            class="flex-1"
+            placeholder="Type a name…"
+            spellcheck="false"
+            class="flex-1 bg-base border border-line rounded-sm px-3 py-2 text-sm text-ink"
             @keydown.enter="namePerson"
           />
-          <Button
-            @click="namePerson"
+          <button
+            class="bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors disabled:opacity-40"
             :disabled="!newName.trim()"
-            class="bg-indigo-600 hover:bg-indigo-500 text-white shrink-0"
-          >
-            Name
-          </Button>
+            @click="namePerson"
+          >Name</button>
+          <button
+            class="border border-line-strong rounded px-3 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors"
+            @click="skip"
+          >Skip</button>
         </div>
-
-        <!-- Merge section -->
         <div v-if="namedPeople.length > 0" class="flex flex-col gap-2 min-h-0">
-          <p class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Or merge with existing person</p>
-          <div class="relative">
-            <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500" />
-            <Input
-              v-model="mergeFilter"
-              placeholder="Filter people..."
-              class="pl-9 h-8 text-sm"
-            />
+          <div class="label">Same person as</div>
+          <input
+            v-model="mergeFilter"
+            placeholder="Search people…"
+            spellcheck="false"
+            class="bg-base border border-line rounded-sm px-3 py-2 text-[13px] text-ink"
+          />
+          <div class="card-ab overflow-y-auto max-h-40">
+            <button
+              v-for="person in filteredNamedPeople"
+              :key="person.id"
+              class="flex items-center gap-2 w-full px-3 py-2 border-b border-line hover:bg-raised transition-colors text-left"
+              @click="mergePerson(person.id)"
+            >
+              <span class="w-6 h-6 rounded bg-raised border border-line overflow-hidden flex items-center justify-center font-mono text-[11px] text-ink-tertiary shrink-0">
+                <img v-if="person.thumbnail_url" :src="person.thumbnail_url" class="w-full h-full object-cover" />
+                <template v-else>{{ (person.name || '?')[0] }}</template>
+              </span>
+              <span class="flex-1 text-[13px] text-ink truncate">{{ person.name }}</span>
+              <span class="font-mono text-[11px] text-ink-tertiary">{{ person.face_count }} faces</span>
+            </button>
           </div>
-          <ScrollArea class="max-h-40 rounded-lg border border-white/5">
-            <div class="p-1 space-y-0.5">
-              <button
-                v-for="person in filteredNamedPeople"
-                :key="person.id"
-                @click="mergePerson(person.id)"
-                class="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left hover:bg-white/5 transition-colors group"
-              >
-                <div class="w-8 h-8 rounded-full bg-zinc-800 border border-white/10 overflow-hidden flex items-center justify-center shrink-0">
-                  <img
-                    v-if="person.thumbnail_url"
-                    :src="person.thumbnail_url"
-                    class="w-full h-full object-cover"
-                  />
-                  <span v-else class="text-xs font-bold text-zinc-500">{{ (person.name || '?')[0] }}</span>
-                </div>
-                <span class="text-sm text-zinc-300 group-hover:text-white truncate">{{ person.name }}</span>
-                <span class="text-xs text-zinc-600 ml-auto shrink-0">{{ person.face_count }} faces</span>
-              </button>
-              <p v-if="filteredNamedPeople.length === 0" class="text-xs text-zinc-500 text-center py-3">
-                No matching people
-              </p>
-            </div>
-          </ScrollArea>
         </div>
       </div>
-    </DialogContent>
-  </Dialog>
+    </div>
+  </div>
 </template>

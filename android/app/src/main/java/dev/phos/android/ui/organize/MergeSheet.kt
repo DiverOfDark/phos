@@ -12,12 +12,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.border
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ListItem
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -31,6 +28,10 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
 import dev.phos.android.domain.model.SimilarShot
+import dev.phos.android.ui.common.PhosColors
+import dev.phos.android.ui.common.PhosSheet
+import dev.phos.android.ui.common.PhosSheetHeader
+import dev.phos.android.ui.common.PhosSheetRow
 
 /**
  * "Is one of these the same picture?"
@@ -53,54 +54,45 @@ fun MergeSheet(
     onMerge: (sourceShotId: String) -> Unit,
 ) {
     var pending by remember { mutableStateOf<SimilarShot?>(null) }
+    val c = PhosColors.current
 
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    PhosSheet(onDismiss = onDismiss) {
+        PhosSheetHeader(
+            title = "Merge into this shot",
+            subtitle = "The shot you pick is absorbed and deleted.",
+            onDismiss = onDismiss,
+        )
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .navigationBarsPadding()
-                .padding(horizontal = 16.dp),
+                .navigationBarsPadding(),
         ) {
-            SheetHeader(
-                title = "Merge into this shot",
-                subtitle = "The shot you pick is absorbed: its files move here and it " +
-                    "is deleted. This shot keeps its original.",
-            )
-
             when {
-                isLoading -> Column(modifier = Modifier.fillMaxWidth().padding(24.dp)) {
-                    CircularProgressIndicator()
-                }
+                isLoading -> CenteredNotice("finding similar shots…")
 
-                candidates.isEmpty() -> CenteredNotice("Nothing similar enough to merge.")
+                candidates.isEmpty() -> CenteredNotice("nothing similar enough to merge")
 
                 else -> LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
                     items(candidates, key = { it.id }) { candidate ->
-                        ListItem(
-                            leadingContent = {
+                        PhosSheetRow(
+                            label = candidate.personName ?: "unsorted",
+                            // Distance is the whole basis of the suggestion, so it
+                            // is shown rather than hidden behind "similar".
+                            meta = "${candidate.fileCount} file(s) · " +
+                                if (candidate.distance == 0) "identical" else "Δ ${candidate.distance}",
+                            metaColor = if (candidate.distance == 0) c.ready else c.textTertiary,
+                            leading = {
                                 AsyncImage(
                                     model = thumbnailUrl(candidate.thumbnailUrl),
                                     contentDescription = null,
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier
-                                        .size(56.dp)
-                                        .clip(RoundedCornerShape(6.dp)),
+                                        .size(48.dp)
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .border(1.dp, c.line, RoundedCornerShape(4.dp)),
                                 )
                             },
-                            headlineContent = {
-                                Text(candidate.personName ?: "Unassigned")
-                            },
-                            supportingContent = {
-                                Text(
-                                    "${candidate.fileCount} file(s) · " +
-                                        if (candidate.distance == 0) {
-                                            "identical"
-                                        } else {
-                                            "distance ${candidate.distance}"
-                                        }
-                                )
-                            },
-                            modifier = Modifier.clickable(enabled = !isBusy) { pending = candidate },
+                            onClick = { if (!isBusy) pending = candidate },
                         )
                     }
                 }
@@ -114,6 +106,7 @@ fun MergeSheet(
     if (target != null) {
         AlertDialog(
             onDismissRequest = { pending = null },
+            containerColor = c.overlay,
             title = { Text("Merge and delete?") },
             text = {
                 Text(
@@ -129,7 +122,7 @@ fun MergeSheet(
                         onMerge(target.id)
                     },
                 ) {
-                    Text("Merge", color = MaterialTheme.colorScheme.error)
+                    Text("Merge", color = c.error)
                 }
             },
             dismissButton = {

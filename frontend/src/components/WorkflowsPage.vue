@@ -1,30 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { cn } from '@/lib/utils'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import {
-  Wand2,
-  Plus,
-  Trash2,
-  RefreshCw,
-  Check,
-  AlertCircle,
-  X,
-  ChevronRight,
-  Clock,
-  RotateCcw,
-  ExternalLink,
-  FileJson,
-  ChevronDown,
-  ChevronUp,
-  Pencil,
-  Save,
-} from 'lucide-vue-next'
+import WorkflowGraph from '@/components/WorkflowGraph.vue'
 
 // --- Connection health ---
 const comfyuiHealthy = ref(false)
@@ -59,6 +36,11 @@ async function fetchWorkflows() {
     const res = await fetch('/api/comfyui/workflows')
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     workflows.value = await res.json()
+    // Land on something: an empty detail pane says nothing about the workflows.
+    if (!selectedWorkflowId.value && workflows.value.length) {
+      selectedWorkflowId.value = workflows.value[0].id
+      fetchPresets(selectedWorkflowId.value)
+    }
   } catch (e) {
     console.error('Failed to fetch workflows', e)
   } finally {
@@ -138,9 +120,6 @@ async function importWorkflow() {
     importing.value = false
   }
 }
-
-// --- JSON viewer toggle ---
-const showRawJson = ref(false)
 
 // ===== PRESETS =====
 const presets = ref([])
@@ -358,21 +337,32 @@ async function deleteTask(taskId) {
   }
 }
 
-function statusBadgeClass(status) {
+function statusColor(status) {
   switch (status) {
-    case 'completed':
-      return 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-    case 'failed':
-      return 'bg-red-500/10 text-red-400 border-red-500/20'
-    case 'running':
-      return 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20'
-    case 'cancelled':
-      return 'bg-zinc-500/10 text-zinc-400 border-zinc-500/20'
-    case 'pending':
-    default:
-      return 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20'
+    case 'completed': return 'var(--status-ready)'
+    case 'failed': return 'var(--status-error)'
+    case 'running': return 'var(--status-building)'
+    case 'cancelled': return 'var(--status-stopped)'
+    default: return 'var(--status-degraded)'
   }
 }
+
+/** Task ids are long; the queue shows the first 7, like a commit. */
+function shortId(id) {
+  return String(id || '').slice(0, 7)
+}
+
+/** Text inputs of a workflow — LoadImage is fed by the shot, never by hand. */
+function textInputsOf(wf) {
+  return (wf?.inputs || []).filter(i => i.node_type !== 'LoadImage')
+}
+
+const importReady = computed(() => importName.value.trim() && importJson.value.trim())
+
+/** Node ids the Enhance dialog can override — the graph marks them as editable. */
+const editableNodeIds = computed(() =>
+  textInputsOf(selectedWorkflow.value).map((i) => String(i.node_id))
+)
 
 function formatRelativeTime(dateStr) {
   if (!dateStr) return ''
@@ -420,490 +410,348 @@ onMounted(() => {
 onUnmounted(() => {
   stopTaskPolling()
 })
+
+defineExpose({ loadData: fetchWorkflows })
 </script>
 
 <template>
-  <div class="space-y-6">
-    <!-- Header -->
-    <div class="flex items-center justify-between gap-4">
-      <div class="flex items-center gap-3">
-        <div class="w-10 h-10 rounded-xl bg-indigo-600/10 border border-indigo-500/20 flex items-center justify-center">
-          <Wand2 class="w-5 h-5 text-indigo-400" />
-        </div>
-        <div>
-          <h2 class="text-xl font-bold text-white">Workflows</h2>
-          <p class="text-zinc-500 text-xs mt-0.5">ComfyUI workflow management</p>
-        </div>
-      </div>
-
-      <!-- Connection status -->
-      <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-800/50 border border-white/5">
-        <div
-          :class="cn(
-            'w-2 h-2 rounded-full',
-            healthChecking ? 'bg-zinc-500 animate-pulse' : comfyuiHealthy ? 'bg-emerald-500' : 'bg-red-500'
-          )"
-        />
-        <span class="text-xs font-medium text-zinc-400">
-          {{ healthChecking ? 'Checking...' : comfyuiHealthy ? 'Connected' : 'Disconnected' }}
-        </span>
+  <div class="p-4 md:p-8 max-w-[1040px] w-full mx-auto flex flex-col gap-6">
+    <div class="flex flex-wrap items-baseline justify-between gap-4">
+      <h2 class="text-[22px] font-semibold">Workflows</h2>
+      <div class="flex items-center gap-2 font-mono text-xs text-ink-tertiary">
+        <span
+          class="signal-dot"
+          style="width:6px;height:6px"
+          :style="{ background: healthChecking ? 'var(--status-pending)' : comfyuiHealthy ? 'var(--status-ready)' : 'var(--status-error)' }"
+        ></span>
+        comfyui · {{ healthChecking ? 'checking' : comfyuiHealthy ? 'reachable' : 'unreachable' }}
       </div>
     </div>
 
+    <div class="text-[13px] font-light text-ink-secondary max-w-[560px]">
+      Imported ComfyUI workflows run on demand — open a shot and use
+      <span class="font-normal text-ink">Enhance</span>. Results attach to the shot as a new file.
+    </div>
+
     <!-- Tabs -->
-    <Tabs :model-value="activeTab" @update:model-value="onTabChange">
-      <TabsList class="grid w-full grid-cols-2 max-w-xs">
-        <TabsTrigger value="workflows">Workflows</TabsTrigger>
-        <TabsTrigger value="queue">Queue</TabsTrigger>
-      </TabsList>
+    <div class="flex items-center gap-1 border-b border-line">
+      <button
+        v-for="t in [
+          { id: 'workflows', label: 'Workflows', count: workflows.length },
+          { id: 'queue', label: 'Queue', count: tasks.length },
+        ]"
+        :key="t.id"
+        class="flex items-center gap-2 px-3 py-2 border-b-2 text-[13px] transition-colors"
+        :class="activeTab === t.id
+          ? 'border-signal text-ink font-medium'
+          : 'border-transparent text-ink-secondary hover:text-ink'"
+        @click="onTabChange(t.id)"
+      >
+        {{ t.label }}
+        <span class="font-mono text-[11px] text-ink-tertiary">{{ t.count }}</span>
+      </button>
+    </div>
 
-      <!-- ===== WORKFLOWS TAB ===== -->
-      <TabsContent value="workflows" class="mt-6">
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <!-- Left column: Workflow list -->
-          <div class="lg:col-span-1 space-y-3">
-            <div class="flex items-center justify-between">
-              <h3 class="text-sm font-semibold text-zinc-300">Available Workflows</h3>
-              <Button
-                variant="ghost"
-                size="sm"
-                class="gap-1.5 text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10"
-                @click="openImportForm"
-              >
-                <Plus class="w-3.5 h-3.5" />
-                Import
-              </Button>
-            </div>
+    <!-- Workflows tab -->
+    <div v-if="activeTab === 'workflows'" class="grid gap-6 items-start lg:grid-cols-[320px_minmax(0,1fr)]">
+      <div class="flex flex-col gap-2">
+        <button
+          v-for="wf in workflows"
+          :key="wf.id"
+          class="flex flex-col gap-1 p-4 border rounded text-left transition-colors"
+          :class="selectedWorkflowId === wf.id && !showImportForm
+            ? 'border-signal bg-surface'
+            : 'border-line hover:bg-raised'"
+          @click="showImportForm = false; selectedWorkflowId = wf.id"
+        >
+          <span class="font-mono text-[13px] font-medium text-ink">{{ wf.name }}</span>
+          <span v-if="wf.description" class="text-xs font-light text-ink-secondary">{{ wf.description }}</span>
+          <span class="font-mono text-[11px] text-ink-tertiary">
+            {{ textInputsOf(wf).length }} input(s) · {{ (wf.outputs || []).length }} output(s)
+          </span>
+        </button>
 
-            <!-- Loading -->
-            <div v-if="loadingWorkflows" class="flex items-center justify-center py-8">
-              <RefreshCw class="w-5 h-5 text-indigo-400 animate-spin" />
-            </div>
+        <div v-if="loadingWorkflows" class="font-mono text-xs text-ink-tertiary px-1">loading workflows…</div>
 
-            <!-- Workflow cards -->
-            <div v-else-if="workflows.length" class="space-y-2">
-              <button
-                v-for="wf in workflows"
-                :key="wf.id"
-                class="w-full text-left p-3 rounded-xl border transition-all group/wf"
-                :class="selectedWorkflowId === wf.id && !showImportForm
-                  ? 'bg-indigo-600/10 border-indigo-500/20'
-                  : 'bg-zinc-800/30 border-white/5 hover:border-white/10 hover:bg-zinc-800/50'"
-                @click="showImportForm = false; selectedWorkflowId = wf.id"
-              >
-                <div class="flex items-start justify-between gap-2">
-                  <div class="min-w-0 flex-1">
-                    <p class="text-sm font-medium text-zinc-200 truncate">{{ wf.name }}</p>
-                    <p v-if="wf.description" class="text-xs text-zinc-500 mt-0.5 line-clamp-2">{{ wf.description }}</p>
-                  </div>
-                  <button
-                    class="p-1 rounded text-zinc-600 hover:text-red-400 hover:bg-red-500/10 transition-colors opacity-0 group-hover/wf:opacity-100 shrink-0"
-                    @click.stop="deleteWorkflow(wf.id)"
-                  >
-                    <Trash2 class="w-3.5 h-3.5" />
-                  </button>
-                </div>
+        <button
+          class="px-4 py-3 border border-dashed border-line-strong rounded text-[13px] text-ink-secondary hover:text-signal transition-colors text-left"
+          @click="openImportForm"
+        >+ Import workflow</button>
+      </div>
 
-                <div class="flex items-center gap-2 mt-2">
-                  <span
-                    v-if="wf.outputs?.length"
-                    class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
-                  >
-                    {{ wf.outputs[0].node_type || 'output' }}
-                  </span>
-                  <span v-if="wf.inputs?.length" class="text-[10px] text-zinc-500">
-                    {{ wf.inputs.length }} input{{ wf.inputs.length !== 1 ? 's' : '' }}
-                  </span>
-                  <span class="text-[10px] text-zinc-600 ml-auto">{{ formatDate(wf.created_at) }}</span>
-                </div>
-              </button>
-            </div>
-
-            <!-- Empty state -->
-            <div v-else class="text-center py-8">
-              <Wand2 class="w-8 h-8 text-zinc-700 mx-auto mb-2" />
-              <p class="text-sm text-zinc-500">No workflows yet</p>
-              <p class="text-xs text-zinc-600 mt-1">Import a ComfyUI workflow to get started.</p>
-            </div>
-          </div>
-
-          <!-- Right column: Detail or Import panel -->
-          <div class="lg:col-span-2">
-            <!-- Import form -->
-            <div v-if="showImportForm" class="rounded-xl bg-zinc-800/30 border border-white/5 p-6 space-y-4">
-              <div class="flex items-center justify-between">
-                <h3 class="text-sm font-semibold text-zinc-200">Import Workflow</h3>
-                <button class="text-zinc-500 hover:text-white transition-colors" @click="showImportForm = false">
-                  <X class="w-4 h-4" />
-                </button>
-              </div>
-
-              <div class="space-y-2">
-                <Label>Name</Label>
-                <Input v-model="importName" placeholder="My Upscale Workflow" class="bg-zinc-900/50 border-white/10" />
-              </div>
-
-              <div class="space-y-2">
-                <Label>Description</Label>
-                <textarea
-                  v-model="importDescription"
-                  rows="2"
-                  placeholder="Optional description..."
-                  class="flex w-full rounded-lg border border-white/10 bg-zinc-900/50 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 focus-visible:ring-offset-0 resize-y"
-                />
-              </div>
-
-              <div class="space-y-2">
-                <Label>Workflow JSON</Label>
-                <textarea
-                  v-model="importJson"
-                  rows="15"
-                  placeholder='Paste your ComfyUI workflow JSON here...'
-                  class="flex w-full rounded-lg border border-white/10 bg-zinc-900/50 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 focus-visible:ring-offset-0 resize-y font-mono text-xs"
-                />
-              </div>
-
-              <!-- Feedback -->
-              <div v-if="importError" class="flex items-start gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/20">
-                <AlertCircle class="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
-                <p class="text-sm text-red-400">{{ importError }}</p>
-              </div>
-              <div v-if="importSuccess" class="flex items-start gap-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
-                <Check class="w-4 h-4 text-emerald-500 mt-0.5 shrink-0" />
-                <p class="text-sm text-emerald-400">Workflow imported successfully!</p>
-              </div>
-
-              <Button
-                class="w-full bg-indigo-600 hover:bg-indigo-500 text-white gap-2"
-                :disabled="!importName.trim() || !importJson.trim() || importing"
-                @click="importWorkflow"
-              >
-                <RefreshCw v-if="importing" class="w-4 h-4 animate-spin" />
-                <Plus v-else class="w-4 h-4" />
-                {{ importing ? 'Importing...' : 'Import Workflow' }}
-              </Button>
-            </div>
-
-            <!-- Workflow detail -->
-            <div v-else-if="selectedWorkflow" class="rounded-xl bg-zinc-800/30 border border-white/5 p-6 space-y-5">
-              <div class="flex items-start justify-between gap-4">
-                <div>
-                  <h3 class="text-lg font-semibold text-white">{{ selectedWorkflow.name }}</h3>
-                  <p v-if="selectedWorkflow.description" class="text-sm text-zinc-400 mt-1">{{ selectedWorkflow.description }}</p>
-                  <p class="text-xs text-zinc-500 mt-2">Created {{ formatDate(selectedWorkflow.created_at) }}</p>
-                </div>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  class="gap-1.5 text-zinc-500 hover:text-red-400 hover:bg-red-500/10 shrink-0"
-                  @click="deleteWorkflow(selectedWorkflow.id)"
-                >
-                  <Trash2 class="w-3.5 h-3.5" />
-                  Delete
-                </Button>
-              </div>
-
-              <!-- Detected Inputs -->
-              <div v-if="selectedWorkflow.inputs?.length" class="space-y-2">
-                <h4 class="text-sm font-medium text-zinc-300">Detected Inputs</h4>
-                <div class="space-y-1.5">
-                  <div
-                    v-for="input in selectedWorkflow.inputs"
-                    :key="input.node_id"
-                    class="flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-900/50 border border-white/5"
-                  >
-                    <span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-zinc-800 text-zinc-400 border border-white/5">
-                      {{ input.node_type }}
-                    </span>
-                    <span class="text-sm text-zinc-300">{{ input.field_name }} <span class="text-zinc-600">(node {{ input.node_id }})</span></span>
-                    <span v-if="input.current_value && typeof input.current_value === 'string'" class="text-xs text-zinc-500 ml-auto truncate max-w-[200px]">
-                      {{ input.current_value }}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              <!-- Detected Outputs -->
-              <div v-if="selectedWorkflow.outputs?.length" class="space-y-2">
-                <h4 class="text-sm font-medium text-zinc-300">Detected Outputs</h4>
-                <div class="flex flex-wrap gap-2">
-                  <span
-                    v-for="(output, i) in selectedWorkflow.outputs"
-                    :key="i"
-                    class="px-2 py-1 rounded-lg text-xs font-medium bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
-                  >
-                    {{ output.node_type || 'output' }}
-                  </span>
-                </div>
-              </div>
-
-              <!-- Presets -->
-              <div class="space-y-3">
-                <div class="flex items-center justify-between">
-                  <h4 class="text-sm font-medium text-zinc-300">Prompt Presets</h4>
-                  <Button
-                    v-if="!showAddPreset"
-                    variant="ghost"
-                    size="sm"
-                    class="gap-1.5 text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10"
-                    @click="showAddPreset = true; newPresetName = ''"
-                  >
-                    <Plus class="w-3.5 h-3.5" />
-                    Add
-                  </Button>
-                </div>
-
-                <!-- Add preset form -->
-                <div v-if="showAddPreset" class="flex items-center gap-2">
-                  <Input
-                    v-model="newPresetName"
-                    placeholder="Preset name..."
-                    class="bg-zinc-900/50 border-white/10 flex-1"
-                    @keyup.enter="createPreset"
-                  />
-                  <Button
-                    size="sm"
-                    class="bg-indigo-600 hover:bg-indigo-500 text-white gap-1"
-                    :disabled="!newPresetName.trim()"
-                    @click="createPreset"
-                  >
-                    <Check class="w-3.5 h-3.5" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    class="text-zinc-500 hover:text-white"
-                    @click="showAddPreset = false"
-                  >
-                    <X class="w-3.5 h-3.5" />
-                  </Button>
-                </div>
-
-                <!-- Preset list -->
-                <div v-if="loadingPresets" class="flex items-center justify-center py-4">
-                  <RefreshCw class="w-4 h-4 text-indigo-400 animate-spin" />
-                </div>
-                <div v-else-if="presets.length" class="space-y-2">
-                  <div
-                    v-for="preset in presets"
-                    :key="preset.id"
-                    class="rounded-lg bg-zinc-900/50 border border-white/5 p-3 space-y-2"
-                  >
-                    <!-- Preset header -->
-                    <div class="flex items-center justify-between gap-2">
-                      <div v-if="editingPresetId === preset.id" class="flex items-center gap-2 flex-1">
-                        <Input
-                          v-model="editingPresetName"
-                          class="bg-zinc-800/50 border-white/10 text-sm h-7 flex-1"
-                          @keyup.enter="savePresetName(preset)"
-                        />
-                        <button class="text-emerald-400 hover:text-emerald-300" @click="savePresetName(preset)">
-                          <Save class="w-3.5 h-3.5" />
-                        </button>
-                        <button class="text-zinc-500 hover:text-white" @click="editingPresetId = null">
-                          <X class="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                      <span v-else class="text-sm font-medium text-amber-300">{{ preset.name }}</span>
-                      <div v-if="editingPresetId !== preset.id" class="flex items-center gap-1 shrink-0">
-                        <button
-                          class="p-1 rounded text-zinc-600 hover:text-zinc-300 hover:bg-white/5 transition-colors"
-                          @click="startEditPreset(preset)"
-                        >
-                          <Pencil class="w-3 h-3" />
-                        </button>
-                        <button
-                          class="p-1 rounded text-zinc-600 hover:text-red-400 hover:bg-red-500/10 transition-colors"
-                          @click="deletePreset(preset.id)"
-                        >
-                          <Trash2 class="w-3 h-3" />
-                        </button>
-                      </div>
-                    </div>
-
-                    <!-- Preset text overrides (editable) -->
-                    <div
-                      v-for="input in (selectedWorkflow.inputs || []).filter(i => i.node_type !== 'LoadImage')"
-                      :key="`${input.node_id}.${input.field_name}`"
-                      class="space-y-1"
-                    >
-                      <label class="text-[10px] font-medium text-zinc-500">
-                        {{ input.field_name }} ({{ input.node_type }})
-                      </label>
-                      <textarea
-                        :value="preset.text_overrides[`${input.node_id}.${input.field_name}`] || ''"
-                        rows="2"
-                        class="flex w-full rounded-md border border-white/5 bg-zinc-800/30 px-2 py-1.5 text-xs text-zinc-300 placeholder:text-zinc-600 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500/40 resize-y"
-                        :placeholder="typeof input.current_value === 'string' ? input.current_value : ''"
-                        @change="updatePresetOverrides(preset, `${input.node_id}.${input.field_name}`, $event.target.value)"
-                      />
-                    </div>
-                  </div>
-                </div>
-                <p v-else class="text-xs text-zinc-600">No presets yet. Add one to save prompt text for quick reuse.</p>
-              </div>
-
-              <!-- Raw JSON viewer -->
-              <div class="space-y-2">
-                <button
-                  class="flex items-center gap-1.5 text-xs font-medium text-zinc-500 hover:text-zinc-300 transition-colors"
-                  @click="showRawJson = !showRawJson"
-                >
-                  <FileJson class="w-3.5 h-3.5" />
-                  Raw JSON
-                  <ChevronDown v-if="!showRawJson" class="w-3 h-3" />
-                  <ChevronUp v-else class="w-3 h-3" />
-                </button>
-                <div v-if="showRawJson" class="max-h-64 overflow-auto rounded-lg bg-zinc-900 border border-white/5 p-3">
-                  <pre class="text-xs text-zinc-400 font-mono whitespace-pre-wrap break-all">{{ JSON.stringify(selectedWorkflow, null, 2) }}</pre>
-                </div>
-              </div>
-            </div>
-
-            <!-- No selection -->
-            <div v-else class="rounded-xl bg-zinc-800/30 border border-white/5 p-12 text-center">
-              <ChevronRight class="w-8 h-8 text-zinc-700 mx-auto mb-3" />
-              <p class="text-sm text-zinc-500">Select a workflow or import a new one</p>
-            </div>
-          </div>
+      <!-- Import form -->
+      <div v-if="showImportForm" class="card-ab p-6 flex flex-col gap-4">
+        <div class="flex items-center justify-between">
+          <div class="label">Import workflow</div>
+          <button class="font-mono text-[13px] text-ink-tertiary hover:text-signal" @click="showImportForm = false">✕</button>
         </div>
-      </TabsContent>
+        <div class="flex flex-col gap-2">
+          <span class="label">Name</span>
+          <input
+            v-model="importName"
+            placeholder="upscale-4x"
+            spellcheck="false"
+            class="bg-base border border-line rounded-sm px-3 py-2 font-mono text-[13px] text-ink"
+          />
+        </div>
+        <div class="flex flex-col gap-2">
+          <span class="label">Description</span>
+          <input
+            v-model="importDescription"
+            placeholder="Optional"
+            spellcheck="false"
+            class="bg-base border border-line rounded-sm px-3 py-2 text-[13px] text-ink"
+          />
+        </div>
+        <div class="flex flex-col gap-2">
+          <span class="label">Workflow JSON</span>
+          <textarea
+            v-model="importJson"
+            rows="10"
+            placeholder="Paste ComfyUI API-format JSON"
+            spellcheck="false"
+            class="w-full bg-base border border-line rounded-sm px-3 py-2 font-mono text-xs text-ink"
+          ></textarea>
+          <span class="text-xs font-light text-ink-secondary">
+            Inputs (LoadImage, text fields) and outputs are detected automatically on import.
+          </span>
+        </div>
+        <div v-if="importError" class="font-mono text-xs text-error">{{ importError }}</div>
+        <div v-if="importSuccess" class="font-mono text-xs text-ready">workflow imported</div>
+        <div>
+          <button
+            class="bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors disabled:opacity-50"
+            :disabled="importing || !importReady"
+            @click="importWorkflow"
+          >{{ importing ? 'Importing…' : 'Import' }}</button>
+        </div>
+      </div>
 
-      <!-- ===== QUEUE TAB ===== -->
-      <TabsContent value="queue" class="mt-6">
-        <div class="space-y-4">
-          <!-- Queue header -->
-          <div class="flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-zinc-300">Task Queue</h3>
-            <Button
-              variant="ghost"
-              size="sm"
-              class="gap-1.5 text-zinc-400 hover:text-white hover:bg-white/5"
-              @click="fetchTasks"
-            >
-              <RefreshCw :class="cn('w-3.5 h-3.5', loadingTasks && 'animate-spin')" />
-              Refresh
-            </Button>
+      <!-- Workflow detail -->
+      <div v-else-if="selectedWorkflow" class="card-ab p-6 flex flex-col gap-6 min-w-0">
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <div class="font-mono text-base font-medium text-ink">{{ selectedWorkflow.name }}</div>
+            <div v-if="selectedWorkflow.description" class="text-[13px] font-light text-ink-secondary mt-1">
+              {{ selectedWorkflow.description }}
+            </div>
+            <div class="font-mono text-[11px] text-ink-tertiary mt-2">
+              imported {{ formatDate(selectedWorkflow.created_at) }}
+              <template v-if="(selectedWorkflow.outputs || []).length">
+                · output {{ selectedWorkflow.outputs[0].node_type }}
+              </template>
+            </div>
           </div>
+          <button
+            class="border border-line-strong rounded px-3 py-1.5 text-xs text-error flex-none"
+            @click="deleteWorkflow(selectedWorkflow.id)"
+          >Delete</button>
+        </div>
 
-          <!-- Loading -->
-          <div v-if="loadingTasks && !tasks.length" class="flex items-center justify-center py-12">
-            <RefreshCw class="w-5 h-5 text-indigo-400 animate-spin" />
-          </div>
-
-          <!-- Task list -->
-          <div v-else-if="tasks.length" ref="taskListRef" class="space-y-2 max-h-[calc(100vh-16rem)] overflow-y-auto" @scroll="onTaskListScroll">
+        <!-- Detected inputs -->
+        <div class="flex flex-col gap-2 min-w-0">
+          <div class="label">Detected inputs</div>
+          <div class="border border-line rounded overflow-hidden overflow-x-auto">
             <div
-              v-for="task in tasks"
-              :key="task.id"
-              class="flex items-center gap-4 p-4 rounded-xl bg-zinc-800/30 border border-white/5 hover:border-white/10 transition-colors"
+              class="grid gap-4 px-3 py-2 border-b min-w-[420px]"
+              style="grid-template-columns: 64px 1fr 1fr 1fr; border-color: var(--border-strong)"
             >
-              <!-- Shot thumbnail -->
-              <router-link
-                v-if="task.shot_id"
-                :to="`/shot/${task.shot_id}`"
-                class="w-12 h-12 rounded-lg overflow-hidden bg-zinc-800 border border-white/5 shrink-0 hover:border-indigo-500/30 transition-colors"
-              >
-                <img
-                  v-if="task.thumbnail_url"
-                  :src="task.thumbnail_url"
-                  class="w-full h-full object-cover"
-                  loading="lazy"
-                />
-                <div v-else class="w-full h-full flex items-center justify-center">
-                  <Wand2 class="w-4 h-4 text-zinc-600" />
-                </div>
-              </router-link>
-              <div v-else class="w-12 h-12 rounded-lg bg-zinc-800 border border-white/5 shrink-0 flex items-center justify-center">
-                <Wand2 class="w-4 h-4 text-zinc-600" />
-              </div>
-
-              <!-- Task info -->
-              <div class="flex-1 min-w-0">
-                <p class="text-sm font-medium text-zinc-200 truncate">
-                  {{ task.workflow_name || 'Unknown Workflow' }}
-                </p>
-                <div class="flex items-center gap-2 mt-1">
-                  <span
-                    :class="cn(
-                      'px-1.5 py-0.5 rounded text-[10px] font-medium border',
-                      statusBadgeClass(task.status)
-                    )"
-                  >
-                    <RefreshCw v-if="task.status === 'running'" class="w-2.5 h-2.5 inline animate-spin mr-0.5" />
-                    {{ task.status }}
-                  </span>
-                  <span v-if="task.retry_count > 0" class="text-[10px] text-zinc-500">
-                    {{ task.retry_count }} {{ task.retry_count === 1 ? 'retry' : 'retries' }}
-                  </span>
-                  <span class="text-[10px] text-zinc-600">
-                    {{ formatRelativeTime(task.created_at) }}
-                  </span>
-                </div>
-                <p v-if="task.error" class="text-xs text-red-400 mt-1 truncate">{{ task.error }}</p>
-              </div>
-
-              <!-- Actions -->
-              <div class="flex items-center gap-1 shrink-0">
-                <Button
-                  v-if="task.status === 'pending' || task.status === 'running'"
-                  variant="ghost"
-                  size="sm"
-                  class="text-zinc-500 hover:text-red-400 hover:bg-red-500/10"
-                  @click="cancelTask(task.id)"
-                >
-                  <X class="w-3.5 h-3.5" />
-                </Button>
-                <Button
-                  v-if="task.status === 'failed'"
-                  variant="ghost"
-                  size="sm"
-                  class="gap-1 text-zinc-500 hover:text-indigo-400 hover:bg-indigo-500/10"
-                  @click="retryTask(task.id)"
-                >
-                  <RotateCcw class="w-3.5 h-3.5" />
-                </Button>
-                <Button
-                  v-if="task.status === 'failed'"
-                  variant="ghost"
-                  size="sm"
-                  class="gap-1 text-zinc-500 hover:text-red-400 hover:bg-red-500/10"
-                  title="Remove"
-                  @click="deleteTask(task.id)"
-                >
-                  <Trash2 class="w-3.5 h-3.5" />
-                </Button>
-                <router-link
-                  v-if="task.status === 'completed' && task.shot_id"
-                  :to="`/shot/${task.shot_id}`"
-                >
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    class="gap-1 text-zinc-500 hover:text-emerald-400 hover:bg-emerald-500/10"
-                  >
-                    <ExternalLink class="w-3.5 h-3.5" />
-                  </Button>
-                </router-link>
-              </div>
+              <span class="label">Node</span>
+              <span class="label">Type</span>
+              <span class="label">Field</span>
+              <span class="label">Default</span>
             </div>
-            <!-- Load more indicator -->
-            <div v-if="loadingMore" class="flex items-center justify-center py-4">
-              <RefreshCw class="w-4 h-4 text-indigo-400 animate-spin" />
+            <div
+              v-for="input in (selectedWorkflow.inputs || [])"
+              :key="`${input.node_id}.${input.field_name}`"
+              class="grid gap-4 px-3 py-2 border-b border-line font-mono text-xs min-w-[420px]"
+              style="grid-template-columns: 64px 1fr 1fr 1fr"
+            >
+              <span class="text-ink-tertiary">{{ input.node_id }}</span>
+              <span class="text-ink-secondary truncate">{{ input.node_type }}</span>
+              <span class="text-ink truncate">{{ input.field_name }}</span>
+              <span class="text-ink-secondary truncate">
+                {{ input.node_type === 'LoadImage' ? '(source file)' : (input.current_value ?? '') }}
+              </span>
             </div>
-            <div v-else-if="nextCursor" class="flex items-center justify-center py-2">
-              <span class="text-xs text-zinc-600">Scroll for more</span>
-            </div>
-          </div>
-
-          <!-- Empty state -->
-          <div v-else class="text-center py-12">
-            <Clock class="w-8 h-8 text-zinc-700 mx-auto mb-2" />
-            <p class="text-sm text-zinc-500">No tasks in the queue</p>
-            <p class="text-xs text-zinc-600 mt-1">Enhance a shot to see tasks appear here.</p>
           </div>
         </div>
-      </TabsContent>
-    </Tabs>
+
+        <!-- Prompt presets -->
+        <div class="flex flex-col gap-2">
+          <div class="label">Prompt presets</div>
+          <div v-if="loadingPresets" class="font-mono text-xs text-ink-tertiary">loading presets…</div>
+          <div class="flex flex-col gap-2">
+            <div
+              v-for="preset in presets"
+              :key="preset.id"
+              class="flex flex-col gap-2 p-3 border border-line rounded bg-base"
+            >
+              <div class="flex items-center gap-2">
+                <template v-if="editingPresetId === preset.id">
+                  <input
+                    v-model="editingPresetName"
+                    spellcheck="false"
+                    class="bg-surface border border-line rounded-sm px-2 py-1 text-[13px] text-ink"
+                    @keydown.enter="savePresetName(preset)"
+                  />
+                  <button class="font-mono text-[11px] text-signal" @click="savePresetName(preset)">save</button>
+                  <button class="font-mono text-[11px] text-ink-tertiary" @click="editingPresetId = null">cancel</button>
+                </template>
+                <template v-else>
+                  <span class="text-[13px] font-medium text-signal">{{ preset.name }}</span>
+                  <button
+                    class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+                    @click="startEditPreset(preset)"
+                  >rename</button>
+                </template>
+                <span class="flex-1"></span>
+                <button
+                  class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
+                  @click="deletePreset(preset.id)"
+                >remove</button>
+              </div>
+
+              <template v-if="textInputsOf(selectedWorkflow).length">
+                <div
+                  v-for="input in textInputsOf(selectedWorkflow)"
+                  :key="`${preset.id}-${input.node_id}.${input.field_name}`"
+                  class="flex flex-col gap-1"
+                >
+                  <span class="font-mono text-[11px] text-ink-tertiary">
+                    {{ input.node_id }} · {{ input.field_name }}
+                  </span>
+                  <textarea
+                    rows="2"
+                    spellcheck="false"
+                    class="w-full bg-surface border border-line rounded-sm px-3 py-2 font-mono text-xs text-ink"
+                    :value="preset.text_overrides?.[`${input.node_id}.${input.field_name}`] || ''"
+                    @change="updatePresetOverrides(preset, `${input.node_id}.${input.field_name}`, $event.target.value)"
+                  ></textarea>
+                </div>
+              </template>
+              <span v-else class="text-xs font-light text-ink-secondary">
+                No text inputs in this workflow — the preset runs node defaults.
+              </span>
+            </div>
+          </div>
+
+          <div class="flex gap-2">
+            <input
+              v-model="newPresetName"
+              placeholder="New preset name…"
+              spellcheck="false"
+              class="flex-1 bg-base border border-line rounded-sm px-3 py-2 text-[13px] text-ink"
+              @keydown.enter="createPreset"
+            />
+            <button
+              class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors disabled:opacity-50"
+              :disabled="!newPresetName.trim()"
+              @click="createPreset"
+            >Add preset</button>
+          </div>
+          <div class="text-xs font-light text-ink-secondary">
+            Presets save prompt text per node — picking one in the Enhance dialog fills the input
+            overrides; typing there deselects it.
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="card-ab p-6 font-mono text-xs text-ink-tertiary">
+        select a workflow, or import one
+      </div>
+    </div>
+
+    <!-- The graph: what actually runs, and in what order. Full width, because a
+         node diagram is the widest thing on this page and the least useful when
+         cropped. -->
+    <WorkflowGraph
+      v-if="activeTab === 'workflows' && selectedWorkflow && !showImportForm"
+      :workflow-id="selectedWorkflow.id"
+      :editable-node-ids="editableNodeIds"
+    />
+
+    <!-- Queue tab -->
+    <div v-else class="flex flex-col gap-2">
+      <div class="card-ab overflow-hidden overflow-x-auto" ref="taskListRef" @scroll="onTaskListScroll">
+        <div
+          class="grid gap-2 px-4 py-2 border-b min-w-[720px]"
+          style="grid-template-columns: 72px 128px 128px minmax(0,1fr) 104px 72px; border-color: var(--border-strong)"
+        >
+          <span class="label">Time</span>
+          <span class="label">Workflow</span>
+          <span class="label">Source</span>
+          <span class="label">Detail</span>
+          <span class="label">Status</span>
+          <span></span>
+        </div>
+        <div
+          v-for="task in tasks"
+          :key="task.id"
+          class="grid gap-2 items-center px-4 py-2 border-b border-line hover:bg-raised transition-colors min-w-[720px]"
+          style="grid-template-columns: 72px 128px 128px minmax(0,1fr) 104px 72px"
+        >
+          <span class="font-mono text-xs text-ink-tertiary">{{ formatRelativeTime(task.created_at) }}</span>
+          <span class="font-mono text-xs text-ink truncate">{{ task.workflow_name || task.workflow_id }}</span>
+          <router-link
+            v-if="task.shot_id"
+            :to="{ name: 'shot-detail', params: { id: task.shot_id } }"
+            class="font-mono text-xs text-ink-secondary truncate hover:text-signal"
+          >shot/{{ shortId(task.shot_id) }}</router-link>
+          <span v-else class="font-mono text-xs text-ink-tertiary">—</span>
+          <span
+            class="font-mono text-xs truncate min-w-0"
+            :style="{ color: task.status === 'failed' ? 'var(--status-error)' : 'var(--text-secondary)' }"
+          >{{ task.error || task.detail || '' }}</span>
+          <span
+            class="flex items-center gap-1.5 font-mono text-[11px] tracking-[0.08em] uppercase"
+            :style="{ color: statusColor(task.status) }"
+          >
+            <span
+              class="signal-dot"
+              :class="{ 'signal-pulse': task.status === 'running' || task.status === 'pending' }"
+              style="width:6px;height:6px"
+              :style="{ background: statusColor(task.status) }"
+            ></span>
+            {{ task.status }}
+          </span>
+          <span class="flex gap-2 justify-end">
+            <button
+              v-if="task.status === 'failed'"
+              class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+              @click="retryTask(task.id)"
+            >retry</button>
+            <button
+              v-else-if="task.status === 'pending' || task.status === 'running'"
+              class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
+              @click="cancelTask(task.id)"
+            >cancel</button>
+            <button
+              v-else
+              class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
+              @click="deleteTask(task.id)"
+            >remove</button>
+          </span>
+        </div>
+
+        <div v-if="loadingTasks && tasks.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
+          loading queue…
+        </div>
+        <div v-else-if="tasks.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
+          nothing queued
+        </div>
+      </div>
+
+      <button
+        v-if="nextCursor"
+        class="self-start border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors disabled:opacity-50"
+        :disabled="loadingMore"
+        @click="fetchMoreTasks"
+      >{{ loadingMore ? 'Loading…' : 'Load more' }}</button>
+
+      <div v-if="hasActiveTasks" class="font-mono text-[11px] text-ink-tertiary">
+        refreshing every 5s while tasks are active
+      </div>
+    </div>
   </div>
 </template>

@@ -1,33 +1,39 @@
 package dev.phos.android.ui.update
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import dev.phos.android.ui.common.MonoBody
+import dev.phos.android.ui.common.PhosColors
+import dev.phos.android.ui.common.PhosLabel
+import dev.phos.android.ui.common.PhosMonoText
+import dev.phos.android.ui.common.PhosOutlinedButton
+import dev.phos.android.ui.common.PhosPrimaryButton
+import dev.phos.android.ui.common.SignalDot
 import dev.phos.android.update.InstallState
 import dev.phos.android.update.UpdateState
 import java.util.Locale
 
 /**
- * The "App version / check for updates" block on the settings screen.
+ * The "App update" block on the settings screen.
  *
  * Always shows what is running, because that is the fact a self-hosting user needs
  * when something looks wrong; shows what is available only when there genuinely is
@@ -40,140 +46,193 @@ fun UpdateSection(
 ) {
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
+    val c = PhosColors.current
+    val update = state.update
 
-    Column(modifier = modifier.fillMaxWidth()) {
-        Text("App version", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(4.dp))
-        Text(
-            "Running ${state.runningVersionName} (build ${state.runningVersionCode})",
-            style = MaterialTheme.typography.bodyMedium,
-        )
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        PhosLabel("App update")
 
-        Spacer(Modifier.height(8.dp))
-
-        when (val update = state.update) {
-            is UpdateState.Available -> AvailableRow(
-                available = update,
-                install = state.install,
-                onInstall = { viewModel.install(update) },
-                onDismiss = viewModel::dismiss,
-                onGrantPermission = { context.startActivity(viewModel.permissionSettingsIntent()) },
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            PhosMonoText(
+                text = buildString {
+                    append("this build ")
+                    append(state.runningVersionName)
+                    append(" · ")
+                    append(
+                        when (update) {
+                            is UpdateState.Available -> "server ships ${update.versionName}"
+                            UpdateState.Checking -> "checking the server"
+                            is UpdateState.Failed -> "server unreachable"
+                            else -> "build ${state.runningVersionCode}"
+                        }
+                    )
+                },
+                color = c.textSecondary,
+                style = MonoBody,
+                maxLines = 2,
+                modifier = Modifier.weight(1f),
             )
 
-            UpdateState.UpToDate -> Muted("This is the newest build the server has.")
+            when (update) {
+                is UpdateState.Available -> InstallControl(
+                    available = update,
+                    install = state.install,
+                    onInstall = { viewModel.install(update) },
+                    onDismiss = viewModel::dismiss,
+                    onGrantPermission = { context.startActivity(viewModel.permissionSettingsIntent()) },
+                )
 
-            UpdateState.Checking -> Muted("Checking…")
+                UpdateState.UpToDate -> Text(
+                    text = "UP TO DATE",
+                    style = MonoBody,
+                    color = c.ready,
+                )
 
-            // Never checked — either the app just started or there is no server yet.
-            // Says nothing rather than guessing.
-            UpdateState.Unknown -> Unit
+                UpdateState.Checking -> SignalDot(color = c.building, size = 6.dp, pulsing = true)
 
-            is UpdateState.Failed -> Muted(update.message)
+                // Never checked — either the app just started or there is no server
+                // yet. Says nothing rather than guessing.
+                UpdateState.Unknown -> Unit
+
+                is UpdateState.Failed -> Unit
+            }
         }
 
-        Spacer(Modifier.height(8.dp))
-        OutlinedButton(
+        if (update is UpdateState.Failed) {
+            PhosMonoText(text = update.message, color = c.error, maxLines = 2)
+        }
+
+        InstallDetail(state.install, c.textSecondary, c.error)
+
+        Text(
+            text = "APKs are checksum- and signature-verified before install.",
+            style = MaterialTheme.typography.bodySmall,
+            color = c.textSecondary,
+        )
+
+        PhosOutlinedButton(
             onClick = viewModel::check,
             enabled = !state.busy,
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text("Check for updates")
+            Text(
+                text = "Check for updates",
+                style = MaterialTheme.typography.bodySmall,
+                color = c.textSecondary,
+            )
         }
     }
 }
 
+/** The button (or the state that replaces it) for an update that exists. */
 @Composable
-private fun AvailableRow(
+private fun InstallControl(
     available: UpdateState.Available,
     install: InstallState,
     onInstall: () -> Unit,
     onDismiss: () -> Unit,
     onGrantPermission: () -> Unit,
 ) {
-    Column(Modifier.fillMaxWidth()) {
-        Text(
-            "${available.versionName} (build ${available.versionCode}) is available — " +
-                formatSize(available.sizeBytes),
-            style = MaterialTheme.typography.bodyMedium,
-            fontWeight = FontWeight.Medium,
-        )
-        Spacer(Modifier.height(8.dp))
+    val c = PhosColors.current
+    when (install) {
+        InstallState.Idle -> PhosPrimaryButton(onClick = onInstall) {
+            Text(
+                text = "Install ${available.versionName}",
+                style = MaterialTheme.typography.labelMedium,
+                color = c.signalFg,
+            )
+        }
 
-        when (install) {
-            InstallState.Idle -> Button(onClick = onInstall, modifier = Modifier.fillMaxWidth()) {
-                Text("Download and install")
-            }
+        is InstallState.Downloading,
+        InstallState.Verifying,
+        InstallState.AwaitingConfirmation,
+        -> SignalDot(color = c.building, size = 6.dp, pulsing = true)
 
-            is InstallState.Downloading -> Column(Modifier.fillMaxWidth()) {
-                LinearProgressIndicator(
-                    progress = { install.fraction },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(4.dp))
-                Muted("Downloading ${formatSize(install.bytesRead)} of ${formatSize(install.totalBytes)}")
-            }
+        InstallState.Installed -> Text("INSTALLED", style = MonoBody, color = c.ready)
 
-            InstallState.Verifying ->
-                // Named, not hidden behind a spinner: this is the step that makes
-                // installing a network download defensible, and the user should see
-                // that it happens.
-                Muted("Checking the download's checksum and signing certificate…")
+        InstallState.Declined,
+        is InstallState.Failed,
+        -> PhosOutlinedButton(onClick = onDismiss) {
+            Text("Try again", style = MaterialTheme.typography.bodySmall, color = c.textSecondary)
+        }
 
-            InstallState.AwaitingConfirmation ->
-                Muted("Waiting for Android's install confirmation.")
+        is InstallState.Refused -> PhosOutlinedButton(onClick = onDismiss) {
+            Text("Dismiss", style = MaterialTheme.typography.bodySmall, color = c.error)
+        }
 
-            InstallState.Installed -> Muted("Installed. Restart Phos to use it.")
-
-            InstallState.Declined -> Column {
-                Muted("Install cancelled.")
-                TextButton(onClick = onDismiss) { Text("Try again") }
-            }
-
-            // A verification failure. Rendered in the error colour and never auto-retried:
-            // the artefact is not what it said it was, and downloading it again is unlikely
-            // to change that.
-            is InstallState.Refused -> Column {
-                Loud(install.reason)
-                TextButton(onClick = onDismiss) { Text("Dismiss") }
-            }
-
-            is InstallState.Failed -> Column {
-                Muted(install.reason)
-                TextButton(onClick = onDismiss) { Text("Try again") }
-            }
-
-            InstallState.PermissionRequired -> Column {
-                Muted(
-                    "Android needs permission to install apps from Phos. " +
-                        "This is the switch that lets the app update itself."
-                )
-                TextButton(onClick = onGrantPermission) { Text("Open settings") }
-            }
+        InstallState.PermissionRequired -> PhosOutlinedButton(onClick = onGrantPermission) {
+            Text("Open settings", style = MaterialTheme.typography.bodySmall, color = c.textSecondary)
         }
     }
 }
 
+/** The sentence that explains whatever the install control is currently doing. */
 @Composable
-private fun Muted(text: String) {
-    Text(
-        text,
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
-}
+private fun InstallDetail(
+    install: InstallState,
+    mutedColor: androidx.compose.ui.graphics.Color,
+    errorColor: androidx.compose.ui.graphics.Color,
+) {
+    val c = PhosColors.current
+    when (install) {
+        is InstallState.Downloading -> Column(Modifier.fillMaxWidth()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(2.dp)
+                    .clip(RoundedCornerShape(1.dp))
+                    .background(c.raised),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(install.fraction.coerceIn(0f, 1f))
+                        .height(2.dp)
+                        .background(c.signal),
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            PhosMonoText(
+                text = "downloading ${formatSize(install.bytesRead)} of ${formatSize(install.totalBytes)}",
+                color = mutedColor,
+            )
+        }
 
-@Composable
-private fun Loud(text: String) {
-    Text(
-        text,
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(MaterialTheme.colorScheme.errorContainer)
-            .padding(12.dp),
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onErrorContainer,
-    )
+        // Named, not hidden behind a spinner: this is the step that makes installing
+        // a network download defensible, and the user should see that it happens.
+        InstallState.Verifying -> PhosMonoText(
+            text = "checking the download's checksum and signing certificate",
+            color = mutedColor,
+        )
+
+        InstallState.AwaitingConfirmation -> PhosMonoText(
+            text = "waiting for Android's install confirmation",
+            color = mutedColor,
+        )
+
+        InstallState.Installed -> PhosMonoText(text = "restart Phos to use it", color = mutedColor)
+
+        InstallState.Declined -> PhosMonoText(text = "install cancelled", color = mutedColor)
+
+        // A verification failure. Never auto-retried: the artefact is not what it
+        // said it was, and downloading it again is unlikely to change that.
+        is InstallState.Refused -> PhosMonoText(text = install.reason, color = errorColor, maxLines = 3)
+
+        is InstallState.Failed -> PhosMonoText(text = install.reason, color = mutedColor, maxLines = 3)
+
+        InstallState.PermissionRequired -> PhosMonoText(
+            text = "Android needs permission to install apps from Phos",
+            color = mutedColor,
+            maxLines = 2,
+        )
+
+        InstallState.Idle -> Unit
+    }
 }
 
 /** MB to one decimal — the only unit an APK is ever worth quoting in. */

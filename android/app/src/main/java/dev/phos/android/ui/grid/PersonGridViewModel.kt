@@ -40,9 +40,14 @@ data class PersonGridUiState(
     val message: String? = null,
     val people: List<Person> = emptyList(),
     val peopleLoading: Boolean = false,
+    /**
+     * Set by the "select" button, which opens the contextual bar before anything
+     * is picked. Long-press still works and skips straight past this.
+     */
+    val selectionArmed: Boolean = false,
 ) {
-    /** The grid is in selection mode exactly while something is selected. */
-    val selectionMode: Boolean get() = selected.isNotEmpty()
+    /** The grid is in selection mode while something is selected, or armed for it. */
+    val selectionMode: Boolean get() = selectionArmed || selected.isNotEmpty()
 }
 
 @HiltViewModel
@@ -109,8 +114,12 @@ class PersonGridViewModel @Inject constructor(
         )
     }
 
+    fun enterSelectionMode() {
+        _uiState.value = _uiState.value.copy(selectionArmed = true)
+    }
+
     fun clearSelection() {
-        _uiState.value = _uiState.value.copy(selected = emptySet())
+        _uiState.value = _uiState.value.copy(selected = emptySet(), selectionArmed = false)
     }
 
     fun selectAll() {
@@ -212,12 +221,14 @@ class PersonGridViewModel @Inject constructor(
                     GridTile(shot = it.shot, cover = it.files.firstOrNull(), fileCount = it.files.size)
                 },
                 selected = emptySet(),
+                selectionArmed = false,
                 busy = false,
                 message = message,
             )
         } catch (e: Exception) {
             _uiState.value = _uiState.value.copy(
                 selected = emptySet(),
+                selectionArmed = false,
                 busy = false,
                 message = "$message, but reloading failed: ${e.message}",
             )

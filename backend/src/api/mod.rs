@@ -87,6 +87,7 @@ use utoipa::OpenApi;
         comfyui::comfyui_list_workflows,
         comfyui::comfyui_import_workflow,
         comfyui::comfyui_delete_workflow,
+        comfyui::comfyui_workflow_graph,
         comfyui::comfyui_enhance,
         comfyui::comfyui_list_tasks,
         comfyui::comfyui_get_task,
@@ -486,6 +487,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/comfyui/workflows/{id}",
             delete(comfyui::comfyui_delete_workflow),
+        )
+        .route(
+            "/api/comfyui/workflows/{id}/graph",
+            get(comfyui::comfyui_workflow_graph),
         )
         .route(
             "/api/comfyui/workflows/{id}/presets",

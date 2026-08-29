@@ -1,13 +1,13 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuth } from '@/composables/useAuth'
 import OrganizeDashboard from './components/OrganizeDashboard.vue'
-import ReviewQueue from './components/ReviewQueue.vue'
-import VariationsQueue from './components/VariationsQueue.vue'
 import ShotDetail from './components/ShotDetail.vue'
 import PersonDetail from './components/PersonDetail.vue'
 import PeopleList from './components/PeopleList.vue'
 import LoginPage from './components/LoginPage.vue'
 import WorkflowsPage from './components/WorkflowsPage.vue'
+import ReviewDesk from './components/ReviewDesk.vue'
+import SettingsPage from './components/SettingsPage.vue'
 
 const routes = [
   {
@@ -20,25 +20,25 @@ const routes = [
     path: '/',
     name: 'organize',
     component: OrganizeDashboard,
-    meta: { view: 'organize' },
+    meta: { view: 'overview' },
   },
   {
     path: '/review',
     name: 'review',
-    component: ReviewQueue,
+    component: ReviewDesk,
     meta: { view: 'review' },
   },
   {
+    // The duplicates queue is a lane of the Review Desk now; the old route
+    // stays as a redirect so bookmarks keep working.
     path: '/variations',
-    name: 'variations',
-    component: VariationsQueue,
-    meta: { view: 'variations' },
+    redirect: { name: 'review', query: { lane: 'duplicates' } },
   },
   {
     path: '/shot/:id',
     name: 'shot-detail',
     component: ShotDetail,
-    meta: { view: 'organize' },
+    meta: { view: 'overview' },
   },
   {
     path: '/person/:id',
@@ -57,6 +57,12 @@ const routes = [
     name: 'workflows',
     component: WorkflowsPage,
     meta: { view: 'workflows' },
+  },
+  {
+    path: '/settings',
+    name: 'settings',
+    component: SettingsPage,
+    meta: { view: 'settings' },
   },
 ]
 

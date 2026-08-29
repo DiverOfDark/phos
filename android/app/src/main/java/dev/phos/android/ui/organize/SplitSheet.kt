@@ -10,19 +10,18 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.Checkbox
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,6 +34,12 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
 import dev.phos.android.domain.model.MediaFile
+import dev.phos.android.ui.common.MonoSmall
+import dev.phos.android.ui.common.PhosColors
+import dev.phos.android.ui.common.PhosOutlinedButton
+import dev.phos.android.ui.common.PhosPrimaryButton
+import dev.phos.android.ui.common.PhosSheet
+import dev.phos.android.ui.common.PhosSheetHeader
 
 /**
  * "Which of these files don't belong here?"
@@ -56,19 +61,20 @@ fun SplitSheet(
     onSplit: (fileIds: List<String>) -> Unit,
 ) {
     var selected by remember { mutableStateOf(emptySet<String>()) }
+    val c = PhosColors.current
 
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    PhosSheet(onDismiss = onDismiss) {
+        PhosSheetHeader(
+            title = "Split shot",
+            subtitle = "At least one file has to stay here.",
+            onDismiss = onDismiss,
+        )
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(horizontal = 16.dp),
+                .padding(16.dp),
         ) {
-            SheetHeader(
-                title = "Split shot",
-                subtitle = "Pick the files to move out. They become a new, unreviewed " +
-                    "shot; at least one file has to stay here.",
-            )
 
             LazyVerticalGrid(
                 columns = GridCells.Adaptive(minSize = 96.dp),
@@ -81,7 +87,12 @@ fun SplitSheet(
                     Box(
                         modifier = Modifier
                             .aspectRatio(1f)
-                            .clip(RoundedCornerShape(8.dp))
+                            .clip(RoundedCornerShape(2.dp))
+                            .border(
+                                1.dp,
+                                if (isSelected) c.signal else c.line,
+                                RoundedCornerShape(2.dp),
+                            )
                             .clickable(enabled = !isBusy) {
                                 selected = if (isSelected) selected - file.id else selected + file.id
                             },
@@ -92,22 +103,34 @@ fun SplitSheet(
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxWidth().aspectRatio(1f),
                         )
-                        Checkbox(
-                            checked = isSelected,
-                            // Null so the whole tile is the hit target — a checkbox
-                            // that also handles taps double-fires on a fast tap.
-                            onCheckedChange = null,
-                            modifier = Modifier.align(Alignment.TopStart),
-                        )
+                        // A 12dp square, checked in signal amber: the whole tile is
+                        // the hit target, so this only has to say what the state is.
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(4.dp)
+                                .size(14.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(if (isSelected) c.signal else c.base.copy(alpha = 0.7f))
+                                .border(
+                                    1.dp,
+                                    if (isSelected) c.signal else c.lineStrong,
+                                    RoundedCornerShape(2.dp),
+                                ),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (isSelected) Text("✓", style = MonoSmall, color = c.signalFg)
+                        }
                         if (file.isOriginal) {
-                            Text(
-                                "original",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            Box(
                                 modifier = Modifier
                                     .align(Alignment.BottomEnd)
-                                    .padding(4.dp),
-                            )
+                                    .padding(4.dp)
+                                    .background(c.base, RoundedCornerShape(2.dp))
+                                    .padding(horizontal = 3.dp),
+                            ) {
+                                Text("MASTER", style = MonoSmall, color = c.signal)
+                            }
                         }
                     }
                 }
@@ -123,22 +146,28 @@ fun SplitSheet(
                     else -> "${selected.size} of ${files.size} files will move to a new shot."
                 },
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = if (selected.isNotEmpty() && !leavesOneBehind) c.degraded else c.textSecondary,
             )
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(12.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                TextButton(onClick = onDismiss, enabled = !isBusy) { Text("Cancel") }
-                Spacer(Modifier.height(8.dp))
-                Button(
+                PhosOutlinedButton(onClick = onDismiss, enabled = !isBusy) {
+                    Text("Cancel", style = MaterialTheme.typography.bodySmall, color = c.textSecondary)
+                }
+                PhosPrimaryButton(
                     onClick = { onSplit(selected.toList()) },
                     enabled = leavesOneBehind && !isBusy,
+                    modifier = Modifier.weight(1f),
                 ) {
-                    Text("Split")
+                    Text(
+                        text = "Split into new shot",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = c.signalFg,
+                    )
                 }
             }
 

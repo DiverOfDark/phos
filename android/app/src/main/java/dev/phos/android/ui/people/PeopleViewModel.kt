@@ -12,6 +12,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
+enum class PeopleSort(val label: String) {
+    SHOTS("shots"),
+    NAME("name"),
+    PENDING("pending"),
+}
+
 @HiltViewModel
 class PeopleViewModel @Inject constructor(
     private val peopleRepository: PeopleRepository,
@@ -34,6 +40,10 @@ class PeopleViewModel @Inject constructor(
     private val _unsortedCount = MutableStateFlow(0)
     val unsortedCount: StateFlow<Int> = _unsortedCount.asStateFlow()
 
+    /** When the list last came back from the server, for the footer's sync line. */
+    private val _lastSyncedAt = MutableStateFlow<Long?>(null)
+    val lastSyncedAt: StateFlow<Long?> = _lastSyncedAt.asStateFlow()
+
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
@@ -53,6 +63,7 @@ class PeopleViewModel @Inject constructor(
                 // last shot is moved or deleted, and a grid of names that open
                 // onto nothing is worse than a shorter grid.
                 _people.value = peopleRepository.fetchPeople().filter { it.shotCount > 0 }
+                _lastSyncedAt.value = System.currentTimeMillis()
             } catch (e: Exception) {
                 _people.value = emptyList()
                 _error.value = "Failed to refresh: ${e.message}"
@@ -76,5 +87,32 @@ class PeopleViewModel @Inject constructor(
         val thumbnailUrl = person.coverShotThumbnailUrl ?: person.thumbnailUrl ?: return null
         val baseUrl = authRepository.getServerUrl()?.trimEnd('/') ?: return null
         return if (thumbnailUrl.startsWith("/")) "$baseUrl$thumbnailUrl" else thumbnailUrl
+    }
+
+    /**
+     * The tight face crop, preferred over the cover shot.
+     *
+     * A whole photo at tile size is a scene; a face crop is a person, and the
+     * face is what the eye actually matches a name to.
+     */
+    fun buildFaceUrl(person: Person): String? {
+        val thumbnailUrl = person.thumbnailUrl ?: person.coverShotThumbnailUrl ?: return null
+        val baseUrl = authRepository.getServerUrl()?.trimEnd('/') ?: return null
+        return if (thumbnailUrl.startsWith("/")) "$baseUrl$thumbnailUrl" else thumbnailUrl
+    }
+
+    /** How the wall is ordered. Kept here so it survives a rotation. */
+    private val _sort = MutableStateFlow(PeopleSort.SHOTS)
+    val sort: StateFlow<PeopleSort> = _sort.asStateFlow()
+
+    fun setSort(value: PeopleSort) {
+        _sort.value = value
+    }
+
+    private val _query = MutableStateFlow("")
+    val query: StateFlow<String> = _query.asStateFlow()
+
+    fun setQuery(value: String) {
+        _query.value = value
     }
 }

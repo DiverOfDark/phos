@@ -1,10 +1,11 @@
 package dev.phos.android.ui.organize
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -12,17 +13,8 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Person
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -31,8 +23,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
+import coil3.compose.AsyncImage
 import dev.phos.android.domain.model.Person
+import dev.phos.android.ui.common.PhosAvatarBox
+import dev.phos.android.ui.common.PhosColors
+import dev.phos.android.ui.common.PhosMonoText
+import dev.phos.android.ui.common.PhosSearchField
+import dev.phos.android.ui.common.PhosSheet
+import dev.phos.android.ui.common.PhosSheetHeader
+import dev.phos.android.ui.common.PhosSheetRow
+import dev.phos.android.ui.common.SignalDot
 
 /**
  * "Which person?" — the picker behind every reassignment.
@@ -54,26 +56,23 @@ fun PersonPickerSheet(
     onCreate: (name: String) -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
+    val c = PhosColors.current
 
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    PhosSheet(onDismiss = onDismiss) {
+        PhosSheetHeader(title = title, onDismiss = onDismiss)
+
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .navigationBarsPadding()
-                .padding(horizontal = 16.dp),
+                .navigationBarsPadding(),
         ) {
-            Text(title, style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(12.dp))
-
-            OutlinedTextField(
-                value = query,
-                onValueChange = { query = it },
-                label = { Text("Search or type a new name") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-
-            Spacer(Modifier.height(8.dp))
+            Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                PhosSearchField(
+                    value = query,
+                    onValueChange = { query = it },
+                    placeholder = "Search or type a new name…",
+                )
+            }
 
             val trimmed = query.trim()
             val matches = remember(people, trimmed) {
@@ -89,43 +88,42 @@ fun PersonPickerSheet(
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(24.dp),
                     horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    CircularProgressIndicator()
+                    SignalDot(color = c.building, size = 6.dp, pulsing = true)
+                    Spacer(Modifier.padding(4.dp))
+                    PhosMonoText("loading people…", color = c.textSecondary)
                 }
             } else {
                 LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
                     if (canCreate) {
                         item {
-                            ListItem(
-                                leadingContent = { Icon(Icons.Default.Add, contentDescription = null) },
-                                headlineContent = { Text("Create \"$trimmed\"") },
-                                supportingContent = { Text("New person, assigned right away") },
-                                modifier = Modifier.clickable { onCreate(trimmed) },
+                            PhosSheetRow(
+                                label = "Create \"$trimmed\"",
+                                labelColor = c.signal,
+                                meta = "new person",
+                                leading = { PhosAvatarBox(size = 32.dp) { PhosMonoText("+", color = c.signal) } },
+                                onClick = { onCreate(trimmed) },
                             )
-                            HorizontalDivider()
                         }
                     }
 
                     items(matches, key = { it.id }) { person ->
-                        ListItem(
-                            leadingContent = {
-                                Icon(Icons.Default.Person, contentDescription = null)
-                            },
-                            headlineContent = { Text(person.name ?: "Unnamed") },
-                            supportingContent = {
-                                Text("${person.shotCount} shots · ${person.faceCount} faces")
-                            },
-                            modifier = Modifier.clickable { onPick(person.id) },
+                        PhosSheetRow(
+                            label = person.name ?: "unnamed cluster",
+                            meta = "${person.shotCount} shots",
+                            leading = { PersonAvatar(person) },
+                            onClick = { onPick(person.id) },
                         )
                     }
 
                     if (matches.isEmpty() && !canCreate) {
                         item {
                             Text(
-                                "No people yet.",
+                                text = "No people yet.",
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(vertical = 24.dp),
+                                color = c.textSecondary,
+                                modifier = Modifier.padding(24.dp),
                             )
                         }
                     }
@@ -137,35 +135,51 @@ fun PersonPickerSheet(
     }
 }
 
-/** Shared by the sheets below: a row that is only tappable when it makes sense. */
+/** A person's square avatar: their cover crop, or their initial. */
+@Composable
+internal fun PersonAvatar(person: Person, size: androidx.compose.ui.unit.Dp = 32.dp) {
+    val c = PhosColors.current
+    PhosAvatarBox(size = size) {
+        val url = person.coverShotThumbnailUrl ?: person.thumbnailUrl
+        if (url != null && url.startsWith("http")) {
+            AsyncImage(
+                model = url,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            PhosMonoText((person.name ?: "?").take(1).uppercase(), color = c.textTertiary)
+        }
+    }
+}
+
+/** Shared by the sheets below: a title with an optional explanatory line. */
 @Composable
 internal fun SheetHeader(title: String, subtitle: String?) {
-    Column(modifier = Modifier.fillMaxWidth()) {
-        Text(title, style = MaterialTheme.typography.titleMedium)
+    val c = PhosColors.current
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
+        Text(title, style = MaterialTheme.typography.titleMedium, color = c.textPrimary)
         if (subtitle != null) {
             Spacer(Modifier.height(4.dp))
             Text(
-                subtitle,
+                text = subtitle,
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = c.textSecondary,
             )
         }
-        Spacer(Modifier.height(12.dp))
     }
 }
 
 /** Vertically centred row used for the sheets' empty and loading states. */
 @Composable
 internal fun CenteredNotice(text: String) {
+    val c = PhosColors.current
     Row(
         modifier = Modifier.fillMaxWidth().padding(24.dp),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            text,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        PhosMonoText(text, color = c.textSecondary, maxLines = 2)
     }
 }

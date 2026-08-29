@@ -1,28 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from '@/components/ui/dialog'
 import ShotCard from '@/components/ShotCard.vue'
-import {
-  ArrowLeft,
-  Edit3,
-  Check,
-  X,
-  Merge,
-  Search,
-  Trash2,
-  Users,
-  Image as ImageIcon,
-} from 'lucide-vue-next'
 
 const route = useRoute()
 const router = useRouter()
@@ -184,126 +163,90 @@ watch(personId, () => {
 })
 
 onMounted(loadData)
+
+defineExpose({ loadData, fetchPeople: fetchPerson, fetchShots })
 </script>
 
 <template>
-  <div>
-    <!-- Loading -->
-    <div v-if="loading" class="flex items-center justify-center py-20">
-      <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
-    </div>
+  <div class="p-4 md:p-8 max-w-[1040px] w-full mx-auto flex flex-col gap-6">
+    <div v-if="loading" class="font-mono text-xs text-ink-tertiary py-16 text-center">loading person…</div>
 
-    <!-- Error state -->
-    <div v-else-if="error && !person" class="text-center py-20">
-      <p class="text-zinc-500 text-sm">Could not load person data. Is the backend running?</p>
-      <Button
-        variant="outline"
-        class="mt-4 border-white/10 text-zinc-300"
+    <div v-else-if="error && !person" class="flex flex-col items-center gap-2 py-16 text-center">
+      <span class="signal-dot" style="width:10px;height:10px;background:var(--status-error)"></span>
+      <div class="font-heading text-base font-semibold text-ink">Could not load this person</div>
+      <div class="font-mono text-xs text-error">{{ error }}</div>
+      <button
+        class="mt-2 border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors"
         @click="router.push('/people')"
-      >
-        <ArrowLeft class="w-4 h-4 mr-2" />
-        Back to People
-      </Button>
+      >Back to People</button>
     </div>
 
-    <div v-else>
-      <!-- Header -->
-      <div class="flex items-start gap-4 mb-8">
-        <!-- Back button -->
-        <Button
-          variant="ghost"
-          size="icon"
-          class="text-zinc-400 hover:text-white rounded-xl hover:bg-white/5 shrink-0 mt-1"
-          @click="router.back()"
-        >
-          <ArrowLeft class="w-5 h-5" />
-        </Button>
+    <template v-else>
+      <button
+        class="self-start font-mono text-xs text-ink-tertiary hover:text-signal transition-colors"
+        @click="router.push('/people')"
+      >← People</button>
 
-        <!-- Face thumbnail -->
-        <div class="w-20 h-20 rounded-full bg-zinc-800 border-2 border-zinc-700 overflow-hidden flex items-center justify-center shrink-0">
-          <img
-            v-if="person?.thumbnail_url"
-            :src="person.thumbnail_url"
-            class="w-full h-full object-cover"
-          />
-          <Users v-else class="w-8 h-8 text-zinc-600" />
+      <div class="flex flex-wrap items-center gap-4">
+        <div class="w-16 h-16 rounded bg-raised border border-line overflow-hidden flex items-center justify-center font-mono text-[22px] text-ink-tertiary shrink-0">
+          <img v-if="person?.thumbnail_url" :src="person.thumbnail_url" class="w-full h-full object-cover" />
+          <template v-else>{{ displayName[0] }}</template>
         </div>
 
-        <!-- Name + info -->
-        <div class="flex-1 min-w-0">
-          <!-- Editable name -->
-          <div v-if="isEditingName" class="flex items-center gap-2 mb-1">
-            <Input
+        <div class="flex-1 min-w-[200px]">
+          <div v-if="isEditingName" class="flex gap-2 items-center flex-wrap">
+            <input
               v-model="editName"
-              class="h-9 text-lg font-bold bg-zinc-800/50 border-white/10"
-              placeholder="Enter name..."
+              spellcheck="false"
+              class="bg-surface border border-line rounded-sm px-3 py-2 font-heading text-lg font-semibold text-ink w-60"
               @keydown.enter="saveName"
-              @keydown.escape="cancelEditName"
-              autofocus
+              @keydown.esc="cancelEditName"
             />
-            <Button
-              variant="ghost"
-              size="icon"
-              class="text-emerald-500 hover:text-emerald-400 hover:bg-emerald-500/10 shrink-0"
-              :disabled="savingName || !editName.trim()"
+            <button
+              class="bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors disabled:opacity-50"
+              :disabled="savingName"
               @click="saveName"
-            >
-              <Check class="w-4 h-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              class="text-zinc-400 hover:text-white hover:bg-white/5 shrink-0"
-              @click="cancelEditName"
-            >
-              <X class="w-4 h-4" />
-            </Button>
+            >Save</button>
+            <button class="font-mono text-xs text-ink-tertiary hover:text-signal" @click="cancelEditName">cancel</button>
           </div>
-          <div v-else class="flex items-center gap-2 mb-1">
-            <h2 class="text-2xl font-bold text-white truncate">{{ displayName }}</h2>
-            <Button
-              variant="ghost"
-              size="icon"
-              class="text-zinc-500 hover:text-white hover:bg-white/5 shrink-0"
-              @click="startEditName"
-              title="Rename"
-            >
-              <Edit3 class="w-4 h-4" />
-            </Button>
+          <h2 v-else class="text-[22px] font-semibold">{{ displayName }}</h2>
+          <div class="font-mono text-xs text-ink-tertiary mt-1">
+            {{ person?.shot_count || 0 }} shots · {{ person?.face_count || 0 }} faces ·
+            {{ (person?.pending_count || 0) > 0 ? `${person.pending_count} pending` : 'nothing pending' }}
           </div>
+        </div>
 
-          <div class="flex items-center gap-4 text-sm text-zinc-400">
-            <span>{{ shots.length }} {{ shots.length === 1 ? 'shot' : 'shots' }}</span>
-            <span v-if="person?.face_count">{{ person.face_count }} {{ person.face_count === 1 ? 'face' : 'faces' }}</span>
-            <span v-if="person?.pending_count > 0" class="text-yellow-500">{{ person.pending_count }} pending</span>
-          </div>
-
-          <!-- Actions row -->
-          <div class="flex items-center gap-2 mt-3">
-            <Button
-              variant="outline"
-              size="sm"
-              class="border-white/10 text-zinc-300 hover:text-white gap-1.5"
-              @click="showMergeDialog = true"
-            >
-              <Merge class="w-3.5 h-3.5" />
-              Merge with...
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              class="border-red-500/30 text-red-400 hover:text-red-300 hover:bg-red-500/10 gap-1.5"
-              @click="showDeleteDialog = true"
-            >
-              <Trash2 class="w-3.5 h-3.5" />
-              Delete
-            </Button>
-          </div>
+        <div class="flex flex-wrap gap-2 items-center">
+          <button
+            class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors"
+            @click="startEditName"
+          >Rename</button>
+          <button
+            class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors whitespace-nowrap"
+            @click="showMergeDialog = true; mergeFilter = ''"
+          >Merge into…</button>
+          <template v-if="showDeleteDialog">
+            <button
+              class="rounded px-4 py-2 text-[13px] font-medium text-ink whitespace-nowrap"
+              style="background: var(--status-error)"
+              :disabled="deleting"
+              @click="deletePerson"
+            >Delete person + face markers</button>
+            <button class="font-mono text-xs text-ink-tertiary hover:text-signal" @click="showDeleteDialog = false">cancel</button>
+          </template>
+          <button
+            v-else
+            class="border border-line-strong rounded px-4 py-2 text-[13px] text-error transition-colors"
+            @click="showDeleteDialog = true"
+          >Delete</button>
         </div>
       </div>
 
-      <!-- Shots grid -->
-      <div v-if="shots.length > 0" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">
+      <div v-if="showDeleteDialog" class="font-mono text-xs" style="color: var(--status-degraded)">
+        Removes all face markers of this person and the person record. Photos are not deleted.
+      </div>
+
+      <div v-if="shots.length" class="grid gap-4" style="grid-template-columns: repeat(auto-fill, minmax(160px, 1fr))">
         <ShotCard
           v-for="shot in shots"
           :key="shot.id"
@@ -311,99 +254,58 @@ onMounted(loadData)
           @click="navigateToShot(shot.id)"
         />
       </div>
+      <div v-else class="flex flex-col items-center gap-2 py-16 text-center">
+        <span class="signal-dot" style="width:10px;height:10px;background:var(--status-stopped)"></span>
+        <div class="font-heading text-base font-semibold text-ink">No shots filed here yet</div>
+      </div>
+    </template>
 
-      <!-- Empty shots state -->
-      <div v-else class="text-center py-16">
-        <ImageIcon class="w-12 h-12 text-zinc-700 mx-auto mb-4" />
-        <p class="text-white font-medium mb-2">No shots found</p>
-        <p class="text-zinc-500 text-sm">This person does not have any shots assigned yet.</p>
+    <!-- Merge dialog -->
+    <div
+      v-if="showMergeDialog"
+      class="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style="background: var(--scrim)"
+      @click="showMergeDialog = false"
+    >
+      <div
+        class="w-[400px] max-w-full max-h-[calc(100vh-64px)] bg-overlay border border-line-strong rounded shadow-lg flex flex-col overflow-hidden"
+        @click.stop
+      >
+        <div class="flex items-center justify-between px-6 py-4 border-b border-line">
+          <div class="font-heading text-base font-semibold text-ink">Merge {{ displayName }} into…</div>
+          <button class="font-mono text-[13px] text-ink-tertiary hover:text-signal" @click="showMergeDialog = false">✕</button>
+        </div>
+        <div class="px-6 py-4 flex flex-col gap-2 overflow-y-auto min-h-0">
+          <div class="text-xs font-light text-ink-secondary">
+            All faces move to the target person; this person is deleted.
+          </div>
+          <input
+            v-model="mergeFilter"
+            placeholder="Search people…"
+            spellcheck="false"
+            class="bg-base border border-line rounded-sm px-3 py-2 text-[13px] text-ink w-full"
+          />
+          <div class="flex flex-col gap-0.5">
+            <button
+              v-for="p in filteredMergePeople"
+              :key="p.id"
+              class="flex items-center gap-2 p-2 border border-line rounded hover:bg-raised transition-colors text-left"
+              :disabled="merging"
+              @click="mergeWith(p.id)"
+            >
+              <span class="w-6 h-6 rounded bg-raised border border-line overflow-hidden flex items-center justify-center font-mono text-[11px] text-ink-tertiary shrink-0">
+                <img v-if="p.thumbnail_url" :src="p.thumbnail_url" class="w-full h-full object-cover" />
+                <template v-else>{{ (p.name || '?')[0] }}</template>
+              </span>
+              <span class="flex-1 text-[13px] text-ink truncate">{{ p.name || 'unnamed cluster' }}</span>
+              <span class="font-mono text-[11px] text-ink-tertiary">{{ p.shot_count || 0 }} shots</span>
+            </button>
+            <p v-if="filteredMergePeople.length === 0" class="font-mono text-[11px] text-ink-tertiary text-center py-3">
+              no matching people
+            </p>
+          </div>
+        </div>
       </div>
     </div>
-
-    <!-- Merge Dialog -->
-    <Dialog v-model:open="showMergeDialog">
-      <DialogContent class="sm:max-w-[420px] max-h-[70vh] overflow-hidden flex flex-col">
-        <DialogHeader>
-          <DialogTitle>Merge "{{ displayName }}" with...</DialogTitle>
-          <DialogDescription>
-            All faces from this person will be moved to the selected target person. This person will be deleted.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div class="flex flex-col gap-3 min-h-0 mt-2">
-          <!-- Search filter -->
-          <div class="relative">
-            <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500" />
-            <Input
-              v-model="mergeFilter"
-              placeholder="Search people..."
-              class="pl-9 h-8 text-sm"
-            />
-          </div>
-
-          <!-- People list -->
-          <ScrollArea class="max-h-72 rounded-lg border border-white/5">
-            <div class="p-1 space-y-0.5">
-              <button
-                v-for="target in filteredMergePeople"
-                :key="target.id"
-                @click="mergeWith(target.id)"
-                :disabled="merging"
-                class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-left hover:bg-white/5 transition-colors group disabled:opacity-50"
-              >
-                <div class="w-10 h-10 rounded-full bg-zinc-800 border border-white/10 overflow-hidden flex items-center justify-center shrink-0">
-                  <img
-                    v-if="target.thumbnail_url"
-                    :src="target.thumbnail_url"
-                    class="w-full h-full object-cover"
-                  />
-                  <span v-else class="text-sm font-bold text-zinc-500">{{ (target.name || '?')[0] }}</span>
-                </div>
-                <div class="flex-1 min-w-0">
-                  <span class="text-sm text-zinc-300 group-hover:text-white truncate block">
-                    {{ target.name || 'Unnamed' }}
-                  </span>
-                  <span class="text-[10px] text-zinc-600">
-                    {{ target.face_count }} faces / {{ target.shot_count || 0 }} shots
-                  </span>
-                </div>
-              </button>
-              <p v-if="filteredMergePeople.length === 0" class="text-xs text-zinc-500 text-center py-6">
-                No other people to merge with
-              </p>
-            </div>
-          </ScrollArea>
-        </div>
-      </DialogContent>
-    </Dialog>
-
-    <!-- Delete Confirmation Dialog -->
-    <Dialog v-model:open="showDeleteDialog">
-      <DialogContent class="sm:max-w-[400px]">
-        <DialogHeader>
-          <DialogTitle>Delete "{{ displayName }}"?</DialogTitle>
-          <DialogDescription>
-            This will remove all face markers from all photos of this person and delete the person record. The photos themselves will not be deleted.
-          </DialogDescription>
-        </DialogHeader>
-        <div class="flex justify-end gap-2 mt-4">
-          <Button
-            variant="outline"
-            class="border-white/10 text-zinc-300"
-            :disabled="deleting"
-            @click="showDeleteDialog = false"
-          >
-            Cancel
-          </Button>
-          <Button
-            class="bg-red-600 hover:bg-red-700 text-white"
-            :disabled="deleting"
-            @click="deletePerson"
-          >
-            {{ deleting ? 'Deleting...' : 'Delete' }}
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
   </div>
 </template>

@@ -194,6 +194,63 @@ pub(super) async fn comfyui_import_workflow(
     })))
 }
 
+/// GET /api/comfyui/workflows/:id/graph — the stored node graph
+///
+/// The list endpoint deliberately omits `workflow_json`: a graph is tens of
+/// kilobytes and listing ten workflows would ship all of them to draw none. The
+/// console asks for one graph when it opens one workflow.
+#[utoipa::path(
+    get,
+    path = "/api/comfyui/workflows/{id}/graph",
+    tag = "comfyui",
+    summary = "Get a workflow's node graph",
+    description = "Return the stored ComfyUI API-format graph for one workflow, \
+                   alongside the inputs and outputs detected at import time.",
+    params(("id" = String, Path, description = "Workflow ID")),
+    responses(
+        (status = 200, description = "Workflow graph"),
+        (status = 404, description = "Workflow not found"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
+pub(super) async fn comfyui_workflow_graph(
+    Path(id): Path<String>,
+    UState(state): UState,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _ = require_comfyui(&state)?;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let wf: crate::models::ComfyuiWorkflow = comfyui_workflows::table
+        .filter(comfyui_workflows::id.eq(&id))
+        .first(&mut conn)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // A graph that no longer parses is a broken import, not a server fault: the
+    // console gets an empty object and says so rather than a 500.
+    let graph: serde_json::Value = serde_json::from_str(&wf.workflow_json)
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let inputs: serde_json::Value = wf
+        .inputs_json
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    let outputs: serde_json::Value = wf
+        .outputs_json
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Array(vec![]));
+
+    Ok(Json(serde_json::json!({
+        "id": wf.id,
+        "name": wf.name,
+        "graph": graph,
+        "inputs": inputs,
+        "outputs": outputs,
+    })))
+}
+
 /// DELETE /api/comfyui/workflows/:id
 #[utoipa::path(
     delete,

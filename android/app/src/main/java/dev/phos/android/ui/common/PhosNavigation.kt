@@ -3,9 +3,11 @@ package dev.phos.android.ui.common
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
@@ -139,28 +141,30 @@ fun AuthExpiredBanner(
     onReLogin: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.errorContainer)
-            .clickable(onClick = onReLogin)
-            .padding(12.dp),
-    ) {
+    val c = PhosColors.current
+    Column(modifier = modifier.fillMaxWidth()) {
         Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(c.surface)
+                .clickable(onClick = onReLogin)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = "Session expired.",
-                color = MaterialTheme.colorScheme.onErrorContainer,
+                text = "Session expired — cached library stays browsable.",
+                color = c.error,
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.weight(1f),
             )
             Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = "Sign in",
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.labelMedium,
-            )
+            PhosMonoText(text = "sign in", color = c.error)
         }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(c.error),
+        )
     }
 }

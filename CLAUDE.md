@@ -60,9 +60,25 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
 
 ### Frontend Structure (`frontend/src/`)
-- **`App.vue`** — Main shell: header, gallery, stats cards, settings sheet, import dialog
-- **`components/ui/`** — shadcn-vue primitives (button, card, dialog, input, sheet, tabs, etc.)
+- **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
+- **`components/ReviewDesk.vue`** — One screen, three lanes (`?lane=` → shots / duplicates / faces); `/variations` redirects into it
+- **`components/SettingsPage.vue`** — Settings as a route (library path, WebDAV, S3, dedupe maintenance, APK)
+- **`style.css`** — The AppBahn design system: raw tokens on `:root`, then a `@theme` block remapping Tailwind's palette, radii, shadows and fonts onto them, so utility classes render in the system. Semantic aliases (`bg-base`, `text-ink`, `border-line`, `text-signal`, `text-ready`…) are what components should use
+- **`components/ui/`** — shadcn-vue primitives, no longer used by any screen (only the unreferenced `PhotoLightbox.vue`)
 - **`lib/utils.js`** — `cn()` helper (clsx + tailwind-merge)
+
+### Design System — AppBahn (Bauhaus Engineering)
+Both clients follow one system: dark by default, a single **signal amber** accent, status colour
+(ready / degraded / error / pending / building) as the *only* other colour, hierarchy through font
+weight rather than hue, 1px borders instead of shadows, 2px/4px radii and nothing pill-shaped, an
+8px spacing grid, Geist / Inter / JetBrains Mono, and no gradients, glows or protection scrims.
+Uppercase mono is the "railway schedule" register for labels, counts, ids and filenames.
+- Web tokens live in `frontend/src/style.css`; fonts are bundled via `@fontsource-variable/*` so a
+  LAN-only install still renders correctly
+- Android tokens live in `android/.../ui/common/PhosTheme.kt` (`PhosColors` carries what Material 3
+  has no slot for) with shared primitives in `PhosComponents.kt`; fonts are TTFs in `res/font/`
+- Dynamic colour is deliberately off on Android: status colour carries meaning, so the wallpaper
+  does not get a vote
 
 ### Key Design Decisions
 - No global database — each root directory gets its own `.phos.db`

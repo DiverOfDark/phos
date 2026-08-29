@@ -1,25 +1,16 @@
 <script setup>
+/**
+ * Shots lane — the review desk proper.
+ *
+ * Left: the shot on a stage, with face boxes you can click and a filmstrip of
+ * the files that belong to it. Right: the decision. Everything that changes the
+ * shot lives in the panel; the stage grows no buttons beyond the two it needs
+ * (play a video, draw a face).
+ */
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { cn } from '@/lib/utils'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import {
-  Check,
-  ChevronLeft,
-  ChevronRight,
-  Star,
-  Trash2,
-  X,
-  RefreshCw,
-  Scissors,
-  ArrowRightLeft,
-  FolderOpen,
-  AlertCircle,
-  Plus,
-  Video,
-} from 'lucide-vue-next'
+
+const emit = defineEmits(['changed'])
 
 const route = useRoute()
 const router = useRouter()
@@ -29,15 +20,12 @@ const shots = ref([])
 const currentIndex = ref(0)
 const loading = ref(true)
 const error = ref(null)
+const clearedThisSession = ref(0)
 
 const statusFilter = computed(() => route.query.status || 'pending')
 
 const currentShot = computed(() => shots.value[currentIndex.value] || null)
 const totalShots = computed(() => shots.value.length)
-const reviewedCount = computed(() => {
-  // Shots before the current index are "reviewed" in this session
-  return currentIndex.value
-})
 
 async function fetchShots() {
   loading.value = true
@@ -56,7 +44,6 @@ async function fetchShots() {
   }
 }
 
-// Reload when route query changes
 watch(() => route.query.status, () => {
   fetchShots()
 })
@@ -64,6 +51,7 @@ watch(() => route.query.status, () => {
 // --- Shot detail ---
 const detail = ref(null)
 const loadingDetail = ref(false)
+const similarCount = ref(0)
 
 async function fetchShotDetail(id) {
   if (!id) {
@@ -81,6 +69,18 @@ async function fetchShotDetail(id) {
   } finally {
     loadingDetail.value = false
   }
+  fetchSimilarCount(id)
+  fetchShotSuggestions()
+}
+
+async function fetchSimilarCount(id) {
+  similarCount.value = 0
+  try {
+    const res = await fetch(`/api/shots/${id}/similar`)
+    if (!res.ok) return
+    const data = await res.json()
+    similarCount.value = Array.isArray(data) ? data.length : (data.shots?.length || 0)
+  } catch { /* the near-duplicates block just stays hidden */ }
 }
 
 watch(currentShot, (shot) => {
@@ -96,7 +96,8 @@ const files = computed(() => detail.value?.files || [])
 const originalFile = computed(() => files.value.find(f => f.is_original))
 const mainFile = computed(() => originalFile.value || files.value[0] || null)
 const mainFileIsVideo = computed(() => mainFile.value?.mime_type?.startsWith('video/'))
-// For videos, show a large thumbnail (first frame) so face overlays can work on a static image
+// Videos get their first frame as a large thumbnail so face overlays land on a
+// static image instead of a moving one.
 const mainFileMediaUrl = computed(() => {
   if (!mainFile.value) return ''
   return mainFileIsVideo.value
@@ -104,7 +105,34 @@ const mainFileMediaUrl = computed(() => {
     : `/api/files/${mainFile.value.id}`
 })
 
-// --- People list (for reassignment) ---
+function baseName(path) {
+  return path?.split('/').pop() || 'file'
+}
+
+const curFileName = computed(() => baseName(mainFile.value?.path))
+const curDims = computed(() => {
+  const w = mainFile.value?.width || detail.value?.width
+  const h = mainFile.value?.height || detail.value?.height
+  const ms = mainFile.value?.duration_ms
+  const size = w && h ? `${w}×${h}` : ''
+  if (!ms) return size
+  const secs = Math.round(ms / 1000)
+  const clock = `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`
+  return size ? `${size} · ${clock}` : clock
+})
+
+const statusTag = computed(() => {
+  const s = detail.value?.review_status || currentShot.value?.review_status
+  if (s === 'confirmed') return { label: 'CONFIRMED', color: 'var(--status-ready)' }
+  if (s === 'unsorted') return { label: 'UNSORTED', color: 'var(--status-pending)' }
+  return { label: 'PENDING', color: 'var(--status-degraded)' }
+})
+
+// --- Video playback ---
+const playing = ref(false)
+watch(currentIndex, () => { playing.value = false })
+
+// --- People ---
 const people = ref([])
 const peopleLoaded = ref(false)
 
@@ -123,9 +151,7 @@ async function fetchPeople() {
 
 const peopleMap = computed(() => {
   const map = {}
-  for (const p of people.value) {
-    map[p.id] = p
-  }
+  for (const p of people.value) map[p.id] = p
   return map
 })
 
@@ -133,6 +159,9 @@ function personName(personId) {
   if (!personId) return null
   return peopleMap.value[personId]?.name || null
 }
+
+const assignName = computed(() => detail.value?.primary_person_name || 'Unsorted')
+const assignInitial = computed(() => (detail.value?.primary_person_name || '?')[0])
 
 // --- Face overlays ---
 const faces = computed(() => detail.value?.faces || [])
@@ -146,57 +175,67 @@ function onMainImageLoad(e) {
 
 function faceStyle(face) {
   if (!naturalWidth.value || !naturalHeight.value) return { display: 'none' }
-  const left = (face.box_x1 / naturalWidth.value) * 100
-  const top = (face.box_y1 / naturalHeight.value) * 100
-  const width = ((face.box_x2 - face.box_x1) / naturalWidth.value) * 100
-  const height = ((face.box_y2 - face.box_y1) / naturalHeight.value) * 100
   return {
-    left: `${left}%`,
-    top: `${top}%`,
-    width: `${width}%`,
-    height: `${height}%`,
+    left: `${(face.box_x1 / naturalWidth.value) * 100}%`,
+    top: `${(face.box_y1 / naturalHeight.value) * 100}%`,
+    width: `${((face.box_x2 - face.box_x1) / naturalWidth.value) * 100}%`,
+    height: `${((face.box_y2 - face.box_y1) / naturalHeight.value) * 100}%`,
   }
 }
 
-// --- Face popover (reassign / delete) ---
+function faceLabel(face) {
+  return face.person_name || personName(face.person_id) || '?'
+}
+
+// --- Face panel (reassign / delete a single detection) ---
 const activeFaceId = ref(null)
 const faceSearch = ref('')
 const faceActionLoading = ref(false)
 const faceSuggestions = ref([])
-const loadingSuggestions = ref(false)
-const newPersonName = ref('')
 const creatingPerson = ref(false)
 
-function openFacePopover(faceId) {
+const activeFace = computed(() => faces.value.find(f => f.id === activeFaceId.value) || null)
+
+function openFacePanel(faceId) {
   activeFaceId.value = faceId
   faceSearch.value = ''
-  newPersonName.value = ''
   fetchFaceSuggestions(faceId)
 }
 
-function closeFacePopover() {
+function closeFacePanel() {
   activeFaceId.value = null
   faceSearch.value = ''
-  newPersonName.value = ''
   faceSuggestions.value = []
 }
 
 async function fetchFaceSuggestions(faceId) {
-  loadingSuggestions.value = true
   try {
     const res = await fetch(`/api/faces/${faceId}/suggestions`)
-    if (res.ok) {
-      faceSuggestions.value = await res.json()
-    }
+    if (res.ok) faceSuggestions.value = await res.json()
   } catch (e) {
     console.warn('Failed to fetch face suggestions:', e)
-  } finally {
-    loadingSuggestions.value = false
   }
 }
 
+const facePanelPeople = computed(() => {
+  const q = faceSearch.value.toLowerCase().trim()
+  let list = people.value
+  if (q) list = list.filter(p => (p.name || 'unnamed').toLowerCase().includes(q))
+  if (faceSuggestions.value.length > 0) {
+    const distMap = {}
+    for (const s of faceSuggestions.value) distMap[s.person_id] = s.distance
+    list = [...list].sort((a, b) => (distMap[a.id] ?? 999) - (distMap[b.id] ?? 999))
+  }
+  return list.slice(0, 8)
+})
+
+const faceCreateVisible = computed(() =>
+  faceSearch.value.trim().length > 0 &&
+  !people.value.some(p => (p.name || '').toLowerCase() === faceSearch.value.trim().toLowerCase())
+)
+
 async function createPersonAndAssign(faceId) {
-  const name = newPersonName.value.trim()
+  const name = faceSearch.value.trim()
   if (!name || creatingPerson.value) return
   creatingPerson.value = true
   try {
@@ -207,9 +246,7 @@ async function createPersonAndAssign(faceId) {
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const created = await res.json()
-    // Reassign face to the newly created person
     await reassignFace(faceId, created.id)
-    // Refresh people list
     peopleLoaded.value = false
     fetchPeople()
   } catch (e) {
@@ -218,32 +255,6 @@ async function createPersonAndAssign(faceId) {
     creatingPerson.value = false
   }
 }
-
-const filteredPeople = computed(() => {
-  const q = faceSearch.value.toLowerCase().trim()
-  let list = people.value
-  if (q) {
-    list = list.filter(p => (p.name || 'unnamed').toLowerCase().includes(q))
-  }
-  // If we have suggestions, sort matching people by suggestion distance
-  if (faceSuggestions.value.length > 0) {
-    const distMap = {}
-    for (const s of faceSuggestions.value) {
-      distMap[s.person_id] = s.distance
-    }
-    list = [...list].sort((a, b) => {
-      const da = distMap[a.id] ?? 999
-      const db = distMap[b.id] ?? 999
-      return da - db
-    })
-  }
-  return list
-})
-
-// Suggested person IDs for highlighting
-const suggestedPersonIds = computed(() => {
-  return new Set(faceSuggestions.value.map(s => s.person_id))
-})
 
 async function reassignFace(faceId, targetPersonId) {
   faceActionLoading.value = true
@@ -254,9 +265,8 @@ async function reassignFace(faceId, targetPersonId) {
       body: JSON.stringify({ person_id: targetPersonId }),
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    // Refresh detail to pick up cascaded changes
     if (currentShot.value) await fetchShotDetail(currentShot.value.id)
-    closeFacePopover()
+    closeFacePanel()
   } catch (e) {
     console.error('Failed to reassign face:', e)
   } finally {
@@ -270,7 +280,7 @@ async function deleteFace(faceId) {
     const res = await fetch(`/api/faces/${faceId}`, { method: 'DELETE' })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     if (currentShot.value) await fetchShotDetail(currentShot.value.id)
-    closeFacePopover()
+    closeFacePanel()
   } catch (e) {
     console.error('Failed to delete face:', e)
   } finally {
@@ -278,7 +288,49 @@ async function deleteFace(faceId) {
   }
 }
 
-// --- Set original ---
+// --- Shot-level suggestions ---
+//
+// The API suggests people per face; the desk decides per shot, so the faces'
+// suggestions are merged and the best distance for each person wins.
+const shotSuggestions = ref([])
+
+async function fetchShotSuggestions() {
+  shotSuggestions.value = []
+  const list = faces.value
+  if (list.length === 0) return
+  const best = new Map()
+  for (const face of list.slice(0, 4)) {
+    try {
+      const res = await fetch(`/api/faces/${face.id}/suggestions`)
+      if (!res.ok) continue
+      for (const s of await res.json()) {
+        const prev = best.get(s.person_id)
+        if (!prev || s.distance < prev.distance) best.set(s.person_id, s)
+      }
+    } catch { /* a missing suggestion just means fewer shortcuts */ }
+  }
+  shotSuggestions.value = [...best.values()]
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, 3)
+}
+
+const bestDistance = computed(() => {
+  const s = shotSuggestions.value.find(x => x.person_id === detail.value?.primary_person_id)
+    || shotSuggestions.value[0]
+  return s ? s.distance.toFixed(2) : '—'
+})
+
+// --- Route to anyone else ---
+const routeSearch = ref('')
+const routeMatches = computed(() => {
+  const q = routeSearch.value.toLowerCase().trim()
+  if (!q) return []
+  return people.value
+    .filter(p => (p.name || 'unnamed').toLowerCase().includes(q))
+    .slice(0, 5)
+})
+
+// --- Files: master + split ---
 async function setOriginal(fileId) {
   try {
     const res = await fetch(`/api/files/${fileId}/set-original`, { method: 'PUT' })
@@ -289,7 +341,53 @@ async function setOriginal(fileId) {
   }
 }
 
-// --- Action: Confirm ---
+const splitSelection = ref(new Set())
+const splitting = ref(false)
+const splitMsg = ref('')
+
+function toggleSplitFile(fileId) {
+  if (splitSelection.value.has(fileId)) {
+    splitSelection.value.delete(fileId)
+  } else {
+    splitSelection.value.add(fileId)
+  }
+  // Set mutations are not reactive on their own.
+  splitSelection.value = new Set(splitSelection.value)
+}
+
+function clearSplit() {
+  splitSelection.value = new Set()
+}
+
+// Splitting every file out would leave an empty shot behind, so the button only
+// appears once at least one file is left unselected.
+const splitReady = computed(() =>
+  splitSelection.value.size > 0 && splitSelection.value.size < files.value.length
+)
+
+async function confirmSplit() {
+  if (!currentShot.value || !splitReady.value || splitting.value) return
+  splitting.value = true
+  try {
+    const res = await fetch(`/api/shots/${currentShot.value.id}/split`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_ids: [...splitSelection.value] }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    splitMsg.value = `split ${splitSelection.value.size} file(s) into a new shot`
+    clearSplit()
+    await fetchShotDetail(currentShot.value.id)
+    emit('changed')
+  } catch (e) {
+    console.error('Failed to split shot:', e)
+    splitMsg.value = ''
+  } finally {
+    splitting.value = false
+  }
+}
+
+// --- Decisions ---
 const confirming = ref(false)
 
 async function confirmShot() {
@@ -302,7 +400,6 @@ async function confirmShot() {
       body: JSON.stringify({ shot_ids: [currentShot.value.id] }),
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    // Remove from list and advance
     removeCurrentAndAdvance()
   } catch (e) {
     console.error('Failed to confirm shot:', e)
@@ -314,37 +411,16 @@ async function confirmShot() {
 function removeCurrentAndAdvance() {
   const idx = currentIndex.value
   shots.value.splice(idx, 1)
+  clearedThisSession.value++
   if (shots.value.length === 0) {
     detail.value = null
   } else if (idx >= shots.value.length) {
     currentIndex.value = shots.value.length - 1
   }
-  // currentIndex stays or the watcher re-fetches detail
+  emit('changed')
 }
 
-// --- Action: Reassign shot ---
-const showReassignDropdown = ref(false)
-const reassignSearch = ref('')
 const reassigningShot = ref(false)
-
-function toggleReassignDropdown() {
-  showReassignDropdown.value = !showReassignDropdown.value
-  reassignSearch.value = ''
-}
-
-function closeReassignDropdown() {
-  showReassignDropdown.value = false
-  reassignSearch.value = ''
-}
-
-const filteredReassignPeople = computed(() => {
-  const q = reassignSearch.value.toLowerCase().trim()
-  let list = people.value
-  if (q) {
-    list = list.filter(p => (p.name || 'unnamed').toLowerCase().includes(q))
-  }
-  return list
-})
 
 async function reassignShot(personId) {
   if (!currentShot.value || reassigningShot.value) return
@@ -356,7 +432,7 @@ async function reassignShot(personId) {
       body: JSON.stringify({ primary_person_id: personId }),
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    closeReassignDropdown()
+    routeSearch.value = ''
     removeCurrentAndAdvance()
   } catch (e) {
     console.error('Failed to reassign shot:', e)
@@ -365,7 +441,6 @@ async function reassignShot(personId) {
   }
 }
 
-// --- Action: Mark unsorted ---
 async function markUnsorted() {
   if (!currentShot.value) return
   try {
@@ -381,16 +456,20 @@ async function markUnsorted() {
   }
 }
 
-// --- Action: Delete shot ---
 const deleting = ref(false)
+const deleteArmed = ref(false)
+
 async function deleteShot() {
   if (!currentShot.value || deleting.value) return
+  if (!deleteArmed.value) {
+    deleteArmed.value = true
+    return
+  }
   deleting.value = true
   try {
-    const res = await fetch(`/api/shots/${currentShot.value.id}`, {
-      method: 'DELETE',
-    })
+    const res = await fetch(`/api/shots/${currentShot.value.id}`, { method: 'DELETE' })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    deleteArmed.value = false
     removeCurrentAndAdvance()
   } catch (e) {
     console.error('Failed to delete shot:', e)
@@ -399,76 +478,32 @@ async function deleteShot() {
   }
 }
 
-// --- Action: Split mode ---
-const splitMode = ref(false)
-const splitSelection = ref(new Set())
-const splitting = ref(false)
-
-function enterSplitMode() {
-  if (files.value.length < 2) return // need at least 2 files to split
-  splitMode.value = true
-  splitSelection.value = new Set()
-}
-
-function exitSplitMode() {
-  splitMode.value = false
-  splitSelection.value = new Set()
-}
-
-function toggleSplitFile(fileId) {
-  if (splitSelection.value.has(fileId)) {
-    splitSelection.value.delete(fileId)
-  } else {
-    splitSelection.value.add(fileId)
-  }
-  // Trigger reactivity
-  splitSelection.value = new Set(splitSelection.value)
-}
-
-async function confirmSplit() {
-  if (!currentShot.value || splitSelection.value.size === 0 || splitting.value) return
-  splitting.value = true
-  try {
-    const res = await fetch(`/api/shots/${currentShot.value.id}/split`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_ids: [...splitSelection.value] }),
-    })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    exitSplitMode()
-    // Refresh the detail
-    if (currentShot.value) await fetchShotDetail(currentShot.value.id)
-  } catch (e) {
-    console.error('Failed to split shot:', e)
-  } finally {
-    splitting.value = false
-  }
-}
-
-// --- Action: Draw face mode ---
-const drawFaceMode = ref(false)
-const drawStart = ref(null)   // { x, y } in CSS pixels relative to image
-const drawCurrent = ref(null) // { x, y } during drag
+// --- Draw a face box by hand ---
+const drawMode = ref(false)
+const drawStart = ref(null)
+const drawCurrent = ref(null)
 const addingFace = ref(false)
+const stageEl = ref(null)
 const imageEl = ref(null)
 
-function enterDrawFaceMode() {
-  if (splitMode.value) exitSplitMode()
-  closeFacePopover()
-  closeReassignDropdown()
-  drawFaceMode.value = true
+function toggleDrawMode() {
+  drawMode.value = !drawMode.value
   drawStart.value = null
   drawCurrent.value = null
+  if (drawMode.value) {
+    closeFacePanel()
+    clearSplit()
+  }
 }
 
-function exitDrawFaceMode() {
-  drawFaceMode.value = false
+function exitDrawMode() {
+  drawMode.value = false
   drawStart.value = null
   drawCurrent.value = null
 }
 
 function onDrawMousedown(e) {
-  if (!drawFaceMode.value || !imageEl.value) return
+  if (!drawMode.value || !imageEl.value) return
   e.preventDefault()
   const rect = imageEl.value.getBoundingClientRect()
   drawStart.value = { x: e.clientX - rect.left, y: e.clientY - rect.top }
@@ -476,7 +511,7 @@ function onDrawMousedown(e) {
 }
 
 function onDrawMousemove(e) {
-  if (!drawFaceMode.value || !drawStart.value || !imageEl.value) return
+  if (!drawMode.value || !drawStart.value || !imageEl.value) return
   const rect = imageEl.value.getBoundingClientRect()
   drawCurrent.value = {
     x: Math.max(0, Math.min(e.clientX - rect.left, rect.width)),
@@ -485,20 +520,19 @@ function onDrawMousemove(e) {
 }
 
 async function onDrawMouseup() {
-  if (!drawFaceMode.value || !drawStart.value || !drawCurrent.value || !imageEl.value || !mainFile.value) return
+  if (!drawMode.value || !drawStart.value || !drawCurrent.value || !imageEl.value || !mainFile.value) return
   if (addingFace.value) return
 
   const rect = imageEl.value.getBoundingClientRect()
   const scaleX = naturalWidth.value / rect.width
   const scaleY = naturalHeight.value / rect.height
 
-  // Convert CSS pixels to natural image pixels
   const x1 = Math.min(drawStart.value.x, drawCurrent.value.x) * scaleX
   const y1 = Math.min(drawStart.value.y, drawCurrent.value.y) * scaleY
   const x2 = Math.max(drawStart.value.x, drawCurrent.value.x) * scaleX
   const y2 = Math.max(drawStart.value.y, drawCurrent.value.y) * scaleY
 
-  // Ignore tiny rectangles (likely accidental clicks)
+  // Ignore tiny rectangles — those are stray clicks, not faces.
   if (x2 - x1 < 10 || y2 - y1 < 10) {
     drawStart.value = null
     drawCurrent.value = null
@@ -518,88 +552,63 @@ async function onDrawMouseup() {
     console.error('Failed to add manual face:', e)
   } finally {
     addingFace.value = false
-    exitDrawFaceMode()
+    exitDrawMode()
   }
 }
 
 const drawRectStyle = computed(() => {
   if (!drawStart.value || !drawCurrent.value) return { display: 'none' }
-  const x1 = Math.min(drawStart.value.x, drawCurrent.value.x)
-  const y1 = Math.min(drawStart.value.y, drawCurrent.value.y)
-  const w = Math.abs(drawCurrent.value.x - drawStart.value.x)
-  const h = Math.abs(drawCurrent.value.y - drawStart.value.y)
   return {
-    left: `${x1}px`,
-    top: `${y1}px`,
-    width: `${w}px`,
-    height: `${h}px`,
+    left: `${Math.min(drawStart.value.x, drawCurrent.value.x)}px`,
+    top: `${Math.min(drawStart.value.y, drawCurrent.value.y)}px`,
+    width: `${Math.abs(drawCurrent.value.x - drawStart.value.x)}px`,
+    height: `${Math.abs(drawCurrent.value.y - drawStart.value.y)}px`,
   }
 })
 
 // --- Navigation ---
 function prevShot() {
-  if (currentIndex.value > 0) {
-    closeFacePopover()
-    closeReassignDropdown()
-    exitSplitMode()
-    exitDrawFaceMode()
-    currentIndex.value--
-  }
+  if (currentIndex.value > 0) currentIndex.value--
 }
 
 function nextShot() {
-  if (currentIndex.value < shots.value.length - 1) {
-    closeFacePopover()
-    closeReassignDropdown()
-    exitSplitMode()
-    exitDrawFaceMode()
-    currentIndex.value++
-  }
+  if (currentIndex.value < shots.value.length - 1) currentIndex.value++
 }
 
-// --- Keyboard shortcuts ---
 function onKeydown(e) {
-  // Don't handle if focused on an input
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
 
   if (e.key === 'Escape') {
-    if (drawFaceMode.value) {
-      exitDrawFaceMode()
-    } else if (activeFaceId.value) {
-      closeFacePopover()
-    } else if (showReassignDropdown.value) {
-      closeReassignDropdown()
-    } else if (splitMode.value) {
-      exitSplitMode()
-    }
+    if (drawMode.value) exitDrawMode()
+    else if (activeFaceId.value) closeFacePanel()
+    else if (splitSelection.value.size) clearSplit()
+    else if (deleteArmed.value) deleteArmed.value = false
     return
   }
 
-  // Don't handle other keys if a popover or draw mode is active
-  if (activeFaceId.value || showReassignDropdown.value || drawFaceMode.value) return
+  if (activeFaceId.value || drawMode.value) return
 
   if (e.key === 'Enter') {
     e.preventDefault()
     confirmShot()
-  } else if (e.key === 'r' || e.key === 'R') {
+  } else if (e.key === 'u' || e.key === 'U') {
     e.preventDefault()
-    toggleReassignDropdown()
-  } else if (e.key === 's' || e.key === 'S') {
-    e.preventDefault()
-    if (splitMode.value) {
-      confirmSplit()
-    } else {
-      enterSplitMode()
-    }
+    markUnsorted()
   } else if (e.key === 'f' || e.key === 'F') {
     e.preventDefault()
-    enterDrawFaceMode()
+    toggleDrawMode()
   } else if (e.key === 'ArrowLeft') {
     e.preventDefault()
     prevShot()
   } else if (e.key === 'ArrowRight') {
     e.preventDefault()
     nextShot()
+  } else if (['1', '2', '3'].includes(e.key)) {
+    const s = shotSuggestions.value[Number(e.key) - 1]
+    if (s) {
+      e.preventDefault()
+      reassignShot(s.person_id)
+    }
   }
 }
 
@@ -613,540 +622,349 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
 })
 
-// Reset zoom/face state when navigating
 watch(currentIndex, () => {
   naturalWidth.value = 0
   naturalHeight.value = 0
-  closeFacePopover()
-  closeReassignDropdown()
-  exitSplitMode()
-  exitDrawFaceMode()
+  closeFacePanel()
+  clearSplit()
+  exitDrawMode()
+  splitMsg.value = ''
+  routeSearch.value = ''
+  deleteArmed.value = false
 })
 
-// Expose for App.vue refresh pattern
 defineExpose({ loadData: fetchShots })
 </script>
 
 <template>
-  <div>
-    <!-- Header -->
-    <div class="mb-6">
-      <div class="flex items-center justify-between mb-2">
-        <h2 class="text-2xl font-bold text-white">
-          {{ statusFilter === 'unsorted' ? 'Unsorted Shots' : 'Review Queue' }}
-        </h2>
-        <div v-if="totalShots > 0" class="flex items-center gap-2 text-sm text-zinc-400">
-          <span class="font-medium text-white">{{ currentIndex + 1 }}</span>
-          <span>of</span>
-          <span class="font-medium text-white">{{ totalShots }}</span>
-        </div>
-      </div>
-      <p class="text-zinc-400 text-sm">
-        {{ statusFilter === 'unsorted'
-          ? 'Review shots with no assigned person.'
-          : 'Review AI-assigned shots and confirm or reassign them.' }}
-      </p>
+  <div class="flex flex-col flex-1 min-h-0">
+    <div v-if="loading" class="flex-1 flex items-center justify-center py-16">
+      <span class="font-mono text-xs text-ink-tertiary">loading queue…</span>
     </div>
 
-    <!-- Progress bar -->
-    <div v-if="totalShots > 0" class="mb-6">
-      <div class="flex items-center justify-between mb-1.5">
-        <span class="text-xs font-medium text-zinc-400">
-          {{ reviewedCount }} of {{ totalShots + reviewedCount }} reviewed
-        </span>
-        <span class="text-xs text-zinc-500">
-          {{ totalShots }} remaining
-        </span>
+    <div v-else-if="error" class="flex-1 flex flex-col items-center justify-center gap-2 p-16 text-center">
+      <span class="signal-dot" style="width:10px;height:10px;background:var(--status-error)"></span>
+      <div class="font-heading text-base font-semibold text-ink">Could not load shots</div>
+      <div class="font-mono text-xs text-error">{{ error }}</div>
+      <button
+        class="mt-2 border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors"
+        @click="fetchShots"
+      >Retry</button>
+    </div>
+
+    <div v-else-if="totalShots === 0" class="flex-1 flex flex-col items-center justify-center gap-2 p-16 text-center">
+      <span class="signal-dot" style="width:10px;height:10px;background:var(--status-ready)"></span>
+      <div class="font-heading text-base font-semibold text-ink">Queue clear</div>
+      <div class="text-[13px] font-light text-ink-secondary max-w-md">
+        <template v-if="clearedThisSession">{{ clearedThisSession }} shots reviewed this session. </template>
+        <template v-if="statusFilter === 'unsorted'">Nothing is sitting unsorted.</template>
+        <template v-else>New pending shots appear after a scan.</template>
       </div>
-      <div class="h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+    </div>
+
+    <div v-else-if="currentShot" class="flex-1 flex flex-col lg:flex-row min-h-0">
+      <!-- Photo stage -->
+      <div class="flex-1 min-w-0 flex flex-col gap-4 p-4 lg:pl-8 lg:pr-6 lg:py-6">
         <div
-          class="h-full bg-indigo-600 rounded-full transition-all duration-500 ease-out"
-          :style="{ width: totalShots + reviewedCount > 0 ? `${(reviewedCount / (totalShots + reviewedCount)) * 100}%` : '0%' }"
-        />
-      </div>
-    </div>
+          ref="stageEl"
+          class="relative bg-surface border border-line rounded overflow-hidden flex items-center justify-center select-none"
+          style="aspect-ratio: 3/2"
+          :style="{ cursor: drawMode ? 'crosshair' : 'default' }"
+          @mousedown="onDrawMousedown"
+          @mousemove="onDrawMousemove"
+          @mouseup="onDrawMouseup"
+        >
+          <div v-if="loadingDetail" class="font-mono text-[13px] text-ink-tertiary">loading shot…</div>
 
-    <!-- Loading -->
-    <div v-if="loading" class="flex items-center justify-center py-20">
-      <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
-    </div>
+          <template v-else-if="mainFile">
+            <!-- The image sits in its own positioned box so face boxes are
+                 measured against the rendered picture, not the letterboxing. -->
+            <div class="relative max-w-full max-h-full">
+              <img
+                ref="imageEl"
+                :src="mainFileMediaUrl"
+                :alt="curFileName"
+                class="max-w-full max-h-full block object-contain"
+                style="max-height: calc(100vh - 340px)"
+                draggable="false"
+                @load="onMainImageLoad"
+              />
 
-    <!-- Error -->
-    <div v-else-if="error" class="flex flex-col items-center justify-center py-20 text-center">
-      <AlertCircle class="w-12 h-12 text-red-500/40 mb-4" />
-      <p class="text-white font-medium mb-2">Failed to load shots</p>
-      <p class="text-zinc-500 text-sm mb-4">{{ error }}</p>
-      <Button variant="outline" class="border-white/10" @click="fetchShots">
-        <RefreshCw class="w-4 h-4 mr-2" />
-        Retry
-      </Button>
-    </div>
+              <template v-if="!drawMode && naturalWidth > 0">
+                <button
+                  v-for="face in faces"
+                  :key="face.id"
+                  class="absolute rounded-sm p-0 transition-colors"
+                  :style="{
+                    ...faceStyle(face),
+                    border: `1px solid ${face.person_id ? 'oklch(100% 0 0 / 0.7)' : 'var(--accent)'}`,
+                    background: activeFaceId === face.id ? 'oklch(80% 0.16 80 / 0.12)' : 'transparent',
+                  }"
+                  title="Reassign or delete this face"
+                  @click.stop="openFacePanel(face.id)"
+                >
+                  <span
+                    class="absolute left-0 font-mono text-[11px] whitespace-nowrap bg-base border border-line rounded-sm px-1.5"
+                    style="top: calc(100% + 4px)"
+                    :style="{ color: face.person_id ? 'var(--text-secondary)' : 'var(--accent)' }"
+                  >{{ faceLabel(face) }}</span>
+                </button>
+              </template>
 
-    <!-- Empty state -->
-    <div v-else-if="totalShots === 0" class="flex flex-col items-center justify-center py-20 text-center">
-      <div class="w-16 h-16 rounded-2xl bg-zinc-800 border border-white/5 flex items-center justify-center mb-4">
-        <Check class="w-8 h-8 text-emerald-500" />
-      </div>
-      <p class="text-white font-medium mb-2">All caught up!</p>
-      <p class="text-zinc-500 text-sm max-w-sm">
-        {{ statusFilter === 'unsorted'
-          ? 'No unsorted shots to review.'
-          : 'All shots have been reviewed. New pending shots will appear here after scanning.' }}
-      </p>
-      <Button
-        variant="outline"
-        class="mt-4 border-white/10 text-zinc-300"
-        @click="router.push('/')"
-      >
-        Back to Dashboard
-      </Button>
-    </div>
-
-    <!-- Main review view -->
-    <div v-else-if="currentShot" class="space-y-4">
-      <!-- Shot info bar -->
-      <div class="flex items-center gap-3 text-sm">
-        <div
-          :class="cn(
-            'w-2 h-2 rounded-full',
-            currentShot.review_status === 'confirmed' ? 'bg-emerald-500' : 'bg-yellow-500'
-          )"
-        />
-        <span class="text-zinc-400">
-          {{ currentShot.review_status === 'confirmed' ? 'Confirmed' : 'Pending' }}
-        </span>
-        <span v-if="detail?.primary_person_name" class="text-zinc-300 font-medium">
-          {{ detail.primary_person_name }}
-        </span>
-        <span v-else class="text-zinc-500 italic">Unsorted</span>
-        <span v-if="files.length > 1" class="text-zinc-500">
-          {{ files.length }} files
-        </span>
-      </div>
-
-      <!-- Files display -->
-      <div class="flex flex-col lg:flex-row gap-4">
-        <!-- Main image with face overlays -->
-        <div class="flex-1 min-w-0">
-          <div class="relative inline-block w-full">
-            <!-- Loading spinner while detail loads -->
-            <div v-if="loadingDetail" class="aspect-video bg-zinc-900 rounded-lg flex items-center justify-center">
-              <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
-            </div>
-            <template v-else-if="mainFile">
-              <div class="flex justify-center bg-zinc-900 rounded-lg overflow-visible">
               <div
-                class="relative inline-block overflow-visible"
-                :class="{ 'cursor-crosshair': drawFaceMode }"
-                @mousedown="onDrawMousedown"
-                @mousemove="onDrawMousemove"
-                @mouseup="onDrawMouseup"
-              >
-                <img
-                  ref="imageEl"
-                  :src="mainFileMediaUrl"
-                  :alt="mainFile.path?.split('/').pop() || 'Shot'"
-                  class="max-w-full max-h-[60vh] select-none block rounded-lg"
-                  draggable="false"
-                  @load="onMainImageLoad"
-                  @click="closeFacePopover"
-                />
+                v-if="drawMode && drawStart && drawCurrent"
+                class="absolute rounded-sm pointer-events-none"
+                style="border: 1px dashed var(--accent); background: oklch(80% 0.16 80 / 0.08)"
+                :style="drawRectStyle"
+              ></div>
+            </div>
 
-                <!-- Video badge -->
-                <div
-                  v-if="mainFileIsVideo"
-                  class="absolute top-3 right-14 flex items-center gap-1 px-2 py-1 bg-purple-500/20 backdrop-blur-sm border border-purple-500/30 rounded-lg"
-                >
-                  <Video class="w-3.5 h-3.5 text-purple-400" />
-                  <span class="text-xs font-semibold text-purple-300">Video</span>
-                </div>
+            <!-- Video playback replaces the stage entirely -->
+            <div v-if="playing" class="absolute inset-0 bg-base flex items-center justify-center">
+              <video
+                :src="`/api/files/${mainFile.id}`"
+                class="max-w-full max-h-full"
+                controls
+                autoplay
+              ></video>
+              <button
+                class="absolute top-2 right-2 bg-base border border-line-strong rounded-sm px-2 py-0.5 font-mono text-[11px] text-ink-secondary hover:text-signal"
+                @click="playing = false"
+              >stop</button>
+            </div>
 
-                <!-- Original badge on main image -->
-                <div
-                  v-if="mainFile.is_original"
-                  class="absolute top-3 left-3 flex items-center gap-1 px-2 py-1 bg-yellow-500/20 backdrop-blur-sm border border-yellow-500/30 rounded-lg"
-                >
-                  <Star class="w-3.5 h-3.5 text-yellow-400 fill-yellow-400" />
-                  <span class="text-xs font-semibold text-yellow-300">Original</span>
-                </div>
+            <!-- Stage tags -->
+            <div class="absolute top-2 left-2 flex gap-2 flex-wrap">
+              <span class="tag bg-base" :style="{ color: statusTag.color }">{{ statusTag.label }}</span>
+              <span v-if="mainFileIsVideo" class="tag bg-base" style="color: var(--status-building)">Video</span>
+              <span v-if="drawMode" class="tag bg-base" style="color: var(--accent); border-color: var(--accent-muted)">Draw face — drag on image</span>
+            </div>
 
-                <!-- Draw face rectangle preview -->
-                <div
-                  v-if="drawFaceMode && drawStart && drawCurrent"
-                  class="absolute border-2 border-dashed border-indigo-400 bg-indigo-500/10 rounded-sm pointer-events-none"
-                  :style="drawRectStyle"
-                />
-
-                <!-- Draw face mode indicator -->
-                <div
-                  v-if="drawFaceMode"
-                  class="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1.5 bg-indigo-600/80 backdrop-blur-sm border border-indigo-400/30 rounded-lg"
-                >
-                  <Plus class="w-3.5 h-3.5 text-white" />
-                  <span class="text-xs font-semibold text-white">Draw face</span>
-                </div>
-
-                <!-- Face overlays -->
-                <template v-if="faces.length > 0 && naturalWidth > 0 && !drawFaceMode">
-                  <div
-                    v-for="face in faces"
-                    :key="face.id"
-                    class="absolute border-2 border-indigo-400/70 rounded-sm cursor-pointer hover:border-indigo-300 transition-colors group/face"
-                    :style="faceStyle(face)"
-                    @click.stop="openFacePopover(face.id)"
-                  >
-                    <!-- Person name label -->
-                    <div class="absolute -bottom-6 left-1/2 -translate-x-1/2 whitespace-nowrap">
-                      <span class="px-1.5 py-0.5 text-[10px] font-medium bg-black/70 text-zinc-200 rounded backdrop-blur-sm group-hover/face:bg-indigo-600/80 group-hover/face:text-white transition-colors">
-                        {{ personName(face.person_id) || 'Unknown' }}
-                      </span>
-                    </div>
-
-                    <!-- Face action popover -->
-                    <div
-                      v-if="activeFaceId === face.id"
-                      class="absolute top-full left-1/2 -translate-x-1/2 mt-8 z-50"
-                      @click.stop
-                    >
-                      <div class="w-64 bg-zinc-900 border border-white/10 rounded-xl shadow-2xl overflow-hidden">
-                        <div class="p-2 border-b border-white/5">
-                          <div class="flex items-center justify-between mb-1.5 px-1">
-                            <span class="text-xs font-semibold text-zinc-400">Reassign to</span>
-                            <div class="flex items-center gap-1">
-                              <button
-                                class="p-1 text-zinc-500 hover:text-red-400 transition-colors rounded"
-                                title="Delete this face detection"
-                                @click.stop="deleteFace(face.id)"
-                              >
-                                <Trash2 class="w-3.5 h-3.5" />
-                              </button>
-                              <button
-                                class="p-1 text-zinc-500 hover:text-white transition-colors rounded"
-                                @click.stop="closeFacePopover"
-                              >
-                                <X class="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          </div>
-                          <Input
-                            v-model="faceSearch"
-                            placeholder="Search or type new name..."
-                            class="h-7 text-xs bg-zinc-800/50 border-white/5"
-                            @click.stop
-                            @keydown.enter.stop="faceSearch.trim() ? (newPersonName = faceSearch.trim(), createPersonAndAssign(face.id)) : null"
-                          />
-                        </div>
-                        <ScrollArea class="max-h-56">
-                          <div class="p-1">
-                            <div v-if="faceActionLoading || creatingPerson" class="flex items-center justify-center py-4">
-                              <RefreshCw class="w-4 h-4 text-indigo-400 animate-spin" />
-                            </div>
-                            <template v-else>
-                              <!-- Suggestions header -->
-                              <div v-if="faceSuggestions.length > 0 && !faceSearch" class="px-2 pt-1 pb-0.5">
-                                <span class="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Suggested</span>
-                              </div>
-
-                              <button
-                                v-for="person in filteredPeople"
-                                :key="person.id"
-                                class="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left transition-colors"
-                                :class="face.person_id === person.id
-                                  ? 'bg-indigo-600/20 text-indigo-300'
-                                  : suggestedPersonIds.has(person.id) && !faceSearch
-                                    ? 'bg-emerald-600/10 text-zinc-200 hover:bg-emerald-600/20'
-                                    : 'text-zinc-300 hover:bg-white/5 hover:text-white'"
-                                @click.stop="reassignFace(face.id, person.id)"
-                              >
-                                <div class="w-6 h-6 rounded-full bg-zinc-800 border border-zinc-700 overflow-hidden flex items-center justify-center shrink-0">
-                                  <img
-                                    v-if="person.thumbnail_url"
-                                    :src="person.thumbnail_url"
-                                    class="w-full h-full object-cover"
-                                  />
-                                  <span v-else class="text-[10px] font-bold text-zinc-500">{{ (person.name || '?')[0] }}</span>
-                                </div>
-                                <span class="text-xs font-medium truncate">{{ person.name || 'Unnamed' }}</span>
-                                <span v-if="face.person_id === person.id" class="ml-auto text-[10px] text-indigo-400">current</span>
-                                <span v-else-if="suggestedPersonIds.has(person.id) && !faceSearch" class="ml-auto text-[10px] text-emerald-400">match</span>
-                              </button>
-
-                              <!-- Create new person option (always visible when typing) -->
-                              <div v-if="faceSearch.trim()" class="p-1 border-t border-white/5">
-                                <button
-                                  class="w-full flex items-center gap-2 px-2 py-2 rounded-lg text-left bg-indigo-600/10 text-indigo-300 hover:bg-indigo-600/20 transition-colors"
-                                  @click.stop="newPersonName = faceSearch.trim(); createPersonAndAssign(face.id)"
-                                >
-                                  <div class="w-6 h-6 rounded-full bg-indigo-600/30 border border-indigo-500/30 flex items-center justify-center shrink-0">
-                                    <span class="text-xs font-bold text-indigo-300">+</span>
-                                  </div>
-                                  <span class="text-xs font-medium">Create "{{ faceSearch.trim() }}"</span>
-                                </button>
-                              </div>
-
-                              <p v-if="filteredPeople.length === 0 && !faceSearch.trim()" class="text-xs text-zinc-500 text-center py-3">No people found</p>
-                            </template>
-                          </div>
-                        </ScrollArea>
-                      </div>
-                    </div>
-                  </div>
-                </template>
-              </div>
-              </div>
-            </template>
-          </div>
+            <div class="absolute top-2 right-2 flex gap-2">
+              <button
+                v-if="mainFileIsVideo && !playing"
+                class="bg-base border border-line-strong rounded-sm px-2 py-0.5 font-mono text-[11px] text-ink-secondary hover:text-signal transition-colors"
+                @click.stop="playing = true"
+              >▶ play</button>
+              <button
+                class="bg-base border border-line-strong rounded-sm px-2 py-0.5 font-mono text-[11px] text-ink-secondary hover:text-signal transition-colors"
+                @click.stop="toggleDrawMode"
+              >+ face <span class="text-ink-tertiary">F</span></button>
+            </div>
+          </template>
         </div>
 
-        <!-- Side file list (when more than 1 file) -->
-        <div v-if="files.length > 1" class="lg:w-48 flex lg:flex-col gap-2 overflow-x-auto lg:overflow-x-visible pb-2 lg:pb-0">
-          <div
+        <!-- Filmstrip -->
+        <div class="flex gap-2 items-center flex-none min-w-0 overflow-x-auto">
+          <button
             v-for="file in files"
             :key="file.id"
-            class="relative shrink-0 w-36 lg:w-full aspect-square bg-zinc-900 rounded-lg overflow-hidden border transition-colors cursor-pointer"
-            :class="[
-              splitMode
-                ? splitSelection.has(file.id)
-                  ? 'border-indigo-500 ring-2 ring-indigo-500/30'
-                  : 'border-zinc-700 hover:border-zinc-600'
-                : file.id === mainFile?.id
-                  ? 'border-indigo-500'
-                  : 'border-zinc-800 hover:border-zinc-700',
-            ]"
-            @click="splitMode ? toggleSplitFile(file.id) : null"
+            :title="baseName(file.path)"
+            class="w-16 h-12 flex-none rounded-sm bg-raised border overflow-hidden relative p-0"
+            :class="splitSelection.has(file.id)
+              ? 'border-signal'
+              : file.id === mainFile?.id ? 'border-line-strong' : 'border-line'"
+            @click="toggleSplitFile(file.id)"
           >
-            <img
-              :src="`/api/files/${file.id}/thumbnail`"
-              class="w-full h-full object-cover"
-              loading="lazy"
+            <img :src="`/api/files/${file.id}/thumbnail`" class="w-full h-full object-cover" loading="lazy" />
+            <span v-if="file.is_original" class="absolute top-1 left-1 w-1.5 h-1.5 rounded-full bg-signal"></span>
+            <span v-if="splitSelection.has(file.id)" class="absolute top-0.5 right-1 font-mono text-[11px] text-signal">✓</span>
+          </button>
+          <div class="flex-1"></div>
+          <div class="font-mono text-xs text-ink-tertiary whitespace-nowrap flex-none">
+            {{ currentIndex + 1 }} / {{ totalShots }} · {{ files.length }} file{{ files.length === 1 ? '' : 's' }}
+          </div>
+        </div>
+      </div>
+
+      <!-- Decision panel -->
+      <div class="w-full lg:w-[336px] flex-none border-t lg:border-t-0 lg:border-l border-line flex flex-col overflow-y-auto">
+        <div class="p-6 flex flex-col gap-6 flex-1">
+          <!-- Face panel -->
+          <div
+            v-if="activeFace"
+            class="flex flex-col gap-2 p-3 border rounded bg-surface"
+            style="border-color: var(--accent-muted)"
+          >
+            <div class="flex items-center gap-2">
+              <div class="label flex-1">Face — {{ faceLabel(activeFace) }}</div>
+              <button class="font-mono text-[11px] text-error" @click="deleteFace(activeFace.id)">delete</button>
+              <button class="font-mono text-[13px] text-ink-tertiary hover:text-signal" @click="closeFacePanel">✕</button>
+            </div>
+            <input
+              v-model="faceSearch"
+              placeholder="Search or type a new name…"
+              spellcheck="false"
+              class="bg-base border border-line rounded-sm px-2 py-1.5 text-[13px] text-ink w-full"
+              @keydown.enter="faceCreateVisible ? createPersonAndAssign(activeFace.id) : null"
             />
-
-            <!-- Original badge -->
-            <div
-              v-if="file.is_original"
-              class="absolute top-1.5 left-1.5 flex items-center gap-0.5 px-1.5 py-0.5 bg-yellow-500/20 backdrop-blur-sm border border-yellow-500/30 rounded"
-            >
-              <Star class="w-2.5 h-2.5 text-yellow-400 fill-yellow-400" />
-              <span class="text-[9px] font-semibold text-yellow-300">Original</span>
+            <div class="flex flex-col gap-0.5">
+              <button
+                v-for="p in facePanelPeople"
+                :key="p.id"
+                class="flex items-center gap-2 px-2 py-1.5 border border-line rounded hover:bg-raised transition-colors text-left"
+                :disabled="faceActionLoading"
+                @click="reassignFace(activeFace.id, p.id)"
+              >
+                <span class="w-5 h-5 rounded bg-raised border border-line overflow-hidden flex items-center justify-center font-mono text-[10px] text-ink-tertiary shrink-0">
+                  <img v-if="p.thumbnail_url" :src="p.thumbnail_url" class="w-full h-full object-cover" />
+                  <template v-else>{{ (p.name || '?')[0] }}</template>
+                </span>
+                <span class="text-[13px] text-ink truncate">{{ p.name || 'unnamed' }}</span>
+                <span v-if="activeFace.person_id === p.id" class="ml-auto font-mono text-[10px] text-signal">current</span>
+              </button>
+              <button
+                v-if="faceCreateVisible"
+                class="flex items-center gap-2 px-2 py-1.5 border rounded text-[13px] text-signal hover:bg-raised transition-colors text-left"
+                style="border-color: var(--accent-muted)"
+                :disabled="creatingPerson"
+                @click="createPersonAndAssign(activeFace.id)"
+              >Create "{{ faceSearch.trim() }}"</button>
             </div>
+          </div>
 
-            <!-- Set as Original button (non-original files, not in split mode) -->
+          <!-- Route to -->
+          <div class="flex flex-col gap-2">
+            <div class="label">Route to</div>
+            <div class="flex items-center gap-2">
+              <span class="w-8 h-8 rounded bg-raised border border-line flex items-center justify-center font-mono text-[13px] text-ink-secondary">
+                {{ assignInitial }}
+              </span>
+              <div class="flex-1 min-w-0">
+                <div class="text-sm font-medium text-ink truncate">{{ assignName }}</div>
+                <div class="font-mono text-[11px] text-ink-tertiary">match distance {{ bestDistance }}</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Suggestions -->
+          <div class="flex flex-col gap-2">
+            <div class="label">Suggestions</div>
+            <div v-if="shotSuggestions.length" class="flex flex-col gap-0.5">
+              <button
+                v-for="(s, i) in shotSuggestions"
+                :key="s.person_id"
+                class="flex items-center gap-2 p-2 border rounded hover:bg-raised transition-colors text-left"
+                :class="s.person_id === detail?.primary_person_id ? 'border-signal bg-surface' : 'border-line'"
+                @click="reassignShot(s.person_id)"
+              >
+                <kbd class="kbd-ab">{{ i + 1 }}</kbd>
+                <span class="flex-1 text-[13px] text-ink truncate">{{ s.person_name || 'unnamed' }}</span>
+                <span
+                  class="font-mono text-[11px]"
+                  :style="{ color: s.distance < 0.4 ? 'var(--status-ready)' : 'var(--text-tertiary)' }"
+                >{{ s.distance.toFixed(2) }}</span>
+              </button>
+            </div>
+            <div v-else class="font-mono text-[11px] text-ink-tertiary">no close matches</div>
+
+            <input
+              v-model="routeSearch"
+              placeholder="Route to anyone else…"
+              spellcheck="false"
+              class="bg-base border border-line rounded-sm px-2 py-1.5 text-[13px] text-ink w-full"
+            />
+            <div v-if="routeMatches.length" class="flex flex-col gap-0.5">
+              <button
+                v-for="p in routeMatches"
+                :key="p.id"
+                class="flex items-center gap-2 px-2 py-1.5 border border-line rounded hover:bg-raised transition-colors text-left"
+                @click="reassignShot(p.id)"
+              >
+                <span class="w-5 h-5 rounded bg-raised border border-line overflow-hidden flex items-center justify-center font-mono text-[10px] text-ink-tertiary shrink-0">
+                  <img v-if="p.thumbnail_url" :src="p.thumbnail_url" class="w-full h-full object-cover" />
+                  <template v-else>{{ (p.name || '?')[0] }}</template>
+                </span>
+                <span class="text-[13px] text-ink truncate">{{ p.name || 'unnamed' }}</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Files -->
+          <div class="flex flex-col gap-2">
+            <div class="label">Files · {{ files.length }}</div>
+            <div class="flex flex-col gap-0.5">
+              <div
+                v-for="file in files"
+                :key="file.id"
+                class="flex items-center gap-2 px-2 py-1.5 border rounded text-left"
+                :class="splitSelection.has(file.id) ? 'border-signal bg-surface' : 'border-line'"
+              >
+                <button
+                  class="w-3 h-3 flex-none border rounded-sm flex items-center justify-center text-[9px]"
+                  :class="splitSelection.has(file.id)
+                    ? 'bg-signal border-signal text-signal-fg'
+                    : 'border-line-strong text-transparent'"
+                  title="Select for split"
+                  @click="toggleSplitFile(file.id)"
+                >✓</button>
+                <span class="flex-1 font-mono text-xs text-ink-secondary truncate">{{ baseName(file.path) }}</span>
+                <span v-if="file.mime_type?.startsWith('video/')" class="font-mono text-[10px] tracking-[0.08em] text-building">VID</span>
+                <span
+                  v-if="file.is_original"
+                  class="font-mono text-[10px] tracking-[0.08em] text-signal border rounded-sm px-1"
+                  style="border-color: var(--accent-muted)"
+                >MASTER</span>
+                <button
+                  v-else
+                  class="font-mono text-[10px] text-ink-tertiary hover:text-signal transition-colors"
+                  @click="setOriginal(file.id)"
+                >set master</button>
+              </div>
+            </div>
             <button
-              v-if="!file.is_original && !splitMode"
-              class="absolute bottom-1.5 left-1.5 right-1.5 flex items-center justify-center gap-1 py-1 bg-black/70 backdrop-blur-sm border border-white/10 rounded text-[10px] font-medium text-zinc-300 hover:text-white hover:bg-black/90 transition-colors opacity-0 group-hover:opacity-100"
-              :class="{ 'opacity-100': true }"
-              @click.stop="setOriginal(file.id)"
-            >
-              <Star class="w-2.5 h-2.5" />
-              Set as Original
-            </button>
-
-            <!-- Split selection check -->
-            <div
-              v-if="splitMode && splitSelection.has(file.id)"
-              class="absolute top-1.5 right-1.5 w-5 h-5 bg-indigo-600 rounded-full flex items-center justify-center"
-            >
-              <Check class="w-3 h-3 text-white" />
-            </div>
-
-            <!-- Filename -->
-            <div class="absolute bottom-0 inset-x-0 px-1.5 py-1 bg-gradient-to-t from-black/70 to-transparent">
-              <p class="text-[9px] text-zinc-300 truncate">{{ file.path?.split('/').pop() || 'file' }}</p>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Navigation arrows (mobile-friendly) -->
-      <div class="flex items-center justify-center gap-4 py-2">
-        <button
-          class="p-2 rounded-full transition-colors"
-          :class="currentIndex > 0
-            ? 'text-zinc-300 hover:text-white hover:bg-white/5'
-            : 'text-zinc-700 cursor-not-allowed'"
-          :disabled="currentIndex <= 0"
-          @click="prevShot"
-        >
-          <ChevronLeft class="w-5 h-5" />
-        </button>
-        <span class="text-sm text-zinc-500 font-mono">{{ currentIndex + 1 }} / {{ totalShots }}</span>
-        <button
-          class="p-2 rounded-full transition-colors"
-          :class="currentIndex < totalShots - 1
-            ? 'text-zinc-300 hover:text-white hover:bg-white/5'
-            : 'text-zinc-700 cursor-not-allowed'"
-          :disabled="currentIndex >= totalShots - 1"
-          @click="nextShot"
-        >
-          <ChevronRight class="w-5 h-5" />
-        </button>
-      </div>
-
-      <!-- Action bar -->
-      <div class="border-t border-white/5 pt-4">
-        <!-- Split mode bar -->
-        <div v-if="splitMode" class="flex items-center justify-between">
-          <div class="flex items-center gap-2 text-sm">
-            <Scissors class="w-4 h-4 text-indigo-400" />
-            <span class="text-zinc-300">Split mode:</span>
-            <span class="text-white font-medium">{{ splitSelection.size }} file{{ splitSelection.size !== 1 ? 's' : '' }} selected</span>
-          </div>
-          <div class="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              class="border-white/10 text-zinc-400 hover:text-white"
-              @click="exitSplitMode"
-            >
-              Cancel
-            </Button>
-            <Button
-              size="sm"
-              class="bg-indigo-600 hover:bg-indigo-500 text-white"
-              :disabled="splitSelection.size === 0 || splitting"
+              v-if="splitReady"
+              class="self-start border border-line-strong rounded px-3 py-1.5 text-xs text-ink-secondary hover:text-signal transition-colors disabled:opacity-50"
+              :disabled="splitting"
               @click="confirmSplit"
+            >Split {{ splitSelection.size }} into new shot</button>
+            <div v-if="splitMsg" class="font-mono text-[11px] text-ready">{{ splitMsg }}</div>
+          </div>
+
+          <!-- Near-duplicates -->
+          <div v-if="similarCount > 0" class="flex flex-col gap-2">
+            <div class="label">Near-duplicates</div>
+            <button
+              class="flex items-center gap-2 p-2 border border-line rounded hover:bg-raised transition-colors text-left"
+              @click="router.push({ path: '/review', query: { lane: 'duplicates' } })"
             >
-              <RefreshCw v-if="splitting" class="w-3.5 h-3.5 animate-spin" />
-              <Scissors v-else class="w-3.5 h-3.5" />
-              Split (S)
-            </Button>
+              <span class="signal-dot signal-pulse" style="background: var(--status-degraded)"></span>
+              <span class="flex-1 text-xs text-ink-secondary">{{ similarCount }} similar shots found</span>
+              <span class="font-mono text-xs text-ink-tertiary">→</span>
+            </button>
           </div>
         </div>
 
-        <!-- Normal action bar -->
-        <div v-else class="flex flex-wrap items-center gap-2">
-          <!-- Confirm -->
-          <Button
-            class="bg-emerald-600 hover:bg-emerald-500 text-white gap-2"
+        <!-- Actions -->
+        <div class="border-t border-line px-6 py-4 flex flex-col gap-2 flex-none sticky bottom-0 bg-base">
+          <button
+            class="flex items-center justify-center gap-2 bg-signal text-signal-fg rounded p-2.5 text-sm font-medium hover:bg-signal-hover transition-colors disabled:opacity-50"
             :disabled="confirming"
             @click="confirmShot"
           >
-            <RefreshCw v-if="confirming" class="w-4 h-4 animate-spin" />
-            <Check v-else class="w-4 h-4" />
-            Confirm
-            <kbd class="ml-1 px-1.5 py-0.5 bg-white/10 rounded text-[10px] font-mono">Enter</kbd>
-          </Button>
-
-          <!-- Reassign -->
-          <div class="relative">
-            <Button
-              variant="outline"
-              class="border-white/10 text-zinc-300 hover:text-white gap-2"
-              @click="toggleReassignDropdown"
-            >
-              <ArrowRightLeft class="w-4 h-4" />
-              Reassign
-              <kbd class="ml-1 px-1.5 py-0.5 bg-white/10 rounded text-[10px] font-mono">R</kbd>
-            </Button>
-
-            <!-- Reassign dropdown -->
-            <div
-              v-if="showReassignDropdown"
-              class="absolute bottom-full left-0 mb-2 z-50"
-              @click.stop
-            >
-              <div class="w-64 bg-zinc-900 border border-white/10 rounded-xl shadow-2xl overflow-hidden">
-                <div class="p-2 border-b border-white/5">
-                  <div class="flex items-center justify-between mb-1.5 px-1">
-                    <span class="text-xs font-semibold text-zinc-400">Move shot to</span>
-                    <button
-                      class="text-zinc-500 hover:text-white transition-colors"
-                      @click.stop="closeReassignDropdown"
-                    >
-                      <X class="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                  <Input
-                    v-model="reassignSearch"
-                    placeholder="Search people..."
-                    class="h-7 text-xs bg-zinc-800/50 border-white/5"
-                    @click.stop
-                  />
-                </div>
-                <ScrollArea class="max-h-56">
-                  <div class="p-1">
-                    <div v-if="reassigningShot" class="flex items-center justify-center py-4">
-                      <RefreshCw class="w-4 h-4 text-indigo-400 animate-spin" />
-                    </div>
-                    <template v-else>
-                      <button
-                        v-for="person in filteredReassignPeople"
-                        :key="person.id"
-                        class="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left transition-colors"
-                        :class="detail?.primary_person_id === person.id
-                          ? 'bg-indigo-600/20 text-indigo-300'
-                          : 'text-zinc-300 hover:bg-white/5 hover:text-white'"
-                        @click.stop="reassignShot(person.id)"
-                      >
-                        <div class="w-6 h-6 rounded-full bg-zinc-800 border border-zinc-700 overflow-hidden flex items-center justify-center shrink-0">
-                          <img
-                            v-if="person.thumbnail_url"
-                            :src="person.thumbnail_url"
-                            class="w-full h-full object-cover"
-                          />
-                          <span v-else class="text-[10px] font-bold text-zinc-500">{{ (person.name || '?')[0] }}</span>
-                        </div>
-                        <span class="text-xs font-medium truncate">{{ person.name || 'Unnamed' }}</span>
-                        <span v-if="detail?.primary_person_id === person.id" class="ml-auto text-[10px] text-indigo-400">current</span>
-                      </button>
-                      <p v-if="filteredReassignPeople.length === 0" class="text-xs text-zinc-500 text-center py-3">No people found</p>
-                    </template>
-                  </div>
-                </ScrollArea>
-              </div>
-            </div>
+            Confirm — {{ assignName }}
+            <kbd class="font-mono text-[10px] border rounded-sm px-1" style="border-color: oklch(15% 0.01 80 / .3)">⏎</kbd>
+          </button>
+          <div class="flex gap-2">
+            <button
+              class="flex-1 border border-line-strong rounded p-2 text-xs text-ink-secondary hover:text-signal transition-colors"
+              @click="markUnsorted"
+            >Unsorted <span class="font-mono text-[10px] text-ink-tertiary">U</span></button>
+            <button
+              class="flex-1 border border-line-strong rounded p-2 text-xs text-ink-secondary hover:text-signal transition-colors disabled:opacity-40"
+              :disabled="currentIndex >= totalShots - 1"
+              @click="nextShot"
+            >Skip <span class="font-mono text-[10px] text-ink-tertiary">→</span></button>
+            <button
+              class="flex-1 border rounded p-2 text-xs transition-colors"
+              :class="deleteArmed ? 'text-ink' : 'text-error border-line-strong'"
+              :style="deleteArmed ? 'background: var(--status-error); border-color: var(--status-error)' : ''"
+              :disabled="deleting"
+              @click="deleteShot"
+            >{{ deleteArmed ? 'Confirm' : 'Delete' }}</button>
           </div>
-
-          <!-- Split -->
-          <Button
-            variant="outline"
-            class="border-white/10 text-zinc-300 hover:text-white gap-2"
-            :disabled="files.length < 2"
-            :title="files.length < 2 ? 'Need at least 2 files to split' : 'Split selected files into a new shot'"
-            @click="enterSplitMode"
-          >
-            <Scissors class="w-4 h-4" />
-            Split
-            <kbd class="ml-1 px-1.5 py-0.5 bg-white/10 rounded text-[10px] font-mono">S</kbd>
-          </Button>
-
-          <!-- Add Face -->
-          <Button
-            variant="outline"
-            class="border-white/10 text-zinc-300 hover:text-white gap-2"
-            title="Draw a face bounding box manually"
-            @click="enterDrawFaceMode"
-          >
-            <Plus class="w-4 h-4" />
-            Add Face
-            <kbd class="ml-1 px-1.5 py-0.5 bg-white/10 rounded text-[10px] font-mono">F</kbd>
-          </Button>
-
-          <!-- Mark Unsorted -->
-          <Button
-            variant="outline"
-            class="border-white/10 text-zinc-400 hover:text-zinc-200 gap-2"
-            @click="markUnsorted"
-          >
-            <FolderOpen class="w-4 h-4" />
-            Mark Unsorted
-          </Button>
-
-          <!-- Delete -->
-          <Button
-            variant="outline"
-            class="border-red-500/30 text-red-400 hover:text-red-300 hover:bg-red-500/10 gap-2"
-            :disabled="deleting"
-            @click="deleteShot"
-          >
-            <Trash2 class="w-4 h-4" />
-            Delete
-          </Button>
-
-          <!-- Keyboard hints -->
-          <div class="hidden md:flex items-center gap-3 ml-auto text-[10px] text-zinc-600">
-            <span><kbd class="px-1 py-0.5 bg-zinc-800 border border-zinc-700 rounded font-mono">&#8592;</kbd> <kbd class="px-1 py-0.5 bg-zinc-800 border border-zinc-700 rounded font-mono">&#8594;</kbd> navigate</span>
-            <span><kbd class="px-1 py-0.5 bg-zinc-800 border border-zinc-700 rounded font-mono">Esc</kbd> close</span>
+          <div v-if="deleteArmed" class="font-mono text-[11px]" style="color: var(--status-degraded)">
+            Deletes the shot and every file in it. Can't be undone. Esc to cancel.
           </div>
         </div>
       </div>

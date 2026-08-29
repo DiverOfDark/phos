@@ -1,24 +1,13 @@
 <script setup>
-import { ref, computed, onMounted, defineExpose } from 'vue'
+/**
+ * Overview — the library as a route diagram.
+ *
+ * Files enter at the left and end up filed at the right; each station shows how
+ * many are sitting there. Anything that needs a person is a work-queue row
+ * underneath, counted and one click from the desk that clears it.
+ */
+import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import PersonNamer from '@/components/PersonNamer.vue'
-import {
-  Image as ImageIcon,
-  Users,
-  ClipboardCheck,
-  AlertTriangle,
-  FolderOpen,
-  RefreshCw,
-  ArrowRight,
-  UserPlus,
-  ScanLine,
-  Scissors,
-  Check,
-  AlertCircle,
-} from 'lucide-vue-next'
 
 const router = useRouter()
 
@@ -33,49 +22,26 @@ const stats = ref({
 })
 const people = ref([])
 const loading = ref(true)
-const error = ref(null)
 
-// Scan state
+// --- Scan ---
 const isScanning = ref(false)
 const scanProgress = ref(0)
 const scanMessage = ref('')
 const scanError = ref('')
 const libraryPath = ref(localStorage.getItem('phos_library_path') || '/mnt/photos')
+const lastScan = ref(localStorage.getItem('phos_last_scan') || '')
 
-// PersonNamer dialog
-const showNamer = ref(false)
-
-// Duplicate face boxes
-//
-// Two-step on purpose: deleting a face cannot be undone, so the first click only
-// counts and the second one confirms that exact number.
-const dedupeBusy = ref(false)
-const dedupePending = ref(0)
-const dedupeMessage = ref('')
-const dedupeError = ref('')
-
-async function dedupeFaces(dryRun) {
-  dedupeBusy.value = true
-  dedupeError.value = ''
-  dedupeMessage.value = ''
-  try {
-    const res = await fetch(`/api/faces/dedupe?dry_run=${dryRun}`, { method: 'POST' })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const result = await res.json()
-    if (dryRun) {
-      dedupePending.value = result.removed
-      if (result.removed === 0) dedupeMessage.value = 'No duplicate boxes found.'
-    } else {
-      dedupePending.value = 0
-      dedupeMessage.value = `Removed ${result.removed} duplicate box${result.removed === 1 ? '' : 'es'}.`
-      await loadData()
-    }
-  } catch (e) {
-    dedupeError.value = e.message || 'Failed to check for duplicate boxes.'
-  } finally {
-    dedupeBusy.value = false
-  }
-}
+const lastScanLabel = computed(() => {
+  if (!lastScan.value) return 'never'
+  const then = new Date(lastScan.value)
+  if (Number.isNaN(then.getTime())) return 'never'
+  const mins = Math.floor((Date.now() - then.getTime()) / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  return `${Math.floor(hours / 24)}d ago`
+})
 
 const progressPercent = computed(() => {
   const total = stats.value.total_shots
@@ -83,13 +49,62 @@ const progressPercent = computed(() => {
   return Math.round((stats.value.confirmed / total) * 100)
 })
 
+/** The route diagram: one station per stage, tracks drawn between them. */
+const stations = computed(() => {
+  const s = stats.value
+  const st = (label, count, sub, color) => ({ label, count, sub, color })
+  return [
+    st('FILES', s.total_files, 'on disk', s.total_files ? 'var(--status-ready)' : 'var(--status-stopped)'),
+    st('SHOTS', s.total_shots, 'grouped', s.total_shots ? 'var(--status-ready)' : 'var(--status-stopped)'),
+    st('PENDING', s.pending_review, 'awaiting review', s.pending_review ? 'var(--status-degraded)' : 'var(--status-ready)'),
+    st('UNSORTED', s.unsorted, 'no person yet', s.unsorted ? 'var(--status-pending)' : 'var(--status-ready)'),
+    st('FILED', s.confirmed, 'confirmed', s.confirmed ? 'var(--status-ready)' : 'var(--status-stopped)'),
+  ]
+})
+
+const workRows = computed(() => {
+  const s = stats.value
+  const rows = []
+  if (s.pending_review > 0) {
+    rows.push({
+      key: 'pending',
+      count: s.pending_review,
+      dot: 'var(--status-degraded)',
+      title: 'shots pending review',
+      sub: 'confirm or route each one',
+      go: () => router.push('/review'),
+    })
+  }
+  if (s.unnamed_people > 0) {
+    rows.push({
+      key: 'clusters',
+      count: s.unnamed_people,
+      dot: 'var(--status-degraded)',
+      title: 'unnamed face clusters',
+      sub: 'name or merge them',
+      go: () => router.push({ path: '/review', query: { lane: 'faces' } }),
+    })
+  }
+  if (s.unsorted > 0) {
+    rows.push({
+      key: 'unsorted',
+      count: s.unsorted,
+      dot: 'var(--status-pending)',
+      title: 'shots without a person',
+      sub: 'left unsorted on purpose or not yet seen',
+      go: () => router.push({ path: '/review', query: { status: 'unsorted' } }),
+    })
+  }
+  return rows
+})
+
 async function fetchStats() {
   try {
     const res = await fetch('/api/organize/stats')
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     stats.value = await res.json()
-  } catch (e) {
-    // Fallback: try the old stats endpoint
+  } catch {
+    // Fallback: the older stats endpoint has no queue counts.
     try {
       const res = await fetch('/api/stats')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -103,9 +118,7 @@ async function fetchStats() {
         unsorted: 0,
         unnamed_people: 0,
       }
-    } catch {
-      // ignore
-    }
+    } catch { /* the empty state covers it */ }
   }
 }
 
@@ -121,11 +134,8 @@ async function fetchPeople() {
 
 async function loadData() {
   loading.value = true
-  error.value = null
   try {
     await Promise.all([fetchStats(), fetchPeople()])
-  } catch (e) {
-    error.value = e.message
   } finally {
     loading.value = false
   }
@@ -137,6 +147,7 @@ async function startScan() {
   scanMessage.value = ''
   scanError.value = ''
   scanProgress.value = 0
+  localStorage.setItem('phos_library_path', libraryPath.value)
 
   try {
     const response = await fetch('/api/scan', {
@@ -144,24 +155,21 @@ async function startScan() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: libraryPath.value }),
     })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
 
-    if (!response.ok) {
-      throw new Error(`Scan request failed: HTTP ${response.status}`)
-    }
+    lastScan.value = new Date().toISOString()
+    localStorage.setItem('phos_last_scan', lastScan.value)
+    scanMessage.value = `walking ${libraryPath.value}`
 
-    scanMessage.value = 'Scan started. Processing in background...'
-
-    // Simulate progress while scan runs in background
+    // The server scans in the background and reports no percentage, so the bar
+    // creeps to 95% and the poll below decides when it is actually done.
     let progress = 0
     const interval = setInterval(() => {
       progress += 2
       scanProgress.value = Math.min(progress, 95)
-      if (progress >= 95) {
-        clearInterval(interval)
-      }
+      if (progress >= 95) clearInterval(interval)
     }, 300)
 
-    // Poll stats to detect completion
     const pollInterval = setInterval(async () => {
       try {
         await fetchStats()
@@ -170,38 +178,21 @@ async function startScan() {
           clearInterval(pollInterval)
           clearInterval(interval)
           scanProgress.value = 100
-          scanMessage.value = 'Scan complete!'
-
+          scanMessage.value = 'scan complete'
           setTimeout(() => {
             isScanning.value = false
             scanProgress.value = 0
             scanMessage.value = ''
           }, 2000)
         }
-      } catch {
-        // ignore polling errors
-      }
+      } catch { /* keep polling */ }
     }, 3000)
   } catch (e) {
     console.error('Scan failed:', e)
-    scanError.value = e.message || 'Scan failed. Is the backend running?'
-
-    let progress = 0
-    const interval = setInterval(() => {
-      progress += 5
-      scanProgress.value = progress
-      if (progress >= 100) {
-        clearInterval(interval)
-        isScanning.value = false
-        scanProgress.value = 0
-      }
-    }, 200)
+    scanError.value = e.message || 'scan request failed — is the backend running?'
+    isScanning.value = false
+    scanProgress.value = 0
   }
-}
-
-function onNamerChanged() {
-  fetchPeople()
-  fetchStats()
 }
 
 onMounted(loadData)
@@ -210,263 +201,135 @@ defineExpose({ loadData, fetchPeople })
 </script>
 
 <template>
-  <div>
-    <div class="mb-8">
-      <h2 class="text-2xl font-bold text-white mb-2">Organization Overview</h2>
-      <p class="text-zinc-400 text-sm">Track your photo organization progress and take action.</p>
+  <div class="p-4 md:p-8 max-w-[1040px] w-full mx-auto flex flex-col gap-8">
+    <div class="flex flex-wrap items-baseline justify-between gap-4">
+      <h2 class="text-[22px] font-semibold">Library</h2>
+      <div class="font-mono text-xs text-ink-tertiary">
+        {{ stats.total_files }} files · {{ stats.total_shots }} shots · last scan {{ lastScanLabel }}
+      </div>
     </div>
 
-    <!-- Loading -->
-    <div v-if="loading" class="flex items-center justify-center py-20">
-      <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
-    </div>
+    <div v-if="loading" class="font-mono text-xs text-ink-tertiary py-16 text-center">loading library…</div>
 
-    <div v-else>
-      <!-- Overall progress bar -->
-      <div v-if="stats.total_shots > 0" class="mb-6">
-        <div class="flex items-center justify-between mb-2">
-          <span class="text-sm font-medium text-zinc-300">Organization Progress</span>
-          <span class="text-sm font-medium text-zinc-400">{{ progressPercent }}%</span>
-        </div>
-        <div class="w-full bg-zinc-800 h-2 rounded-full overflow-hidden">
+    <template v-else>
+      <!-- Pipeline route diagram -->
+      <div class="card-ab p-6">
+        <div class="label mb-6">Pipeline</div>
+        <div class="flex items-start overflow-x-auto">
           <div
-            class="bg-emerald-500 h-full rounded-full transition-all duration-500"
-            :style="{ width: `${progressPercent}%` }"
-          ></div>
-        </div>
-        <p class="text-xs text-zinc-500 mt-1">
-          {{ stats.confirmed }} of {{ stats.total_shots }} shots confirmed
-        </p>
-      </div>
-
-      <!-- Stats grid -->
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-        <Card class="bg-zinc-900/40 border-white/5">
-          <CardHeader class="flex flex-row items-center justify-between pb-2 space-y-0">
-            <CardTitle class="text-sm font-semibold text-zinc-400">Pending</CardTitle>
-            <AlertTriangle class="w-4 h-4 text-yellow-500" />
-          </CardHeader>
-          <CardContent>
-            <div class="text-2xl font-bold text-white">{{ stats.pending_review }}</div>
-            <p class="text-xs text-zinc-500 mt-1">shots awaiting review</p>
-          </CardContent>
-        </Card>
-
-        <Card class="bg-zinc-900/40 border-white/5">
-          <CardHeader class="flex flex-row items-center justify-between pb-2 space-y-0">
-            <CardTitle class="text-sm font-semibold text-zinc-400">Confirmed</CardTitle>
-            <ClipboardCheck class="w-4 h-4 text-emerald-500" />
-          </CardHeader>
-          <CardContent>
-            <div class="text-2xl font-bold text-white">{{ stats.confirmed }}</div>
-            <p class="text-xs text-zinc-500 mt-1">shots organized</p>
-          </CardContent>
-        </Card>
-
-        <Card class="bg-zinc-900/40 border-white/5">
-          <CardHeader class="flex flex-row items-center justify-between pb-2 space-y-0">
-            <CardTitle class="text-sm font-semibold text-zinc-400">People</CardTitle>
-            <Users class="w-4 h-4 text-indigo-400" />
-          </CardHeader>
-          <CardContent>
-            <div class="text-2xl font-bold text-white">{{ stats.total_people }}</div>
-            <p v-if="stats.unnamed_people > 0" class="text-xs text-yellow-500 mt-1">{{ stats.unnamed_people }} unnamed</p>
-            <p v-else class="text-xs text-zinc-500 mt-1">all named</p>
-          </CardContent>
-        </Card>
-
-        <Card class="bg-zinc-900/40 border-white/5">
-          <CardHeader class="flex flex-row items-center justify-between pb-2 space-y-0">
-            <CardTitle class="text-sm font-semibold text-zinc-400">Unsorted</CardTitle>
-            <FolderOpen class="w-4 h-4 text-zinc-400" />
-          </CardHeader>
-          <CardContent>
-            <div class="text-2xl font-bold text-white">{{ stats.unsorted }}</div>
-            <p class="text-xs text-zinc-500 mt-1">shots without a person</p>
-          </CardContent>
-        </Card>
-      </div>
-
-      <!-- Quick actions -->
-      <div class="flex flex-wrap gap-3 mb-8">
-        <Button
-          v-if="stats.pending_review > 0"
-          class="bg-indigo-600 hover:bg-indigo-500 text-white gap-2"
-          @click="router.push('/review')"
-        >
-          <ClipboardCheck class="w-4 h-4" />
-          Review Pending
-          <span class="ml-1 px-1.5 py-0.5 bg-white/20 rounded text-xs">{{ stats.pending_review }}</span>
-        </Button>
-        <Button
-          v-if="stats.unnamed_people > 0"
-          class="bg-indigo-600 hover:bg-indigo-500 text-white gap-2"
-          @click="showNamer = true"
-        >
-          <UserPlus class="w-4 h-4" />
-          Name People
-          <span class="ml-1 px-1.5 py-0.5 bg-white/20 rounded text-xs">{{ stats.unnamed_people }}</span>
-        </Button>
-        <Button
-          v-if="stats.unsorted > 0"
-          variant="outline"
-          class="border-white/10 text-zinc-300 hover:text-white gap-2"
-          @click="router.push('/review?status=unsorted')"
-        >
-          <FolderOpen class="w-4 h-4" />
-          View Unsorted
-        </Button>
-      </div>
-
-      <!-- Scan section -->
-      <div class="mb-8 p-4 rounded-xl bg-zinc-900/40 border border-white/5">
-        <div class="flex items-center justify-between mb-3">
-          <div>
-            <h3 class="text-sm font-semibold text-white">Library Scan</h3>
-            <p class="text-xs text-zinc-500 mt-0.5">Scan your library to detect new photos and faces.</p>
-          </div>
-          <Button
-            :disabled="isScanning"
-            class="bg-indigo-600 hover:bg-indigo-500 text-white gap-2"
-            @click="startScan"
+            v-for="(st, i) in stations"
+            :key="st.label"
+            class="flex items-start"
+            :class="i === stations.length - 1 ? 'flex-none' : 'flex-1'"
           >
-            <RefreshCw v-if="isScanning" class="w-4 h-4 animate-spin" />
-            <ScanLine v-else class="w-4 h-4" />
-            {{ isScanning ? 'Scanning...' : 'Scan Library' }}
-          </Button>
-        </div>
-
-        <div class="flex gap-2 mb-3">
-          <Input
-            v-model="libraryPath"
-            placeholder="/path/to/photos"
-            class="flex-1 h-8 text-sm bg-zinc-800/50 border-white/5"
-            :disabled="isScanning"
-          />
-        </div>
-
-        <!-- Scan progress bar -->
-        <div v-if="isScanning" class="mb-2">
-          <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden">
+            <div class="flex flex-col gap-2 items-start min-w-[88px]">
+              <div class="flex items-center h-4">
+                <span
+                  class="w-2.5 h-2.5 rounded-full"
+                  :style="{ background: st.color, outline: `1px solid ${st.color}`, border: '2px solid var(--bg-surface)' }"
+                ></span>
+              </div>
+              <div class="font-mono text-[11px] tracking-[0.08em] text-ink-tertiary">{{ st.label }}</div>
+              <div class="font-mono text-lg font-medium" :style="{ color: st.count ? 'var(--text-primary)' : 'var(--text-tertiary)' }">
+                {{ st.count }}
+              </div>
+              <div class="text-xs font-light text-ink-secondary whitespace-nowrap">{{ st.sub }}</div>
+            </div>
             <div
-              class="bg-indigo-500 h-full rounded-full transition-all duration-300"
-              :style="{ width: `${scanProgress}%` }"
+              v-if="i < stations.length - 1"
+              class="flex-1 h-0.5 mt-[7px] mx-4 min-w-6"
+              :style="{ background: 'var(--border-strong)' }"
             ></div>
           </div>
         </div>
-
-        <!-- Scan feedback -->
-        <div v-if="scanMessage" class="flex items-start gap-2 p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
-          <Check class="w-3.5 h-3.5 text-emerald-500 mt-0.5 shrink-0" />
-          <p class="text-xs text-emerald-400">{{ scanMessage }}</p>
-        </div>
-        <div v-if="scanError" class="flex items-start gap-2 p-2 rounded-lg bg-red-500/10 border border-red-500/20">
-          <AlertCircle class="w-3.5 h-3.5 text-red-500 mt-0.5 shrink-0" />
-          <p class="text-xs text-red-400">{{ scanError }}</p>
-        </div>
       </div>
 
-      <!-- Duplicate face boxes -->
-      <div class="mb-8 p-4 rounded-xl bg-zinc-900/40 border border-white/5">
-        <div class="flex items-center justify-between mb-3">
-          <div>
-            <h3 class="text-sm font-semibold text-white">Duplicate Face Boxes</h3>
-            <p class="text-xs text-zinc-500 mt-0.5">
-              Collapse overlapping rectangles drawn on the same face. Two boxes assigned
-              to different people are never merged, and reviewed shots are left alone.
-            </p>
-          </div>
-          <div class="flex gap-2">
-            <Button
-              v-if="dedupePending > 0"
-              :disabled="dedupeBusy"
-              class="bg-red-600 hover:bg-red-500 text-white gap-2"
-              @click="dedupeFaces(false)"
-            >
-              <RefreshCw v-if="dedupeBusy" class="w-4 h-4 animate-spin" />
-              <Scissors v-else class="w-4 h-4" />
-              Remove {{ dedupePending }}
-            </Button>
-            <Button
-              :disabled="dedupeBusy"
-              variant="outline"
-              class="border-white/10 text-zinc-300 hover:text-white gap-2"
-              @click="dedupeFaces(true)"
-            >
-              <RefreshCw v-if="dedupeBusy" class="w-4 h-4 animate-spin" />
-              <Scissors v-else class="w-4 h-4" />
-              {{ dedupePending > 0 ? 'Re-check' : 'Find duplicates' }}
-            </Button>
-          </div>
+      <!-- Work queue -->
+      <div class="flex flex-col gap-2">
+        <div class="flex items-baseline justify-between gap-4">
+          <div class="label whitespace-nowrap">Needs attention</div>
+          <div class="font-mono text-xs text-ink-tertiary whitespace-nowrap">{{ progressPercent }}% of library filed</div>
         </div>
-
-        <div v-if="dedupePending > 0" class="flex items-start gap-2 p-2 rounded-lg bg-yellow-500/10 border border-yellow-500/20">
-          <AlertTriangle class="w-3.5 h-3.5 text-yellow-500 mt-0.5 shrink-0" />
-          <p class="text-xs text-yellow-400">
-            {{ dedupePending }} duplicate box{{ dedupePending === 1 ? '' : 'es' }} found. Removing them can't be undone.
-          </p>
-        </div>
-        <div v-if="dedupeMessage" class="flex items-start gap-2 p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
-          <Check class="w-3.5 h-3.5 text-emerald-500 mt-0.5 shrink-0" />
-          <p class="text-xs text-emerald-400">{{ dedupeMessage }}</p>
-        </div>
-        <div v-if="dedupeError" class="flex items-start gap-2 p-2 rounded-lg bg-red-500/10 border border-red-500/20">
-          <AlertCircle class="w-3.5 h-3.5 text-red-500 mt-0.5 shrink-0" />
-          <p class="text-xs text-red-400">{{ dedupeError }}</p>
-        </div>
-      </div>
-
-      <!-- People summary -->
-      <div v-if="people.length > 0">
-        <div class="flex items-center justify-between mb-4">
-          <h3 class="text-lg font-semibold text-white">People</h3>
-          <router-link to="/people" class="text-indigo-400 hover:text-indigo-300 text-sm font-medium flex items-center gap-1">
-            View all <ArrowRight class="w-3.5 h-3.5" />
-          </router-link>
-        </div>
-        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
-          <div
-            v-for="person in people.slice(0, 12)"
-            :key="person.id"
-            class="flex flex-col items-center p-3 rounded-xl bg-zinc-900/40 border border-white/5 hover:border-indigo-500/50 group cursor-pointer transition-colors"
-            @click="router.push({ name: 'person-detail', params: { id: person.id } })"
+        <div class="card-ab overflow-hidden">
+          <button
+            v-for="w in workRows"
+            :key="w.key"
+            class="flex items-center gap-4 w-full p-4 border-b border-line hover:bg-raised transition-colors text-left"
+            @click="w.go()"
           >
-            <div class="w-16 h-16 rounded-full bg-zinc-800 border-2 border-zinc-700 group-hover:border-indigo-500 overflow-hidden flex items-center justify-center transition-colors mb-2">
-              <img
-                v-if="person.thumbnail_url"
-                :src="person.thumbnail_url"
-                class="w-full h-full object-cover"
-              />
-              <span v-else class="text-lg font-bold text-zinc-600">{{ (person.name || '?')[0] }}</span>
-            </div>
-            <span class="text-xs font-medium text-zinc-300 group-hover:text-white transition-colors truncate max-w-full">
-              {{ person.name || 'Unnamed' }}
+            <span class="signal-dot" :style="{ background: w.dot }"></span>
+            <span class="font-mono text-sm font-medium text-ink w-12 text-right">{{ w.count }}</span>
+            <span class="flex-1 text-[13px] text-ink">
+              {{ w.title }}<span class="text-ink-secondary font-light"> — {{ w.sub }}</span>
             </span>
-            <div class="flex items-center gap-2 mt-1">
-              <span class="text-[10px] text-zinc-500">{{ person.shot_count || 0 }} shots</span>
-              <span
-                v-if="(person.pending_count || 0) > 0"
-                class="text-[10px] text-yellow-500"
-              >
-                {{ person.pending_count }} pending
-              </span>
-            </div>
+            <span class="font-mono text-xs text-ink-tertiary">→</span>
+          </button>
+          <div class="flex items-center gap-4 p-4">
+            <span class="signal-dot" style="background: var(--status-ready)"></span>
+            <span class="font-mono text-sm font-medium text-ink w-12 text-right">{{ stats.confirmed }}</span>
+            <span class="flex-1 text-[13px] font-light text-ink-secondary">shots filed and confirmed</span>
           </div>
         </div>
       </div>
 
-      <!-- Empty state -->
-      <div v-else-if="stats.total_shots === 0" class="text-center py-16">
-        <ImageIcon class="w-12 h-12 text-zinc-700 mx-auto mb-4" />
-        <p class="text-white font-medium mb-2">No shots yet</p>
-        <p class="text-zinc-500 text-sm mb-6">Scan a library to start organizing your photos.</p>
-      </div>
-    </div>
+      <!-- Scan + people -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div class="card-ab p-6 flex flex-col gap-4">
+          <div class="flex items-center justify-between">
+            <div class="label">Library scan</div>
+            <span v-if="isScanning" class="font-mono text-[11px] tracking-[0.08em] text-building">
+              SCANNING <span class="signal-pulse">●</span>
+            </span>
+          </div>
+          <input
+            v-model="libraryPath"
+            spellcheck="false"
+            :disabled="isScanning"
+            class="bg-base border border-line rounded-sm p-2 font-mono text-[13px] text-ink w-full"
+          />
+          <div v-if="isScanning" class="h-0.5 bg-raised rounded-sm overflow-hidden">
+            <div class="h-full bg-signal transition-[width] duration-300" :style="{ width: `${scanProgress}%` }"></div>
+          </div>
+          <div v-if="scanMessage" class="font-mono text-xs text-ink-secondary">{{ scanMessage }}</div>
+          <div v-if="scanError" class="font-mono text-xs text-error">{{ scanError }}</div>
+          <div>
+            <button
+              class="bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors disabled:opacity-50"
+              :disabled="isScanning"
+              @click="startScan"
+            >{{ isScanning ? 'Scanning…' : 'Scan library' }}</button>
+          </div>
+        </div>
 
-    <!-- PersonNamer dialog -->
-    <PersonNamer
-      v-model:open="showNamer"
-      @changed="onNamerChanged"
-    />
+        <div class="card-ab p-6 flex flex-col gap-4">
+          <div class="flex items-center justify-between">
+            <div class="label">People</div>
+            <router-link to="/people" class="font-mono text-xs text-signal hover:text-signal-hover">all →</router-link>
+          </div>
+          <div v-if="people.length" class="flex flex-wrap gap-2">
+            <button
+              v-for="p in people.slice(0, 12)"
+              :key="p.id"
+              :title="p.name || 'Unnamed'"
+              class="flex flex-col gap-1 items-center w-14"
+              @click="router.push({ name: 'person-detail', params: { id: p.id } })"
+            >
+              <span class="w-12 h-12 rounded bg-raised border border-line overflow-hidden flex items-center justify-center font-mono text-sm text-ink-tertiary hover:border-signal transition-colors">
+                <img v-if="p.thumbnail_url" :src="p.thumbnail_url" class="w-full h-full object-cover" />
+                <template v-else>{{ (p.name || '?')[0] }}</template>
+              </span>
+              <span class="text-[11px] text-ink-secondary truncate max-w-14">{{ p.name || 'unnamed' }}</span>
+            </button>
+          </div>
+          <div v-else class="font-mono text-xs text-ink-tertiary">no people detected yet</div>
+        </div>
+      </div>
+
+      <div v-if="stats.total_shots === 0" class="flex flex-col items-center gap-2 py-16 text-center">
+        <span class="signal-dot" style="width:10px;height:10px;background:var(--status-stopped)"></span>
+        <div class="font-heading text-base font-semibold text-ink">Nothing indexed yet</div>
+        <div class="text-[13px] font-light text-ink-secondary">Scan a directory above to start filing photos.</div>
+      </div>
+    </template>
   </div>
 </template>
