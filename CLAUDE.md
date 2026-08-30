@@ -96,8 +96,12 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`components/ui/`** — shadcn-vue primitives, no longer used by any screen (only the unreferenced `PhotoLightbox.vue`)
 - **`lib/utils.js`** — `cn()` helper (clsx + tailwind-merge)
 - **`lib/takes.js`** — The Takes lane's rules and none of its drawing: the key map as data, the
-  reducer, what the next verdict will keep/reject/free, and which parameters actually differ
-  across a sheet's takes
+  reducer, what the next verdict will keep/reject/free, which parameters actually differ across a
+  sheet's takes, and what to say about the batch a run came from. `batchOf` reads FR7's
+  `GET /api/comfyui/batches` for a name and falls back to the batch id, so a missing or failing
+  endpoint costs a label and never a rendered run; `batchNotice` prints FR7's own `paused_note`
+  when a batch is paused on its outstanding-hold cap, because the person in this lane is the one
+  whose verdicts lift it
 
 ### Design System — AppBahn (Bauhaus Engineering)
 Both clients follow one system: dark by default, a single **signal amber** accent, status colour

@@ -69,6 +69,62 @@ export function shortId(id) {
   return String(id ?? "").slice(0, 8);
 }
 
+// ===== The batch a run came from ===========================================
+
+/**
+ * What to say about a run's batch, given whatever FR7's endpoint answered.
+ *
+ * Two things make this worth a function rather than an expression in the
+ * template. The first is that the endpoint may not be there: FR7 ships
+ * `GET /api/comfyui/batches`, and until that lands — or when it fails, or when
+ * a batch has been deleted out from under a still-held run — the lane still has
+ * a `batch_id` to draw. It falls back to the short id, which is what it drew
+ * before there was anything better, rather than to nothing.
+ *
+ * The second is the pause. FR7's outstanding-hold cap stops a batch feeding
+ * when more runs are held than it allows, and **the person in this lane is the
+ * one who unblocks it** — they are looking at exactly the runs whose verdicts
+ * bring the count down. A batch that is paused waiting on this screen and does
+ * not say so is the single most useful sentence the lane could be printing and
+ * is not.
+ */
+export function batchOf(sheet, batches = {}) {
+  const id = sheet?.batch_id;
+  if (!id) return null;
+  const row = (batches && batches[id]) || null;
+  const label = typeof row?.label === "string" && row.label.trim() ? row.label.trim() : null;
+  return {
+    id,
+    // The name FR7 gives it, or the id it has always had. Never empty.
+    label: label || shortId(id),
+    /** Whether that label is a real name or a fallback, so the tag can say `batch` either way. */
+    named: Boolean(label),
+    status: row?.status || null,
+    paused: row?.status === "paused",
+    pausedReason: row?.paused_reason || null,
+    // FR7 writes the sentence; repeating it here in different words is how two
+    // screens come to disagree about why something stopped.
+    pausedNote: row?.paused_note || null,
+  };
+}
+
+/**
+ * The sentence to print when a batch is paused, or `null`.
+ *
+ * FR7's own `paused_note` wherever there is one. When there is not, the lane
+ * says something only for the pause it can actually do something about —
+ * `holds` — and stays quiet about a disk floor or a time window, which no
+ * verdict here will lift.
+ */
+export function batchNotice(batch) {
+  if (!batch?.paused) return null;
+  if (batch.pausedNote) return batch.pausedNote;
+  if (batch.pausedReason === "holds") {
+    return "This batch is paused until enough of these runs have a verdict.";
+  }
+  return null;
+}
+
 /**
  * The mono strip under one take's picture: what makes *this* one this one.
  *

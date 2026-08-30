@@ -32,6 +32,8 @@ import { useRouter } from 'vue-router'
 import {
   KEY_MAP,
   backlog,
+  batchNotice,
+  batchOf,
   currentSheet,
   currentTake,
   formatBytes,
@@ -70,6 +72,11 @@ const take = computed(() => currentTake(state.value))
 const summary = computed(() => verdictSummary(state.value))
 const counts = computed(() => backlog(state.value.sheets))
 const varying = computed(() => varyingKeys(sheet.value?.takes || []))
+
+/** FR7's batches, id → row. Empty whenever that endpoint cannot be asked. */
+const batches = ref({})
+const batch = computed(() => batchOf(sheet.value, batches.value))
+const batchSays = computed(() => batchNotice(batch.value))
 
 /** What continuing with the takes marked so far will queue below the hold. */
 const cost = computed(() =>
@@ -126,6 +133,7 @@ async function fetchPage(append = false) {
     state.value = append
       ? { ...state.value, sheets: [...state.value.sheets, ...data.items] }
       : initialState(data.items)
+    fetchBatches()
   } catch (e) {
     console.error('Failed to fetch held runs', e)
     error.value = String(e.message || e)
@@ -136,6 +144,32 @@ async function fetchPage(append = false) {
 
 function refillIfThin() {
   if (cursor.value && state.value.sheets.length < REFILL_BELOW) fetchPage(true)
+}
+
+/**
+ * The names FR7 gives its batches, and whether any of them is paused.
+ *
+ * Asked once per page rather than per run, and **never allowed to fail loudly**:
+ * this endpoint is FR7's and may not be there at all, in which case every run
+ * still draws with the batch id it already had. A lane that could not render a
+ * held run because a name was unavailable would be trading the thing it is for
+ * a decoration.
+ *
+ * Re-asked after a verdict, because clearing a run is exactly what lifts a
+ * hold-cap pause — the sentence under the tag should stop being true on the
+ * screen of the person who made it stop being true.
+ */
+async function fetchBatches() {
+  if (!state.value.sheets.some((s) => s.batch_id)) return
+  try {
+    const res = await fetch('/api/comfyui/batches')
+    if (!res.ok) return
+    const data = await res.json()
+    const rows = Array.isArray(data) ? data : data.items || []
+    batches.value = Object.fromEntries(rows.filter((r) => r?.id).map((r) => [r.id, r]))
+  } catch {
+    // No names today. Every run still draws.
+  }
 }
 
 // ===== Keys ================================================================
@@ -208,6 +242,7 @@ async function sendVerdict(fx) {
     }
     emit('changed')
     refillIfThin()
+    if (batch.value?.paused) fetchBatches()
   } catch (e) {
     console.error('Verdict failed', e)
     state.value = { ...before, said: `That verdict did not land: ${e.message}` }
@@ -386,12 +421,23 @@ defineExpose({ loadData: () => fetchPage(false) })
               class="tag bg-base"
               style="color: var(--status-degraded); border-color: var(--status-degraded)"
             >held</span>
-            <span v-if="sheet.batch_id" class="tag bg-base text-ink-tertiary">
-              batch {{ shortId(sheet.batch_id) }}
-            </span>
+            <span
+              v-if="batch"
+              class="tag bg-base"
+              :class="batch.paused ? '' : 'text-ink-tertiary'"
+              :style="batch.paused
+                ? 'color: var(--status-degraded); border-color: var(--status-degraded)'
+                : ''"
+              :title="batch.named ? batch.id : undefined"
+            >batch {{ batch.label }}</span>
             <span class="label">
               keeping one costs {{ cost }} task<template v-if="cost !== 1">s</template> below
             </span>
+            <span
+              v-if="batchSays"
+              class="font-mono text-[11px]"
+              style="color: var(--status-degraded)"
+            >{{ batchSays }}</span>
             <span class="flex-1"></span>
             <button class="label hover:text-signal transition-colors" @click="act({ type: 'help' })">
               <kbd class="kbd-ab">?</kbd> keys

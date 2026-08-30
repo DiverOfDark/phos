@@ -12,6 +12,8 @@ import assert from "node:assert/strict";
 import {
   KEY_MAP,
   backlog,
+  batchNotice,
+  batchOf,
   currentTake,
   formatBytes,
   initialState,
@@ -443,6 +445,73 @@ test("bytes read like a schedule rather than a spreadsheet", () => {
   assert.equal(formatBytes(940), "940 B");
   assert.equal(formatBytes(412 * 1024 * 1024), "412 MB");
   assert.equal(formatBytes(1.4 * 1024 ** 3), "1.4 GB");
+});
+
+// ===== The batch a run came from ===========================================
+
+test("a batch is drawn by FR7's name for it when FR7 has one", () => {
+  const batches = {
+    "batch-a": { label: "Restore & upscale · person · –1990", status: "running" },
+  };
+  const b = batchOf(sheet("run-1"), batches);
+  assert.equal(b.label, "Restore & upscale · person · –1990");
+  assert.equal(b.named, true);
+  assert.equal(batchNotice(b), null, "a running batch has nothing to announce");
+});
+
+test("a batch with no name yet still draws, as the id it has always had", () => {
+  // The state of the world until FR7's endpoint lands — and afterwards whenever
+  // it fails, or a batch is deleted out from under a still-held run. Falling
+  // back to nothing would make the tag disappear rather than degrade.
+  const b = batchOf(sheet("run-1"), {});
+  assert.equal(b.label, "batch-a");
+  assert.equal(b.named, false);
+  assert.equal(b.id, "batch-a");
+});
+
+test("a run that came from no batch says nothing about batches", () => {
+  assert.equal(batchOf(sheet("run-1", 4, { batch_id: null }), {}), null);
+  assert.equal(batchOf(null, {}), null);
+});
+
+test("a batch paused on its hold cap says so, because this lane is what unblocks it", () => {
+  // The reviewer here is looking at exactly the runs whose verdicts bring the
+  // outstanding-hold count down. A batch waiting on them that does not say so
+  // is the most useful sentence the lane could print and is not.
+  const b = batchOf(sheet("run-1"), {
+    "batch-a": {
+      label: "Extend clips",
+      status: "paused",
+      paused_reason: "holds",
+      paused_note: "Paused: 40 runs are waiting on a verdict, and the cap is 40.",
+    },
+  });
+  assert.equal(b.paused, true);
+  assert.equal(
+    batchNotice(b),
+    "Paused: 40 runs are waiting on a verdict, and the cap is 40.",
+    "FR7 writes the sentence; saying it again in different words is how two screens disagree",
+  );
+});
+
+test("a hold-capped pause with no sentence gets one; another kind of pause does not", () => {
+  const capped = batchOf(sheet("run-1"), {
+    "batch-a": { status: "paused", paused_reason: "holds" },
+  });
+  assert.match(batchNotice(capped), /verdict/i);
+
+  // A disk floor or a time window is not something a verdict in this lane
+  // lifts, so the lane does not imply that it is.
+  const disk = batchOf(sheet("run-1"), {
+    "batch-a": { status: "paused", paused_reason: "disk" },
+  });
+  assert.equal(batchNotice(disk), null);
+});
+
+test("a batch whose label is blank falls back rather than drawing an empty tag", () => {
+  const b = batchOf(sheet("run-1"), { "batch-a": { label: "   " } });
+  assert.equal(b.label, "batch-a");
+  assert.equal(b.named, false);
 });
 
 // ===== Provenance ==========================================================
