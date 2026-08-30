@@ -29,8 +29,10 @@
 //! * [`history`] — what did ComfyUI say? Outputs, still running, or an error.
 //! * [`policy`] — what do we do about it? How long to wait for a file that has
 //!   not appeared, and whether a failure is worth another attempt.
-//! * [`workflow`] — what does this graph produce, and how do we rewrite it for
-//!   one run?
+//! * [`workflow`] — what does this graph take and produce, and how do we
+//!   rewrite it for one run?
+//! * [`loaders`] — which node reads the file we uploaded, and which slot of a
+//!   multi-input graph does it fill?
 //! * [`nodes`] — what does ComfyUI say its installed node classes take?
 //! * [`overrides`] — so which of this graph's fields can a person change, and
 //!   what kind of control does each one want?
@@ -53,9 +55,14 @@
 //! * **Failures are split by site.** A refused graph or a node exception fails
 //!   at once with the real message; a dropped connection backs off and tries
 //!   again.
+//! * **A video can go in whole.** [`source`] decides what a run consumes — a
+//!   frame of the clip (the first, the last, one at a timestamp, one of the
+//!   indexed keyframes) or the file itself, which is the default whenever the
+//!   graph has a video loader to read it.
 
 mod client;
 mod history;
+mod loaders;
 pub mod nodes;
 mod outputs;
 mod overrides;
@@ -66,8 +73,10 @@ mod worker;
 mod workflow;
 
 pub use client::ComfyUiClient;
+pub use loaders::{detect_loaders, importable, LoaderKind};
 pub use nodes::NodeCatalog;
 pub use overrides::detect_inputs;
+pub use source::SourceMode;
 pub use worker::spawn_enhancement_worker;
 pub use workflow::detect_outputs;
 

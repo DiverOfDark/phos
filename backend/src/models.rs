@@ -135,6 +135,9 @@ pub struct NewEnhancementTask<'a> {
     pub workflow_id: &'a str,
     pub text_overrides: Option<&'a str>,
     pub source_file_id: Option<&'a str>,
+    /// Which part of a video source the run consumes. `None` means "decide from
+    /// the workflow" — see `SourceMode` in `comfyui::source`.
+    pub source_mode: Option<&'a str>,
 }
 
 #[derive(AsChangeset)]
