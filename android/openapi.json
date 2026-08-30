@@ -266,6 +266,9 @@
           "200": {
             "description": "Enhancement task queued"
           },
+          "400": {
+            "description": "Unrecognised source_mode"
+          },
           "404": {
             "description": "Shot or workflow not found"
           },
@@ -2536,6 +2539,13 @@
               "null"
             ],
             "description": "Optional: specific file to use as source. If omitted, the original file is used."
+          },
+          "source_mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which part of a video source to feed the workflow: `first_frame`,\n`last_frame`, `at_time:<ms>`, `keyframe:<n>` or `whole_video`.\n\nOmit it to let the workflow decide — a graph with a video loader takes\nthe whole clip, anything else takes the first frame. Ignored for stills."
           },
           "text_overrides": {
             "type": "object",

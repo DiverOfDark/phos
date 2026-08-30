@@ -31,6 +31,8 @@
 //!   not appeared, and whether a failure is worth another attempt.
 //! * [`workflow`] — what does this graph take and produce, and how do we
 //!   rewrite it for one run?
+//! * [`loaders`] — which node reads the file we uploaded, and which slot of a
+//!   multi-input graph does it fill?
 //!
 //! Those three take `serde_json::Value` in and give an answer out, so the whole
 //! completion path is tested against recorded `/history` payloads with no
@@ -50,9 +52,14 @@
 //! * **Failures are split by site.** A refused graph or a node exception fails
 //!   at once with the real message; a dropped connection backs off and tries
 //!   again.
+//! * **A video can go in whole.** [`source`] decides what a run consumes — a
+//!   frame of the clip (the first, the last, one at a timestamp, one of the
+//!   indexed keyframes) or the file itself, which is the default whenever the
+//!   graph has a video loader to read it.
 
 mod client;
 mod history;
+mod loaders;
 mod outputs;
 mod policy;
 mod source;
@@ -61,6 +68,8 @@ mod worker;
 mod workflow;
 
 pub use client::ComfyUiClient;
+pub use loaders::{detect_loaders, importable, LoaderKind};
+pub use source::SourceMode;
 pub use worker::spawn_enhancement_worker;
 pub use workflow::{detect_inputs, detect_outputs};
 

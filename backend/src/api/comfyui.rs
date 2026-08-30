@@ -20,6 +20,40 @@ fn require_comfyui(state: &AppState) -> Result<String, StatusCode> {
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
+/// A status plus, where it helps, something the user can act on.
+///
+/// Import is the one endpoint here where a bare 400 is actively unhelpful: the
+/// user pasted a graph and needs to know which part of it Phos could not use.
+/// The UI already reads `error` out of a JSON body.
+pub(super) struct ApiError(StatusCode, Option<String>);
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self(StatusCode::BAD_REQUEST, Some(message.into()))
+    }
+
+    fn internal() -> Self {
+        Self(StatusCode::INTERNAL_SERVER_ERROR, None)
+    }
+}
+
+impl From<StatusCode> for ApiError {
+    fn from(status: StatusCode) -> Self {
+        Self(status, None)
+    }
+}
+
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        match self.1 {
+            Some(message) => {
+                (self.0, Json(serde_json::json!({ "error": message }))).into_response()
+            }
+            None => self.0.into_response(),
+        }
+    }
+}
+
 /// GET /api/comfyui/health
 #[utoipa::path(
     get,
@@ -89,6 +123,16 @@ pub(super) async fn comfyui_list_workflows(
     let workflows: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|wf| {
+            // Loaders are derived on read rather than stored: workflows
+            // imported before this existed have no record of theirs, and the
+            // graph is already in memory here — the list only omits it from the
+            // *response*, which is tens of kilobytes per row.
+            let loaders = serde_json::from_str::<serde_json::Value>(&wf.workflow_json)
+                .map(|graph| crate::comfyui::detect_loaders(&graph))
+                .unwrap_or_default();
+            let takes_video = loaders
+                .iter()
+                .any(|l| l.kind == crate::comfyui::LoaderKind::Video);
             let inputs: serde_json::Value = wf
                 .inputs_json
                 .and_then(|s| serde_json::from_str(&s).ok())
@@ -103,6 +147,8 @@ pub(super) async fn comfyui_list_workflows(
                 "description": wf.description,
                 "inputs": inputs,
                 "outputs": outputs,
+                "loaders": loaders,
+                "takes_video": takes_video,
                 "created_at": wf.created_at,
             })
         })
@@ -136,39 +182,36 @@ pub(super) struct ImportWorkflowPayload {
 pub(super) async fn comfyui_import_workflow(
     UState(state): UState,
     Json(payload): Json<ImportWorkflowPayload>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let _ = require_comfyui(&state)?;
 
     if payload.name.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::bad_request("A workflow needs a name."));
     }
 
     // Validate: must be a JSON object
     if !payload.workflow.is_object() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::bad_request(
+            "The workflow must be a ComfyUI API-format graph: a JSON object of nodes \
+             keyed by node id. Export it with 'Save (API Format)', not 'Save'.",
+        ));
     }
 
-    // Must have at least one LoadImage node
+    // Must have somewhere to put the source: an image loader, or a video one.
+    // Requiring `LoadImage` specifically 400'd every video workflow, which made
+    // video→video unreachable however good the rest of the pipeline was.
+    crate::comfyui::importable(&payload.workflow).map_err(ApiError::bad_request)?;
+
     let inputs = crate::comfyui::detect_inputs(&payload.workflow);
-    let has_load_image = inputs.iter().any(|i| i.node_type == "LoadImage");
-    if !has_load_image {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
     let outputs = crate::comfyui::detect_outputs(&payload.workflow);
 
     let id = uuid::Uuid::new_v4().to_string();
-    let workflow_json =
-        serde_json::to_string(&payload.workflow).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let inputs_json =
-        serde_json::to_string(&inputs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let outputs_json =
-        serde_json::to_string(&outputs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let workflow_json = serde_json::to_string(&payload.workflow)
+        .map_err(|_| ApiError::bad_request("The workflow is not serialisable JSON."))?;
+    let inputs_json = serde_json::to_string(&inputs).map_err(|_| ApiError::internal())?;
+    let outputs_json = serde_json::to_string(&outputs).map_err(|_| ApiError::internal())?;
 
-    let mut conn = state
-        .pool
-        .get()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut conn = state.pool.get().map_err(|_| ApiError::internal())?;
 
     diesel::insert_into(comfyui_workflows::table)
         .values(NewComfyuiWorkflow {
@@ -182,7 +225,7 @@ pub(super) async fn comfyui_import_workflow(
         .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to insert workflow: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::internal()
         })?;
 
     Ok(Json(serde_json::json!({
@@ -297,6 +340,12 @@ pub(super) struct EnhancePayload {
     workflow_id: String,
     /// Optional: specific file to use as source. If omitted, the original file is used.
     source_file_id: Option<String>,
+    /// Which part of a video source to feed the workflow: `first_frame`,
+    /// `last_frame`, `at_time:<ms>`, `keyframe:<n>` or `whole_video`.
+    ///
+    /// Omit it to let the workflow decide — a graph with a video loader takes
+    /// the whole clip, anything else takes the first frame. Ignored for stills.
+    source_mode: Option<String>,
     #[serde(default)]
     text_overrides: std::collections::HashMap<String, String>,
 }
@@ -310,6 +359,7 @@ pub(super) struct EnhancePayload {
     request_body = EnhancePayload,
     responses(
         (status = 200, description = "Enhancement task queued"),
+        (status = 400, description = "Unrecognised source_mode"),
         (status = 404, description = "Shot or workflow not found"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "ComfyUI not configured"),
@@ -320,6 +370,15 @@ pub(super) async fn comfyui_enhance(
     Json(payload): Json<EnhancePayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let _ = require_comfyui(&state)?;
+
+    // Reject an unreadable source mode here rather than storing it and letting
+    // the worker fall back to a default the caller did not ask for.
+    if let Some(mode) = payload.source_mode.as_deref() {
+        if mode.parse::<crate::comfyui::SourceMode>().is_err() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
     let mut conn = state
         .pool
         .get()
@@ -360,6 +419,7 @@ pub(super) async fn comfyui_enhance(
             workflow_id: &payload.workflow_id,
             text_overrides: Some(&text_overrides_json),
             source_file_id: payload.source_file_id.as_deref(),
+            source_mode: payload.source_mode.as_deref(),
         })
         .execute(&mut conn)
         .map_err(|e| {

@@ -1,0 +1,18 @@
+-- Which part of the source a ComfyUI run consumes.
+--
+-- Before this column there was no choice: a video contributed frame zero and
+-- nothing else, which is what made video-to-video impossible — no extending a
+-- clip from its own last frame, no upscaling a video, no interpolation.
+--
+-- Values (see `SourceMode` in src/comfyui/source.rs):
+--   first_frame     frame zero, the historical behaviour and the default for a
+--                   workflow that only loads images
+--   last_frame      the final frame — what an extension continues from
+--   at_time:<ms>    the frame covering that position
+--   keyframe:<n>    the n-th row in video_keyframes for the file, zero-based
+--   whole_video     the video file itself, the default when the workflow has a
+--                   video loader to read it
+--
+-- NULL means "decide from the workflow", which is what every task queued before
+-- this migration carries, so their behaviour is unchanged.
+ALTER TABLE enhancement_tasks ADD COLUMN source_mode TEXT;

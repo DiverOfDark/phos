@@ -30,6 +30,7 @@ diesel::table! {
         output_prefix -> Nullable<Text>,
         settle_until -> Nullable<Timestamp>,
         next_attempt_at -> Nullable<Timestamp>,
+        source_mode -> Nullable<Text>,
     }
 }
 
