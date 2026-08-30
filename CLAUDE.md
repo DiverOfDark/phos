@@ -62,18 +62,28 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
-- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what travels along each join, what happens after a stage lands, what a verdict on a hold point may say, and whether a run is over), `editor.rs` (what the line editor may offer, and what a join has to be asked), `promote.rs` (which chains somebody has been running by hand often enough to be worth saving) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `holds/` (`mod.rs` reads a hold, `verdict.rs` writes what was decided), `api/line_io.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
+- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what travels along each join, what happens after a stage lands, what a verdict on a hold point may say, and whether a run is over), `editor.rs` (what the line editor may offer, and what a join has to be asked), `promote.rs` (which chains somebody has been running by hand often enough to be worth saving), `batch/` (a whole library sent to one line: `plan.rs` is the cursor, the caps and the estimate with no database anywhere near them, `selection.rs` is what was pointed at, `store.rs` is the row and the counts, `feed.rs` is the tick and STOP) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `holds/` (`mod.rs` reads a hold, `verdict.rs` writes what was decided), `api/line_io.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
 
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
 - **`components/ReviewDesk.vue`** — One screen, three lanes (`?lane=` → shots / duplicates / faces); `/variations` redirects into it
+<<<<<<< HEAD
 - **`components/WorkflowsPage.vue`** — Three tabs: workflows, lines, and a queue that is a schedule
+=======
+- **`components/WorkflowsPage.vue`** — Five tabs: templates, workflows, lines, batches, and a queue that is a schedule
+>>>>>>> a85dd12 (docs: say what a batch is, and which of its guardrails are load-bearing)
   board of **runs** — one row per run saying `STAGE 2/4 · UPSCALE · 00:03:12`, with the tasks
   underneath one click away. A four-stage run as four unrelated rows is what it replaced. A run
   parked at a hold point reads `HELD · 4 TAKES` and opens a review strip: its takes, tick the ones
   worth the stages below, and the three verdicts. That strip is deliberately just enough to give a
   verdict from — the keyboard-driven contact sheet over every held run at once is FR10b, and reads
   the same two endpoints
+- **`components/BatchSheet.vue`** — The confirm sheet: four rows, largest number
+  first, each narrowing the one above. Matched, already-generated (with the
+  `skip`/`redo` switch on the row it changes), what actually runs and what that
+  comes to in tasks, then GPU and disk. It says out loud where a number is a
+  guess and where a hold makes it an upper bound. `lib/batches.js` formats;
+  nothing in it counts or estimates
 - **`components/LineEditor.vue`** — A line, read as a route board and built as a vertical list.
   Read-only it draws like `WorkflowContract.vue`; under edit it is a list whose `Add stage` picker
   only offers what fits. `lib/lines.js` holds its bookkeeping and none of its rules
@@ -139,6 +149,26 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   `reviewed_task_ids`. The second is not redundant — without it a passed-over take is
   indistinguishable from one nobody has seen, and the run parks again on it forever. It has exactly
   `parent_task_id`'s property: it exists precisely when the thing it marks happened
+- **A batch is a query, not a list.** `batches` holds the selection — an
+  `api::shots::ShotsQuery` verbatim, or an explicit id list — plus a keyset
+  cursor over `(COALESCE(shots.timestamp,''), shots.id)` ascending. The feeder
+  opens the next handful each tick; fifty thousand `runs` rows are never
+  inserted at once. That is what makes STOP instant (the runs that were never
+  opened were never rows), keeps the board a board, and lets a batch pick up
+  shots imported after it was sent. There is **one** filter language in Phos and
+  this reuses it: `api::shots::shot_conditions` builds the SQL for the gallery
+  and for the batch alike. Nothing runs on a timer — a batch exists because
+  somebody pressed Send, and a window only *paces* work already queued
+- **A batch's caps are the feature, not settings for later.** At this scale the
+  failure mode is not a crash, it is generating more than anyone will look at.
+  A confirm sheet before anything queues; a daily task cap; an optional window;
+  a disk floor; and a cap on **outstanding holds** — 3,329 shots through
+  `×4 extend → hold → upscale` park 13,316 clips in front of a person before any
+  upscale runs. That cap counts `runs.status='held'` and never joins to
+  `held_at_stage`, the one marker FR5c leaves that is not self-evidencing: a cap
+  that ignored a held run with a NULL stage would let the mountain grow past the
+  limit it exists to enforce. Every count the caps read is a `COUNT(*)`, never a
+  column, so none of them can disagree with what they describe
 - **A held run parks; it never blocks.** Both halves of the advance pass filter on
   `status = running`, so a held run is read by nothing until a verdict releases it — 3,329 shots
   through a hold point park 3,329 runs and the queue keeps feeding the GPU from everything else.
@@ -264,6 +294,10 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `POST /api/faces/dedupe?dry_run=` — Collapse overlapping boxes drawn on one face (never merges two boxes assigned to different people; skips reviewed shots). Also runs at startup and after each upload batch is analyzed
 - `PUT /api/comfyui/workflows/{id}/contract` — Replace the corrections applied to a workflow's derived stage contract, and get back the contract that results. Sending `{}` discards every correction and takes the derivation as it stands
 - `GET /api/files/{id}/manifest` — Whether a file was generated, and the provenance manifest recording how. Answers for any file; a photograph comes back `synthetic: false` with no manifest
+- `POST /api/comfyui/batches/preview` — What sending this selection to this line would cost: matched, already-generated, to-run, tasks, GPU seconds, disk, and per stage whether that cost was *measured* here or guessed. Writes nothing; this is the confirm sheet
+- `POST /api/comfyui/batches` — Send it. Writes **one** row holding the query and a cursor; the worker opens runs a handful at a time. `GET` lists them with their run counts and why one is paused
+- `POST /api/comfyui/batches/{id}/stop` — Instant. The batch is marked stopped *first*, so a concurrent tick opens nothing behind the cancel, and only then are its live runs cancelled and their prompts dropped from ComfyUI's queue. A held run goes through its hold's own Cancel verdict
+- `GET|POST /api/comfyui/selections`, `DELETE /api/comfyui/selections/{id}` — A query plus the line you usually send it to. One click to repeat; it never fires on its own, and there is no schedule column
 - `POST /api/comfyui/runs` — Start a line against a shot: `{ line_id, shot_id }`, plus optional `stage_values` answering what each stage left open. Queues stage 1; the worker queues each stage after it as the one before lands. FR7 replaces `shot_id` with a query and adds a cursor, which is why the handler already resolves a *set* of shots and answers with a list of runs
 - `GET /api/comfyui/runs` — The queue board: one row per run, with the stage it is on, of how many, what that stage is running, and its clock. `GET /api/comfyui/runs/{id}` is the drill-down to the tasks underneath
 - `POST /api/comfyui/runs/{id}/retry` — Resume from the stage that failed. What already succeeded is not re-run
