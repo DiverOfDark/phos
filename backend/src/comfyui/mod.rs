@@ -113,6 +113,7 @@ pub use overrides::detect_inputs;
 pub use overrides::WorkflowInput;
 pub use params::{check_sweep_targets, expand, ParameterMap, VaryMap, VaryMode, VarySpec};
 pub use source::SourceMode;
+pub(crate) use worker::advance::{cancel_run, retry_run};
 pub use worker::spawn_enhancement_worker;
 pub use workflow::detect_outputs;
 
