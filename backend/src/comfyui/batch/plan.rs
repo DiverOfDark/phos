@@ -148,6 +148,17 @@ impl PauseReason {
     /// synthesised on some other screen would paraphrase each other right up
     /// until the day they disagreed about why something stopped.
     ///
+    /// That is the obvious reason. The one worth writing down is not: when this
+    /// string grew from 62 characters to 111, it broke the layout of *both*
+    /// screens that render it — truncated into a 196px cell on the batch board,
+    /// wrapped and shunted a button onto a third line in the Takes lane — and
+    /// neither author noticed until one of them measured. Sharing the string is
+    /// what gave that bug a single place to surface. Two hand-written sentences
+    /// would have cost two subtly different wordings *and* two layout bugs, and
+    /// the second would have been found by a user rather than by us. So: if you
+    /// are about to write a second sentence for a paused batch somewhere else,
+    /// don't. Render this one, and re-measure the screens that show it.
+    ///
     /// It carries the numbers *and* who can act on them: the reader learns what
     /// stopped the batch, by how much, and whether they are the one who
     /// unsticks it. The hold cap is the only pause a person lifts by working,
