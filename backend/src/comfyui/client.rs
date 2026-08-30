@@ -29,16 +29,49 @@ impl ComfyUiClient {
         }
     }
 
+    /// The server this client talks to, normalised. Used as the node-info
+    /// cache key.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Check if ComfyUI is reachable.
+    ///
+    /// The result is also handed to [`super::nodes::observe_health`], which is
+    /// what notices a *reconnect* and drops the cached `/object_info` — a
+    /// restarted ComfyUI may have a different set of models installed. Doing it
+    /// here rather than at each call site is deliberate: this is the only place
+    /// that learns whether the server is up.
     pub fn health_check(&self) -> anyhow::Result<()> {
         let url = format!("{}/system_stats", self.base_url);
-        let resp = ureq::get(&url)
+        let outcome = (|| {
+            let resp = ureq::get(&url)
+                .call()
+                .map_err(|e| anyhow::anyhow!("ComfyUI health check failed: {}", e))?;
+            if resp.status() != 200 {
+                anyhow::bail!("ComfyUI returned status {}", resp.status());
+            }
+            Ok(())
+        })();
+        super::nodes::observe_health(&self.base_url, outcome.is_ok());
+        outcome
+    }
+
+    /// Ask ComfyUI what its installed node classes take.
+    ///
+    /// The answer runs to megabytes on a loaded box, so it carries its own
+    /// timeout: an import must not hang on a server that accepted the
+    /// connection and then went quiet. Reading the document is
+    /// [`super::nodes`]' job; this only fetches it.
+    pub(crate) fn object_info(&self) -> anyhow::Result<Value> {
+        let url = format!("{}/object_info", self.base_url);
+        let mut resp = ureq::get(&url)
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build()
             .call()
-            .map_err(|e| anyhow::anyhow!("ComfyUI health check failed: {}", e))?;
-        if resp.status() != 200 {
-            anyhow::bail!("ComfyUI returned status {}", resp.status());
-        }
-        Ok(())
+            .map_err(|e| anyhow::anyhow!("object_info fetch failed: {}", e))?;
+        Ok(resp.body_mut().read_json()?)
     }
 
     /// Upload an image to ComfyUI's /upload/image endpoint using manual multipart.

@@ -56,6 +56,24 @@ pub(super) async fn comfyui_health(
     }
 }
 
+/// Read the node catalogue off the blocking thread pool.
+///
+/// `None` covers every way ComfyUI can decline to describe itself — down, too
+/// old to have `/object_info`, or answering something unparseable — and every
+/// caller treats that as ordinary rather than as an error.
+async fn node_catalog(url: &str) -> Option<std::sync::Arc<crate::comfyui::NodeCatalog>> {
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || {
+        let client = crate::comfyui::ComfyUiClient::new(&url);
+        crate::comfyui::node_catalog(&client)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!("Reading ComfyUI node info panicked: {}", e);
+        None
+    })
+}
+
 /// GET /api/comfyui/workflows
 #[utoipa::path(
     get,
@@ -137,7 +155,7 @@ pub(super) async fn comfyui_import_workflow(
     UState(state): UState,
     Json(payload): Json<ImportWorkflowPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let _ = require_comfyui(&state)?;
+    let url = require_comfyui(&state)?;
 
     if payload.name.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -148,8 +166,13 @@ pub(super) async fn comfyui_import_workflow(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Ask ComfyUI what its nodes take, so the stored inputs carry real types
+    // and ranges. A server that cannot say falls the import back to the old
+    // heuristics rather than refusing it.
+    let catalog = node_catalog(&url).await;
+
     // Must have at least one LoadImage node
-    let inputs = crate::comfyui::detect_inputs(&payload.workflow);
+    let inputs = crate::comfyui::detect_inputs(&payload.workflow, catalog.as_deref());
     let has_load_image = inputs.iter().any(|i| i.node_type == "LoadImage");
     if !has_load_image {
         return Err(StatusCode::BAD_REQUEST);
