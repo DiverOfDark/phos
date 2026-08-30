@@ -3,7 +3,11 @@ mod comfyui;
 mod describe;
 mod faces;
 mod files;
+<<<<<<< HEAD
 mod line_io;
+=======
+mod line_editor;
+>>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
 mod lines;
 mod people;
 pub mod settings;
@@ -116,10 +120,17 @@ use utoipa::OpenApi;
         lines::get_run,
         lines::retry_run,
         lines::cancel_run,
+<<<<<<< HEAD
         line_io::export_line,
         line_io::import_line,
         describe::describe_shot,
         describe::get_description,
+=======
+        line_editor::list_stage_options,
+        line_editor::validate_line,
+        line_editor::duplicate_line,
+        line_editor::list_suggestions,
+>>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
         // Settings
         settings::get_webdav_settings,
         settings::set_webdav_settings,
@@ -578,6 +589,22 @@ pub fn create_router(state: AppState) -> Router {
             post(comfyui::comfyui_cancel_task),
         )
         // Production lines: a chain of workflows, and the runs that walk one.
+        .route(
+            "/api/comfyui/lines/stage-options",
+            get(line_editor::list_stage_options),
+        )
+        .route(
+            "/api/comfyui/lines/validate",
+            post(line_editor::validate_line),
+        )
+        .route(
+            "/api/comfyui/lines/suggestions",
+            get(line_editor::list_suggestions),
+        )
+        .route(
+            "/api/comfyui/lines/{id}/duplicate",
+            post(line_editor::duplicate_line),
+        )
         .route(
             "/api/comfyui/lines",
             get(lines::list_lines).post(lines::create_line),

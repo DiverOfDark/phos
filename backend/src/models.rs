@@ -204,6 +204,9 @@ pub struct NewLineStage<'a> {
     pub source_mode: Option<&'a str>,
     /// Whether this stage's intermediate survives the run.
     pub keep_output: bool,
+    /// Keys this stage deliberately does not pin, as a JSON array — the ones
+    /// starting a run may supply, and the only ones it may.
+    pub exposed: Option<&'a str>,
 }
 
 // ── Runs ──
@@ -220,6 +223,10 @@ pub struct NewRun<'a> {
     /// correctly after the line is renamed or deleted.
     pub label: &'a str,
     pub stage_count: i32,
+    /// What the sender answered for the stages that asked — a JSON object
+    /// keyed by stage index, snapshotted here because the worker queues the
+    /// later stages long after the request that carried the answers is gone.
+    pub stage_values: Option<&'a str>,
 }
 
 #[derive(AsChangeset, Default)]

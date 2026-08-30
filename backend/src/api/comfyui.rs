@@ -799,7 +799,8 @@ fn queue_enhancement(
     // then failing would leave a sweep with holes in it.
     let (run_id, task_ids): (String, Vec<String>) = conn
         .transaction::<_, diesel::result::Error, _>(|conn| {
-            let run_id = crate::comfyui::runs::open_run(conn, None, &payload.shot_id, &label, 1)?;
+            let run_id =
+                crate::comfyui::runs::open_run(conn, None, &payload.shot_id, &label, 1, None)?;
             let mut ids = Vec::with_capacity(runs.len());
             for run in runs {
                 let task_id = uuid::Uuid::new_v4().to_string();

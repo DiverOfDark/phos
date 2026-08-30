@@ -94,6 +94,7 @@ diesel::table! {
         source_mode -> Nullable<Text>,
         keep_output -> Bool,
         created_at -> Nullable<Timestamp>,
+        exposed -> Nullable<Text>,
     }
 }
 
@@ -130,6 +131,7 @@ diesel::table! {
         error_message -> Nullable<Text>,
         created_at -> Nullable<Timestamp>,
         finished_at -> Nullable<Timestamp>,
+        stage_values -> Nullable<Text>,
     }
 }
 
