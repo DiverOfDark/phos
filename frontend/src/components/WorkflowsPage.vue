@@ -2,7 +2,8 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import WorkflowGraph from '@/components/WorkflowGraph.vue'
-import { isEditableInput, isComboInput, comboChoices } from '@/lib/utils'
+import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
+import { controlKind, isParameterInput, isTextInput, inputKey, parameterValue } from '@/lib/utils'
 
 // --- Connection health ---
 const comfyuiHealthy = ref(false)
@@ -150,13 +151,14 @@ async function fetchPresets(workflowId) {
 
 async function createPreset() {
   if (!newPresetName.value.trim() || !selectedWorkflowId.value) return
-  // Build text_overrides from workflow's current default inputs
+  // A new preset starts where the workflow does: its author's own prompts and
+  // its author's own seed, steps and model, so saving one changes nothing until
+  // it is edited.
   const overrides = {}
-  const inputs = selectedWorkflow.value?.inputs || []
-  for (const input of inputs) {
-    if (isEditableInput(input)) {
-      overrides[`${input.node_id}.${input.field_name}`] = String(input.current_value ?? '')
-    }
+  const parameters = {}
+  for (const input of selectedWorkflow.value?.inputs || []) {
+    if (isTextInput(input)) overrides[inputKey(input)] = String(input.current_value ?? '')
+    else if (isParameterInput(input)) parameters[inputKey(input)] = parameterValue(input)
   }
   try {
     const res = await fetch(`/api/comfyui/workflows/${selectedWorkflowId.value}/presets`, {
@@ -165,6 +167,7 @@ async function createPreset() {
       body: JSON.stringify({
         name: newPresetName.value.trim(),
         text_overrides: overrides,
+        parameters,
       }),
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -190,6 +193,7 @@ async function savePresetName(preset) {
       body: JSON.stringify({
         name: editingPresetName.value.trim(),
         text_overrides: preset.text_overrides,
+        parameters: preset.parameters || {},
         sort_order: preset.sort_order,
       }),
     })
@@ -201,23 +205,36 @@ async function savePresetName(preset) {
   }
 }
 
-async function updatePresetOverrides(preset, nodeId, value) {
-  const updated = { ...preset.text_overrides, [nodeId]: value }
-  try {
-    const res = await fetch(`/api/comfyui/workflows/${selectedWorkflowId.value}/presets/${preset.id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: preset.name,
-        text_overrides: updated,
-        sort_order: preset.sort_order,
-      }),
-    })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    await fetchPresets(selectedWorkflowId.value)
-  } catch (e) {
-    console.error('Failed to update preset overrides', e)
-  }
+/** Pending saves, one timer per preset — a control is edited, not submitted. */
+const presetSaveTimers = new Map()
+
+/** Save a preset's values a moment after the last edit to it. */
+function savePresetValues(preset) {
+  clearTimeout(presetSaveTimers.get(preset.id))
+  presetSaveTimers.set(
+    preset.id,
+    setTimeout(async () => {
+      presetSaveTimers.delete(preset.id)
+      try {
+        const res = await fetch(
+          `/api/comfyui/workflows/${selectedWorkflowId.value}/presets/${preset.id}`,
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: preset.name,
+              text_overrides: preset.text_overrides || {},
+              parameters: preset.parameters || {},
+              sort_order: preset.sort_order,
+            }),
+          },
+        )
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      } catch (e) {
+        console.error('Failed to update preset', e)
+      }
+    }, 600),
+  )
 }
 
 async function deletePreset(presetId) {
@@ -374,9 +391,9 @@ function shortId(id) {
   return String(id || '').slice(0, 7)
 }
 
-/** Editable inputs of a workflow — LoadImage is fed by the shot, never by hand. */
+/** Inputs a person can set — LoadImage is fed by the shot, never by hand. */
 function editableInputsOf(wf) {
-  return (wf?.inputs || []).filter(isEditableInput)
+  return (wf?.inputs || []).filter((i) => controlKind(i) !== null)
 }
 
 const importReady = computed(() => importName.value.trim() && importJson.value.trim())
@@ -639,37 +656,14 @@ defineExpose({ loadData: fetchWorkflows })
                 >remove</button>
               </div>
 
-              <template v-if="editableInputsOf(selectedWorkflow).length">
-                <div
-                  v-for="input in editableInputsOf(selectedWorkflow)"
-                  :key="`${preset.id}-${input.node_id}.${input.field_name}`"
-                  class="flex flex-col gap-1"
-                >
-                  <span class="font-mono text-[11px] text-ink-tertiary">
-                    {{ input.node_id }} · {{ input.field_name }}
-                  </span>
-                  <select
-                    v-if="isComboInput(input)"
-                    class="w-full bg-surface border border-line rounded-sm px-3 py-2 font-mono text-xs text-ink"
-                    :value="preset.text_overrides?.[`${input.node_id}.${input.field_name}`] || ''"
-                    @change="updatePresetOverrides(preset, `${input.node_id}.${input.field_name}`, $event.target.value)"
-                  >
-                    <option
-                      v-for="choice in comboChoices(input, preset.text_overrides?.[`${input.node_id}.${input.field_name}`] || '')"
-                      :key="choice"
-                      :value="choice"
-                    >{{ choice }}</option>
-                  </select>
-                  <textarea
-                    v-else
-                    rows="2"
-                    spellcheck="false"
-                    class="w-full bg-surface border border-line rounded-sm px-3 py-2 font-mono text-xs text-ink"
-                    :value="preset.text_overrides?.[`${input.node_id}.${input.field_name}`] || ''"
-                    @change="updatePresetOverrides(preset, `${input.node_id}.${input.field_name}`, $event.target.value)"
-                  ></textarea>
-                </div>
-              </template>
+              <WorkflowInputControls
+                v-if="editableInputsOf(selectedWorkflow).length"
+                v-model:text-overrides="preset.text_overrides"
+                v-model:parameters="preset.parameters"
+                :inputs="selectedWorkflow.inputs || []"
+                :loader-node-ids="(selectedWorkflow.loaders || []).map(l => l.node_id)"
+                @dirty="savePresetValues(preset)"
+              />
               <span v-else class="text-xs font-light text-ink-secondary">
                 No editable inputs in this workflow — the preset runs node defaults.
               </span>
@@ -691,8 +685,9 @@ defineExpose({ loadData: fetchWorkflows })
             >Add preset</button>
           </div>
           <div class="text-xs font-light text-ink-secondary">
-            Presets save prompt text per node — picking one in the Enhance dialog fills the input
-            overrides; typing there deselects it.
+            Presets save a whole set of values — prompts, seeds, step counts, models — per
+            workflow. Picking one in the Enhance dialog fills the controls; changing one there
+            deselects it.
           </div>
         </div>
       </div>
