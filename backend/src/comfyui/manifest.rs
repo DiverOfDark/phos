@@ -46,6 +46,15 @@ pub struct ProvenanceManifest {
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     #[schema(value_type = Object)]
     pub text_overrides: serde_json::Map<String, serde_json::Value>,
+    /// The typed values this run ran with, `"<node_id>.<field_name>"` → value,
+    /// exactly as the task row carried them.
+    ///
+    /// This is what makes a fanned-out run reproducible one file at a time: four
+    /// takes of the same prompt differ only here, and without it their manifests
+    /// are indistinguishable.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = Object)]
+    pub parameters: serde_json::Map<String, serde_json::Value>,
     /// ComfyUI's own id for the run, which is how its history can still be
     /// matched up if the server keeps it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,7 +74,10 @@ pub struct ProvenanceManifest {
     /// Position of this run in a multi-stage line, zero-based.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_index: Option<i64>,
-    /// The seed the sampler actually ran with.
+    /// The seed the sampler actually ran with, lifted out of [`Self::parameters`]
+    /// because it is the value asked for most often. A graph with two samplers
+    /// has two seeds; this is the first in key order, and the map beside it is
+    /// the complete answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
     /// The prompt as submitted, after every override was applied.
@@ -87,34 +99,69 @@ pub struct ProvenanceManifest {
 impl ProvenanceManifest {
     /// The record for one finished ComfyUI run.
     ///
-    /// `text_overrides` is the task's stored JSON; anything unparseable becomes
-    /// an empty object rather than losing the rest of the manifest.
-    pub fn for_comfyui_run(
-        task_id: &str,
-        workflow_id: &str,
-        text_overrides: &str,
-        comfyui_prompt_id: Option<&str>,
-        source_file_id: Option<&str>,
-        output_filename: Option<&str>,
-        generated_at: String,
-    ) -> Self {
+    /// Both override maps are the task's stored JSON; either one being
+    /// unreadable costs that map, never the rest of the record.
+    pub fn for_comfyui_run(run: &ComfyuiRun) -> Self {
+        let parameters: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(run.parameters).unwrap_or_default();
         Self {
             version: MANIFEST_VERSION,
             generator: GENERATOR_COMFYUI.to_string(),
-            generated_at,
-            task_id: task_id.to_string(),
-            workflow_id: workflow_id.to_string(),
-            text_overrides: serde_json::from_str(text_overrides).unwrap_or_default(),
-            comfyui_prompt_id: comfyui_prompt_id.map(str::to_string),
-            source_file_id: source_file_id.map(str::to_string),
-            output_filename: output_filename.map(str::to_string),
+            generated_at: run.generated_at.to_string(),
+            task_id: run.task_id.to_string(),
+            workflow_id: run.workflow_id.to_string(),
+            text_overrides: serde_json::from_str(run.text_overrides).unwrap_or_default(),
+            seed: seed_of(&parameters),
+            parameters,
+            comfyui_prompt_id: run.comfyui_prompt_id.map(str::to_string),
+            source_file_id: run.source_file_id.map(str::to_string),
+            output_filename: run.output_filename.map(str::to_string),
             line_id: None,
             stage_index: None,
-            seed: None,
             compiled_prompt: None,
             extra: serde_json::Map::new(),
         }
     }
+}
+
+/// One finished ComfyUI run, as the completion path knows it.
+///
+/// A struct rather than eight positional arguments: two of them are `&str` of
+/// stored JSON — the prompts and the typed values — and swapping them would
+/// file a seed where a prompt belongs without ever failing to compile.
+pub struct ComfyuiRun<'a> {
+    pub task_id: &'a str,
+    pub workflow_id: &'a str,
+    /// The task's stored `text_overrides` JSON.
+    pub text_overrides: &'a str,
+    /// The task's stored `parameters` JSON: the resolved typed values this run
+    /// was queued with — one task's worth of a fan-out.
+    pub parameters: &'a str,
+    pub comfyui_prompt_id: Option<&'a str>,
+    pub source_file_id: Option<&'a str>,
+    pub output_filename: Option<&'a str>,
+    /// UTC, `YYYY-MM-DD HH:MM:SS`.
+    pub generated_at: &'a str,
+}
+
+/// The seed a parameter map names, if it names one.
+///
+/// The map is keyed `"<node_id>.<field_name>"`, so this is a question about
+/// field names: ComfyUI's samplers call it `seed`, and `KSamplerAdvanced` calls
+/// it `noise_seed`. Anything that is not a whole number is not a seed — a graph
+/// whose author wired that socket from another node has no literal to record.
+fn seed_of(parameters: &serde_json::Map<String, serde_json::Value>) -> Option<i64> {
+    parameters
+        .iter()
+        .filter(|(key, _)| is_seed_field(key))
+        .find_map(|(_, value)| value.as_i64())
+}
+
+fn is_seed_field(key: &str) -> bool {
+    matches!(
+        key.rsplit_once('.').map(|(_, field)| field),
+        Some("seed") | Some("noise_seed")
+    )
 }
 
 #[cfg(test)]
@@ -122,16 +169,36 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A run with prompts but no typed values: every task queued before FR4,
+    /// and every workflow whose fields the catalogue could not describe.
     fn a_run() -> ProvenanceManifest {
-        ProvenanceManifest::for_comfyui_run(
-            "task-1234",
-            "wf-portrait",
-            r#"{"6":"a lighthouse at dusk"}"#,
-            Some("prompt-abcd"),
-            Some("file-source"),
-            Some("task-1234_00001.png"),
-            "2026-08-30 12:00:00".to_string(),
-        )
+        ProvenanceManifest::for_comfyui_run(&ComfyuiRun {
+            task_id: "task-1234",
+            workflow_id: "wf-portrait",
+            text_overrides: r#"{"6":"a lighthouse at dusk"}"#,
+            parameters: "{}",
+            comfyui_prompt_id: Some("prompt-abcd"),
+            source_file_id: Some("file-source"),
+            output_filename: Some("task-1234_00001.png"),
+            generated_at: "2026-08-30 12:00:00",
+        })
+    }
+
+    /// The same run, queued with the typed values FR4 records.
+    fn a_typed_run(parameters: &str) -> ProvenanceManifest {
+        ProvenanceManifest::for_comfyui_run(&ComfyuiRun {
+            parameters,
+            ..ComfyuiRun {
+                task_id: "task-1234",
+                workflow_id: "wf-portrait",
+                text_overrides: r#"{"6":"a lighthouse at dusk"}"#,
+                parameters: "{}",
+                comfyui_prompt_id: Some("prompt-abcd"),
+                source_file_id: Some("file-source"),
+                output_filename: Some("task-1234_00001.png"),
+                generated_at: "2026-08-30 12:00:00",
+            }
+        })
     }
 
     #[test]
@@ -154,12 +221,104 @@ mod tests {
     fn the_fields_later_stages_fill_in_are_simply_absent() {
         let v: serde_json::Value = serde_json::to_value(a_run()).unwrap();
         let obj = v.as_object().unwrap();
-        for later in ["line_id", "stage_index", "seed", "compiled_prompt"] {
+        for later in ["line_id", "stage_index", "compiled_prompt", "parameters"] {
             assert!(
                 !obj.contains_key(later),
                 "{later} should not be written yet"
             );
         }
+        // A run with no typed values has no seed to name either, and says so by
+        // omission rather than by a null.
+        assert!(!obj.contains_key("seed"));
+    }
+
+    // === FR4 — the values that make a take reproducible ======================
+
+    #[test]
+    fn a_run_records_the_typed_values_it_ran_with() {
+        let m = a_typed_run(
+            r#"{"3.seed":4242,"3.steps":28,"3.cfg":6.5,
+                "4.ckpt_name":"sd_xl_base_1.0.safetensors","12.add_noise":true}"#,
+        );
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["parameters"]["3.seed"], json!(4242));
+        assert_eq!(v["parameters"]["3.steps"], json!(28));
+        assert_eq!(v["parameters"]["3.cfg"], json!(6.5));
+        assert_eq!(
+            v["parameters"]["4.ckpt_name"],
+            json!("sd_xl_base_1.0.safetensors")
+        );
+        assert_eq!(v["parameters"]["12.add_noise"], json!(true));
+        // Types survive: a seed read back as a string reproduces nothing.
+        assert!(v["parameters"]["3.seed"].is_i64());
+        // And the prompt half is still where it was.
+        assert_eq!(v["text_overrides"]["6"], json!("a lighthouse at dusk"));
+    }
+
+    #[test]
+    fn the_seed_is_lifted_out_of_the_map_so_the_question_has_one_answer() {
+        assert_eq!(
+            a_typed_run(r#"{"3.seed":4242,"3.steps":28}"#).seed,
+            Some(4242)
+        );
+        // KSamplerAdvanced spells it differently.
+        assert_eq!(a_typed_run(r#"{"3.noise_seed":77}"#).seed, Some(77));
+        // A field merely containing the word is not one.
+        assert_eq!(a_typed_run(r#"{"3.seed_offset":5}"#).seed, None);
+        // Neither is a value that is not a whole number.
+        assert_eq!(a_typed_run(r#"{"3.seed":"random"}"#).seed, None);
+        assert_eq!(a_typed_run(r#"{"3.seed":1.5}"#).seed, None);
+        // Nothing typed at all: nothing to name.
+        assert_eq!(a_typed_run("{}").seed, None);
+        // Two samplers: the first in key order answers, and the map beside it
+        // still carries both.
+        let two = a_typed_run(r#"{"3.seed":11,"9.noise_seed":22}"#);
+        assert_eq!(two.seed, Some(11));
+        assert_eq!(two.parameters["9.noise_seed"], json!(22));
+    }
+
+    #[test]
+    fn a_take_out_of_a_fan_out_is_told_apart_by_its_manifest() {
+        // Four takes of one prompt: identical but for the seed, which is the
+        // whole reason the seed has to be in the record.
+        let takes: Vec<ProvenanceManifest> = [1000, 1001, 1002, 1003]
+            .iter()
+            .map(|seed| a_typed_run(&format!(r#"{{"3.seed":{},"3.steps":28}}"#, seed)))
+            .collect();
+        let seeds: Vec<Option<i64>> = takes.iter().map(|m| m.seed).collect();
+        assert_eq!(seeds, [Some(1000), Some(1001), Some(1002), Some(1003)]);
+        // Distinguishable as whole records, not just in the convenience field.
+        let records: std::collections::HashSet<String> = takes
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect();
+        assert_eq!(records.len(), 4, "two takes wrote the same manifest");
+    }
+
+    #[test]
+    fn unreadable_parameters_cost_the_parameters_and_nothing_else() {
+        let m = a_typed_run("not json at all");
+        assert!(m.parameters.is_empty());
+        assert_eq!(m.seed, None);
+        assert_eq!("task-1234", m.task_id);
+        assert_eq!(
+            Some(&json!("a lighthouse at dusk")),
+            m.text_overrides.get("6")
+        );
+    }
+
+    #[test]
+    fn a_manifest_written_before_the_parameters_existed_still_reads() {
+        // Every generated file already in a library: no `parameters` key at all.
+        let old = json!({
+            "version": 1, "generator": "comfyui",
+            "generated_at": "2026-08-30 12:00:00",
+            "task_id": "t", "workflow_id": "w",
+            "text_overrides": { "6": "a lighthouse at dusk" },
+        });
+        let parsed: ProvenanceManifest = serde_json::from_value(old).unwrap();
+        assert!(parsed.parameters.is_empty());
+        assert_eq!(parsed.seed, None);
     }
 
     /// The point of the version and the catch-all: a manifest from a newer Phos
@@ -196,15 +355,16 @@ mod tests {
     /// Overrides that will not parse cost the overrides, not the manifest.
     #[test]
     fn unparseable_overrides_do_not_take_the_rest_of_the_record_down() {
-        let m = ProvenanceManifest::for_comfyui_run(
-            "t",
-            "w",
-            "not json at all",
-            None,
-            None,
-            None,
-            "2026-08-30 12:00:00".to_string(),
-        );
+        let m = ProvenanceManifest::for_comfyui_run(&ComfyuiRun {
+            task_id: "t",
+            workflow_id: "w",
+            text_overrides: "not json at all",
+            parameters: "{}",
+            comfyui_prompt_id: None,
+            source_file_id: None,
+            output_filename: None,
+            generated_at: "2026-08-30 12:00:00",
+        });
         assert!(m.text_overrides.is_empty());
         assert_eq!("t", m.task_id);
     }

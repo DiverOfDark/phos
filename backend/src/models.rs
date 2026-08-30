@@ -153,6 +153,10 @@ pub struct NewEnhancementTask<'a> {
     /// Which part of a video source the run consumes. `None` means "decide from
     /// the workflow" — see `SourceMode` in `comfyui::source`.
     pub source_mode: Option<&'a str>,
+    /// This run's typed parameters, `{"<node_id>.<field>": <value>}`, already
+    /// resolved — a swept seed is drawn before the row is written. `None` is a
+    /// run that set none, which is every task queued before FR4.
+    pub parameters: Option<&'a str>,
 }
 
 #[derive(AsChangeset)]
@@ -186,6 +190,9 @@ pub struct WorkflowPreset {
     pub text_overrides: String,
     pub sort_order: Option<i32>,
     pub created_at: Option<String>,
+    /// The preset's typed parameters, same shape as a task's. `None` is a
+    /// preset saved before FR4: prompts only.
+    pub parameters: Option<String>,
 }
 
 #[derive(Insertable)]
@@ -196,6 +203,7 @@ pub struct NewWorkflowPreset<'a> {
     pub name: &'a str,
     pub text_overrides: &'a str,
     pub sort_order: Option<i32>,
+    pub parameters: Option<&'a str>,
 }
 
 // ── Ignored Merges ──
