@@ -21,6 +21,9 @@ pub(crate) struct ShotBrief {
     pub review_status: Option<String>,
     pub folder_number: Option<i64>,
     pub description: Option<String>,
+    /// The shot's main file was made by a machine. The card says so, because
+    /// the picture itself cannot.
+    pub synthetic: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -75,7 +78,8 @@ pub(super) async fn get_shots(
         "SELECT DISTINCT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number,
                 f.id AS main_file_id, p.name AS person_name,
                 (SELECT COUNT(*) FROM files WHERE shot_id = s.id) AS file_count,
-                s.description
+                s.description,
+                COALESCE(f.synthetic, 0) AS synthetic
          FROM shots s
          LEFT JOIN files f ON s.main_file_id = f.id
          LEFT JOIN people p ON s.primary_person_id = p.id",
@@ -154,6 +158,8 @@ pub(super) async fn get_shots(
         file_count: i64,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         description: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        synthetic: bool,
     }
 
     // Build the sql_query and bind parameters dynamically
@@ -221,6 +227,7 @@ pub(super) async fn get_shots(
                 review_status: row.review_status,
                 folder_number: row.folder_number.map(|v| v as i64),
                 description: row.description,
+                synthetic: row.synthetic,
             })
             .collect(),
         Err(e) => {
@@ -261,6 +268,9 @@ pub(super) struct FileDetail {
     height: Option<i64>,
     duration_ms: Option<i64>,
     thumbnail_url: String,
+    /// Made by a machine rather than a camera. `GET /api/files/{id}/manifest`
+    /// says how.
+    synthetic: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -326,9 +336,10 @@ pub(super) async fn get_shot_detail(
     let shot_height = shot_height_i32.map(|v| v as i64);
 
     // Get files for this shot
-    let file_rows: Vec<(String, String, Option<String>, Option<bool>, Option<i32>)> = files::table
+    type FileRow = (String, String, Option<String>, Option<bool>, Option<i32>, bool);
+    let file_rows: Vec<FileRow> = files::table
         .filter(files::shot_id.eq(&id))
-        .select((files::id, files::path, files::mime_type, files::is_original, files::file_size))
+        .select((files::id, files::path, files::mime_type, files::is_original, files::file_size, files::synthetic))
         .order((files::is_original.desc(), files::path.asc()))
         .load(&mut conn)
         .map_err(|e| {
@@ -338,7 +349,7 @@ pub(super) async fn get_shot_detail(
 
     let detail_files: Vec<FileDetail> = file_rows
         .into_iter()
-        .map(|(file_id, path, mime_type, is_original, file_size)| FileDetail {
+        .map(|(file_id, path, mime_type, is_original, file_size, synthetic)| FileDetail {
             thumbnail_url: format!("/api/files/{}/thumbnail", file_id),
             id: file_id,
             path,
@@ -348,6 +359,7 @@ pub(super) async fn get_shot_detail(
             width: shot_width,
             height: shot_height,
             duration_ms: None,
+            synthetic,
         })
         .collect();
 

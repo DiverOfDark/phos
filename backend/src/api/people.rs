@@ -209,6 +209,21 @@ pub(super) async fn get_person_shots(
         std::collections::HashMap::new()
     };
 
+    // Which of those main files a machine made, so the card can say so.
+    let main_file_ids: Vec<&str> = shot_rows.iter().filter_map(|r| r.5.as_deref()).collect();
+    let synthetic_main_files: std::collections::HashSet<String> = if !main_file_ids.is_empty() {
+        files::table
+            .filter(files::id.eq_any(&main_file_ids))
+            .filter(files::synthetic.eq(true))
+            .select(files::id)
+            .load::<String>(&mut conn)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let shots: Vec<ShotBrief> = shot_rows
         .into_iter()
         .map(|(sid, timestamp, ppid, review_status, folder_number, main_file_id, description)| ShotBrief {
@@ -218,6 +233,9 @@ pub(super) async fn get_person_shots(
             primary_person_id: ppid,
             review_status,
             folder_number: folder_number.map(|n| n as i64),
+            synthetic: main_file_id
+                .as_deref()
+                .is_some_and(|fid| synthetic_main_files.contains(fid)),
             thumbnail_url: main_file_id
                 .map(|fid| format!("/api/files/{}/thumbnail", fid))
                 .unwrap_or_default(),

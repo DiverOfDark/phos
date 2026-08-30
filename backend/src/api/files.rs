@@ -509,3 +509,78 @@ pub(super) async fn delete_file(
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
+
+/// What a file says about where it came from.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(super) struct FileManifestResponse {
+    /// The file asked about.
+    file_id: String,
+    /// Whether a machine made this picture rather than a camera.
+    synthetic: bool,
+    /// How it was made. Absent for a photograph, and for a generated file that
+    /// predates provenance being recorded — a library can hold variants created
+    /// before anyone wrote down where they came from.
+    manifest: Option<crate::comfyui::ProvenanceManifest>,
+    /// Present when a stored manifest could not be read back. The raw text is
+    /// returned rather than dropped: unreadable provenance is still evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_error: Option<String>,
+    /// The stored manifest exactly as written, when it would not parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_raw: Option<String>,
+}
+
+/// GET /api/files/:id/manifest — the provenance of a generated file.
+#[utoipa::path(
+    get,
+    path = "/api/files/{id}/manifest",
+    tag = "files",
+    summary = "Get file provenance",
+    description = "Whether a file was generated, and the manifest recording how — the task and workflow that ran, the prompt overrides, the ComfyUI prompt id, the source file and the name the generator gave its output. Answers for any file: a photograph comes back with `synthetic: false` and no manifest.",
+    params(("id" = String, Path, description = "File ID")),
+    responses(
+        (status = 200, description = "File provenance", body = FileManifestResponse),
+        (status = 404, description = "File not found"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
+pub(super) async fn get_file_manifest(
+    Path(id): Path<String>,
+    UState(state): UState,
+) -> Result<Json<FileManifestResponse>, StatusCode> {
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let (synthetic, manifest_json): (bool, Option<String>) = files::table
+        .filter(files::id.eq(&id))
+        .select((files::synthetic, files::manifest_json))
+        .first::<(bool, Option<String>)>(&mut conn)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let mut response = FileManifestResponse {
+        file_id: id,
+        synthetic,
+        manifest: None,
+        manifest_error: None,
+        manifest_raw: None,
+    };
+
+    if let Some(raw) = manifest_json {
+        match serde_json::from_str(&raw) {
+            Ok(manifest) => response.manifest = Some(manifest),
+            Err(e) => {
+                tracing::warn!(
+                    "File {} has a manifest that will not parse: {}",
+                    response.file_id,
+                    e
+                );
+                response.manifest_error = Some(e.to_string());
+                response.manifest_raw = Some(raw);
+            }
+        }
+    }
+
+    Ok(Json(response))
+}

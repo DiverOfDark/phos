@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "master"
+    "version": "feat/synthetic-provenance"
   },
   "paths": {
     "/api/auth/callback": {
@@ -1121,6 +1121,45 @@
           },
           "400": {
             "description": "Invalid bounding box coordinates"
+          },
+          "404": {
+            "description": "File not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/files/{id}/manifest": {
+      "get": {
+        "tags": [
+          "files"
+        ],
+        "summary": "Get file provenance",
+        "description": "Whether a file was generated, and the manifest recording how — the task and workflow that ran, the prompt overrides, the ComfyUI prompt id, the source file and the name the generator gave its output. Answers for any file: a photograph comes back with `synthetic: false` and no manifest.",
+        "operationId": "get_file_manifest",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "File ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File provenance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileManifestResponse"
+                }
+              }
+            }
           },
           "404": {
             "description": "File not found"
@@ -2633,7 +2672,8 @@
           "id",
           "path",
           "is_original",
-          "thumbnail_url"
+          "thumbnail_url",
+          "synthetic"
         ],
         "properties": {
           "duration_ms": {
@@ -2672,6 +2712,10 @@
           "path": {
             "type": "string"
           },
+          "synthetic": {
+            "type": "boolean",
+            "description": "Made by a machine rather than a camera. `GET /api/files/{id}/manifest`\nsays how."
+          },
           "thumbnail_url": {
             "type": "string"
           },
@@ -2681,6 +2725,49 @@
               "null"
             ],
             "format": "int64"
+          }
+        }
+      },
+      "FileManifestResponse": {
+        "type": "object",
+        "description": "What a file says about where it came from.",
+        "required": [
+          "file_id",
+          "synthetic"
+        ],
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "The file asked about."
+          },
+          "manifest": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProvenanceManifest",
+                "description": "How it was made. Absent for a photograph, and for a generated file that\npredates provenance being recorded — a library can hold variants created\nbefore anyone wrote down where they came from."
+              }
+            ]
+          },
+          "manifest_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Present when a stored manifest could not be read back. The raw text is\nreturned rather than dropped: unreadable provenance is still evidence."
+          },
+          "manifest_raw": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The stored manifest exactly as written, when it would not parse."
+          },
+          "synthetic": {
+            "type": "boolean",
+            "description": "Whether a machine made this picture rather than a camera."
           }
         }
       },
@@ -2964,6 +3051,99 @@
           }
         }
       },
+      "ProvenanceManifest": {
+        "type": "object",
+        "description": "How a generated file came to exist.",
+        "required": [
+          "version",
+          "generator",
+          "generated_at",
+          "task_id",
+          "workflow_id"
+        ],
+        "properties": {
+          "comfyui_prompt_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ComfyUI's own id for the run, which is how its history can still be\nmatched up if the server keeps it."
+          },
+          "compiled_prompt": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The prompt as submitted, after every override was applied."
+          },
+          "generated_at": {
+            "type": "string",
+            "description": "When Phos brought the file into the library, UTC, `YYYY-MM-DD HH:MM:SS`."
+          },
+          "generator": {
+            "type": "string",
+            "description": "What produced the file — [`GENERATOR_COMFYUI`] today."
+          },
+          "line_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The generation line this file belongs to."
+          },
+          "output_filename": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name ComfyUI gave the output, before Phos renamed it into the\nlibrary — the last thread back to the run that made it."
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The seed the sampler actually ran with."
+          },
+          "source_file_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The library file the run was given to work from, when there was one."
+          },
+          "stage_index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Position of this run in a multi-stage line, zero-based."
+          },
+          "task_id": {
+            "type": "string",
+            "description": "The `enhancement_tasks` row that produced it."
+          },
+          "text_overrides": {
+            "type": "object",
+            "description": "The text the user put into the workflow, node id → prompt."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Which shape of this record was written. See [`MANIFEST_VERSION`].",
+            "minimum": 0
+          },
+          "workflow_id": {
+            "type": "string",
+            "description": "The workflow that was run."
+          }
+        },
+        "additionalProperties": {
+          "description": "Anything a newer Phos wrote that this one has no field for. Kept so a\nround trip through an older binary does not quietly drop provenance.\n\nFlattened, so it has no name of its own in the JSON and nothing to\npublish in the schema — a client generated from an older spec simply\ndoes not see the newer keys, which is the point."
+        }
+      },
       "ReassignFacePayload": {
         "type": "object",
         "description": "Reassign a face to a different person",
@@ -3069,7 +3249,8 @@
         "required": [
           "id",
           "thumbnail_url",
-          "file_count"
+          "file_count",
+          "synthetic"
         ],
         "properties": {
           "description": {
@@ -3109,6 +3290,10 @@
               "string",
               "null"
             ]
+          },
+          "synthetic": {
+            "type": "boolean",
+            "description": "The shot's main file was made by a machine. The card says so, because\nthe picture itself cannot."
           },
           "thumbnail_url": {
             "type": "string"
