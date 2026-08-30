@@ -476,16 +476,21 @@ defineExpose({ loadData: () => fetchPage(false) })
             <span class="label">
               keeping one costs {{ cost }} task<template v-if="cost !== 1">s</template> below
             </span>
-            <span
-              v-if="batchSays"
-              class="font-mono text-[11px]"
-              style="color: var(--status-degraded)"
-            >{{ batchSays }}</span>
             <span class="flex-1"></span>
             <button class="label hover:text-signal transition-colors" @click="act({ type: 'help' })">
               <kbd class="kbd-ab">?</kbd> keys
             </button>
           </div>
+
+          <!-- Why nothing new is arriving. Its own row rather than a fourth
+               tag: it is a sentence, it is the longest thing on the screen, and
+               letting it wrap inside the tag row pushed the keys button onto a
+               line of its own at narrow widths. FR7 writes the words. -->
+          <div
+            v-if="batchSays"
+            class="flex-none font-mono text-[11px] leading-snug"
+            style="color: var(--status-degraded)"
+          >{{ batchSays }}</div>
 
           <!-- Compare: the original the takes are variations of, beside them. -->
           <div class="flex-1 min-h-0 flex gap-4 items-stretch">
