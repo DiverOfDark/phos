@@ -6,6 +6,9 @@ const props = defineProps({
   shotId: [String, Number],
   shotLabel: { type: String, default: '' },
   fileId: String,
+  /** Mime type of the file the run will read, so the source picker knows
+   *  whether there is a video to take a frame of. */
+  sourceMime: { type: String, default: '' },
 })
 
 const emit = defineEmits(['update:open', 'taskCreated'])
@@ -33,6 +36,42 @@ const generations = ref([])
 
 // --- Text overrides ---
 const textOverrides = ref({})
+
+// --- Source mode (videos only) ---
+// A still has no frames to choose between, so the whole section stays out of
+// the way unless the source is a video.
+const sourceIsVideo = computed(() => (props.sourceMime || '').startsWith('video/'))
+
+const SOURCE_MODES = [
+  { key: 'whole_video', label: 'whole video', note: 'the clip itself — needs a workflow with a video loader' },
+  { key: 'first_frame', label: 'first frame', note: 'frame zero' },
+  { key: 'last_frame', label: 'last frame', note: 'what an extension continues from' },
+  { key: 'at_time', label: 'at time', note: 'a position in the clip' },
+  { key: 'keyframe', label: 'keyframe', note: 'one of the indexed keyframes' },
+]
+
+const sourceModeKey = ref('first_frame')
+const sourceAtMs = ref(0)
+const sourceKeyframe = ref(0)
+const sourceModeTouched = ref(false)
+
+/** What goes on the wire, or null to let the backend decide. */
+const sourceMode = computed(() => {
+  if (!sourceIsVideo.value) return null
+  if (sourceModeKey.value === 'at_time') return `at_time:${Math.max(0, Math.trunc(sourceAtMs.value || 0))}`
+  if (sourceModeKey.value === 'keyframe') return `keyframe:${Math.max(0, Math.trunc(sourceKeyframe.value || 0))}`
+  return sourceModeKey.value
+})
+
+/** The default the backend would pick, mirrored so the UI shows the truth. */
+function defaultSourceModeKey() {
+  return selectedWorkflow.value?.takes_video ? 'whole_video' : 'first_frame'
+}
+
+function selectSourceMode(key) {
+  sourceModeKey.value = key
+  sourceModeTouched.value = true
+}
 
 // --- Submit state ---
 const submitting = ref(false)
@@ -111,6 +150,21 @@ function overridesMatch(a, b) {
   return true
 }
 
+// A loader node is fed by the source picker, not by a text box.
+function isLoaderInput(wf, input) {
+  if (input.node_type === 'LoadImage') return true
+  return (wf?.loaders || []).some(l => l.node_id === input.node_id)
+}
+
+function defaultOverrides(wf) {
+  const overrides = {}
+  for (const input of wf?.inputs || []) {
+    if (isLoaderInput(wf, input)) continue
+    overrides[`${input.node_id}.${input.field_name}`] = typeof input.current_value === 'string' ? input.current_value : ''
+  }
+  return overrides
+}
+
 // Initialize text overrides when workflow changes
 watch(selectedWorkflow, (wf) => {
   if (!wf) {
@@ -119,15 +173,10 @@ watch(selectedWorkflow, (wf) => {
     selectedPresetId.value = null
     return
   }
-  const overrides = {}
-  const inputs = wf.inputs || []
-  for (const input of inputs) {
-    if (input.node_type !== 'LoadImage') {
-      overrides[`${input.node_id}.${input.field_name}`] = typeof input.current_value === 'string' ? input.current_value : ''
-    }
-  }
-  textOverrides.value = overrides
+  textOverrides.value = defaultOverrides(wf)
   selectedPresetId.value = null
+  // Follow the workflow's own default until the user says otherwise.
+  if (!sourceModeTouched.value) sourceModeKey.value = defaultSourceModeKey()
   fetchPresets(wf.id)
 })
 
@@ -136,6 +185,8 @@ watch(dialogOpen, (val) => {
   if (val) {
     submitError.value = ''
     submitSuccess.value = false
+    sourceModeTouched.value = false
+    sourceModeKey.value = defaultSourceModeKey()
     fetchWorkflows()
     if (props.shotId) {
       fetchGenerations(props.shotId)
@@ -151,14 +202,7 @@ function selectPreset(preset) {
   if (selectedPresetId.value === preset.id) {
     // Deselect — restore workflow defaults
     selectedPresetId.value = null
-    const overrides = {}
-    const inputs = selectedWorkflow.value?.inputs || []
-    for (const input of inputs) {
-      if (input.node_type !== 'LoadImage') {
-        overrides[`${input.node_id}.${input.field_name}`] = typeof input.current_value === 'string' ? input.current_value : ''
-      }
-    }
-    textOverrides.value = overrides
+    textOverrides.value = defaultOverrides(selectedWorkflow.value)
     return
   }
   selectedPresetId.value = preset.id
@@ -172,7 +216,7 @@ function selectPreset(preset) {
 const textInputs = computed(() => {
   if (!selectedWorkflow.value) return []
   return (selectedWorkflow.value.inputs || []).filter(
-    i => i.node_type !== 'LoadImage'
+    i => !isLoaderInput(selectedWorkflow.value, i)
   )
 })
 
@@ -196,6 +240,7 @@ async function enhance() {
         workflow_id: selectedWorkflowId.value,
         text_overrides: textOverrides.value,
         ...(props.fileId ? { source_file_id: props.fileId } : {}),
+        ...(sourceMode.value ? { source_mode: sourceMode.value } : {}),
       }),
     })
     if (!res.ok) {
@@ -267,6 +312,51 @@ async function enhance() {
                   style="background: var(--status-ready)"
                 ></span>
               </button>
+            </div>
+          </div>
+
+          <!-- Source (videos only — a still has no frames to choose between) -->
+          <div v-if="sourceIsVideo" class="flex flex-col gap-2">
+            <div class="label">Source</div>
+            <div class="flex flex-wrap gap-2">
+              <button
+                v-for="mode in SOURCE_MODES"
+                :key="mode.key"
+                :title="mode.note"
+                class="whitespace-nowrap border rounded px-3 py-1.5 font-mono text-xs transition-colors"
+                :class="sourceModeKey === mode.key
+                  ? 'border-signal bg-surface text-signal'
+                  : 'border-line text-ink-secondary hover:bg-raised'"
+                @click="selectSourceMode(mode.key)"
+              >{{ mode.label }}</button>
+            </div>
+            <div v-if="sourceModeKey === 'at_time'" class="flex items-center gap-2">
+              <span class="font-mono text-[11px] text-ink-tertiary">ms into the clip</span>
+              <input
+                v-model.number="sourceAtMs"
+                type="number"
+                min="0"
+                step="100"
+                class="w-32 bg-base border border-line rounded-sm px-3 py-1.5 font-mono text-xs text-ink"
+              />
+            </div>
+            <div v-else-if="sourceModeKey === 'keyframe'" class="flex items-center gap-2">
+              <span class="font-mono text-[11px] text-ink-tertiary">keyframe index, from 0</span>
+              <input
+                v-model.number="sourceKeyframe"
+                type="number"
+                min="0"
+                step="1"
+                class="w-32 bg-base border border-line rounded-sm px-3 py-1.5 font-mono text-xs text-ink"
+              />
+            </div>
+            <div
+              v-else-if="sourceModeKey === 'whole_video' && selectedWorkflow && !selectedWorkflow.takes_video"
+              class="flex items-center gap-2 px-3 py-2 border rounded font-mono text-xs"
+              style="border-color: var(--status-degraded); color: var(--status-degraded)"
+            >
+              <span class="signal-dot" style="width:6px;height:6px;background:var(--status-degraded)"></span>
+              this workflow has no video loader to read the clip
             </div>
           </div>
 
