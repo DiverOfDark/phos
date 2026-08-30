@@ -22,6 +22,8 @@ pub(super) mod advance;
 mod complete;
 mod contracts;
 mod dispatch;
+#[cfg(test)]
+mod drain_tests;
 mod status;
 mod store;
 

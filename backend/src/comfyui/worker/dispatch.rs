@@ -39,11 +39,11 @@ use tracing::{error, info, warn};
 ///
 /// Small on purpose, and unchanged by FR8: the pass runs every three seconds
 /// and each task here is an upload. What FR8 changed is *which* five.
-const DISPATCH_CHUNK: i64 = 5;
+pub(super) const DISPATCH_CHUNK: i64 = 5;
 
 /// A task waiting to be sent to ComfyUI.
-struct PendingTask {
-    id: String,
+pub(super) struct PendingTask {
+    pub(super) id: String,
     shot_id: String,
     workflow_json: String,
     /// The workflow's stored stage contract, read for its role corrections.
@@ -76,7 +76,7 @@ struct PendingTask {
 impl PendingTask {
     /// Where this task sits in the drain order, as
     /// [`crate::comfyui::queue`] describes it with no database involved.
-    fn drain_key(&self) -> queue::DrainKey {
+    pub(super) fn drain_key(&self) -> queue::DrainKey {
         queue::DrainKey {
             priority: queue::Priority::parse(&self.priority),
             stage_idx: self.stage_idx.unwrap_or(0),
@@ -136,6 +136,19 @@ pub(super) fn process_pending_tasks(
         }
     };
 
+    // What the order actually decided, in one line — the queue's own account of
+    // why it is doing these five and not five others.
+    if !tasks.is_empty() {
+        tracing::debug!(
+            "Dispatch pass: {}",
+            tasks
+                .iter()
+                .map(|t| t.drain_key().to_string())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
+
     for task in tasks {
         if let Err(failure) = dispatch_one(conn, client, library_root, &task, &now) {
             handle_failure(
@@ -161,7 +174,7 @@ pub(super) fn process_pending_tasks(
 /// Every nullable column a run needs is read through `COALESCE`, so a row
 /// written before the column existed answers with the empty map rather than
 /// with a `NULL` the caller has to think about.
-fn pending_tasks(
+pub(super) fn pending_tasks(
     conn: &mut SqliteConnection,
     now: &str,
     limit: i64,

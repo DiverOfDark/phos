@@ -19,9 +19,7 @@ use crate::comfyui::line::RunState;
 use crate::comfyui::runs::{start_line_run_for_batch, StartError, SuppliedByStage};
 use crate::models::BatchChangeset;
 
-use super::plan::{
-    advance_cursor, decide, tasks_by_stage, wave_lead, Caps, Feed, DEFAULT_LEAD,
-};
+use super::plan::{advance_cursor, decide, tasks_by_stage, wave_lead, Caps, Feed, DEFAULT_LEAD};
 use super::selection::{next_page, Narrowing};
 use super::store::{self, BatchRow, BatchState};
 

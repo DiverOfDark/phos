@@ -53,15 +53,12 @@
 //! workflow goes first is arbitrary (it is a uuid); it is a *grouping* key, not
 //! a preference.
 
-use serde::{Deserialize, Serialize};
-
 /// Whether a person is waiting for this task.
 ///
 /// Two values and deliberately no third. The question a dispatcher has to
 /// answer is not "how important is this" — it is "is somebody looking at a
 /// spinner right now", and that has two answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) enum Priority {
     /// Somebody pressed a button and is waiting: Enhance on one shot, Describe,
     /// a retry, or a verdict given on the run in front of them.
@@ -150,6 +147,22 @@ impl DrainKey {
     }
 }
 
+impl std::fmt::Display for DrainKey {
+    /// One task's place in the queue, for the line the dispatcher logs each
+    /// pass. On a farm this is the answer to "why is it doing *that* one next",
+    /// and it is worth being able to read without a debugger.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} stage {} {} ({})",
+            self.priority.as_str(),
+            self.stage_idx + 1,
+            self.workflow_id,
+            self.id
+        )
+    }
+}
+
 impl Ord for DrainKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.tuple().cmp(&other.tuple())
@@ -212,7 +225,13 @@ mod tests {
                 )
             })
             .collect();
-        queue.push(key(Priority::Interactive, 0, "portrait", "23:59:59", "mine"));
+        queue.push(key(
+            Priority::Interactive,
+            0,
+            "portrait",
+            "23:59:59",
+            "mine",
+        ));
         assert_eq!(drained(queue)[0], "mine");
     }
 
