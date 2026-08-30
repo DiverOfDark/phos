@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
-import { isTextInput } from '@/lib/utils'
+import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
+import { isTextInput, isParameterInput, inputKey, parameterValue, runCount, MAX_FANOUT } from '@/lib/utils'
 
 const props = defineProps({
   open: Boolean,
@@ -35,8 +36,13 @@ const selectedPresetId = ref(null)
 // --- Generations (existing variations for this shot) ---
 const generations = ref([])
 
-// --- Text overrides ---
+// --- What this run sets ---
+// Two channels, matching the backend: prompts (and anything ComfyUI could not
+// describe) as strings, everything else typed. `vary` turns one of those into
+// several runs.
 const textOverrides = ref({})
+const parameters = ref({})
+const vary = ref({})
 
 // --- Source mode (videos only) ---
 // A still has no frames to choose between, so the whole section stays out of
@@ -164,20 +170,40 @@ function defaultOverrides(wf) {
     // is not a prompt box. Neither belongs in the override map.
     if (isLoaderInput(wf, input)) continue
     if (!isTextInput(input)) continue
-    overrides[`${input.node_id}.${input.field_name}`] = String(input.current_value ?? '')
+    overrides[inputKey(input)] = String(input.current_value ?? '')
   }
   return overrides
 }
 
-// Initialize text overrides when workflow changes
+/** Every typed field, starting at whatever the workflow's author saved. */
+function defaultParameters(wf) {
+  const params = {}
+  for (const input of wf?.inputs || []) {
+    if (isLoaderInput(wf, input)) continue
+    if (!isParameterInput(input)) continue
+    params[inputKey(input)] = parameterValue(input)
+  }
+  return params
+}
+
+/** The node ids the source picker fills, so the control list can skip them. */
+const loaderNodeIds = computed(() =>
+  (selectedWorkflow.value?.loaders || []).map(l => l.node_id),
+)
+
+// Initialize overrides when workflow changes
 watch(selectedWorkflow, (wf) => {
   if (!wf) {
     textOverrides.value = {}
+    parameters.value = {}
+    vary.value = {}
     presets.value = []
     selectedPresetId.value = null
     return
   }
   textOverrides.value = defaultOverrides(wf)
+  parameters.value = defaultParameters(wf)
+  vary.value = {}
   selectedPresetId.value = null
   // Follow the workflow's own default until the user says otherwise.
   if (!sourceModeTouched.value) sourceModeKey.value = defaultSourceModeKey()
@@ -207,27 +233,24 @@ function selectPreset(preset) {
     // Deselect — restore workflow defaults
     selectedPresetId.value = null
     textOverrides.value = defaultOverrides(selectedWorkflow.value)
+    parameters.value = defaultParameters(selectedWorkflow.value)
     return
   }
   selectedPresetId.value = preset.id
-  const overrides = { ...textOverrides.value }
-  for (const [key, value] of Object.entries(preset.text_overrides)) {
-    overrides[key] = value
-  }
-  textOverrides.value = overrides
+  textOverrides.value = { ...textOverrides.value, ...(preset.text_overrides || {}) }
+  // A preset saved before parameters existed has none, and leaves the
+  // workflow's own values in place rather than blanking them.
+  parameters.value = { ...parameters.value, ...(preset.parameters || {}) }
 }
-
-const textInputs = computed(() => {
-  if (!selectedWorkflow.value) return []
-  return (selectedWorkflow.value.inputs || []).filter(
-    i => isTextInput(i) && !isLoaderInput(selectedWorkflow.value, i)
-  )
-})
 
 const outputType = computed(() => {
   if (!selectedWorkflow.value?.outputs?.length) return null
   return selectedWorkflow.value.outputs[0].node_type || 'image'
 })
+
+/** How many tasks pressing Enhance queues. */
+const runs = computed(() => runCount(vary.value))
+const tooManyRuns = computed(() => runs.value > MAX_FANOUT)
 
 async function enhance() {
   if (!selectedWorkflowId.value || !props.shotId) return
@@ -243,6 +266,8 @@ async function enhance() {
         shot_id: props.shotId,
         workflow_id: selectedWorkflowId.value,
         text_overrides: textOverrides.value,
+        parameters: parameters.value,
+        ...(Object.keys(vary.value).length ? { vary: vary.value } : {}),
         ...(props.fileId ? { source_file_id: props.fileId } : {}),
         ...(sourceMode.value ? { source_mode: sourceMode.value } : {}),
       }),
@@ -388,20 +413,35 @@ async function enhance() {
           </div>
 
           <!-- Input overrides -->
-          <div v-if="textInputs.length" class="flex flex-col gap-2">
-            <div class="label">Input overrides</div>
-            <div v-for="input in textInputs" :key="`${input.node_id}.${input.field_name}`" class="flex flex-col gap-1">
-              <span class="font-mono text-[11px] text-ink-tertiary">
-                {{ input.node_id }} · {{ input.node_type }} · {{ input.field_name }}
-              </span>
-              <textarea
-                v-model="textOverrides[`${input.node_id}.${input.field_name}`]"
-                rows="2"
-                spellcheck="false"
-                class="w-full bg-base border border-line rounded-sm px-3 py-2 font-mono text-xs text-ink"
-                @input="selectedPresetId = null"
-              ></textarea>
+          <div v-if="selectedWorkflow" class="flex flex-col gap-2">
+            <div class="flex items-baseline gap-2">
+              <div class="label">Inputs</div>
+              <span class="flex-1"></span>
+              <span
+                v-if="runs > 1"
+                class="font-mono text-[10px] uppercase tracking-[0.08em]"
+                :class="tooManyRuns ? '' : 'text-signal'"
+                :style="tooManyRuns ? 'color: var(--status-error)' : ''"
+              >{{ runs }} runs</span>
             </div>
+            <div
+              v-if="tooManyRuns"
+              class="flex items-center gap-2 px-3 py-2 border rounded font-mono text-xs"
+              style="border-color: var(--status-error); color: var(--status-error)"
+            >
+              <span class="signal-dot" style="width:6px;height:6px;background:var(--status-error)"></span>
+              {{ runs }} runs is more than the {{ MAX_FANOUT }} one request may queue
+            </div>
+            <WorkflowInputControls
+              :key="selectedWorkflowId"
+              v-model:text-overrides="textOverrides"
+              v-model:parameters="parameters"
+              v-model:vary="vary"
+              :inputs="selectedWorkflow.inputs || []"
+              :loader-node-ids="loaderNodeIds"
+              allow-vary
+              @dirty="selectedPresetId = null"
+            />
           </div>
 
           <div
@@ -419,11 +459,14 @@ async function enhance() {
 
       <div class="border-t border-line px-6 py-4 flex items-center gap-4 flex-none">
         <button
-          class="bg-signal text-signal-fg rounded px-6 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors disabled:opacity-50"
-          :disabled="submitting || !selectedWorkflowId"
+          class="bg-signal text-signal-fg rounded px-6 py-2 text-[13px] font-medium whitespace-nowrap hover:bg-signal-hover transition-colors disabled:opacity-50"
+          :title="tooManyRuns ? `${runs} runs is more than the ${MAX_FANOUT} one request may queue` : ''"
+          :disabled="submitting || !selectedWorkflowId || tooManyRuns"
           @click="enhance"
-        >{{ submitting ? 'Queuing…' : 'Enhance' }}</button>
-        <span v-if="submitSuccess" class="font-mono text-xs text-ready">task queued — see Workflows › Queue</span>
+        >{{ submitting ? 'Queuing…' : (runs > 1 ? `Enhance ×${runs}` : 'Enhance') }}</button>
+        <span v-if="submitSuccess" class="font-mono text-xs text-ready">
+          {{ runs > 1 ? `${runs} tasks queued` : 'task queued' }} — see Workflows › Queue
+        </span>
         <span class="flex-1"></span>
         <span class="font-mono text-[11px] text-ink-tertiary whitespace-nowrap">
           output attaches as a new file<template v-if="outputType"> · {{ outputType }}</template>
