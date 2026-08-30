@@ -35,6 +35,7 @@
 //! reads the intermediate the stage before it made.
 
 use crate::comfyui::line::{self, RunState, StageDisposition, TaskPhase};
+use crate::comfyui::prompt;
 use crate::comfyui::runs::{queue_stage, stage_at};
 use crate::comfyui::timestamp::format_ts;
 use crate::schema::{enhancement_tasks, faces, files, line_stages, runs, video_keyframes};
@@ -69,6 +70,14 @@ struct Continuation {
     stage_idx: i32,
     stage_count: i32,
     output_file_id: Option<String>,
+    /// What this task read. A describe stage makes no file, so the stage after
+    /// it reads the same photograph this one did.
+    source_file_id: Option<String>,
+    /// The sentence a describe stage produced, if this was one.
+    text_output: Option<String>,
+    /// The describe stage's own directives, so the stage after it inherits the
+    /// intent and the constraints a person typed once.
+    text_overrides: Option<String>,
 }
 
 type ContinuationRow = (
@@ -79,7 +88,23 @@ type ContinuationRow = (
     i32,
     i32,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
 );
+
+/// What a completed stage hands the one after it.
+enum Handoff {
+    /// A file. The ordinary case: the next stage loads it.
+    File(String),
+    /// A sentence, and no file at all. What the describe stage read is still
+    /// what the next stage reads — the photograph is unchanged by having been
+    /// described — and the sentence goes into the next stage's prompt slot.
+    Description {
+        text: String,
+        source_file_id: Option<String>,
+    },
+}
 
 /// Queue the stage after every completed task that is owed one.
 ///
@@ -105,6 +130,9 @@ fn queue_continuations(
             enhancement_tasks::stage_idx.assume_not_null(),
             runs::stage_count,
             enhancement_tasks::output_file_id,
+            enhancement_tasks::source_file_id,
+            enhancement_tasks::text_output,
+            enhancement_tasks::text_overrides,
         ))
         .load(conn)?;
 
@@ -118,6 +146,9 @@ fn queue_continuations(
             stage_idx: r.4,
             stage_count: r.5,
             output_file_id: r.6,
+            source_file_id: r.7,
+            text_output: r.8,
+            text_overrides: r.9,
         })
         // The last stage owes nothing: its output is the product.
         .filter(|c| {
@@ -174,26 +205,58 @@ fn continue_one(conn: &mut SqliteConnection, c: &Continuation) -> Result<(), Str
         .as_deref()
         .ok_or_else(|| "the run has more than one stage but no line".to_string())?;
 
-    // `mark_completed` is only ever reached once a file has landed, so this is
-    // a can't-happen — but a continuation with no source would silently read
-    // the shot's original instead of the clip the stage before it made, which
-    // is exactly the kind of wrong that looks right.
-    let source_file_id = c
-        .output_file_id
-        .as_deref()
-        .ok_or_else(|| format!("stage {} completed without an output file", c.stage_idx + 1))?;
+    // `mark_completed` is only ever reached once a file has landed *or* a
+    // description has, so the third arm is a can't-happen — but a continuation
+    // with no source would silently read the shot's original instead of the
+    // clip the stage before it made, which is exactly the kind of wrong that
+    // looks right.
+    let handoff = match (c.output_file_id.as_deref(), c.text_output.as_deref()) {
+        (Some(file_id), _) => Handoff::File(file_id.to_string()),
+        (None, Some(text)) if !text.trim().is_empty() => Handoff::Description {
+            text: text.to_string(),
+            source_file_id: c.source_file_id.clone(),
+        },
+        _ => {
+            return Err(format!(
+                "stage {} completed without an output",
+                c.stage_idx + 1
+            ))
+        }
+    };
 
     let stage = stage_at(conn, line_id, next_idx)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("stage {} is no longer part of the line", next_idx + 1))?;
 
-    let plan = stage.plan();
+    let mut plan = stage.plan_for(conn, &c.shot_id);
+    let source_file_id = match &handoff {
+        Handoff::File(file_id) => Some(file_id.as_str()),
+        Handoff::Description {
+            text,
+            source_file_id,
+        } => {
+            // The one binding this whole feature is about, and it is one entry
+            // in a map the dispatcher already reads.
+            let upstream: std::collections::HashMap<String, String> = c
+                .text_overrides
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let intent = prompt::Intent::from_overrides(&plan.text_overrides)
+                .inherit(prompt::Intent::from_overrides(&upstream));
+            let compiled = prompt::compile_from_text(text, &intent);
+            prompt::bind_description(&stage.contract, &mut plan.text_overrides, &compiled)
+                .map_err(|e| e.message)?;
+            source_file_id.as_deref()
+        }
+    };
+
     let queued = queue_stage(
         conn,
         &c.run_id,
         &c.shot_id,
         &plan,
-        Some(source_file_id),
+        source_file_id,
         Some(&c.task_id),
     )?;
     info!(
@@ -992,5 +1055,235 @@ mod tests {
         let error = error.unwrap();
         assert!(error.contains("takes video"), "{}", error);
         assert!(error.contains("handed it image"), "{}", error);
+    }
+
+    // === FR9 — a describe stage, and the prompt it writes ====================
+
+    /// A graph that reads a photograph and previews a sentence: no saver, no
+    /// file, `produces: text`.
+    const DESCRIBE_GRAPH: &str = r#"{
+        "1": {"class_type": "LoadImage", "inputs": {"image": "example.png"}},
+        "2": {"class_type": "QwenVLRun",
+              "inputs": {"image": ["1", 0], "prompt": "describe this photograph"}},
+        "8": {"class_type": "PreviewText", "inputs": {"text": ["2", 0]}}
+    }"#;
+
+    /// The contract a server that can be asked derives for it.
+    ///
+    /// Stored rather than derived on the spot, because a custom VL node is
+    /// invisible to the offline heuristics — they only surface string fields on
+    /// classes named like text nodes — which is the whole reason
+    /// `comfyui_workflows.contract_json` exists and the worker backfills it
+    /// from `/object_info`.
+    const DESCRIBE_CONTRACT: &str = r#"{
+        "accepts": "image", "produces": "text",
+        "slots": [{"name": "positive", "node_id": "2", "field": "prompt",
+                   "multiline": true}]
+    }"#;
+
+    /// A graph with a prompt and a negative prompt, told apart by which
+    /// sampler socket each is wired into.
+    const GENERATE_GRAPH: &str = r#"{
+        "3": {"class_type": "KSampler",
+              "inputs": {"seed": 1, "steps": 20, "cfg": 8.0,
+                         "positive": ["6", 0], "negative": ["7", 0]}},
+        "4": {"class_type": "LoadImage", "inputs": {"image": "example.png"}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a photograph"}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry"}},
+        "9": {"class_type": "SaveImage",
+              "inputs": {"filename_prefix": "out", "images": ["3", 0]}}
+    }"#;
+
+    impl Library {
+        /// The line FR9 is about: describe, then generate from the description.
+        ///
+        /// `directives` are the compiler's `phos:` keys, set on the describe
+        /// stage — which is where a person setting up a line would type them.
+        fn describe_then_generate(directives: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(".phos.db");
+            crate::db::init_and_migrate(&db_path).unwrap();
+            let conn = crate::db::open_diesel_connection(&db_path).unwrap();
+            let mut lib = Library { dir, conn };
+            std::fs::write(lib.root().join("original.jpg"), b"jpeg").unwrap();
+            lib.sql(&format!(
+                "INSERT INTO comfyui_workflows (id, name, workflow_json, contract_json) \
+                   VALUES ('wf-describe', 'Describe', '{describe}', '{contract}');
+                 INSERT INTO comfyui_workflows (id, name, workflow_json) \
+                   VALUES ('wf-gen', 'Photo to clip', '{generate}');
+                 INSERT INTO people (id, name) VALUES ('p-anna', 'Anna');
+                 INSERT INTO shots (id, timestamp, latitude, longitude, description, \
+                                    primary_person_id) \
+                   VALUES ('shot-1', '2019-07-14 19:12:03', 59.3293, 18.0686, \
+                           'a woman sitting on a wooden jetty', 'p-anna');
+                 INSERT INTO files (id, shot_id, path, hash, mime_type, is_original) \
+                   VALUES ('file-orig', 'shot-1', 'original.jpg', 'h0', 'image/jpeg', 1);
+                 INSERT INTO faces (id, file_id, person_id) \
+                   VALUES ('face-1', 'file-orig', 'p-anna');
+                 INSERT INTO production_lines (id, name) VALUES ('line-1', 'Describe then clip');
+                 INSERT INTO line_stages (id, line_id, stage_idx, workflow_id, text_overrides) \
+                   VALUES ('st-0', 'line-1', 0, 'wf-describe', '{directives}');
+                 INSERT INTO line_stages (id, line_id, stage_idx, workflow_id) \
+                   VALUES ('st-1', 'line-1', 1, 'wf-gen');",
+                describe = DESCRIBE_GRAPH.replace('\'', "''"),
+                contract = DESCRIBE_CONTRACT.replace('\'', "''"),
+                generate = GENERATE_GRAPH.replace('\'', "''"),
+                directives = directives.replace('\'', "''"),
+            ));
+            lib
+        }
+
+        /// What a describe stage does when it works: a sentence on the task and
+        /// no file anywhere.
+        fn describe(&mut self, task_id: &str, text: &str) {
+            diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id)))
+                .set((
+                    enhancement_tasks::status.eq("completed"),
+                    enhancement_tasks::text_output.eq(text),
+                    enhancement_tasks::completed_at.eq("2026-08-30 12:00:00"),
+                ))
+                .execute(&mut self.conn)
+                .unwrap();
+        }
+
+        fn overrides_of(&mut self, task_id: &str) -> HashMap<String, String> {
+            let raw: Option<String> = enhancement_tasks::table
+                .filter(enhancement_tasks::id.eq(task_id))
+                .select(enhancement_tasks::text_overrides)
+                .first(&mut self.conn)
+                .unwrap();
+            serde_json::from_str(&raw.unwrap_or_default()).unwrap_or_default()
+        }
+    }
+
+    const ANSWER: &str = r#"{
+        "subject": "Anna, seated on a weathered jetty, looking out over the water",
+        "setting": "a still lake at dusk",
+        "lighting": "low warm sun from camera left",
+        "camera": "35mm, waist-up",
+        "motion_affordance": "hair and water could move; the subject is seated",
+        "do_not": ["warp hands"]
+    }"#;
+
+    #[test]
+    fn a_describe_stage_writes_the_next_stages_prompt() {
+        let mut lib = Library::describe_then_generate(
+            r#"{"phos:intent": "a slow push-in as the light fades",
+                 "phos:style": "35mm film, muted palette",
+                 "phos:do_not": "change face"}"#,
+        );
+        let run = lib.start();
+
+        // Stage 1 is the describe stage, and Phos wrote its instruction: the
+        // names clustering found, the EXIF date and place, the caption, and
+        // what the person asked for.
+        let instruction = lib.overrides_of(&run.task_ids[0])["2.prompt"].clone();
+        assert!(instruction.contains("Anna"), "{}", instruction);
+        assert!(instruction.contains("2019-07-14"), "{}", instruction);
+        assert!(instruction.contains("59.3293"), "{}", instruction);
+        assert!(
+            instruction.contains("a woman sitting on a wooden jetty"),
+            "{}",
+            instruction
+        );
+        assert!(
+            instruction.contains("Must not: change face"),
+            "{}",
+            instruction
+        );
+
+        // It answers, and makes no file at all.
+        lib.describe(&run.task_ids[0], ANSWER);
+        assert_eq!(
+            files::table
+                .filter(files::is_original.eq(false))
+                .count()
+                .get_result::<i64>(&mut lib.conn)
+                .unwrap(),
+            0,
+            "a text stage writes no files row"
+        );
+
+        lib.advance();
+
+        // Stage 2 is queued, reading the same photograph — the description
+        // changed nothing about what the line is carrying — with the compiled
+        // prompt in the slot the contract names.
+        let stage2 = lib.pending_at(1);
+        assert_eq!(stage2.len(), 1);
+        let (source, parent): (Option<String>, Option<String>) = enhancement_tasks::table
+            .filter(enhancement_tasks::id.eq(&stage2[0]))
+            .select((
+                enhancement_tasks::source_file_id,
+                enhancement_tasks::parent_task_id,
+            ))
+            .first(&mut lib.conn)
+            .unwrap();
+        assert_eq!(source, None, "still the shot's own photograph");
+        assert_eq!(parent, Some(run.task_ids[0].clone()));
+
+        let overrides = lib.overrides_of(&stage2[0]);
+        // `6.text` is `StageContract::slot("positive").override_key()` — the key
+        // `prepare_workflow` substitutes on, and no new plumbing anywhere.
+        let positive = &overrides["6.text"];
+        assert!(
+            positive.starts_with("Anna, seated on a weathered jetty"),
+            "{}",
+            positive
+        );
+        assert!(
+            positive.contains("hair and water could move"),
+            "{}",
+            positive
+        );
+        // The style and the intent were typed once, on the describe stage, and
+        // the stage after it inherited them.
+        assert!(
+            positive.contains("35mm film, muted palette"),
+            "{}",
+            positive
+        );
+        assert!(
+            positive.contains("a slow push-in as the light fades"),
+            "{}",
+            positive
+        );
+        // Constraints never reach the positive prompt; they join the negative
+        // one the workflow's author already wrote.
+        assert!(!positive.contains("change face"), "{}", positive);
+        assert_eq!(overrides["7.text"], "blurry, warp hands, change face");
+    }
+
+    #[test]
+    fn a_description_the_model_wrote_as_prose_is_still_used() {
+        let mut lib = Library::describe_then_generate("{}");
+        let run = lib.start();
+        lib.describe(&run.task_ids[0], "A woman sits on a jetty at dusk.");
+        lib.advance();
+        let stage2 = lib.pending_at(1);
+        assert_eq!(
+            lib.overrides_of(&stage2[0])["6.text"],
+            "A woman sits on a jetty at dusk."
+        );
+    }
+
+    #[test]
+    fn a_describe_stage_that_said_nothing_stops_the_run() {
+        let mut lib = Library::describe_then_generate("{}");
+        let run = lib.start();
+        // Completed, but with neither a file nor a sentence: there is nothing
+        // to hand on, and inventing an empty prompt would be worse than saying
+        // so.
+        diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&run.task_ids[0])))
+            .set((
+                enhancement_tasks::status.eq("completed"),
+                enhancement_tasks::completed_at.eq("2026-08-30 12:00:00"),
+            ))
+            .execute(&mut lib.conn)
+            .unwrap();
+        lib.advance();
+        let (status, error) = lib.run_status(&run.run_id);
+        assert_eq!(status, "failed");
+        assert!(error.unwrap().contains("without an output"));
     }
 }
