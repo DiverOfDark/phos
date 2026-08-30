@@ -2,12 +2,15 @@
 //!
 //! Reads `/history`, turns it into a [`HistoryVerdict`], and acts on it. The
 //! only subtle case is the one this whole module exists for: ComfyUI says the
-//! prompt finished but names no file. That is *not* a failure. The task moves
-//! to `awaiting_output` with a deadline, and on every re-check we also probe
-//! `/view` for the filenames we pinned before the run started — a file on disk
-//! beats a silent history entry, and history is silent after a ComfyUI restart.
+//! prompt finished but the file is not there yet — either history names no
+//! file, or it names one that `/view` still 404s because the muxer has not
+//! closed it. Neither is a failure. The task moves to `awaiting_output` with a
+//! deadline sized to the workflow, and on every re-check we re-read history,
+//! retry what it names, and probe `/view` for the filenames we pinned before
+//! the run started — a file on disk beats a silent history entry, and history
+//! is silent after a ComfyUI restart.
 
-use super::status::{handle_failure, mark_completed, task_has_output};
+use super::status::{handle_failure, live_task, mark_completed, task_has_output};
 use super::store::download_and_save_output;
 use crate::comfyui::client::ComfyUiClient;
 use crate::comfyui::history::{execution_error_traceback, interpret_history, HistoryVerdict};
@@ -156,14 +159,12 @@ fn poll_one_task(
             // Still executing. If we were settling, ComfyUI re-queued the prompt;
             // drop back to processing and let the run finish.
             if settling {
-                let _ = diesel::update(
-                    enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)),
-                )
-                .set((
-                    enhancement_tasks::status.eq("processing"),
-                    enhancement_tasks::next_attempt_at.eq(None::<String>),
-                ))
-                .execute(conn);
+                let _ = diesel::update(live_task(&task.id))
+                    .set((
+                        enhancement_tasks::status.eq("processing"),
+                        enhancement_tasks::next_attempt_at.eq(None::<String>),
+                    ))
+                    .execute(conn);
             }
         }
         HistoryVerdict::Failed(message) => {
@@ -181,10 +182,33 @@ fn poll_one_task(
             );
         }
         HistoryVerdict::Outputs(refs) => {
-            download_all(conn, client, library_root, task, &refs);
+            // History names the file, but `/view` may still 404 while the
+            // muxer closes it. That is the same "finished, not published yet"
+            // state as an empty history entry, and gets the same budget — a
+            // fixed handful of retries ran out long before a 15-minute video
+            // settle would have.
+            if let Err(detail) = download_all(conn, client, library_root, task, &refs) {
+                settle_task(
+                    conn,
+                    client,
+                    library_root,
+                    task,
+                    now_dt,
+                    history.as_ref(),
+                    Some(&detail),
+                );
+            }
         }
         HistoryVerdict::NoOutputs => {
-            settle_task(conn, client, library_root, task, now_dt, history.as_ref());
+            settle_task(
+                conn,
+                client,
+                library_root,
+                task,
+                now_dt,
+                history.as_ref(),
+                None,
+            );
         }
     }
 }
@@ -226,16 +250,18 @@ fn fetch_history(
 }
 
 /// Download everything history named. Succeeding on any one file completes the
-/// task; failing on all of them is transient, because a 404 from `/view` is very
-/// often a file that is written but not yet closed.
+/// task. Failing on all of them is not a verdict either: a 404 from `/view` is
+/// very often a file that is written but not yet closed, so the caller settles
+/// on it. The `Err` carries what actually went wrong, for the message if the
+/// budget runs out.
 fn download_all(
     conn: &mut SqliteConnection,
     client: &ComfyUiClient,
     library_root: &Path,
     task: &ActiveTask,
     refs: &[OutputRef],
-) {
-    let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)))
+) -> Result<(), String> {
+    let _ = diesel::update(live_task(&task.id))
         .set(enhancement_tasks::status.eq("downloading"))
         .execute(conn);
 
@@ -258,7 +284,7 @@ fn download_all(
 
     if downloaded || task_has_output(conn, &task.id) {
         mark_completed(conn, &task.id);
-        return;
+        return Ok(());
     }
 
     // Say what actually went wrong. The old message ("No output images found in
@@ -267,22 +293,18 @@ fn download_all(
         .first()
         .cloned()
         .unwrap_or_else(|| "no reason reported".to_string());
-    let message = format!(
+    Err(format!(
         "ComfyUI named {} output file(s) but none could be downloaded. First error: {}",
         refs.len(),
         detail
-    );
-    handle_failure(
-        conn,
-        &task.id,
-        FailureSite::Download,
-        &message,
-        task.retry_count,
-    );
+    ))
 }
 
-/// ComfyUI says it is done but has named no file. That is a state, not a
-/// verdict: wait, and meanwhile look for the file under the name we pinned.
+/// ComfyUI says it is done but the file is not there yet — history named
+/// nothing, or named something `/view` could not serve (`download_error`).
+/// That is a state, not a verdict: wait, and meanwhile look for the file under
+/// the name we pinned. Each re-check goes back through history first, so a
+/// named file is retried as well as probed.
 fn settle_task(
     conn: &mut SqliteConnection,
     client: &ComfyUiClient,
@@ -290,6 +312,7 @@ fn settle_task(
     task: &ActiveTask,
     now_dt: chrono::NaiveDateTime,
     history: Option<&Value>,
+    download_error: Option<&str>,
 ) {
     let workflow: Value = serde_json::from_str(&task.workflow_json).unwrap_or(Value::Null);
 
@@ -326,32 +349,38 @@ fn settle_task(
             deadline,
             recheck_at,
         } => {
-            info!(
-                "Task {} finished with no files listed; waiting up to {}s for them",
-                task.id,
-                budget.as_secs()
-            );
-            let _ =
-                diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)))
-                    .set((
-                        enhancement_tasks::status.eq(STATUS_AWAITING_OUTPUT),
-                        enhancement_tasks::settle_until.eq(format_ts(deadline)),
-                        enhancement_tasks::next_attempt_at.eq(format_ts(recheck_at)),
-                        enhancement_tasks::error_message.eq(None::<String>),
-                    ))
-                    .execute(conn);
+            match download_error {
+                Some(detail) => info!(
+                    "Task {} finished but its output is not served yet ({}); waiting up to {}s",
+                    task.id,
+                    detail,
+                    budget.as_secs()
+                ),
+                None => info!(
+                    "Task {} finished with no files listed; waiting up to {}s for them",
+                    task.id,
+                    budget.as_secs()
+                ),
+            }
+            let _ = diesel::update(live_task(&task.id))
+                .set((
+                    enhancement_tasks::status.eq(STATUS_AWAITING_OUTPUT),
+                    enhancement_tasks::settle_until.eq(format_ts(deadline)),
+                    enhancement_tasks::next_attempt_at.eq(format_ts(recheck_at)),
+                    enhancement_tasks::error_message.eq(None::<String>),
+                ))
+                .execute(conn);
         }
         SettleDecision::Wait { recheck_at } => {
-            let _ =
-                diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)))
-                    .set((
-                        enhancement_tasks::status.eq(STATUS_AWAITING_OUTPUT),
-                        enhancement_tasks::next_attempt_at.eq(format_ts(recheck_at)),
-                    ))
-                    .execute(conn);
+            let _ = diesel::update(live_task(&task.id))
+                .set((
+                    enhancement_tasks::status.eq(STATUS_AWAITING_OUTPUT),
+                    enhancement_tasks::next_attempt_at.eq(format_ts(recheck_at)),
+                ))
+                .execute(conn);
         }
         SettleDecision::Expired => {
-            let message = gave_up_message(task, history, budget);
+            let message = gave_up_message(task, history, budget, download_error);
             error!("Task {} gave up settling: {}", task.id, message);
             handle_failure(
                 conn,
@@ -370,10 +399,20 @@ fn gave_up_message(
     task: &ActiveTask,
     history: Option<&Value>,
     budget: std::time::Duration,
+    download_error: Option<&str>,
 ) -> String {
     let prefix = task.output_prefix.as_deref().unwrap_or("(none)");
-    match history {
-        Some(h) => {
+    match (download_error, history) {
+        // History named the file; `/view` never served it.
+        (Some(detail), _) => format!(
+            "{} — still not served {}s after ComfyUI reported prompt {} finished, \
+             and nothing was found under the pinned prefix {}",
+            detail,
+            budget.as_secs(),
+            task.prompt_id,
+            prefix
+        ),
+        (None, Some(h)) => {
             let outputs_debug = h
                 .get("outputs")
                 .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "N/A".to_string()))
@@ -387,7 +426,7 @@ fn gave_up_message(
                 outputs_debug
             )
         }
-        None => format!(
+        (None, None) => format!(
             "Prompt {} is in neither ComfyUI's history nor its queue, and no file \
              appeared under the pinned prefix {} within {}s (job lost, most likely a \
              ComfyUI restart)",

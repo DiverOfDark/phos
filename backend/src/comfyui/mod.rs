@@ -40,13 +40,20 @@
 //! # Three things worth knowing
 //!
 //! * **Output filenames are pinned before the run starts.** Every saver's
-//!   `filename_prefix` is rewritten to `phos/<task_id>`, so when history is
-//!   empty, unhelpful, or lost to a ComfyUI restart, the file can still be
-//!   fetched from `/view` by a name we already know.
+//!   `filename_prefix` is rewritten to `phos/<task_id>-<attempt>`, so when
+//!   history is empty, unhelpful, or lost to a ComfyUI restart, the file can
+//!   still be fetched from `/view` by a name we already know. The attempt token
+//!   is fresh per dispatch, because ComfyUI keeps an earlier run's file and
+//!   advances the counter — a shared prefix would find the stale one.
 //! * **"Finished but no file yet" is a state, not a verdict.** It is
 //!   `awaiting_output`, budgeted at a minute for images and a quarter of an
 //!   hour for video, because `VHS_VideoCombine` shells out to ffmpeg and lands
-//!   in history well before the mp4 is closed.
+//!   in history well before the mp4 is closed. A file history names but `/view`
+//!   still 404s is the same state and gets the same budget.
+//! * **A cancelled row is never written again by the worker.** Cancel claims
+//!   the row with one conditional update before talking to ComfyUI; every
+//!   worker write filters `status != cancelled`, so a worker mid-flight cannot
+//!   move the task back.
 //! * **Failures are split by site.** A refused graph or a node exception fails
 //!   at once with the real message; a dropped connection backs off and tries
 //!   again.
@@ -105,15 +112,13 @@ mod tests {
 
         // Step 3: meanwhile the file is findable by the name we pinned, even
         // though history never mentioned it.
-        assert_eq!(
-            super::workflow::output_prefix_for_task("task-1234"),
-            "phos/task-1234"
-        );
+        let prefix = super::workflow::output_prefix_for_task("task-1234", "a1b2c3d4");
+        assert_eq!(prefix, "phos/task-1234-a1b2c3d4");
         let suffixes = super::workflow::expected_output_suffixes(&wf);
         assert!(
-            super::outputs::fallback_output_candidates("phos/task-1234", &suffixes)
+            super::outputs::fallback_output_candidates(&prefix, &suffixes)
                 .iter()
-                .any(|c| c.filename == "task-1234_00001.mp4" && c.subfolder == "phos")
+                .any(|c| c.filename == "task-1234-a1b2c3d4_00001.mp4" && c.subfolder == "phos")
         );
 
         // Step 4: when it does show up under a key nobody enumerated, it counts.

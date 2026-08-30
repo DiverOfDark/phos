@@ -15,8 +15,19 @@ pub const OUTPUT_SUBFOLDER: &str = "phos";
 /// The `filename_prefix` a task's output nodes are rewritten to. Knowing this
 /// before the run starts is what lets Phos find a file when history is empty,
 /// unhelpful, or gone with a ComfyUI restart.
-pub(crate) fn output_prefix_for_task(task_id: &str) -> String {
-    format!("{}/{}", OUTPUT_SUBFOLDER, task_id)
+///
+/// `attempt` makes the prefix unique per dispatch. ComfyUI never overwrites:
+/// a second run with the same prefix keeps `_00001` and writes `_00002`, so a
+/// by-name probe that only knows the prefix would find the *first* attempt's
+/// file and call the retry done. A fresh prefix per attempt means the file we
+/// look for can only have been written by the run we are following.
+pub(crate) fn output_prefix_for_task(task_id: &str, attempt: &str) -> String {
+    format!("{}/{}-{}", OUTPUT_SUBFOLDER, task_id, attempt)
+}
+
+/// A short token that differs on every dispatch of the same task.
+pub(crate) fn fresh_attempt_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,8 +363,8 @@ mod tests {
             "20": { "class_type": "MysterySaver", "inputs": { "filename_prefix": "whatever" } },
             "4":  { "class_type": "LoadImage", "inputs": { "image": "old.png" } },
         });
-        let prefix = output_prefix_for_task("task-1234");
-        assert_eq!(prefix, "phos/task-1234");
+        let prefix = output_prefix_for_task("task-1234", "a1b2c3d4");
+        assert_eq!(prefix, "phos/task-1234-a1b2c3d4");
 
         let prepared = prepare_workflow(
             &wf,
@@ -364,7 +375,7 @@ mod tests {
         for node in ["9", "12", "20"] {
             assert_eq!(
                 prepared[node]["inputs"]["filename_prefix"].as_str(),
-                Some("phos/task-1234"),
+                Some("phos/task-1234-a1b2c3d4"),
                 "node {} kept its own prefix",
                 node
             );
@@ -375,6 +386,20 @@ mod tests {
             Some("uploaded.png")
         );
         assert_eq!(prepared["12"]["inputs"]["frame_rate"].as_i64(), Some(8));
+    }
+
+    #[test]
+    fn each_dispatch_of_a_task_writes_under_its_own_prefix() {
+        // Same task, two attempts (a manual retry, or a /prompt that timed out
+        // after ComfyUI had accepted it): ComfyUI keeps the first file and
+        // advances the counter for the second, so probing `<prefix>_00001` under
+        // a shared prefix would import the stale result. Distinct prefixes mean
+        // the counter is always `_00001` and always ours.
+        let first = output_prefix_for_task("task-1234", &fresh_attempt_id());
+        let second = output_prefix_for_task("task-1234", &fresh_attempt_id());
+        assert_ne!(first, second);
+        assert!(first.starts_with("phos/task-1234-"));
+        assert!(second.starts_with("phos/task-1234-"));
     }
 
     #[test]

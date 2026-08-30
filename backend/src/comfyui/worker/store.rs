@@ -7,6 +7,7 @@
 //! something the user may already have looked at.
 
 use super::complete::ActiveTask;
+use super::status::live_task;
 use crate::comfyui::client::ComfyUiClient;
 use crate::comfyui::outputs::OutputRef;
 use crate::db;
@@ -31,7 +32,7 @@ pub(super) fn download_and_save_output(
     let file_id = store_output_file(conn, task, out, &data, library_root)?;
 
     // Store the output file ID on the task
-    diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)))
+    diesel::update(live_task(&task.id))
         .set(enhancement_tasks::output_file_id.eq(&file_id))
         .execute(conn)?;
 

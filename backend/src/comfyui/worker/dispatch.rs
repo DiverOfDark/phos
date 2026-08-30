@@ -5,12 +5,12 @@
 //! [`FailureSite`] so [`super::complete::handle_failure`] can tell a dropped
 //! connection (worth another go) from a graph ComfyUI refuses (never is).
 
-use super::status::handle_failure;
+use super::status::{handle_failure, live_task};
 use crate::comfyui::client::ComfyUiClient;
 use crate::comfyui::policy::FailureSite;
 use crate::comfyui::source::get_source_image;
 use crate::comfyui::timestamp::format_ts;
-use crate::comfyui::workflow::{output_prefix_for_task, prepare_workflow};
+use crate::comfyui::workflow::{fresh_attempt_id, output_prefix_for_task, prepare_workflow};
 use crate::schema::{comfyui_workflows, enhancement_tasks};
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
@@ -119,13 +119,20 @@ fn dispatch_one(
     task: &PendingTask,
     now: &str,
 ) -> Result<(), StepFailure> {
-    let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)))
+    // Claim it. Zero rows means it was cancelled between the query and now;
+    // there is nothing to send.
+    let claimed = diesel::update(live_task(&task.id))
         .set((
             enhancement_tasks::status.eq("uploading"),
             enhancement_tasks::started_at.eq(now),
             enhancement_tasks::next_attempt_at.eq(None::<String>),
         ))
-        .execute(conn);
+        .execute(conn)
+        .unwrap_or(0);
+    if claimed == 0 {
+        info!("Task {} was cancelled before dispatch; skipping", task.id);
+        return Ok(());
+    }
 
     // 1. Get source image (use specific file if provided, otherwise original)
     let (image_data, upload_name) = get_source_image(
@@ -155,8 +162,11 @@ fn dispatch_one(
         serde_json::from_str(&task.text_overrides).unwrap_or_default();
 
     // Pin the output names before the run starts, and record the prefix so a
-    // later poll can find the files even if history never mentions them.
-    let output_prefix = output_prefix_for_task(&task.id);
+    // later poll can find the files even if history never mentions them. The
+    // prefix is fresh per dispatch: ComfyUI keeps an earlier attempt's file and
+    // advances the counter for the next one, so a reused prefix would let the
+    // by-name probe import the stale first result.
+    let output_prefix = output_prefix_for_task(&task.id, &fresh_attempt_id());
     let prepared = prepare_workflow(
         &workflow,
         &uploaded_name,
@@ -169,15 +179,28 @@ fn dispatch_one(
         .queue_prompt(&prepared)
         .map_err(|e| StepFailure::new(FailureSite::Queue, "Queue failed", e))?;
 
-    // 5. Set queued with comfyui_prompt_id
-    let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)))
+    // 5. Set queued with comfyui_prompt_id. If the task was cancelled while we
+    // were uploading, the row refuses the write — and the prompt we just queued
+    // is one nobody will ever poll, so take it back off ComfyUI's queue.
+    let still_ours = diesel::update(live_task(&task.id))
         .set((
             enhancement_tasks::status.eq("queued"),
             enhancement_tasks::comfyui_prompt_id.eq(&prompt_id),
             enhancement_tasks::output_prefix.eq(&output_prefix),
             enhancement_tasks::settle_until.eq(None::<String>),
         ))
-        .execute(conn);
+        .execute(conn)
+        .unwrap_or(0);
+    if still_ours == 0 {
+        info!(
+            "Task {} was cancelled while dispatching; withdrawing prompt {}",
+            task.id, prompt_id
+        );
+        if let Err(e) = client.delete_queued(&prompt_id) {
+            error!("Could not withdraw prompt {}: {}", prompt_id, e);
+        }
+        return Ok(());
+    }
 
     info!(
         "Task {} queued as ComfyUI prompt {} (output prefix {})",

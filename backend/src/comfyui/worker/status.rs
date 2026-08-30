@@ -9,10 +9,34 @@ use crate::comfyui::policy::{
     plan_failure, retry_resumes_prompt, FailureAction, FailureSite, MAX_ATTEMPTS,
 };
 use crate::comfyui::timestamp::format_ts;
+use crate::comfyui::STATUS_CANCELLED;
 use crate::schema::enhancement_tasks;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use tracing::{error, info, warn};
+
+/// The row for `task_id`, unless it has been cancelled.
+///
+/// Every write the worker makes goes through this. The cancel endpoint claims
+/// a row with one conditional update and then talks to ComfyUI; a worker that
+/// loaded the task a moment earlier must not be able to move it back to
+/// `queued`, `failed` or `completed` afterwards. Callers that need to know
+/// whether they still own the task check the affected-row count.
+pub(super) type LiveTask<'a> = diesel::dsl::Filter<
+    enhancement_tasks::table,
+    diesel::dsl::And<
+        diesel::dsl::Eq<enhancement_tasks::id, &'a str>,
+        diesel::dsl::NotEq<enhancement_tasks::status, &'static str>,
+    >,
+>;
+
+pub(super) fn live_task(task_id: &str) -> LiveTask<'_> {
+    enhancement_tasks::table.filter(
+        enhancement_tasks::id
+            .eq(task_id)
+            .and(enhancement_tasks::status.ne(STATUS_CANCELLED)),
+    )
+}
 
 /// Record a failure, retrying it if the site says another attempt could help.
 pub(super) fn handle_failure(
@@ -43,7 +67,7 @@ pub(super) fn handle_failure(
                 "Retrying (attempt {}/{}): {}",
                 attempt, MAX_ATTEMPTS, message
             );
-            let filter = enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id));
+            let filter = live_task(task_id);
             let _ = if retry_resumes_prompt(site) {
                 // The prompt already reached ComfyUI; go back to watching it
                 // rather than paying for the whole graph a second time.
@@ -75,7 +99,7 @@ pub(super) fn handle_failure(
 /// Mark a task as failed with an error message.
 fn mark_failed(conn: &mut SqliteConnection, task_id: &str, error_msg: &str) {
     error!("Task {} failed: {}", task_id, error_msg);
-    let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id)))
+    let _ = diesel::update(live_task(task_id))
         .set((
             enhancement_tasks::status.eq("failed"),
             enhancement_tasks::error_message.eq(error_msg),
@@ -86,7 +110,7 @@ fn mark_failed(conn: &mut SqliteConnection, task_id: &str, error_msg: &str) {
 
 pub(super) fn mark_completed(conn: &mut SqliteConnection, task_id: &str) {
     let now = format_ts(chrono::Utc::now().naive_utc());
-    let _ = diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(task_id)))
+    let _ = diesel::update(live_task(task_id))
         .set((
             enhancement_tasks::status.eq("completed"),
             enhancement_tasks::completed_at.eq(&now),

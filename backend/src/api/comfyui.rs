@@ -748,7 +748,8 @@ pub(super) async fn comfyui_retry_task(
     }
 
     // A hand-driven retry starts from scratch: clear the automatic retry budget,
-    // the settle clock, the backoff, and the old prompt id.
+    // the settle clock, the backoff, the old prompt id, and the timestamp a
+    // cancellation stamped on it — a pending task is not "completed at" anything.
     diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&id)))
         .set((
             enhancement_tasks::status.eq("pending"),
@@ -757,6 +758,7 @@ pub(super) async fn comfyui_retry_task(
             enhancement_tasks::settle_until.eq(None::<String>),
             enhancement_tasks::next_attempt_at.eq(None::<String>),
             enhancement_tasks::comfyui_prompt_id.eq(None::<String>),
+            enhancement_tasks::completed_at.eq(None::<String>),
         ))
         .execute(&mut conn)
         .map_err(|e| {
@@ -790,57 +792,35 @@ pub(super) async fn comfyui_cancel_task(
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let url = require_comfyui(&state)?;
-    let mut conn = state
-        .pool
-        .get()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let (status, prompt_id): (String, Option<String>) = enhancement_tasks::table
-        .filter(enhancement_tasks::id.eq(&id))
-        .select((
-            enhancement_tasks::status,
-            enhancement_tasks::comfyui_prompt_id,
-        ))
-        .first(&mut conn)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    // Claim the row first, in one conditional update, and only then talk to
+    // ComfyUI. Two races live here otherwise: the worker can overwrite a
+    // `cancelled` it never saw with `queued` or `completed`, and this handler
+    // can overwrite a task that completed while the remote calls were in
+    // flight. The worker's own writes all refuse to touch a cancelled row, so
+    // once this update lands the task is ours.
+    //
+    // The connection is dropped before the remote calls: the pool holds two,
+    // and holding one for up to thirty seconds of ComfyUI timeouts would let two
+    // cancellations block every other request on this library.
+    let prompt_id: Option<String> = {
+        let mut conn = state
+            .pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Nothing to stop once it has landed.
-    if matches!(
-        status.as_str(),
-        "completed" | "failed" | crate::comfyui::STATUS_CANCELLED
-    ) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Tell ComfyUI first, then record it. A task that never reached ComfyUI has
-    // no prompt id and only needs the local row updated.
-    if let Some(prompt_id) = prompt_id {
-        let _ = tokio::task::spawn_blocking(move || {
-            let client = crate::comfyui::ComfyUiClient::new(&url);
-            // Only the running prompt is worth interrupting — /interrupt stops
-            // whatever is executing, so firing it for a merely-queued prompt
-            // would kill somebody else's job.
-            match client.is_prompt_running(&prompt_id) {
-                Ok(true) => {
-                    if let Err(e) = client.interrupt() {
-                        tracing::warn!("Interrupt for prompt {} failed: {}", prompt_id, e);
-                    }
-                }
-                Ok(false) => {}
-                Err(e) => tracing::warn!("Could not read ComfyUI queue: {}", e),
-            }
-            if let Err(e) = client.delete_queued(&prompt_id) {
-                tracing::warn!("Dropping prompt {} from the queue failed: {}", prompt_id, e);
-            }
-        })
-        .await;
-    }
-
-    let now = chrono::Utc::now()
-        .naive_utc()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
-    diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&id)))
+        let now = chrono::Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let claimed = diesel::update(
+            enhancement_tasks::table.filter(
+                enhancement_tasks::id.eq(&id).and(
+                    enhancement_tasks::status
+                        .ne_all(&["completed", "failed", crate::comfyui::STATUS_CANCELLED]),
+                ),
+            ),
+        )
         .set((
             enhancement_tasks::status.eq(crate::comfyui::STATUS_CANCELLED),
             enhancement_tasks::error_message.eq("Cancelled"),
@@ -854,9 +834,61 @@ pub(super) async fn comfyui_cancel_task(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+        if claimed == 0 {
+            // Either no such task, or nothing left to stop.
+            let exists: i64 = enhancement_tasks::table
+                .filter(enhancement_tasks::id.eq(&id))
+                .count()
+                .get_result(&mut conn)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Err(if exists == 0 {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            });
+        }
+
+        // Read the prompt id *after* the claim: the worker cannot attach one to a
+        // cancelled row, so what we see now is what ComfyUI has.
+        enhancement_tasks::table
+            .filter(enhancement_tasks::id.eq(&id))
+            .select(enhancement_tasks::comfyui_prompt_id)
+            .first(&mut conn)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    // A task that never reached ComfyUI has no prompt id and is already done.
+    if let Some(prompt_id) = prompt_id {
+        let _ = tokio::task::spawn_blocking(move || cancel_on_comfyui(&url, &prompt_id)).await;
+    }
+
     Ok(Json(
         serde_json::json!({"status": crate::comfyui::STATUS_CANCELLED}),
     ))
+}
+
+/// Stop a prompt on ComfyUI, wherever it is.
+///
+/// Pending first, then running: a prompt checked for "running" *before* it is
+/// deleted from the pending queue can start executing in between, at which
+/// point the delete is a no-op and the interrupt was never sent. Deleting
+/// first closes that gap — anything still there afterwards is running, and
+/// `/interrupt` stops whatever is executing, so it is only fired when that is
+/// our prompt and not somebody else's job.
+fn cancel_on_comfyui(url: &str, prompt_id: &str) {
+    let client = crate::comfyui::ComfyUiClient::new(url);
+    if let Err(e) = client.delete_queued(prompt_id) {
+        tracing::warn!("Dropping prompt {} from the queue failed: {}", prompt_id, e);
+    }
+    match client.is_prompt_running(prompt_id) {
+        Ok(true) => {
+            if let Err(e) = client.interrupt() {
+                tracing::warn!("Interrupt for prompt {} failed: {}", prompt_id, e);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!("Could not read ComfyUI queue: {}", e),
+    }
 }
 
 // ===== Shot Generations =====

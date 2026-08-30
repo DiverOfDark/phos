@@ -105,9 +105,11 @@ pub(crate) enum FailureSite {
     History,
     /// A node raised during execution.
     Execution,
-    /// `/view` refused or truncated a file history had named.
-    Download,
-    /// The settle budget ran out with nothing on disk.
+    /// The settle budget ran out with nothing on disk. This is also where a
+    /// file history *named* but `/view` never served ends up: a 404 while the
+    /// muxer closes the file is the same "finished, not published" state as an
+    /// empty history entry, so it waits out the same budget rather than a fixed
+    /// handful of retries.
     Settle,
 }
 
@@ -133,9 +135,7 @@ pub(crate) fn classify_failure(site: FailureSite, message: &str) -> FailureKind 
                 FailureKind::Transient
             }
         }
-        FailureSite::Upload | FailureSite::History | FailureSite::Download => {
-            FailureKind::Transient
-        }
+        FailureSite::Upload | FailureSite::History => FailureKind::Transient,
     }
 }
 
@@ -158,7 +158,7 @@ pub(crate) enum FailureAction {
 /// cheaper and far likelier to work than re-executing the graph. Only failures
 /// that happened before the prompt was accepted start over.
 pub(crate) fn retry_resumes_prompt(site: FailureSite) -> bool {
-    matches!(site, FailureSite::History | FailureSite::Download)
+    matches!(site, FailureSite::History)
 }
 
 /// Backoff before the next attempt: 5s, 15s, 45s.
@@ -260,11 +260,7 @@ mod tests {
     // === Defect 3 / scope D — transient vs permanent =========================
     #[test]
     fn defect_3_transient_failures_are_retried() {
-        for site in [
-            FailureSite::Upload,
-            FailureSite::History,
-            FailureSite::Download,
-        ] {
+        for site in [FailureSite::Upload, FailureSite::History] {
             assert_eq!(
                 classify_failure(site, "connection reset"),
                 FailureKind::Transient,
@@ -309,11 +305,11 @@ mod tests {
 
     #[test]
     fn defect_3_retry_count_is_spent_then_the_real_error_stands() {
-        let msg = "ComfyUI /view returned HTTP 404 for phos/x_00001_.png";
+        let msg = "History fetch failed for prompt abc: connection reset";
         // Attempts 1..3 come back for another go, with a widening delay.
         let mut delays = Vec::new();
         for retry_count in 0..MAX_ATTEMPTS - 1 {
-            match plan_failure(FailureSite::Download, msg, retry_count) {
+            match plan_failure(FailureSite::History, msg, retry_count) {
                 FailureAction::Retry {
                     attempt,
                     delay,
@@ -336,7 +332,7 @@ mod tests {
         );
 
         // The last one keeps the real error rather than inventing a new one.
-        match plan_failure(FailureSite::Download, msg, MAX_ATTEMPTS - 1) {
+        match plan_failure(FailureSite::History, msg, MAX_ATTEMPTS - 1) {
             FailureAction::Fail(text) => {
                 assert!(text.starts_with(msg), "lost the real error: {}", text);
                 assert!(text.contains("after 4 attempts"), "{}", text);
@@ -355,7 +351,6 @@ mod tests {
         for site in [
             FailureSite::Upload,
             FailureSite::History,
-            FailureSite::Download,
             FailureSite::Queue,
         ] {
             assert_eq!(
@@ -372,7 +367,6 @@ mod tests {
         // A prompt that already ran should be re-polled, not re-executed —
         // re-running it is expensive and can duplicate the output.
         assert!(retry_resumes_prompt(FailureSite::History));
-        assert!(retry_resumes_prompt(FailureSite::Download));
         // Nothing reached ComfyUI yet, so these start over.
         assert!(!retry_resumes_prompt(FailureSite::Upload));
         assert!(!retry_resumes_prompt(FailureSite::Queue));
