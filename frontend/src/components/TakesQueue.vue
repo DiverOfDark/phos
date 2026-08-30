@@ -66,6 +66,9 @@ const playing = ref(new Set())
 const PAGE = 24
 /** Refill while there is still a screenful left, so the keyboard never waits. */
 const REFILL_BELOW = 8
+/** How often an empty lane looks again. See `watchForWork`. */
+const WATCH_EVERY_MS = 10000
+let watchTimer = null
 
 const sheet = computed(() => currentSheet(state.value))
 const take = computed(() => currentTake(state.value))
@@ -115,8 +118,8 @@ const crowded = computed(() => (sheet.value?.takes.length || 0) > 6)
 
 // ===== Loading =============================================================
 
-async function fetchPage(append = false) {
-  if (!append) loading.value = true
+async function fetchPage(append = false, quiet = false) {
+  if (!append && !quiet) loading.value = true
   try {
     const q = new URLSearchParams({ limit: String(PAGE) })
     if (append && cursor.value) q.set('cursor', cursor.value)
@@ -144,6 +147,33 @@ async function fetchPage(append = false) {
 
 function refillIfThin() {
   if (cursor.value && state.value.sheets.length < REFILL_BELOW) fetchPage(true)
+}
+
+/**
+ * When the lane runs dry, keep looking.
+ *
+ * A batch does not hand its held runs over all at once: FR7's feeder keeps at
+ * most 64 runs live and opens the next chunk every few seconds, so on a
+ * held-heavy line **this lane is the throttle rather than the queue** — work
+ * arrives at roughly the rate verdicts are given. Paging alone gets that wrong
+ * in one specific and expensive way: once the cursor is exhausted the lane
+ * stops asking, so somebody who clears everything in front of them is told
+ * "nothing waiting" and leaves, while the batch that was paused on their
+ * verdicts starts feeding again the moment they walk away.
+ *
+ * So an empty lane watches. Only while it is empty — with work on screen there
+ * is nothing to wait for — and only while the tab is actually being looked at.
+ */
+function watchForWork() {
+  stopWatching()
+  watchTimer = setInterval(() => {
+    if (!document.hidden) fetchPage(false, true)
+  }, WATCH_EVERY_MS)
+}
+
+function stopWatching() {
+  if (watchTimer) clearInterval(watchTimer)
+  watchTimer = null
 }
 
 /**
@@ -347,11 +377,21 @@ watch(
   },
 )
 
+// An empty lane watches for work; a lane with work in it has nothing to wait for.
+watch(
+  () => state.value.sheets.length === 0 && !loading.value && !error.value,
+  (empty) => (empty ? watchForWork() : stopWatching()),
+  { immediate: true },
+)
+
 onMounted(() => {
   fetchPage(false)
   window.addEventListener('keydown', onKeydown)
 })
-onUnmounted(() => window.removeEventListener('keydown', onKeydown))
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown)
+  stopWatching()
+})
 
 defineExpose({ loadData: () => fetchPage(false) })
 </script>
@@ -387,6 +427,9 @@ defineExpose({ loadData: () => fetchPage(false) })
       <div class="text-[13px] font-light text-ink-secondary max-w-md">
         A stage marked <span class="font-mono">hold for review</span> parks its run here with its
         takes. Until one does, the queue is running unattended.
+      </div>
+      <div class="label">
+        watching for more <span class="text-building signal-pulse">●</span>
       </div>
       <div v-if="decided" class="label mt-2">
         {{ decided }} decided this session<template v-if="freed"> · {{ formatBytes(freed) }} freed</template>
