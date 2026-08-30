@@ -36,6 +36,8 @@
 //! * [`nodes`] — what does ComfyUI say its installed node classes take?
 //! * [`overrides`] — so which of this graph's fields can a person change, and
 //!   what kind of control does each one want?
+//! * [`params`] — what did they set them to, and when they asked for a sweep
+//!   rather than a value, which runs does that come to?
 //!
 //! Those all take `serde_json::Value` in and give an answer out, so the whole
 //! completion path is tested against recorded `/history` payloads with no
@@ -78,6 +80,7 @@ mod manifest;
 pub mod nodes;
 mod outputs;
 mod overrides;
+pub mod params;
 mod policy;
 mod source;
 mod timestamp;
@@ -96,6 +99,7 @@ pub use overrides::detect_inputs;
 // this module directly and has no use for it, which is what the allow is for.
 #[allow(unused_imports)]
 pub use overrides::WorkflowInput;
+pub use params::{expand, ParameterMap, VaryMap, VaryMode, VarySpec};
 pub use source::SourceMode;
 pub use worker::spawn_enhancement_worker;
 pub use workflow::detect_outputs;

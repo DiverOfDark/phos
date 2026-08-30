@@ -2,13 +2,15 @@
 //!
 //! Two jobs: work out what a graph produces (so the poller knows whether to
 //! expect a video, and which filenames are worth probing), and rewrite a copy
-//! of it for one run — the uploaded image, the user's text overrides, and the
-//! pinned `filename_prefix` that makes the output findable by name afterwards.
+//! of it for one run — the uploaded image, the user's text overrides, their
+//! typed parameters, and the pinned `filename_prefix` that makes the output
+//! findable by name afterwards.
 //!
 //! What a graph *takes* is [`super::overrides`]' question, because answering it
 //! well needs what ComfyUI says about its own node classes.
 
 use super::loaders::BindingPlan;
+use super::params::ParameterMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -155,8 +157,8 @@ fn suffixes_for(kind: SaverKind, node_type: &str) -> &'static [&'static str] {
 }
 
 /// Substitute inputs into a workflow copy: point the loader nodes that the
-/// binding selects at the uploaded filename, apply any text overrides, and pin
-/// every saver's `filename_prefix` to `output_prefix`.
+/// binding selects at the uploaded filename, apply any text overrides and typed
+/// parameters, and pin every saver's `filename_prefix` to `output_prefix`.
 ///
 /// Pinning the prefix is what turns a lost history entry from a dead end into a
 /// lookup: Phos knows the filename before the run starts, so it can ask `/view`
@@ -166,10 +168,16 @@ fn suffixes_for(kind: SaverKind, node_type: &str) -> &'static [&'static str] {
 /// not this function's — writing it into *every* `LoadImage`, which is what
 /// happened before, made a start-frame/end-frame workflow impossible to run.
 /// This applies the plan; it does not second-guess it.
+///
+/// The four passes run in that order on purpose: a text override beats the
+/// binding (a user who names a file means it), a typed parameter beats a text
+/// override (it is the channel that knows what the field is), and the pinned
+/// prefix beats everything, because Phos has to be able to find what it made.
 pub(crate) fn prepare_workflow(
     workflow: &Value,
     plan: &BindingPlan,
     text_overrides: &std::collections::HashMap<String, String>,
+    parameters: &ParameterMap,
     output_prefix: Option<&str>,
 ) -> Value {
     let targets = &plan.targets;
@@ -193,6 +201,10 @@ pub(crate) fn prepare_workflow(
                             }
                         }
                     }
+                    // Then the typed ones: seeds, steps, cfg, checkpoints,
+                    // switches — everything the text channel cannot carry
+                    // without changing its type.
+                    super::params::apply_to_node(node_id, obj, parameters);
                 }
             }
 
@@ -237,6 +249,18 @@ mod tests {
             },
         )
         .unwrap_or_default()
+    }
+
+    /// A run that set no typed parameters — every path that existed before FR4.
+    fn no_params() -> ParameterMap {
+        ParameterMap::new()
+    }
+
+    fn params(pairs: &[(&str, Value)]) -> ParameterMap {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     #[test]
@@ -341,6 +365,7 @@ mod tests {
             &wf,
             &plain_image(&wf, "uploaded.png"),
             &std::collections::HashMap::new(),
+            &no_params(),
             Some(&prefix),
         );
         for node in ["9", "12", "20"] {
@@ -385,6 +410,7 @@ mod tests {
             &wf,
             &plain_image(&wf, "uploaded.png"),
             &std::collections::HashMap::new(),
+            &no_params(),
             Some("phos/task-1234"),
         );
         assert_eq!(prepared["9"]["inputs"]["filename_prefix"], json!(["8", 0]));
@@ -405,6 +431,7 @@ mod tests {
             &wf,
             &plan_for(&wf, "phos_ab_cd_video.mp4", LoaderKind::Video),
             &std::collections::HashMap::new(),
+            &no_params(),
             Some("phos/task-1"),
         );
         assert_eq!(
@@ -434,6 +461,7 @@ mod tests {
             &wf,
             &plain_image(&wf, "phos_upload.png"),
             &std::collections::HashMap::new(),
+            &no_params(),
             None,
         );
         assert_eq!(
@@ -459,11 +487,157 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let prepared =
-            prepare_workflow(&wf, &plain_image(&wf, "phos_upload.png"), &overrides, None);
+        let prepared = prepare_workflow(
+            &wf,
+            &plain_image(&wf, "phos_upload.png"),
+            &overrides,
+            &no_params(),
+            None,
+        );
         assert_eq!(
             prepared["4"]["inputs"]["image"].as_str(),
             Some("chosen.png")
         );
+    }
+
+    // === FR4 — typed parameters =============================================
+
+    /// A realistic text-to-image graph, the same one the override detector is
+    /// tested against.
+    fn sampler_graph() -> Value {
+        json!({
+            "3": { "class_type": "KSampler", "inputs": {
+                     "model": ["4", 0], "positive": ["6", 0],
+                     "seed": 156680208700286i64, "steps": 20, "cfg": 8.0,
+                     "sampler_name": "euler", "denoise": 1.0 } },
+            "4": { "class_type": "CheckpointLoaderSimple",
+                   "inputs": { "ckpt_name": "v1-5-pruned-emaonly.ckpt" } },
+            "5": { "class_type": "EmptyLatentImage",
+                   "inputs": { "width": 512, "height": 512, "batch_size": 1 } },
+            "6": { "class_type": "CLIPTextEncode",
+                   "inputs": { "text": "a photograph", "clip": ["4", 1] } },
+            "9": { "class_type": "SaveImage",
+                   "inputs": { "images": ["3", 0], "filename_prefix": "ComfyUI" } },
+        })
+    }
+
+    #[test]
+    fn a_run_carries_its_typed_parameters_into_the_graph_it_submits() {
+        let prepared = prepare_workflow(
+            &sampler_graph(),
+            &plain_image(&sampler_graph(), "uploaded.png"),
+            &std::collections::HashMap::new(),
+            &params(&[
+                ("3.seed", json!(4242)),
+                ("3.steps", json!(28)),
+                ("3.cfg", json!(6.5)),
+                ("3.sampler_name", json!("dpmpp_2m")),
+                ("4.ckpt_name", json!("sd_xl_base_1.0.safetensors")),
+                ("5.width", json!(1024)),
+            ]),
+            Some("phos/task-1"),
+        );
+        assert_eq!(prepared["3"]["inputs"]["seed"], json!(4242));
+        assert_eq!(prepared["3"]["inputs"]["steps"], json!(28));
+        assert_eq!(prepared["3"]["inputs"]["cfg"], json!(6.5));
+        assert_eq!(prepared["3"]["inputs"]["sampler_name"], json!("dpmpp_2m"));
+        assert_eq!(
+            prepared["4"]["inputs"]["ckpt_name"],
+            json!("sd_xl_base_1.0.safetensors")
+        );
+        assert_eq!(prepared["5"]["inputs"]["width"], json!(1024));
+        // Untouched fields keep exactly what the author set.
+        assert_eq!(prepared["5"]["inputs"]["height"], json!(512));
+        assert_eq!(prepared["3"]["inputs"]["denoise"], json!(1.0));
+        // And the wiring survives.
+        assert_eq!(prepared["3"]["inputs"]["model"], json!(["4", 0]));
+    }
+
+    #[test]
+    fn a_parameter_cannot_take_the_output_prefix_away_from_phos() {
+        // The console never offers `filename_prefix`, but a hand-written request
+        // must not be able to make a finished run unfindable either.
+        let prepared = prepare_workflow(
+            &sampler_graph(),
+            &plain_image(&sampler_graph(), "uploaded.png"),
+            &[("9.filename_prefix".to_string(), "mine".to_string())]
+                .into_iter()
+                .collect(),
+            &params(&[("9.filename_prefix", json!("also mine"))]),
+            Some("phos/task-1"),
+        );
+        assert_eq!(
+            prepared["9"]["inputs"]["filename_prefix"],
+            json!("phos/task-1")
+        );
+    }
+
+    #[test]
+    fn a_typed_parameter_beats_a_text_override_on_the_same_field() {
+        // They should not collide — the console sends text one way and numbers
+        // the other — but if they do, the channel that knows the field's type
+        // is the one to believe.
+        let prepared = prepare_workflow(
+            &sampler_graph(),
+            &plain_image(&sampler_graph(), "uploaded.png"),
+            &[("6.text".to_string(), "from the text box".to_string())]
+                .into_iter()
+                .collect(),
+            &params(&[("6.text", json!("from the typed map"))]),
+            None,
+        );
+        assert_eq!(prepared["6"]["inputs"]["text"], json!("from the typed map"));
+    }
+
+    #[test]
+    fn a_run_with_no_parameters_prepares_exactly_the_graph_it_did_before() {
+        // FR3's fallback, and every task queued before this column existed.
+        let overrides: std::collections::HashMap<String, String> =
+            [("6.text".to_string(), "a lighthouse at dusk".to_string())]
+                .into_iter()
+                .collect();
+        let prepared = prepare_workflow(
+            &sampler_graph(),
+            &plain_image(&sampler_graph(), "uploaded.png"),
+            &overrides,
+            &no_params(),
+            Some("phos/task-1"),
+        );
+        assert_eq!(
+            prepared["6"]["inputs"]["text"],
+            json!("a lighthouse at dusk")
+        );
+        assert_eq!(prepared["3"]["inputs"]["seed"], json!(156680208700286i64));
+        assert_eq!(prepared["3"]["inputs"]["steps"], json!(20));
+        assert_eq!(prepared["3"]["inputs"]["cfg"], json!(8.0));
+    }
+
+    #[test]
+    fn a_fanned_out_sweep_submits_a_different_graph_per_task() {
+        // What the queue actually ends up running: four rows, four seeds, one
+        // graph each — end to end from the request shape to the submitted JSON.
+        use crate::comfyui::params::expand;
+        let base: ParameterMap = params(&[("3.seed", json!(1000)), ("3.steps", json!(20))]);
+        let vary: crate::comfyui::params::VaryMap = serde_json::from_value(json!({
+            "3.seed": { "count": 4, "mode": "increment" }
+        }))
+        .unwrap();
+
+        let seeds: Vec<i64> = expand(&base, &vary)
+            .unwrap()
+            .iter()
+            .map(|task| {
+                let prepared = prepare_workflow(
+                    &sampler_graph(),
+                    &plain_image(&sampler_graph(), "uploaded.png"),
+                    &std::collections::HashMap::new(),
+                    task,
+                    Some("phos/task-1"),
+                );
+                assert_eq!(prepared["3"]["inputs"]["steps"], json!(20));
+                prepared["3"]["inputs"]["seed"].as_i64().unwrap()
+            })
+            .collect();
+        assert_eq!(seeds, [1000, 1001, 1002, 1003]);
     }
 }
