@@ -141,16 +141,76 @@ impl PauseReason {
         }
     }
 
-    /// What the board says. Full sentences, because this is the answer to
-    /// "why has nothing happened for six hours".
-    pub fn describe(self) -> &'static str {
+    /// What every screen says when a batch has stopped feeding.
+    ///
+    /// This is the answer to "why has nothing happened for six hours", and
+    /// there is deliberately **one** of it. A note written here and a sentence
+    /// synthesised on some other screen would paraphrase each other right up
+    /// until the day they disagreed about why something stopped.
+    ///
+    /// It carries the numbers *and* who can act on them: the reader learns what
+    /// stopped the batch, by how much, and whether they are the one who
+    /// unsticks it. The hold cap is the only pause a person lifts by working,
+    /// so it is the only one that says so — a sentence implying a window or a
+    /// full disk could be cleared by reviewing would send somebody off to fight
+    /// a problem they cannot solve from where they are standing.
+    ///
+    /// It names the *action* rather than the place, because the same string is
+    /// rendered on the batch board — where holds cannot be cleared — and on the
+    /// Takes lane, where they can.
+    pub fn note(self, caps: &Caps, held: i64) -> String {
         match self {
-            PauseReason::OutsideWindow => "Outside this batch's window.",
-            PauseReason::DailyCap => "This batch has run its tasks for today.",
-            PauseReason::DiskFloor => "Free disk space is at this batch's floor.",
-            PauseReason::HoldCap => "Too many runs are waiting for a verdict.",
+            PauseReason::OutsideWindow => match caps.window {
+                Some((start, end)) => format!(
+                    "Paused: outside this batch's window, {}–{}. It picks up again then.",
+                    clock(start),
+                    clock(end)
+                ),
+                None => "Paused: outside this batch's window.".to_string(),
+            },
+            PauseReason::DailyCap => match caps.daily_task_cap {
+                Some(cap) => format!(
+                    "Paused: this batch has opened its {} tasks for today. \
+                     It carries on after midnight.",
+                    cap
+                ),
+                None => "Paused: this batch has opened its tasks for today.".to_string(),
+            },
+            PauseReason::DiskFloor => match caps.disk_floor_bytes {
+                Some(floor) => format!(
+                    "Paused: free space is down to this batch's floor of {}. \
+                     Only freeing disk lifts this.",
+                    gigabytes(floor)
+                ),
+                None => "Paused: free space is at this batch's floor.".to_string(),
+            },
+            PauseReason::HoldCap => match caps.max_outstanding_holds {
+                Some(cap) => format!(
+                    "Paused: {} runs are waiting on a verdict, and the cap is {}. \
+                     Giving verdicts on some of them lets it feed again.",
+                    held, cap
+                ),
+                None => format!(
+                    "Paused: {} runs are waiting on a verdict. \
+                     Giving verdicts on some of them lets it feed again.",
+                    held
+                ),
+            },
         }
     }
+}
+
+/// Minutes from midnight as `HH:MM`, for a note that names a window.
+fn clock(minutes: i32) -> String {
+    let wrapped = minutes.rem_euclid(1440);
+    format!("{:02}:{:02}", wrapped / 60, wrapped % 60)
+}
+
+/// Bytes as whole gigabytes, for a note that names a disk floor. Rounded down,
+/// so a floor of 50 GB never reads as 51 and sends somebody hunting for a
+/// gigabyte that was never there.
+fn gigabytes(bytes: i64) -> String {
+    format!("{} GB", bytes / 1024i64.pow(3))
 }
 
 /// What the feeder should do this tick.
@@ -436,6 +496,96 @@ mod tests {
     fn a_window_with_equal_ends_is_all_day() {
         assert!(in_window(0, 60, 60));
         assert!(in_window(13 * 60, 60, 60));
+    }
+
+    // ── What a paused batch says ──
+
+    #[test]
+    fn the_hold_note_says_what_stopped_it_by_how_much_and_who_lifts_it() {
+        let caps = Caps {
+            max_outstanding_holds: Some(40),
+            ..Default::default()
+        };
+        let note = PauseReason::HoldCap.note(&caps, 40);
+        assert!(
+            note.contains("40 runs are waiting on a verdict"),
+            "{}",
+            note
+        );
+        assert!(note.contains("the cap is 40"), "{}", note);
+        // The agency half: the reader is the one who unsticks this.
+        assert!(note.contains("Giving verdicts"), "{}", note);
+    }
+
+    #[test]
+    fn the_hold_note_names_the_action_and_never_a_place() {
+        // The same string is rendered on the batch board, where holds cannot be
+        // cleared, and on the Takes lane, where they can. "here" would be right
+        // on one screen and a lie on the other.
+        let note = PauseReason::HoldCap.note(&Caps::default(), 7);
+        assert!(!note.contains(" here"), "{}", note);
+        assert!(note.contains("7 runs"), "{}", note);
+    }
+
+    #[test]
+    fn the_pauses_nobody_can_review_away_promise_nothing() {
+        // A window and a full disk are lifted by the clock and by free space,
+        // not by working. Telling a reviewer otherwise sends them to fight a
+        // problem they cannot solve from where they are standing.
+        let caps = Caps {
+            window: Some((0, 7 * 60)),
+            disk_floor_bytes: Some(50 * 1024i64.pow(3)),
+            ..Default::default()
+        };
+        let window = PauseReason::OutsideWindow.note(&caps, 0);
+        assert!(window.contains("00:00–07:00"), "{}", window);
+        assert!(!window.contains("verdict"), "{}", window);
+
+        let disk = PauseReason::DiskFloor.note(&caps, 0);
+        assert!(disk.contains("50 GB"), "{}", disk);
+        assert!(!disk.contains("verdict"), "{}", disk);
+        assert!(disk.contains("freeing disk"), "{}", disk);
+    }
+
+    #[test]
+    fn the_daily_note_names_the_cap_and_when_it_lifts() {
+        let caps = Caps {
+            daily_task_cap: Some(400),
+            ..Default::default()
+        };
+        let note = PauseReason::DailyCap.note(&caps, 0);
+        assert!(note.contains("400 tasks"), "{}", note);
+        assert!(note.contains("after midnight"), "{}", note);
+    }
+
+    #[test]
+    fn a_note_with_no_cap_behind_it_still_reads_as_a_sentence() {
+        // `paused_reason` and the caps are separate columns, so a hand-edited
+        // row can pause for a reason whose cap is NULL. Every arm still has to
+        // produce something a person can read.
+        for reason in [
+            PauseReason::OutsideWindow,
+            PauseReason::DailyCap,
+            PauseReason::DiskFloor,
+            PauseReason::HoldCap,
+        ] {
+            let note = reason.note(&Caps::default(), 0);
+            assert!(note.starts_with("Paused:"), "{}", note);
+            assert!(note.ends_with('.'), "{}", note);
+        }
+    }
+
+    #[test]
+    fn a_disk_floor_rounds_down_so_nobody_hunts_a_gigabyte_that_was_never_there() {
+        assert_eq!(gigabytes(50 * 1024i64.pow(3)), "50 GB");
+        assert_eq!(gigabytes(50 * 1024i64.pow(3) + 1024i64.pow(3) - 1), "50 GB");
+    }
+
+    #[test]
+    fn a_window_in_a_note_reads_as_a_clock() {
+        assert_eq!(clock(0), "00:00");
+        assert_eq!(clock(7 * 60), "07:00");
+        assert_eq!(clock(22 * 60 + 30), "22:30");
     }
 
     // ── Caps ──

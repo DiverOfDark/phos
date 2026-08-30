@@ -170,7 +170,13 @@ pub(super) struct BatchBrief {
 
 fn brief(conn: &mut SqliteConnection, row: BatchRow) -> BatchBrief {
     let counts = store::run_counts(conn, &row.id).unwrap_or_default();
-    let paused_note = row.paused_reason.as_deref().and_then(note_for);
+    // The note is built here rather than by the feeder, so it carries the count
+    // as it stands *now* — a batch paused on 40 held runs that is down to 12
+    // should say 12, not repeat the number that stopped it an hour ago.
+    let paused_note = row
+        .paused_reason
+        .as_deref()
+        .and_then(|reason| note_for(reason, &row.caps, counts.held));
     BatchBrief {
         id: row.id,
         line_id: row.line_id,
@@ -198,7 +204,7 @@ fn brief(conn: &mut SqliteConnection, row: BatchRow) -> BatchBrief {
     }
 }
 
-fn note_for(reason: &str) -> Option<String> {
+fn note_for(reason: &str, caps: &Caps, held: i64) -> Option<String> {
     use crate::comfyui::batch::plan::PauseReason::*;
     let described = match reason {
         "window" => OutsideWindow,
@@ -207,7 +213,7 @@ fn note_for(reason: &str) -> Option<String> {
         "holds" => HoldCap,
         _ => return None,
     };
-    Some(described.describe().to_string())
+    Some(described.note(caps, held))
 }
 
 // ===== Handlers =============================================================
@@ -779,14 +785,30 @@ mod tests {
 
     #[test]
     fn every_pause_reason_has_a_sentence_and_nothing_else_does() {
+        let caps = Caps::default();
         for reason in ["window", "daily_cap", "disk_floor", "holds"] {
             assert!(
-                note_for(reason).is_some(),
+                note_for(reason, &caps, 0).is_some(),
                 "{} has no sentence for the board",
                 reason
             );
         }
-        assert_eq!(note_for("something_else"), None);
+        assert_eq!(note_for("something_else", &caps, 0), None);
+    }
+
+    #[test]
+    fn the_hold_note_carries_the_count_as_it_stands_now() {
+        // Built on read rather than written by the feeder, so a batch paused on
+        // 40 held runs that is down to 12 says 12 — not the number that stopped
+        // it an hour ago. A reader clearing the pile has to see it shrinking.
+        let caps = Caps {
+            max_outstanding_holds: Some(40),
+            ..Default::default()
+        };
+        let note = note_for("holds", &caps, 12).unwrap();
+        assert!(note.contains("12 runs"), "{}", note);
+        assert!(note.contains("the cap is 40"), "{}", note);
+        assert!(note.contains("verdicts"), "{}", note);
     }
 
     #[test]
