@@ -410,11 +410,23 @@ test("a sweep over something other than a seed is printed by its field name", ()
   ]);
 });
 
-test("a take with nothing to tell it apart falls back to an id, not to nothing", () => {
-  // A describe stage carries no seed. "seed undefined" on four cards is the bug
-  // this whole strip exists to avoid.
-  const written = take(0, { parameters: {} });
-  assert.deepEqual(takeMarks(written, []), [{ label: "", value: "take-0" }]);
+test("a take with nothing to tell it apart falls back to its position", () => {
+  // A describe stage carries no parameters at all. "seed undefined" on four
+  // cards is the bug this strip exists to avoid — and so is three sentences all
+  // labelled `RUN-C-TA`, which is what a truncated task id gives you when the
+  // ids share a prefix. A position cannot collide.
+  const written = [0, 1, 2].map((i) => take(i, { parameters: {}, task_id: `run-c-take-${i}` }));
+  const labels = written.map((t, i) => takeMarks(t, [], i));
+  assert.deepEqual(labels, [
+    [{ label: "take", value: "1" }],
+    [{ label: "take", value: "2" }],
+    [{ label: "take", value: "3" }],
+  ]);
+  assert.equal(
+    new Set(labels.map((l) => l[0].value)).size,
+    3,
+    "three cards a person is choosing between must read as three different cards",
+  );
 });
 
 test("the seed is found whatever the workflow numbered its sampler", () => {
@@ -431,6 +443,31 @@ test("bytes read like a schedule rather than a spreadsheet", () => {
   assert.equal(formatBytes(940), "940 B");
   assert.equal(formatBytes(412 * 1024 * 1024), "412 MB");
   assert.equal(formatBytes(1.4 * 1024 ** 3), "1.4 GB");
+});
+
+// ===== Provenance ==========================================================
+
+test("I asks how a take was made, and asks the server only when somebody asks", () => {
+  // "How did I make this, and can I make another?" is the secondary story, and
+  // it costs one request per take looked at — not one per card drawn.
+  const start = initialState([sheet("run-1")]);
+  const open = type(start, ["i"]);
+  assert.equal(open.state.provenance, true);
+  assert.deepEqual(open.effects, [{ kind: "provenance", fileId: "file-0" }]);
+
+  const shut = type(open.state, ["i"]);
+  assert.equal(shut.state.provenance, false);
+  assert.deepEqual(shut.effects, [], "closing asks nothing");
+});
+
+test("escape closes the provenance panel before it disarms anything", () => {
+  const start = initialState([sheet("run-1")]);
+  const state = type(start, ["Backspace", "i"]).state;
+  assert.equal(state.provenance, true);
+  assert.equal(state.armed, "cancel");
+  const after = type(state, ["Escape"]).state;
+  assert.equal(after.provenance, false);
+  assert.equal(after.armed, "cancel", "one thing at a time");
 });
 
 test("the lane counts runs and takes separately, because they are different backlogs", () => {

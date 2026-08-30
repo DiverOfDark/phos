@@ -75,10 +75,16 @@ export function shortId(id) {
  * The seed first, because it is the answer to the question asked most often and
  * `takeSeed` already matches the field against the same aliases the backend's
  * `ParamName::Seed` does. Then anything else that varied across the sheet —
- * steps, cfg, a frame count — because a fan-out is not always a seed sweep. And
- * a plain id when nothing distinguishes them, rather than "seed undefined".
+ * steps, cfg, a frame count — because a fan-out is not always a seed sweep.
+ *
+ * And when nothing distinguishes them — a describe stage's takes carry no
+ * parameters at all — the take's **position**, not a truncated id. Three
+ * sentences labelled `RUN-C-TA`, `RUN-C-TA`, `RUN-C-TA` is the same failure as
+ * four cards labelled with four indistinguishable hex strings, and a prefix of
+ * an id is exactly the thing that collides when ids share one. A position
+ * cannot collide, and it is what a person says out loud anyway.
  */
-export function takeMarks(take, varying = []) {
+export function takeMarks(take, varying = [], index = null) {
   const marks = [];
   const seed = takeSeed(take);
   if (seed !== null) marks.push({ label: "seed", value: String(seed) });
@@ -95,7 +101,13 @@ export function takeMarks(take, varying = []) {
     marks.push({ label: fieldOf(key), value: String(value) });
   }
 
-  if (!marks.length) marks.push({ label: "", value: shortId(take?.task_id) });
+  if (!marks.length) {
+    marks.push(
+      index === null
+        ? { label: "", value: shortId(take?.task_id) }
+        : { label: "take", value: String(index + 1) },
+    );
+  }
   return marks;
 }
 
@@ -133,6 +145,8 @@ export function initialState(sheets = []) {
     ratings: {},
     /** The original beside the takes, rather than the takes alone. */
     compare: false,
+    /** The provenance panel: how this take was made, and how to make another. */
+    provenance: false,
     /** `"cancel"` once cancel has been pressed but not confirmed. */
     armed: null,
     /** The next verdict goes to the whole batch. */
@@ -203,6 +217,7 @@ export const KEY_MAP = [
   { keys: "R", does: "regenerate — fresh seeds, nothing else changed" },
   { keys: "⌫ ⌫", does: "abandon this run (twice)" },
   { keys: "C", does: "compare against the original" },
+  { keys: "I", does: "how this take was made" },
   { keys: "B", does: "aim the next verdict at the whole batch" },
   { keys: "← →", does: "move between takes" },
   { keys: "↑ ↓", does: "move between runs" },
@@ -248,6 +263,8 @@ export function keyAction(event, state = {}) {
       return { type: "regenerate" };
     case "c":
       return { type: "compare" };
+    case "i":
+      return { type: "provenance" };
     case "b":
       return { type: "bulk" };
     default:
@@ -302,6 +319,7 @@ export function reduce(state, action) {
     case "escape":
       // Unwound in the order somebody would expect to unwind it.
       if (state.help) next.help = false;
+      else if (state.provenance) next.provenance = false;
       else if (state.armed) next.armed = null;
       else if (state.bulk) next.bulk = false;
       else if (state.compare) next.compare = false;
@@ -309,6 +327,15 @@ export function reduce(state, action) {
 
     case "compare":
       next.compare = !state.compare;
+      return { state: next, effects };
+
+    case "provenance":
+      next.provenance = !state.provenance;
+      if (next.provenance && take?.output_file_id) {
+        // "How did I make this, and can I make another?" — the manifest is the
+        // answer and it is one request, asked only when somebody asks for it.
+        effects.push({ kind: "provenance", fileId: take.output_file_id });
+      }
       return { state: next, effects };
 
     case "bulk":

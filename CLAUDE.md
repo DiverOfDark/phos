@@ -62,18 +62,32 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
+<<<<<<< HEAD
 - **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what travels along each join, what happens after a stage lands, what a verdict on a hold point may say, and whether a run is over), `editor.rs` (what the line editor may offer, and what a join has to be asked), `promote.rs` (which chains somebody has been running by hand often enough to be worth saving) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `holds/` (`mod.rs` reads a hold, `verdict.rs` writes what was decided), `api/line_io.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
 
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
 - **`components/ReviewDesk.vue`** — One screen, three lanes (`?lane=` → shots / duplicates / faces); `/variations` redirects into it
 - **`components/WorkflowsPage.vue`** — Three tabs: workflows, lines, and a queue that is a schedule
+=======
+- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what travels along each join, what happens after a stage lands, what a verdict on a hold point may say, and whether a run is over), `editor.rs` (what the line editor may offer, and what a join has to be asked), `promote.rs` (which chains somebody has been running by hand often enough to be worth saving) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `holds/` (`mod.rs` reads a hold, `verdict.rs` writes what was decided), `takes/` (the curation lane's read model over *every* held run, plus what a verdict deletes and how far it reaches — `bulk.rs` is the pure rule for that), `api/line_io.rs` and `worker/` hold the DB writes and the background loop; `templates/` holds the five bundled lines a fresh install ships with. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
+
+### Frontend Structure (`frontend/src/`)
+- **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
+- **`components/ReviewDesk.vue`** — One screen, four lanes (`?lane=` → shots / duplicates / faces / takes); `/variations` redirects into it
+- **`components/TakesQueue.vue`** — The Takes lane: a contact sheet over every run parked at a
+  hold point, keyboard-first, fitted to the window so the footer that says what `⏎` is about to
+  do never scrolls off. `lib/takes.js` holds the whole interaction model as a pure reducer —
+  `keyAction` turns an event into an intent, `reduce` turns an intent into the next state plus
+  effects — so the keyboard is tested by `node --test` rather than by driving a browser
+- **`components/WorkflowsPage.vue`** — Four tabs: templates, workflows, lines, and a queue that is a schedule
+>>>>>>> bfc3600 (feat(ui): the Takes lane — a fourth lane, and the screen the farm is for)
   board of **runs** — one row per run saying `STAGE 2/4 · UPSCALE · 00:03:12`, with the tasks
   underneath one click away. A four-stage run as four unrelated rows is what it replaced. A run
   parked at a hold point reads `HELD · 4 TAKES` and opens a review strip: its takes, tick the ones
   worth the stages below, and the three verdicts. That strip is deliberately just enough to give a
-  verdict from — the keyboard-driven contact sheet over every held run at once is FR10b, and reads
-  the same two endpoints
+  verdict from without leaving the board; the keyboard-driven contact sheet over every held run at
+  once is the Review Desk's Takes lane, and both read the same `POST`
 - **`components/LineEditor.vue`** — A line, read as a route board and built as a vertical list.
   Read-only it draws like `WorkflowContract.vue`; under edit it is a list whose `Add stage` picker
   only offers what fits. `lib/lines.js` holds its bookkeeping and none of its rules
@@ -81,6 +95,9 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`style.css`** — The AppBahn design system: raw tokens on `:root`, then a `@theme` block remapping Tailwind's palette, radii, shadows and fonts onto them, so utility classes render in the system. Semantic aliases (`bg-base`, `text-ink`, `border-line`, `text-signal`, `text-ready`…) are what components should use
 - **`components/ui/`** — shadcn-vue primitives, no longer used by any screen (only the unreferenced `PhotoLightbox.vue`)
 - **`lib/utils.js`** — `cn()` helper (clsx + tailwind-merge)
+- **`lib/takes.js`** — The Takes lane's rules and none of its drawing: the key map as data, the
+  reducer, what the next verdict will keep/reject/free, and which parameters actually differ
+  across a sheet's takes
 
 ### Design System — AppBahn (Bauhaus Engineering)
 Both clients follow one system: dark by default, a single **signal amber** accent, status colour
@@ -139,6 +156,23 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   `reviewed_task_ids`. The second is not redundant — without it a passed-over take is
   indistinguishable from one nobody has seen, and the run parks again on it forever. It has exactly
   `parent_task_id`'s property: it exists precisely when the thing it marks happened
+- **Reject arms; the verdict deletes.** The Takes lane's `X` marks a take and the bytes go when the
+  verdict is sent, not on the keystroke. That is what lets the key cost one press and no dialog
+  while staying reversible right up until it is not — and lets the footer print the megabytes the
+  next `⏎` will free *before* it is pressed. The safeguard is a number always on screen, not a
+  confirmation nobody reads. Rejecting is narrower than not-keeping: a take merely passed over is
+  disposed of by its stage's `keep_output` policy, which is the line author's decision, while a
+  rejected one goes regardless, which is the reviewer's. Both are recorded as *reviewed* on the same
+  `run_holds` row
+- **A verdict may cover a batch, but a rejection never travels.** `scope: "batch"` applies the same
+  verdict to every other run of the same FR7 batch held at the same stage of the same line — you
+  look at a handful of three thousand descriptions and let the rest through. `continue` resolves
+  there to *all* of that run's own waiting takes, because task ids are per run and the selection
+  made here does not exist there; `reject` is refused across a run nobody opened, because deleting
+  bytes is something you do to pictures you have seen. Which runs a verdict covers is
+  `comfyui/takes/bulk.rs`, pure and with no database near it. `runs.batch_id` is FR7's column and
+  is read by a raw-SQL probe that treats the question failing as the answer "no batches", so a
+  batch verdict is quietly a run verdict until FR7 lands
 - **A held run parks; it never blocks.** Both halves of the advance pass filter on
   `status = running`, so a held run is read by nothing until a verdict releases it — 3,329 shots
   through a hold point park 3,329 runs and the queue keeps feeding the GPU from everything else.
@@ -268,7 +302,9 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `GET /api/comfyui/runs` — The queue board: one row per run, with the stage it is on, of how many, what that stage is running, and its clock. `GET /api/comfyui/runs/{id}` is the drill-down to the tasks underneath
 - `POST /api/comfyui/runs/{id}/retry` — Resume from the stage that failed. What already succeeded is not re-run
 - `GET /api/comfyui/runs/{id}/hold` — The takes a held run is waiting on, and what continuing from one of them costs in tasks. `null` for a run that is not holding
-- `POST /api/comfyui/runs/{id}/hold` — The verdict: `continue` with the takes named (each walks the rest of the line for itself), `regenerate` the held stage with fresh seeds, or `cancel` the run. `POST /runs/{id}/cancel` on a held run goes through this same path, so an abandoned hold is recorded like every other verdict
+- `POST /api/comfyui/runs/{id}/hold` — The verdict: `continue` with the takes named (each walks the rest of the line for itself), `regenerate` the held stage with fresh seeds, or `cancel` the run. `reject` names takes whose files leave the library outright; `scope: "batch"` applies the verdict to the rest of the batch, carrying no rejection with it. `POST /runs/{id}/cancel` on a held run goes through this same path, so an abandoned hold is recorded like every other verdict
+- `GET /api/comfyui/takes` — Every run waiting on a verdict, oldest first: one page of held runs with their takes, the file each take was made from, the shot's current main file, and what continuing costs. The Takes lane draws a whole screen from one request
+- `PUT /api/files/{id}/rating` — One to five, or `null` to clear it. The Takes lane's `1`-`5` keys
 - `GET|POST /api/comfyui/lines`, `GET|PUT|DELETE /api/comfyui/lines/{id}` — Line CRUD. A chain whose stages do not fit together is refused with a message naming the stage; editing or deleting a line is refused with `409` while a run of it is in flight
 - `GET /api/comfyui/lines/{id}/export` — The line as one portable JSON bundle: stages, **the workflow graph behind each one**, the derived contracts, and a manifest of the node classes and model files it needs
 - `POST /api/comfyui/lines/import?dry_run=&name=` — Read a bundle back. `dry_run` writes nothing and answers with the requirements report alone
