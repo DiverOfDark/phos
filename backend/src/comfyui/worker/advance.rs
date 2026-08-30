@@ -69,6 +69,10 @@ struct Continuation {
     stage_idx: i32,
     stage_count: i32,
     output_file_id: Option<String>,
+    /// What the sender answered for the stages that asked, snapshotted on the
+    /// run — the later stages are queued here, hours after the request that
+    /// carried them.
+    stage_values: Option<String>,
 }
 
 type ContinuationRow = (
@@ -78,6 +82,7 @@ type ContinuationRow = (
     Option<String>,
     i32,
     i32,
+    Option<String>,
     Option<String>,
 );
 
@@ -105,6 +110,7 @@ fn queue_continuations(
             enhancement_tasks::stage_idx.assume_not_null(),
             runs::stage_count,
             enhancement_tasks::output_file_id,
+            runs::stage_values,
         ))
         .load(conn)?;
 
@@ -118,6 +124,7 @@ fn queue_continuations(
             stage_idx: r.4,
             stage_count: r.5,
             output_file_id: r.6,
+            stage_values: r.7,
         })
         // The last stage owes nothing: its output is the product.
         .filter(|c| {
@@ -187,7 +194,12 @@ fn continue_one(conn: &mut SqliteConnection, c: &Continuation) -> Result<(), Str
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("stage {} is no longer part of the line", next_idx + 1))?;
 
-    let plan = stage.plan();
+    let mut plan = stage.plan();
+    // The answers this run was started with. A stage that asked for a value at
+    // send time gets it here, whichever hour of the run it is queued in.
+    let supplied = crate::comfyui::runs::supplied_for(c.stage_values.as_deref(), next_idx);
+    plan.accept(&stage.exposed, &supplied)
+        .map_err(|e| e.message)?;
     let queued = queue_stage(
         conn,
         &c.run_id,
@@ -566,7 +578,13 @@ mod tests {
         }
 
         fn start(&mut self) -> crate::comfyui::runs::RunStart {
-            crate::comfyui::runs::start_line_run(&mut self.conn, "line-1", "shot-1").unwrap()
+            crate::comfyui::runs::start_line_run(
+                &mut self.conn,
+                "line-1",
+                "shot-1",
+                &Default::default(),
+            )
+            .unwrap()
         }
 
         fn advance(&mut self) {

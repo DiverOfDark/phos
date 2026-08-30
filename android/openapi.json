@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/comfyui-production-lines"
+    "version": "feat/comfyui-line-editor"
   },
   "paths": {
     "/api/auth/callback": {
@@ -384,6 +384,99 @@
         }
       }
     },
+    "/api/comfyui/lines/stage-options": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Which workflows may go in one slot of a line",
+        "description": "Every workflow, marked with whether it may sit between what `after` produces and what `before` accepts. The refused ones come back too, each with the reason, so the editor can say what it is not offering and why. Both bounds are optional: no `after` is the first stage of a line, no `before` is the last.",
+        "operationId": "list_stage_options",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "description": "What the stage above this slot produces: `image`, `video` or `text`.\nOmit it for the first stage of a line, which has nothing above it.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "What the stage below this slot accepts: `image`, `video`, `text` or\n`none`. Omit it for the last stage, which has nothing to satisfy.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The workflows, offered or refused"
+          },
+          "400": {
+            "description": "`after` or `before` is not a type"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/suggestions": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Lines somebody has already been running by hand",
+        "description": "Sequences of workflows a person ran one at a time, over and over, on enough different shots to be a habit rather than an afternoon. Each comes back as a line ready to POST, with the settings that never changed pinned and the ones that did marked as asked-for.",
+        "operationId": "list_suggestions",
+        "responses": {
+          "200": {
+            "description": "The sequences worth offering"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/validate": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Check a line without saving it",
+        "description": "The same check POST and PUT make, with nothing written. What the editor asks after a reorder, so a chain that no longer fits says so where it was dragged rather than after Save.",
+        "operationId": "validate_line",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Whether it holds together, and why not"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
     "/api/comfyui/lines/{id}": {
       "get": {
         "tags": [
@@ -486,6 +579,38 @@
           },
           "409": {
             "description": "A run of this line is still in flight"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/{id}/duplicate": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Fork a production line",
+        "description": "Copy a line and everything its stages carry — workflows, prompts, parameters, sweeps, source modes, keep flags and exposed keys — under a new name. The default way to get a line, and the way to change one that a run is currently walking.",
+        "operationId": "duplicate_line",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Line ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The fork"
+          },
+          "404": {
+            "description": "Line not found"
           },
           "503": {
             "description": "ComfyUI not configured"
@@ -3369,6 +3494,13 @@
           "workflow_id"
         ],
         "properties": {
+          "exposed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Keys this stage deliberately leaves open — the *exposed* disposition.\nStarting a run may supply values for exactly these, and only these."
+          },
           "keep_output": {
             "type": "boolean",
             "description": "Keep this stage's output once the run completes. The last stage's output\nis the product and is kept regardless."
@@ -4143,6 +4275,10 @@
           },
           "shot_id": {
             "type": "string"
+          },
+          "stage_values": {
+            "type": "object",
+            "description": "Values for the keys each stage left open, keyed by stage index as a\nstring. A key a stage did not expose is refused by name rather than\nignored."
           }
         }
       },

@@ -26,6 +26,7 @@ pub(super) fn require_comfyui(state: &AppState) -> Result<String, StatusCode> {
 /// Import is the one endpoint here where a bare 400 is actively unhelpful: the
 /// user pasted a graph and needs to know which part of it Phos could not use.
 /// The UI already reads `error` out of a JSON body.
+#[derive(Debug)]
 pub(super) struct ApiError(pub(super) StatusCode, pub(super) Option<String>);
 
 impl ApiError {
@@ -684,7 +685,8 @@ pub(super) async fn comfyui_enhance(
     // then failing would leave a sweep with holes in it.
     let (run_id, task_ids): (String, Vec<String>) = conn
         .transaction::<_, diesel::result::Error, _>(|conn| {
-            let run_id = crate::comfyui::runs::open_run(conn, None, &payload.shot_id, &label, 1)?;
+            let run_id =
+                crate::comfyui::runs::open_run(conn, None, &payload.shot_id, &label, 1, None)?;
             let mut ids = Vec::with_capacity(runs.len());
             for run in &runs {
                 let task_id = uuid::Uuid::new_v4().to_string();
