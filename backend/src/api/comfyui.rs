@@ -646,7 +646,7 @@ pub(super) struct EnhancePayload {
 )]
 pub(super) async fn comfyui_enhance(
     UState(state): UState,
-    Json(payload): Json<EnhancePayload>,
+    Json(mut payload): Json<EnhancePayload>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let _ = require_comfyui(&state)?;
 
@@ -683,13 +683,13 @@ pub(super) async fn comfyui_enhance(
     // picked — a `whole_video` against a graph with only image loaders (or a
     // frame against a video-only graph) would otherwise queue a task
     // guaranteed to fail.
-    let stored: Option<String> = comfyui_workflows::table
+    let stored: Option<(String, Option<String>)> = comfyui_workflows::table
         .filter(comfyui_workflows::id.eq(&payload.workflow_id))
-        .select(comfyui_workflows::workflow_json)
+        .select((comfyui_workflows::workflow_json, comfyui_workflows::contract_json))
         .first(&mut conn)
         .optional()
         .map_err(|_| ApiError::internal())?;
-    let Some(workflow_json) = stored else {
+    let Some((workflow_json, stored_contract)) = stored else {
         return Err(StatusCode::NOT_FOUND.into());
     };
     // A sweep whose key names no rewritable field would queue N tasks that all
@@ -718,6 +718,22 @@ pub(super) async fn comfyui_enhance(
                 .map_err(ApiError::bad_request)?;
         }
     }
+
+    // A describe stage run on its own still gets the instruction Phos
+    // composed — the names, the date, the place — unless the caller wrote one
+    // into its prompt box themselves. Compiled here, exactly as a line's
+    // queue path compiles it, so the task row records the prompt that was
+    // actually sent.
+    let contract = crate::comfyui::runs::contract_of(
+        stored_contract.as_deref(),
+        &workflow_json,
+    );
+    crate::comfyui::runs::compile_describe_instruction(
+        &mut conn,
+        &payload.shot_id,
+        &contract,
+        &mut payload.text_overrides,
+    );
 
     // Contract role corrections are deliberately *not* folded in here: a task
     // row records what the caller asked for, and `role:` directives written
@@ -886,6 +902,9 @@ struct TaskRow {
     /// FR5 has both: a lone enhance is a one-stage run.
     run_id: Option<String>,
     stage_idx: Option<i32>,
+    /// What a describe stage said. `None` on every stage that makes a file,
+    /// which is all of them but one.
+    text_output: Option<String>,
     main_file_id: Option<String>,
     /// Who the source shot belongs to, and the file the thumbnail shows.
     person_name: Option<String>,
@@ -907,6 +926,7 @@ type TaskTuple = (
     Option<String>,
     Option<String>,
     Option<i32>,
+    Option<String>,
 );
 
 fn task_tuple_to_row(
@@ -930,6 +950,7 @@ fn task_tuple_to_row(
         source_file_id: t.11,
         run_id: t.12,
         stage_idx: t.13,
+        text_output: t.14,
         main_file_id,
         person_name,
         source_name,
@@ -955,6 +976,7 @@ fn task_row_to_json(row: TaskRow) -> serde_json::Value {
         "completed_at": row.completed_at,
         "run_id": row.run_id,
         "stage_idx": row.stage_idx,
+        "text_output": row.text_output,
         "thumbnail_url": thumbnail_url,
         "person_name": row.person_name,
         "source_name": row.source_name,
@@ -982,6 +1004,7 @@ fn query_tasks(
         enhancement_tasks::source_file_id,
         enhancement_tasks::run_id,
         enhancement_tasks::stage_idx,
+        enhancement_tasks::text_output,
     );
 
     // Fetch limit+1 to detect if there's a next page
@@ -1148,6 +1171,7 @@ pub(super) async fn comfyui_get_task(
             enhancement_tasks::source_file_id,
             enhancement_tasks::run_id,
             enhancement_tasks::stage_idx,
+            enhancement_tasks::text_output,
         ))
         .filter(enhancement_tasks::id.eq(&id))
         .first(&mut conn)

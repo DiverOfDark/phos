@@ -1,7 +1,10 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
-import { isTextInput, inputKey, runCount, MAX_FANOUT } from '@/lib/utils'
+import {
+  isTextInput, inputKey, runCount, MAX_FANOUT,
+  isDescribeWorkflow, applyCompiledPrompt, slotKey,
+} from '@/lib/utils'
 
 const props = defineProps({
   open: Boolean,
@@ -86,6 +89,125 @@ function defaultSourceModeKey() {
 function selectSourceMode(key) {
   sourceModeKey.value = key
   sourceModeTouched.value = true
+}
+
+// --- Description ---
+//
+// Phos already knows what is in this photograph: a caption, faces clustered to
+// named people, the EXIF time and place. The prompt is compiled from that
+// rather than retyped for every shot. A describe workflow — one whose contract
+// says it hands on text — runs first, takes seconds, and what it says is shown
+// here to be corrected before the costly stage is queued. A prompt you cannot
+// see or correct is worse than one you typed.
+const intent = ref('')
+const stylePreset = ref('')
+const doNot = ref('')
+
+/** none | running | ready | failed */
+const describeState = ref('none')
+const describeCached = ref(false)
+const describeError = ref('')
+const describeFacts = ref(null)
+/** The compiled prompt, editable. What is in these boxes is what gets queued. */
+const compiled = ref(null)
+const promptApplied = ref(false)
+let describePoll = null
+
+/** Is there a workflow that can describe a photograph at all? */
+const describeWorkflow = computed(() => workflows.value.find(isDescribeWorkflow) || null)
+
+/** The stage the compiled prompt would be written into. */
+const promptTarget = computed(() =>
+  selectedWorkflow.value && !isDescribeWorkflow(selectedWorkflow.value)
+    ? selectedWorkflow.value
+    : null,
+)
+
+function stopDescribePoll() {
+  if (describePoll) {
+    clearTimeout(describePoll)
+    describePoll = null
+  }
+}
+
+function describeParams() {
+  const params = new URLSearchParams()
+  if (intent.value.trim()) params.set('intent', intent.value.trim())
+  if (stylePreset.value.trim()) params.set('style', stylePreset.value.trim())
+  if (doNot.value.trim()) params.set('do_not', doNot.value.trim())
+  return params
+}
+
+function readDescription(data) {
+  describeState.value = data.state
+  describeCached.value = Boolean(data.cached)
+  describeFacts.value = data.facts || null
+  describeError.value = data.error || ''
+  if (data.state === 'ready' && data.prompt) {
+    compiled.value = { positive: data.prompt.positive || '', negative: data.prompt.negative || '' }
+  }
+}
+
+/** Ask for a description, or read the one this shot already carries. */
+async function describe(refresh = false) {
+  if (!props.shotId) return
+  stopDescribePoll()
+  describeError.value = ''
+  promptApplied.value = false
+  describeState.value = 'running'
+  try {
+    const res = await fetch('/api/comfyui/describe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        shot_id: props.shotId,
+        ...(describeWorkflow.value ? { workflow_id: describeWorkflow.value.id } : {}),
+        ...(intent.value.trim() ? { intent: intent.value.trim() } : {}),
+        ...(stylePreset.value.trim() ? { style: stylePreset.value.trim() } : {}),
+        ...(doNot.value.trim()
+          ? { do_not: doNot.value.split(/[\n;]/).map(s => s.trim()).filter(Boolean) }
+          : {}),
+        ...(refresh ? { refresh: true } : {}),
+      }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+    readDescription(data)
+    if (data.state === 'running') pollDescription()
+  } catch (e) {
+    describeState.value = 'failed'
+    describeError.value = e.message || 'Could not describe this shot'
+  }
+}
+
+/** Wait for the describe run. It is seconds, not minutes, so this is short. */
+function pollDescription(attempt = 0) {
+  stopDescribePoll()
+  if (attempt > 90) {
+    describeState.value = 'failed'
+    describeError.value = 'the describe run is taking longer than expected — see Workflows › Queue'
+    return
+  }
+  describePoll = setTimeout(async () => {
+    try {
+      const res = await fetch(`/api/comfyui/describe/${props.shotId}?${describeParams()}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      readDescription(data)
+      if (data.state === 'running' || data.state === 'none') pollDescription(attempt + 1)
+    } catch (e) {
+      describeState.value = 'failed'
+      describeError.value = e.message || 'Lost track of the describe run'
+    }
+  }, 2000)
+}
+
+/** Write what is in the boxes into the workflow's prompt slots. */
+function useCompiledPrompt() {
+  if (!promptTarget.value || !compiled.value) return
+  textOverrides.value = applyCompiledPrompt(promptTarget.value, textOverrides.value, compiled.value)
+  selectedPresetId.value = null
+  promptApplied.value = true
 }
 
 // --- Submit state ---
@@ -265,11 +387,30 @@ watch(dialogOpen, (val) => {
     sourceModeTouched.value = false
     sourceModeKey.value = defaultSourceModeKey()
     selectedLineId.value = null
+    describeState.value = 'none'
+    describeCached.value = false
+    describeError.value = ''
+    describeFacts.value = null
+    compiled.value = null
+    promptApplied.value = false
     fetchWorkflows()
     fetchLines()
     if (props.shotId) {
       fetchGenerations(props.shotId)
+      // Free: the description this shot already carries, and the prompt it
+      // compiles to. Nothing is described and no GPU is asked for anything
+      // until the button is pressed.
+      fetch(`/api/comfyui/describe/${props.shotId}?${describeParams()}`)
+        .then(r => (r.ok ? r.json() : null))
+        .then(d => {
+          if (!d) return
+          readDescription(d)
+          if (d.state === 'running') pollDescription()
+        })
+        .catch(() => {})
     }
+  } else {
+    stopDescribePoll()
   }
 })
 
@@ -521,6 +662,101 @@ async function enhance() {
                   style="background: var(--status-ready)"
                 ></span>
               </button>
+            </div>
+          </div>
+
+          <!-- Description.
+               Phos knows what is in this photograph — the caption, the people
+               clustering named, the EXIF time and place. The prompt is compiled
+               from that rather than retyped, and it is shown here so it can be
+               corrected before the costly stage is queued. -->
+          <div v-if="describeWorkflow && !selectedLineId" class="flex flex-col gap-3">
+            <div class="flex items-baseline gap-2">
+              <div class="label">Description</div>
+              <span class="flex-1"></span>
+              <span
+                v-if="describeCached && describeState === 'ready'"
+                class="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-tertiary"
+              >stored for this shot</span>
+            </div>
+
+            <div class="flex flex-col gap-2">
+              <input
+                v-model="intent"
+                type="text"
+                placeholder="what you are after — a slow push-in as the light fades"
+                class="w-full bg-base border border-line rounded-sm px-3 py-1.5 text-xs text-ink"
+              />
+              <input
+                v-model="stylePreset"
+                type="text"
+                placeholder="style — 35mm film, muted palette"
+                class="w-full bg-base border border-line rounded-sm px-3 py-1.5 text-xs text-ink"
+              />
+              <textarea
+                v-model="doNot"
+                rows="2"
+                placeholder="must not — one per line: change face"
+                class="w-full bg-base border border-line rounded-sm px-3 py-1.5 text-xs text-ink resize-y"
+              ></textarea>
+            </div>
+
+            <div class="flex items-center gap-3">
+              <button
+                class="border border-line rounded px-3 py-1.5 font-mono text-xs text-ink-secondary hover:bg-raised transition-colors disabled:opacity-50"
+                :disabled="describeState === 'running'"
+                @click="describe(describeState === 'ready')"
+              >{{ describeState === 'ready' ? 'Describe again' : 'Describe' }}</button>
+              <span
+                v-if="describeState === 'running'"
+                class="flex items-center gap-2 font-mono text-[11px] text-ink-tertiary"
+              >
+                <span class="signal-dot signal-pulse" style="width:6px;height:6px;background:var(--status-pending)"></span>
+                reading the photograph…
+              </span>
+              <span
+                v-else-if="describeFacts && (describeFacts.people || []).length"
+                class="font-mono text-[11px] text-ink-tertiary truncate"
+              >knows: {{ (describeFacts.people || []).join(', ') }}<template v-if="describeFacts.taken_at"> · {{ describeFacts.taken_at.slice(0, 10) }}</template></span>
+            </div>
+
+            <div
+              v-if="describeState === 'failed'"
+              class="flex items-start gap-2 px-3 py-2 border rounded font-mono text-xs"
+              style="border-color: var(--status-error); color: var(--status-error)"
+            >
+              <span class="signal-dot mt-1 flex-none" style="width:6px;height:6px;background:var(--status-error)"></span>
+              <span>{{ describeError }}</span>
+            </div>
+
+            <!-- Editable, and deliberately so: this is what gets queued. -->
+            <div v-if="compiled && describeState === 'ready'" class="flex flex-col gap-2">
+              <div class="label">Compiled prompt</div>
+              <textarea
+                v-model="compiled.positive"
+                rows="5"
+                class="w-full bg-base border border-line rounded-sm px-3 py-2 text-xs text-ink resize-y leading-relaxed"
+              ></textarea>
+              <div class="label">Must not</div>
+              <textarea
+                v-model="compiled.negative"
+                rows="2"
+                class="w-full bg-base border border-line rounded-sm px-3 py-2 font-mono text-[11px] text-ink resize-y"
+              ></textarea>
+              <div class="flex items-center gap-3">
+                <button
+                  class="border rounded px-3 py-1.5 font-mono text-xs transition-colors disabled:opacity-50"
+                  :class="promptApplied ? 'border-line text-ink-tertiary' : 'border-signal text-signal hover:bg-surface'"
+                  :disabled="!promptTarget"
+                  @click="useCompiledPrompt"
+                >{{ promptApplied ? 'in the prompt boxes' : 'Use this prompt' }}</button>
+                <span v-if="!promptTarget" class="font-mono text-[11px] text-ink-tertiary">
+                  pick the workflow this prompt is for
+                </span>
+                <span v-else-if="!slotKey(promptTarget, 'positive')" class="font-mono text-[11px]" style="color: var(--status-degraded)">
+                  {{ promptTarget.name }} has no prompt box to write into
+                </span>
+              </div>
             </div>
           </div>
 
