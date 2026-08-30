@@ -72,15 +72,11 @@ pub(super) struct LineStagePayload {
     /// Keep this stage's output once the run completes. The last stage's output
     /// is the product and is kept regardless.
     #[serde(default)]
-<<<<<<< HEAD
     pub(super) keep_output: bool,
-=======
-    keep_output: bool,
     /// Keys this stage deliberately leaves open — the *exposed* disposition.
     /// Starting a run may supply values for exactly these, and only these.
     #[serde(default)]
-    exposed: Vec<String>,
->>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
+    pub(super) exposed: Vec<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -144,6 +140,69 @@ impl LinePayload {
     pub(super) fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
+
+    /// Each stage's workflow and the part of an upstream video it consumes —
+    /// the two things working out a draft's joins needs, without exposing the
+    /// payload's fields to the rest of the API.
+    pub(super) fn stage_specs(&self) -> Vec<(&str, Option<&str>)> {
+        self.stages
+            .iter()
+            .map(|s| (s.workflow_id.as_str(), s.source_mode.as_deref()))
+            .collect()
+    }
+}
+
+/// One join of a *draft* line, worked out the same way a stored one's is.
+///
+/// A stage the editor has just added has no join yet — it has never been read
+/// back from the database — so the validate endpoint answers with them, and the
+/// editor draws its connectors from the same function that drew them before the
+/// edit. There is no second derivation for "not saved yet".
+pub(super) fn draft_stages_json(
+    conn: &mut SqliteConnection,
+    specs: &[(&str, Option<&str>)],
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::with_capacity(specs.len());
+    let mut above: Vec<MediaType> = Vec::with_capacity(specs.len());
+    for (idx, (workflow_id, source_mode)) in specs.iter().enumerate() {
+        let row: Option<(Option<String>, String)> = comfyui_workflows::table
+            .filter(comfyui_workflows::id.eq(workflow_id))
+            .select((
+                comfyui_workflows::contract_json,
+                comfyui_workflows::workflow_json,
+            ))
+            .first(conn)
+            .optional()
+            .unwrap_or(None);
+        let Some((contract_json, workflow_json)) = row else {
+            // A stage naming a workflow this library does not have. The
+            // refusal says so; there is nothing to draw for it, and nothing is
+            // known about what it would have handed on.
+            out.push(serde_json::json!({ "stage_idx": idx }));
+            above.clear();
+            continue;
+        };
+        let contract = contract_of(contract_json.as_deref(), &workflow_json);
+        let takes_video = graph_takes_video(&workflow_json);
+        let handoff = crate::comfyui::editor::carried_into(&above).map(|carries| {
+            let h = crate::comfyui::editor::handoff(carries, &contract, takes_video, *source_mode);
+            serde_json::json!({
+                "carries": h.carries,
+                "resolved": h.resolved,
+                "modes": h.modes,
+                "roles": h.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                "is_a_question": h.is_a_question(),
+            })
+        });
+        out.push(serde_json::json!({
+            "stage_idx": idx,
+            "accepts": contract.accepts,
+            "produces": contract.produces,
+            "handoff": handoff,
+        }));
+        above.push(contract.produces);
+    }
+    out
 }
 
 /// What starts a run.
@@ -183,9 +242,6 @@ type RunTaskRow = (String, Option<i32>, String, String, Option<String>);
 
 /// A line's stages, with each workflow's contract folded in — what the editor
 /// draws and what validation reads.
-<<<<<<< HEAD
-pub(super) fn stage_json(stage: &StageRow) -> serde_json::Value {
-=======
 ///
 /// `upstream` is what the stage before it produces, which is what turns a
 /// stage into a *join*: the connector the editor draws between two rows states
@@ -193,10 +249,18 @@ pub(super) fn stage_json(stage: &StageRow) -> serde_json::Value {
 /// here rather than in the browser for the same reason validity is — the
 /// dispatcher's rule lives on this side, and a second copy of it would be a
 /// second copy to disagree with.
-fn stage_json(stage: &StageRow, upstream: Option<MediaType>) -> serde_json::Value {
+pub(super) fn stage_json(
+    stage: &StageRow,
+    upstream: Option<MediaType>,
+    takes_video: bool,
+) -> serde_json::Value {
     let handoff = upstream.map(|carries| {
-        let h =
-            crate::comfyui::editor::handoff(carries, &stage.contract, stage.source_mode.as_deref());
+        let h = crate::comfyui::editor::handoff(
+            carries,
+            &stage.contract,
+            takes_video,
+            stage.source_mode.as_deref(),
+        );
         serde_json::json!({
             "carries": h.carries,
             "resolved": h.resolved,
@@ -205,7 +269,6 @@ fn stage_json(stage: &StageRow, upstream: Option<MediaType>) -> serde_json::Valu
             "is_a_question": h.is_a_question(),
         })
     });
->>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
     serde_json::json!({
         "stage_idx": stage.stage_idx,
         "workflow_id": stage.workflow_id,
@@ -225,23 +288,43 @@ fn stage_json(stage: &StageRow, upstream: Option<MediaType>) -> serde_json::Valu
     })
 }
 
-<<<<<<< HEAD
-=======
 /// Every stage, each with the join above it.
+///
+/// The join is what the *media flow* carries into that stage, not simply what
+/// the stage above produced: a stage that makes no file is transparent to it,
+/// so the connector under a describe stage still says `image`. That rule is
+/// [`crate::comfyui::editor::carried_into`], and it is the only place it is
+/// asked here.
 pub(super) fn stages_json(stages: &[StageRow]) -> Vec<serde_json::Value> {
     stages
         .iter()
         .enumerate()
         .map(|(i, s)| {
+            let above: Vec<MediaType> = stages[..i].iter().map(|p| p.contract.produces).collect();
             stage_json(
                 s,
-                i.checked_sub(1).map(|prev| stages[prev].contract.produces),
+                crate::comfyui::editor::carried_into(&above),
+                s.takes_video,
             )
         })
         .collect()
 }
 
->>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
+/// Does this graph have a loader that can read a clip?
+///
+/// Read off the graph rather than off the contract, because that is where the
+/// dispatcher reads it — see [`crate::comfyui::editor::handoff`].
+pub(super) fn graph_takes_video(workflow_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(workflow_json)
+        .ok()
+        .map(|graph| {
+            crate::comfyui::detect_loaders(&graph)
+                .iter()
+                .any(|l| l.kind == crate::comfyui::LoaderKind::Video)
+        })
+        .unwrap_or(false)
+}
+
 pub(super) fn line_json(
     id: &str,
     name: &str,

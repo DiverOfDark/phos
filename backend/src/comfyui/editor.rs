@@ -8,11 +8,15 @@
 //!
 //! Two questions, both pure functions of the stage contracts:
 //!
-//! * **Which workflows may go here?** [`stage_options`], which asks
-//!   [`Accepts::admits`] of both joins — the one above the slot and the one
-//!   below it. Not a second compatibility rule: [`super::line::validate_chain`]
-//!   and [`super::worker::dispatch`] ask the same function, so a stage the
-//!   picker offers can never be a stage the validator refuses.
+//! * **Which workflows may go here?** [`stage_options`], which builds the line
+//!   that *would* result from each candidate and hands it to
+//!   [`super::line::validate_chain`]. Not "asks the same rule" — asks the same
+//!   *function*, on the whole chain, so the picker cannot drift from the
+//!   validator even by one clause. It is also how the picker keeps up with a
+//!   rule it does not know about: when validation learns that a text-producing
+//!   stage is transparent to the media flow (a describe stage makes no file, so
+//!   the stage after it still reads the shot), the picker learns it in the same
+//!   commit, without a line changing here.
 //! * **What travels along a join, and is there anything to decide about it?**
 //!   [`handoff`]. Usually nothing: an image is an image, and a clip going into
 //!   a graph with a video loader goes in whole. It becomes a question when the
@@ -28,6 +32,7 @@
 //! tests.
 
 use super::contract::{Accepts, MediaType, StageContract};
+use super::line::{validate_chain, StageTyping};
 use super::loaders::{LoaderKind, SourceRole};
 use super::source::SourceMode;
 
@@ -57,70 +62,100 @@ impl StageOption {
     }
 }
 
-/// Where in a line a stage is being put.
-///
-/// Both ends are optional, and both optionals mean the same thing: there is
-/// nothing on that side to fit. `after: None` is the first stage of a line —
-/// what it eats is the shot, and only [`super::line::admits_source`] at run
-/// creation can know whether that fits. `before: None` is the last stage, whose
-/// output is the product and has nothing after it to satisfy.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Slot {
-    /// What the stage above this slot produces.
-    pub after: Option<MediaType>,
-    /// What the stage below this slot accepts.
-    pub before: Option<Accepts>,
+/// What the editor is doing to the position it named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Put the candidate at `at`, pushing whatever is there down.
+    Insert,
+    /// Put the candidate at `at` in place of what is there.
+    Replace,
+}
+
+/// The line that would result from putting `candidate` at `at`.
+fn hypothetical(
+    existing: &[StageTyping],
+    at: usize,
+    placement: Placement,
+    candidate: &Candidate,
+) -> Vec<StageTyping> {
+    let mut chain: Vec<StageTyping> = existing.to_vec();
+    let at = at.min(chain.len());
+    let stage = StageTyping {
+        stage_idx: at as i32,
+        name: candidate.name.clone(),
+        accepts: candidate.accepts,
+        produces: candidate.produces,
+    };
+    match placement {
+        Placement::Insert => chain.insert(at, stage),
+        Placement::Replace if at < chain.len() => chain[at] = stage,
+        Placement::Replace => chain.push(stage),
+    }
+    // `validate_chain` reads `stage_idx` to name the stage it refuses, so the
+    // whole list is renumbered rather than only the part that moved.
+    for (idx, s) in chain.iter_mut().enumerate() {
+        s.stage_idx = idx as i32;
+    }
+    chain
 }
 
 /// May this workflow go in this slot?
 ///
-/// `Ok(())` or the sentence to show against the greyed-out row. Both joins are
-/// [`Accepts::admits`] and nothing else.
-pub fn fits(candidate: &Candidate, slot: Slot) -> Result<(), String> {
-    if let Some(upstream) = slot.after {
-        if !candidate.accepts.admits(upstream) {
-            return Err(if candidate.accepts.starts_a_line() {
-                format!(
-                    "{} consumes nothing, so it can only be the first stage of a line.",
-                    candidate.name
-                )
-            } else {
-                format!(
-                    "{} takes {}, and the stage before it produces {}.",
-                    candidate.name,
-                    candidate.accepts.as_str(),
-                    upstream.as_str()
-                )
-            });
-        }
-    }
-    if let Some(downstream) = slot.before {
-        if !downstream.admits(candidate.produces) {
-            return Err(format!(
-                "{} produces {}, and the stage after it takes {}.",
-                candidate.name,
-                candidate.produces.as_str(),
-                downstream.as_str()
-            ));
-        }
-    }
-    Ok(())
+/// `Ok(())`, or the sentence to show against the greyed-out row — and the
+/// sentence is [`validate_chain`]'s own, because the question asked is
+/// literally "would this line be refused". There is no second rule here to
+/// disagree with the first one, and nothing to keep in step when the first one
+/// changes.
+pub fn fits(
+    existing: &[StageTyping],
+    at: usize,
+    placement: Placement,
+    candidate: &Candidate,
+) -> Result<(), String> {
+    validate_chain(&hypothetical(existing, at, placement, candidate)).map_err(|e| e.message)
 }
 
 /// Every workflow, marked with whether it may go in this slot.
 ///
 /// The refused ones come back too rather than being filtered away, so the
-/// editor can say *how many* it is not offering and why — "only video-accepting
-/// stages offered" is a fact about the line, and a picker that silently omits
-/// half a library reads as a library that has lost half its workflows.
-pub fn stage_options(candidates: &[Candidate], slot: Slot) -> Vec<StageOption> {
+/// editor can say *how many* it is not offering and why — a picker that
+/// silently omits half a library reads as a library that has lost half its
+/// workflows.
+pub fn stage_options(
+    candidates: &[Candidate],
+    existing: &[StageTyping],
+    at: usize,
+    placement: Placement,
+) -> Vec<StageOption> {
     candidates
         .iter()
         .map(|c| StageOption {
             candidate: c.clone(),
-            refused: fits(c, slot).err(),
+            refused: fits(existing, at, placement, c).err(),
         })
         .collect()
+}
+
+/// What is flowing into the slot at `at` — what the connector above it carries.
+///
+/// A stage that produces no file is **transparent** to the media flow: a
+/// describe stage reads the photograph and hands on a sentence, so the stage
+/// after it is still reading the photograph. Skipping those is the difference
+/// between a connector that says `image` and one that says `text` and then
+/// cannot explain why the next stage eats a picture.
+///
+/// **Integration note.** FR9 (`feat/comfyui-prompt-compiler`, PR #117) owns
+/// this rule — it is the same one that makes `validate_chain` accept
+/// `describe → photo-to-clip` — and expresses it in [`super::line`]. This
+/// function exists so that this branch stands on its own, and is the one place
+/// to delete when the two are merged: every caller here goes through it, and
+/// nothing else in this module reasons about the media flow at all.
+pub fn carried_into(above: &[MediaType]) -> Option<MediaType> {
+    above
+        .iter()
+        .rev()
+        .find(|&&produces| produces != MediaType::Text)
+        .copied()
 }
 
 // ===== What travels along a join? ===========================================
@@ -171,8 +206,18 @@ impl Handoff {
 ///   loader is the real question: the clip itself, or a frame of it. That is
 ///   what FR2's source modes are for, and what `bind_targets` then puts in the
 ///   loader of the matching kind.
-pub fn handoff(carries: MediaType, downstream: &StageContract, stored: Option<&str>) -> Handoff {
-    let takes_video = downstream.roles.iter().any(|r| r.kind == LoaderKind::Video);
+///
+/// `takes_video` comes from the caller rather than off `downstream.roles`,
+/// because that is where the dispatcher gets it: straight from the graph, with
+/// [`super::loaders::takes_video`]. A contract stored before loaders were
+/// recorded carries none, and a connector reading the contract alone would then
+/// promise a frame where the run is going to send the whole clip.
+pub fn handoff(
+    carries: MediaType,
+    downstream: &StageContract,
+    takes_video: bool,
+    stored: Option<&str>,
+) -> Handoff {
     let takes_image = downstream.roles.iter().any(|r| r.kind == LoaderKind::Image);
     let carries_video = carries == MediaType::Video;
 
@@ -290,108 +335,206 @@ mod tests {
             .collect()
     }
 
+    fn typing(idx: i32, c: &Candidate) -> StageTyping {
+        StageTyping {
+            stage_idx: idx,
+            name: c.name.clone(),
+            accepts: c.accepts,
+            produces: c.produces,
+        }
+    }
+
+    /// A line already drawn, as the editor holds it while it is being edited.
+    fn drawn(names: &[&str]) -> Vec<StageTyping> {
+        let shop = library();
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                typing(
+                    i as i32,
+                    shop.iter()
+                        .find(|c| &c.name == name)
+                        .expect("in the library"),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn after_a_stage_that_makes_a_clip_only_video_stages_are_offered() {
-        let options = stage_options(
-            &library(),
-            Slot {
-                after: Some(MediaType::Video),
-                before: None,
-            },
-        );
+        let line = drawn(&["Photo to 5s Clip"]);
+        let options = stage_options(&library(), &line, 1, Placement::Insert);
         assert_eq!(offered(&options), ["Interpolate 60fps", "Upscale 4K"]);
-        // And the ones that are not offered say why, in the validator's words.
-        let restore = options
-            .iter()
-            .find(|o| o.candidate.name == "Restore Portrait");
-        assert_eq!(
-            restore.unwrap().refused.as_deref(),
-            Some("Restore Portrait takes image, and the stage before it produces video.")
-        );
-    }
-
-    #[test]
-    fn a_stage_that_consumes_nothing_is_offered_only_at_the_top() {
-        // First slot: nothing above it, so everything fits.
-        let first = stage_options(&library(), Slot::default());
-        assert!(offered(&first).contains(&"Text to Image"));
-        // Anywhere else: it could never be handed the thing above it.
-        let later = stage_options(
-            &library(),
-            Slot {
-                after: Some(MediaType::Image),
-                before: None,
-            },
-        );
-        let t2i = later
-            .iter()
-            .find(|o| o.candidate.name == "Text to Image")
-            .unwrap();
-        assert_eq!(
-            t2i.refused.as_deref(),
-            Some("Text to Image consumes nothing, so it can only be the first stage of a line.")
-        );
-    }
-
-    #[test]
-    fn swapping_a_stage_in_the_middle_has_to_satisfy_both_sides() {
-        // Replacing stage 2 of image → video → video: it must eat an image and
-        // hand on something the 4K upscaler can read.
-        let options = stage_options(
-            &library(),
-            Slot {
-                after: Some(MediaType::Image),
-                before: Some(Accepts::Video),
-            },
-        );
-        assert_eq!(offered(&options), ["Photo to 5s Clip"]);
-        // "Restore Portrait" eats the image happily and then hands on a still.
+        // And the ones that are not offered say why — in the validator's own
+        // words, because it is the validator that was asked.
         let restore = options
             .iter()
             .find(|o| o.candidate.name == "Restore Portrait")
             .unwrap();
         assert_eq!(
             restore.refused.as_deref(),
-            Some("Restore Portrait produces image, and the stage after it takes video.")
+            Some(
+                "Stage 2 (Restore Portrait) takes image, but stage 1 (Photo to 5s Clip) produces video."
+            )
         );
     }
 
     #[test]
+    fn a_stage_that_consumes_nothing_is_offered_only_at_the_top() {
+        // The first slot of an empty line: everything fits, because what a
+        // first stage eats is the shot, and only a run can know what that is.
+        let first = stage_options(&library(), &[], 0, Placement::Insert);
+        assert!(offered(&first).contains(&"Text to Image"));
+        // Anywhere else: it could never be handed the thing above it.
+        let later = stage_options(
+            &library(),
+            &drawn(&["Restore Portrait"]),
+            1,
+            Placement::Insert,
+        );
+        let t2i = later
+            .iter()
+            .find(|o| o.candidate.name == "Text to Image")
+            .unwrap();
+        assert!(
+            t2i.refused
+                .as_deref()
+                .unwrap()
+                .contains("only be the first stage"),
+            "{:?}",
+            t2i.refused
+        );
+    }
+
+    #[test]
+    fn swapping_a_stage_in_the_middle_has_to_satisfy_both_sides() {
+        // Replacing the middle of image → image → video → video: what goes in
+        // must eat the restored still *and* hand on something the upscaler can
+        // read. Exactly one workflow in this library does both.
+        let line = drawn(&["Restore Portrait", "Photo to 5s Clip", "Upscale 4K"]);
+        let options = stage_options(&library(), &line, 1, Placement::Replace);
+        assert_eq!(offered(&options), ["Photo to 5s Clip"]);
+        // "Restore Portrait" would eat the still happily and then hand on
+        // another one, which the upscaler cannot read.
+        let restore = options
+            .iter()
+            .find(|o| o.candidate.name == "Restore Portrait")
+            .unwrap();
+        assert_eq!(
+            restore.refused.as_deref(),
+            Some(
+                "Stage 3 (Upscale 4K) takes video, but stage 2 (Restore Portrait) produces image."
+            )
+        );
+    }
+
+    #[test]
+    fn the_first_stage_of_a_line_is_only_checked_against_what_follows_it() {
+        // Replacing stage 1 puts the candidate at the top, where what it eats
+        // is the shot — and only a run knows what that is. So a video-eating
+        // stage is offered here: a line that begins by upscaling a clip is a
+        // perfectly good line, and refusing it in the picker would be the
+        // editor inventing a rule the validator does not have.
+        let line = drawn(&["Photo to 5s Clip", "Upscale 4K"]);
+        assert_eq!(
+            offered(&stage_options(&library(), &line, 0, Placement::Replace)),
+            ["Photo to 5s Clip", "Interpolate 60fps", "Upscale 4K"],
+            "everything that hands the upscaler a clip"
+        );
+    }
+
+    #[test]
+    fn inserting_and_replacing_at_one_index_are_different_questions() {
+        // image → image → video. At index 1, *inserting* has to feed the still
+        // stage below it; *replacing* removes that stage, so what goes in has
+        // to feed the clip maker instead. Here the answers coincide…
+        let line = drawn(&["Restore Portrait", "Restore Portrait", "Photo to 5s Clip"]);
+        assert_eq!(
+            offered(&stage_options(&library(), &line, 1, Placement::Insert)),
+            ["Restore Portrait"]
+        );
+        // …and on a shorter line they come apart, which is the whole reason
+        // the two are different questions. image → image, at index 1:
+        let two = drawn(&["Restore Portrait", "Restore Portrait"]);
+        assert_eq!(
+            offered(&stage_options(&library(), &two, 1, Placement::Insert)),
+            ["Restore Portrait"],
+            "inserted above a still stage, it has to hand on a still"
+        );
+        assert_eq!(
+            offered(&stage_options(&library(), &two, 1, Placement::Replace)),
+            ["Photo to 5s Clip", "Restore Portrait", "Describe"],
+            "replacing the last stage, there is nothing below to satisfy"
+        );
+    }
+
+    /// The one case FR9 changes, pinned here so the change is visible.
+    ///
+    /// A describe stage reads a photograph and produces a sentence. Today
+    /// `validate_chain` refuses anything after it that wants a file, and the
+    /// picker refuses it too — which is the point: they agree. FR9 makes a
+    /// text-producing stage transparent to the media flow, and when it does,
+    /// this test is the one that says so, without a line of the picker moving.
+    #[test]
+    fn what_may_follow_a_describe_stage_is_whatever_validation_says_may() {
+        let line = drawn(&["Describe"]);
+        let options = stage_options(&library(), &line, 1, Placement::Insert);
+        for option in &options {
+            let chain = hypothetical(&line, 1, Placement::Insert, &option.candidate);
+            assert_eq!(
+                validate_chain(&chain).is_ok(),
+                option.offered(),
+                "{} after a describe stage",
+                option.candidate.name
+            );
+        }
+        // Pre-FR9 that means nothing follows it at all, because nothing in this
+        // library eats text.
+        assert!(offered(&options).is_empty());
+    }
+
+    #[test]
     fn the_picker_and_the_validator_cannot_disagree() {
-        // Every stage the picker offers after a given upstream is a stage
-        // `validate_chain` then accepts, and every one it refuses is one
-        // `validate_chain` refuses. Asked of every pair in the library, because
+        // Every stage the picker offers is one `validate_chain` then accepts,
+        // and every one it refuses is one `validate_chain` refuses — asked of
+        // every candidate at every position of every one-stage line, because
         // "they call the same function" is only worth saying if it is checked.
-        use crate::comfyui::line::{validate_chain, StageTyping};
-        for up in &library() {
-            let slot = Slot {
-                after: Some(up.produces),
-                before: None,
-            };
-            for option in stage_options(&library(), slot) {
-                let chain = [
-                    StageTyping {
-                        stage_idx: 0,
-                        name: up.name.clone(),
-                        accepts: up.accepts,
-                        produces: up.produces,
-                    },
-                    StageTyping {
-                        stage_idx: 1,
-                        name: option.candidate.name.clone(),
-                        accepts: option.candidate.accepts,
-                        produces: option.candidate.produces,
-                    },
-                ];
-                assert_eq!(
-                    validate_chain(&chain).is_ok(),
-                    option.offered(),
-                    "{} after {}: the picker and the validator disagree",
-                    option.candidate.name,
-                    up.name
-                );
+        for above in library() {
+            let line = vec![typing(0, &above)];
+            for placement in [Placement::Insert, Placement::Replace] {
+                for at in 0..=line.len() {
+                    for option in stage_options(&library(), &line, at, placement) {
+                        let chain = hypothetical(&line, at, placement, &option.candidate);
+                        assert_eq!(
+                            validate_chain(&chain).is_ok(),
+                            option.offered(),
+                            "{:?} {} at {} under {}: the picker and the validator disagree",
+                            placement,
+                            option.candidate.name,
+                            at,
+                            above.name
+                        );
+                    }
+                }
             }
         }
+    }
+
+    #[test]
+    fn a_stage_that_makes_no_file_does_not_interrupt_the_media_flow() {
+        // What the connector above a slot carries. A describe stage reads the
+        // photograph and hands on a sentence, so the stage after it is still
+        // reading the photograph — and the join says `image`, not `text`.
+        use MediaType::{Image, Text, Video};
+        assert_eq!(carried_into(&[]), None, "nothing above: the shot decides");
+        assert_eq!(carried_into(&[Image]), Some(Image));
+        assert_eq!(carried_into(&[Image, Text]), Some(Image));
+        assert_eq!(carried_into(&[Image, Text, Text]), Some(Image));
+        assert_eq!(carried_into(&[Image, Video, Text]), Some(Video));
+        // A line that has so far only described things is still reading the
+        // shot, so there is no join above the next stage to draw at all.
+        assert_eq!(carried_into(&[Text]), None);
     }
 
     // ----- Handoffs ---------------------------------------------------------
@@ -429,7 +572,7 @@ mod tests {
             MediaType::Image,
             vec![slot("4", LoaderKind::Image, SourceRole::Start)],
         );
-        let h = handoff(MediaType::Image, &down, None);
+        let h = handoff(MediaType::Image, &down, false, None);
         assert_eq!(h.resolved, "first_frame");
         assert!(h.modes.is_empty(), "there is no frame two of a JPEG");
         assert!(!h.is_a_question());
@@ -442,7 +585,7 @@ mod tests {
             MediaType::Video,
             vec![slot("7", LoaderKind::Video, SourceRole::Start)],
         );
-        let h = handoff(MediaType::Video, &down, None);
+        let h = handoff(MediaType::Video, &down, true, None);
         assert_eq!(h.resolved, "whole_video");
         assert!(h.modes.is_empty());
         assert!(!h.is_a_question());
@@ -461,14 +604,14 @@ mod tests {
                 slot("9", LoaderKind::Image, SourceRole::Reference),
             ],
         );
-        let h = handoff(MediaType::Video, &down, None);
+        let h = handoff(MediaType::Video, &down, true, None);
         assert_eq!(h.resolved, "whole_video", "the dispatcher's own default");
         assert_eq!(h.modes, [WHOLE_VIDEO, FIRST_FRAME, LAST_FRAME, AT_TIME]);
         assert!(h.is_a_question());
         // Choosing a frame moves the upload into the image loader, so the slot
         // it could fill changes with it.
         assert_eq!(h.roles, [SourceRole::Start], "the video loader's slot");
-        let framed = handoff(MediaType::Video, &down, Some("last_frame"));
+        let framed = handoff(MediaType::Video, &down, true, Some("last_frame"));
         assert_eq!(framed.resolved, "last_frame");
         assert_eq!(framed.roles, [SourceRole::Reference]);
     }
@@ -485,16 +628,36 @@ mod tests {
                 slot("5", LoaderKind::Image, SourceRole::End),
             ],
         );
-        let h = handoff(MediaType::Image, &down, None);
+        let h = handoff(MediaType::Image, &down, false, None);
         assert!(h.modes.is_empty(), "a still is a still");
         assert_eq!(h.roles, [SourceRole::Start, SourceRole::End]);
         assert!(h.is_a_question(), "which slot is a real choice");
     }
 
     #[test]
+    fn the_connector_asks_the_graph_what_it_can_load_not_the_contract() {
+        // A contract stored before loaders were recorded: it says it takes
+        // video and lists nothing. The graph underneath does have a video
+        // loader, and the dispatcher will read it there — so the connector has
+        // to say `whole video`, not `first frame`, or it promises a frame the
+        // run is never going to send.
+        let bare = contract(Accepts::Video, MediaType::Video, Vec::new());
+        assert_eq!(
+            handoff(MediaType::Video, &bare, true, None).resolved,
+            "whole_video"
+        );
+        // And with no video loader anywhere, the same contract resolves to the
+        // frame the dispatcher would actually extract.
+        assert_eq!(
+            handoff(MediaType::Video, &bare, false, None).resolved,
+            "first_frame"
+        );
+    }
+
+    #[test]
     fn a_graph_with_no_loader_at_all_still_answers() {
         let down = contract(Accepts::None, MediaType::Image, Vec::new());
-        let h = handoff(MediaType::Image, &down, None);
+        let h = handoff(MediaType::Image, &down, false, None);
         assert!(h.roles.is_empty());
         assert!(!h.is_a_question());
     }
@@ -528,7 +691,7 @@ mod tests {
                 slot("9", LoaderKind::Image, SourceRole::Start),
             ],
         );
-        for mode in handoff(MediaType::Video, &down, None).modes {
+        for mode in handoff(MediaType::Video, &down, true, None).modes {
             // `at_time` is the one the editor completes with a number.
             let spelling = if mode == AT_TIME {
                 "at_time:1500".to_string()

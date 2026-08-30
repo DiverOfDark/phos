@@ -6,11 +6,7 @@
     "license": {
       "name": "MIT"
     },
-<<<<<<< HEAD
-    "version": "feat/comfyui-prompt-compiler"
-=======
     "version": "feat/comfyui-line-editor"
->>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
   },
   "paths": {
     "/api/auth/callback": {
@@ -248,120 +244,6 @@
         ]
       }
     },
-    "/api/comfyui/describe": {
-      "post": {
-        "tags": [
-          "comfyui"
-        ],
-        "summary": "Describe a shot, and compile a prompt from it",
-        "description": "Run a describe workflow against one shot and compile a prompt from what it says, together with the person names, EXIF date and place, and caption the library already holds. Answers immediately from the shot's cached description unless `refresh` is set. The compiled prompt is meant to be shown and edited before the costly stage is queued.",
-        "operationId": "describe_shot",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DescribePayload"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "The description, or the run that will produce one",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DescribeResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "No workflow that produces text"
-          },
-          "404": {
-            "description": "Shot or workflow not found"
-          },
-          "503": {
-            "description": "ComfyUI not configured"
-          }
-        }
-      }
-    },
-    "/api/comfyui/describe/{shot_id}": {
-      "get": {
-        "tags": [
-          "comfyui"
-        ],
-        "summary": "The description a shot carries, and the prompt it compiles to",
-        "description": "Poll for a describe run, or read the description a shot already carries. `intent`, `style` and `do_not` re-compile the prompt without describing the photograph again.",
-        "operationId": "get_description",
-        "parameters": [
-          {
-            "name": "shot_id",
-            "in": "path",
-            "description": "Shot ID",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "intent",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          {
-            "name": "style",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          {
-            "name": "do_not",
-            "in": "query",
-            "description": "Constraints, one per line or separated by `;`.",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Where the description has got to",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DescribeResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Shot not found"
-          },
-          "503": {
-            "description": "ComfyUI not configured"
-          }
-        }
-      }
-    },
     "/api/comfyui/enhance": {
       "post": {
         "tags": [
@@ -385,7 +267,7 @@
             "description": "Enhancement task(s) queued"
           },
           "400": {
-            "description": "Unrecognised source_mode, one this workflow cannot take, or an unusable sweep"
+            "description": "Unrecognised source_mode, or an unusable sweep"
           },
           "404": {
             "description": "Shot or workflow not found"
@@ -405,7 +287,7 @@
           "comfyui"
         ],
         "summary": "Get shot generation history",
-        "description": "Returns the workflow, text overrides and typed parameters used to generate each non-original file for a shot.",
+        "description": "Returns the workflow and text overrides used to generate each non-original file for a shot.",
         "operationId": "comfyui_shot_generations",
         "parameters": [
           {
@@ -502,71 +384,19 @@
         }
       }
     },
-<<<<<<< HEAD
-    "/api/comfyui/lines/import": {
+    "/api/comfyui/lines/stage-options": {
       "post": {
         "tags": [
           "comfyui"
         ],
-        "summary": "Import a production line",
-        "description": "Read a line out of an exported bundle — the same format bundled templates ship in. Its workflows are created, or reused where an identical graph is already here, and its requirements are checked against what this ComfyUI has installed. A line whose nodes or models are missing is still imported; the response says what is missing. A name already in use is suffixed, never overwritten. Pass `dry_run=true` for the report alone.",
-        "operationId": "import_line",
-        "parameters": [
-          {
-            "name": "dry_run",
-            "in": "query",
-            "description": "Check the bundle and report what it needs, writing nothing. Defaults to\n`false`.",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
-          },
-          {
-            "name": "name",
-            "in": "query",
-            "description": "Name the imported line this rather than what the file calls it. A name\nalready in use is still suffixed rather than overwritten.",
-=======
-    "/api/comfyui/lines/stage-options": {
-      "get": {
-        "tags": [
-          "comfyui"
-        ],
         "summary": "Which workflows may go in one slot of a line",
-        "description": "Every workflow, marked with whether it may sit between what `after` produces and what `before` accepts. The refused ones come back too, each with the reason, so the editor can say what it is not offering and why. Both bounds are optional: no `after` is the first stage of a line, no `before` is the last.",
+        "description": "Send the line as it stands and the position being filled; every workflow comes back marked offered or refused. The verdict is `validate_chain` run over the line that each candidate would make, so a stage this offers can never be one that saving then refuses — and the refused ones come back too, each with the reason, so the editor can say what it is not offering and why.",
         "operationId": "list_stage_options",
-        "parameters": [
-          {
-            "name": "after",
-            "in": "query",
-            "description": "What the stage above this slot produces: `image`, `video` or `text`.\nOmit it for the first stage of a line, which has nothing above it.",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          {
-            "name": "before",
-            "in": "query",
-            "description": "What the stage below this slot accepts: `image`, `video`, `text` or\n`none`. Omit it for the last stage, which has nothing to satisfy.",
->>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          }
-        ],
-<<<<<<< HEAD
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/LineBundle"
+                "$ref": "#/components/schemas/StageOptionsPayload"
               }
             }
           },
@@ -574,17 +404,7 @@
         },
         "responses": {
           "200": {
-            "description": "The imported line, and what it needs"
-          },
-          "400": {
-            "description": "The file is not a readable line export, or its chain does not fit together here"
-=======
-        "responses": {
-          "200": {
             "description": "The workflows, offered or refused"
-          },
-          "400": {
-            "description": "`after` or `before` is not a type"
           },
           "503": {
             "description": "ComfyUI not configured"
@@ -631,7 +451,6 @@
         "responses": {
           "200": {
             "description": "Whether it holds together, and why not"
->>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
           },
           "503": {
             "description": "ComfyUI not configured"
@@ -748,16 +567,6 @@
         }
       }
     },
-<<<<<<< HEAD
-    "/api/comfyui/lines/{id}/export": {
-      "get": {
-        "tags": [
-          "comfyui"
-        ],
-        "summary": "Export a production line",
-        "description": "The line, its stages, the workflow graph behind every stage, and a manifest of the node classes and model files it needs — as one JSON document that can be imported into another library or another Phos install. This is the same format bundled templates ship in.",
-        "operationId": "export_line",
-=======
     "/api/comfyui/lines/{id}/duplicate": {
       "post": {
         "tags": [
@@ -766,7 +575,6 @@
         "summary": "Fork a production line",
         "description": "Copy a line and everything its stages carry — workflows, prompts, parameters, sweeps, source modes, keep flags and exposed keys — under a new name. The default way to get a line, and the way to change one that a run is currently walking.",
         "operationId": "duplicate_line",
->>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
         "parameters": [
           {
             "name": "id",
@@ -780,18 +588,7 @@
         ],
         "responses": {
           "200": {
-<<<<<<< HEAD
-            "description": "The line as a portable bundle",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LineBundle"
-                }
-              }
-            }
-=======
             "description": "The fork"
->>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
           },
           "404": {
             "description": "Line not found"
@@ -808,7 +605,7 @@
           "comfyui"
         ],
         "summary": "Get ComfyUI node definitions",
-        "description": "What ComfyUI says its installed node classes take: every input's name, type, default and range, and for an enum its contents — the checkpoints, samplers, schedulers and LoRAs installed on that server. Cached in memory for five minutes and re-read when ComfyUI comes back after being down; `refresh=true` re-reads it now. Always 200: a server that is unreachable or too old to have /object_info answers `available: false`, and the console falls back to plain text boxes.",
+        "description": "What ComfyUI says its installed node classes take: every input's name, type, default and range, and for an enum its contents — the checkpoints, samplers, schedulers and LoRAs installed on that server. Cached in memory and re-read when ComfyUI comes back after being down. Always 200: a server that is unreachable or too old to have /object_info answers `available: false`, and the console falls back to plain text boxes.",
         "operationId": "comfyui_nodes",
         "parameters": [
           {
@@ -821,15 +618,6 @@
                 "string",
                 "null"
               ]
-            }
-          },
-          {
-            "name": "refresh",
-            "in": "query",
-            "description": "Read `/object_info` from ComfyUI now instead of serving the cached\ncopy. For after installing a model or a node pack.",
-            "required": false,
-            "schema": {
-              "type": "boolean"
             }
           }
         ],
@@ -879,7 +667,7 @@
           {
             "name": "cursor",
             "in": "query",
-            "description": "Cursor: `next_cursor` from the previous page — `created_at|id` of its\nlast run. The id is the tie-breaker: a migrated backlog can put dozens\nof runs on the same second, and a timestamp alone would skip the rest\nof them.",
+            "description": "Cursor: `created_at` of the last run from the previous page",
             "required": false,
             "schema": {
               "type": [
@@ -1318,9 +1106,6 @@
           "404": {
             "description": "Workflow not found"
           },
-          "409": {
-            "description": "A production line still uses this workflow"
-          },
           "500": {
             "description": "Internal server error"
           },
@@ -1685,9 +1470,6 @@
           "404": {
             "description": "Face or target person not found"
           },
-          "409": {
-            "description": "Face is on a machine-generated file and cannot join the person model"
-          },
           "500": {
             "description": "Internal server error"
           }
@@ -1877,9 +1659,6 @@
           },
           "404": {
             "description": "File not found"
-          },
-          "409": {
-            "description": "File is machine-generated; faces on it are not accepted"
           },
           "500": {
             "description": "Internal server error"
@@ -3110,34 +2889,6 @@
           }
         }
       },
-      "Analysis": {
-        "type": "object",
-        "description": "The structured description a describe stage returns.\n\nStructured on purpose: a paragraph is a thing to read, and this is a thing\nto *use* — the fields are recombined per stage, the constraints become a\nnegative prompt, and the whole is cached and re-read by later runs.",
-        "properties": {
-          "camera": {
-            "type": "string"
-          },
-          "do_not": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "One constraint per entry. A model that answers with a single string\ninstead of a list is still answering; see [`StringOrList`]."
-          },
-          "lighting": {
-            "type": "string"
-          },
-          "motion_affordance": {
-            "type": "string"
-          },
-          "setting": {
-            "type": "string"
-          },
-          "subject": {
-            "type": "string"
-          }
-        }
-      },
       "AuthConfigResponse": {
         "type": "object",
         "description": "Response for the auth config endpoint.",
@@ -3206,8 +2957,7 @@
         "required": [
           "id",
           "is_original",
-          "thumbnail_url",
-          "synthetic"
+          "thumbnail_url"
         ],
         "properties": {
           "file_size": {
@@ -3228,10 +2978,6 @@
               "string",
               "null"
             ]
-          },
-          "synthetic": {
-            "type": "boolean",
-            "description": "A workflow made this file, not a camera. The client says so."
           },
           "thumbnail_url": {
             "type": "string"
@@ -3265,96 +3011,6 @@
               "string",
               "null"
             ]
-          }
-        }
-      },
-      "BundleLine": {
-        "type": "object",
-        "description": "The line itself. Stage order is array order — there is no `stage_idx`,\nbecause two sources of truth for one ordering is one too many.",
-        "required": [
-          "name",
-          "stages"
-        ],
-        "properties": {
-          "description": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "type": "string"
-          },
-          "stages": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/BundleStage"
-            }
-          }
-        }
-      },
-      "BundleStage": {
-        "type": "object",
-        "description": "One step of a line, as it travels.\n\nField for field this is what line CRUD already takes, with one difference:\n`workflow` is a key into this bundle's own `workflows` map rather than a\nlibrary id, because a library id is meaningless in the library it is being\ncarried to.",
-        "required": [
-          "workflow"
-        ],
-        "properties": {
-          "keep_output": {
-            "type": "boolean"
-          },
-          "parameters": {
-            "type": "object"
-          },
-          "source_mode": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "text_overrides": {
-            "type": "object",
-            "description": "Prompt bindings, plus the `role:<node_id>` directives the loader binder\nreads.",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "propertyNames": {
-              "type": "string"
-            }
-          },
-          "vary": {
-            "type": "object"
-          },
-          "workflow": {
-            "type": "string",
-            "description": "Which entry of `workflows` this stage runs. Any string: an export uses\nthe source library's workflow id, a hand-written template can use a\nreadable name."
-          }
-        }
-      },
-      "BundleWorkflow": {
-        "type": "object",
-        "description": "A workflow, carried whole.",
-        "required": [
-          "name",
-          "graph"
-        ],
-        "properties": {
-          "contract": {
-            "type": "object",
-            "description": "The contract this workflow carried where it came from.\n\nOptional, and re-derived on import against the *target* box's node\ncatalogue — only the `corrections` inside it survive verbatim, because a\ncorrection is the one part of a contract that cannot be worked out\nagain. A hand-written template can leave it out entirely."
-          },
-          "description": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "graph": {
-            "type": "object",
-            "description": "The ComfyUI API-format graph, exactly as the library stores it."
-          },
-          "name": {
-            "type": "string"
           }
         }
       },
@@ -3395,22 +3051,6 @@
           "version_name": {
             "type": "string",
             "description": "`versionName` of the bundled APK — a tag (`1.2.3`) or `master+<sha>`.\n\nEmpty when `available` is `false`. Display only: version *names* are not\nordered and must never be compared."
-          }
-        }
-      },
-      "CompiledPrompt": {
-        "type": "object",
-        "description": "The two strings a generation stage takes.",
-        "required": [
-          "positive",
-          "negative"
-        ],
-        "properties": {
-          "negative": {
-            "type": "string"
-          },
-          "positive": {
-            "type": "string"
           }
         }
       },
@@ -3506,146 +3146,6 @@
             "minimum": 0
           }
         }
-      },
-      "DescribePayload": {
-        "type": "object",
-        "description": "What the caller wants described, and what for.",
-        "required": [
-          "shot_id"
-        ],
-        "properties": {
-          "do_not": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "What the run must not do. Reaches the model as a rule and the generation\nstage as a negative prompt."
-          },
-          "intent": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The user's one line about what they are after."
-          },
-          "refresh": {
-            "type": "boolean",
-            "description": "Describe it again even though the shot already carries a description."
-          },
-          "shot_id": {
-            "type": "string"
-          },
-          "style": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "A style preset, in the preset's own words."
-          },
-          "workflow_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Which describe workflow to run. Omit it and the first workflow whose\ncontract says `produces: text` is used."
-          }
-        }
-      },
-      "DescribeResponse": {
-        "type": "object",
-        "description": "The description, the prompt it compiles to, and everything that went into\nboth — which is what makes the prompt correctable rather than magic.",
-        "required": [
-          "shot_id",
-          "state",
-          "cached",
-          "facts"
-        ],
-        "properties": {
-          "analysis": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Analysis",
-                "description": "Its structured form, when the model produced one."
-              }
-            ]
-          },
-          "cached": {
-            "type": "boolean",
-            "description": "Answered from `shots.analysis_json` rather than from a run."
-          },
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "facts": {
-            "$ref": "#/components/schemas/ShotFacts",
-            "description": "What Phos knew and the model could not see."
-          },
-          "instruction": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The instruction that was, or would be, sent into the describe workflow."
-          },
-          "prompt": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/CompiledPrompt",
-                "description": "The two strings a generation stage takes. Editable: the dialog sends\nwhatever the person left in the box as an ordinary `text_overrides`\nentry."
-              }
-            ]
-          },
-          "run_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "shot_id": {
-            "type": "string"
-          },
-          "state": {
-            "$ref": "#/components/schemas/DescribeState"
-          },
-          "task_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "text": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Exactly what the describe stage published, unedited."
-          },
-          "workflow_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        }
-      },
-      "DescribeState": {
-        "type": "string",
-        "description": "Where the description for one shot has got to.",
-        "enum": [
-          "none",
-          "running",
-          "ready",
-          "failed"
-        ]
       },
       "EnhancePayload": {
         "type": "object",
@@ -3944,75 +3444,6 @@
           }
         }
       },
-      "Intent": {
-        "type": "object",
-        "description": "What the person asked for, as opposed to what is in the photograph.",
-        "properties": {
-          "do_not": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "What the run must not do. Reaches the model as a rule *and* the\ngeneration stage as a negative prompt, because a model told not to do\nsomething is not the same as a sampler steered away from it."
-          },
-          "intent": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "One line: \"a slow push-in as the light fades\"."
-          },
-          "style": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "A style preset: \"35mm film, muted palette\"."
-          }
-        }
-      },
-      "LineBundle": {
-        "type": "object",
-        "description": "A line, its stages, its workflows and what it needs installed.",
-        "required": [
-          "line"
-        ],
-        "properties": {
-          "exported_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "When it left, for a human reading the file. Never read by the importer."
-          },
-          "format": {
-            "type": "string",
-            "description": "Always [`BUNDLE_FORMAT`]."
-          },
-          "format_version": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "line": {
-            "$ref": "#/components/schemas/BundleLine"
-          },
-          "requirements": {
-            "$ref": "#/components/schemas/Requirements",
-            "description": "What this line needs installed, as computed where it was exported.\n\nDocumentation, not input: the importer recomputes it from the graphs in\nthis same file, so a stale or hand-edited manifest cannot make an import\nreport something untrue."
-          },
-          "workflows": {
-            "type": "object",
-            "description": "Every workflow the stages name, keyed by whatever they name it.",
-            "additionalProperties": {
-              "$ref": "#/components/schemas/BundleWorkflow"
-            },
-            "propertyNames": {
-              "type": "string"
-            }
-          }
-        }
-      },
       "LinePayload": {
         "type": "object",
         "required": [
@@ -4128,26 +3559,6 @@
             "type": "string"
           },
           "target_id": {
-            "type": "string"
-          }
-        }
-      },
-      "ModelRef": {
-        "type": "object",
-        "description": "One weights file a graph names, and where it names it.\n\nThe node class and field are carried because \"sd_xl.safetensors is missing\"\nis not actionable and \"CheckpointLoaderSimple wants sd_xl.safetensors in\nckpt_name\" is: it says which of ComfyUI's model directories to put it in.",
-        "required": [
-          "class_type",
-          "field",
-          "name"
-        ],
-        "properties": {
-          "class_type": {
-            "type": "string"
-          },
-          "field": {
-            "type": "string"
-          },
-          "name": {
             "type": "string"
           }
         }
@@ -4464,70 +3875,6 @@
           }
         }
       },
-      "Requirements": {
-        "type": "object",
-        "description": "What a line needs installed on the ComfyUI that will run it.",
-        "properties": {
-          "models": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModelRef"
-            },
-            "description": "Every weights file the graphs name, sorted."
-          },
-          "node_classes": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Every distinct `class_type` in the line's graphs, sorted."
-          }
-        }
-      },
-      "RequirementsReport": {
-        "type": "object",
-        "description": "What the catalogue said, and what is missing.\n\nNever a refusal on its own: an import goes through with things missing, so a\nline can be filed on the box that stores the library and run on the box that\nhas the GPU. The report is what the person acts on.",
-        "required": [
-          "checked",
-          "missing_nodes",
-          "missing_models",
-          "unverified_models",
-          "warnings"
-        ],
-        "properties": {
-          "checked": {
-            "type": "boolean",
-            "description": "False when there was no catalogue to check against."
-          },
-          "missing_models": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModelRef"
-            },
-            "description": "Weights files this ComfyUI's own enum of installed files does not list."
-          },
-          "missing_nodes": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Node classes this ComfyUI does not have. Naming them is the whole point."
-          },
-          "unverified_models": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModelRef"
-            },
-            "description": "Weights files that could be neither confirmed nor denied."
-          },
-          "warnings": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          }
-        }
-      },
       "S3Settings": {
         "type": "object",
         "required": [
@@ -4761,54 +4108,6 @@
           }
         }
       },
-      "ShotFacts": {
-        "type": "object",
-        "description": "What the library already holds about one photograph.\n\nEvery field is what a vision model cannot get from the pixels: who these\npeople are, when this was, where it was, and the caption search already\nmatches on. Read from the database by [`shot_facts`]; a pure value here so\nthe wording can be exercised without one.",
-        "required": [
-          "people"
-        ],
-        "properties": {
-          "caption": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The Florence-2 library caption from `shots.description`. Read as one\ninput among several: it is what search matches on, and it is emphatically\nnot the prompt."
-          },
-          "people": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "The named people clustered onto this shot, primary person first.\nUnnamed clusters are left out: \"person 4f2a\" helps nobody."
-          },
-          "place": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": false,
-            "prefixItems": [
-              {
-                "type": "number",
-                "format": "float"
-              },
-              {
-                "type": "number",
-                "format": "float"
-              }
-            ],
-            "description": "EXIF coordinates. Phos has no geocoder, so this is degrees and says so\n— a model that recognises the place from the pixels can still use them\nas corroboration."
-          },
-          "taken_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The EXIF capture time, as stored (`YYYY-MM-DD HH:MM:SS`)."
-          }
-        }
-      },
       "SimilarGroupsResponse": {
         "type": "object",
         "required": [
@@ -4944,6 +4243,31 @@
           }
         }
       },
+      "StageOptionsPayload": {
+        "type": "object",
+        "description": "The draft being edited, and where in it a stage is going.\n\nThe whole draft rather than the two types either side of the slot, because\nwhether a stage fits is a question about the *line*: a stage that makes no\nfile is transparent to what flows past it, so the join above position 3 is\nnot necessarily what stage 2 produced. Sending the line and letting\n`validate_chain` answer is the only shape that cannot fall behind that rule.",
+        "properties": {
+          "at": {
+            "type": "integer",
+            "description": "The position being filled, 0-based.",
+            "minimum": 0
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`insert` (the default) pushes whatever is at `at` down; `replace` puts\nthe candidate in its place."
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The workflow ids of the line as it stands, in order. Empty for a line\nwith no stages yet."
+          }
+        }
+      },
       "StartRunPayload": {
         "type": "object",
         "description": "What starts a run.\n\nFR7 adds a query in place of `shot_id` and a cursor beside it; the handler\nis already written around \"which shots does this ask for\", so that is a new\nfield rather than a new endpoint.",
@@ -5076,8 +4400,10 @@
           },
           "values": {
             "type": "array",
-            "items": {},
-            "description": "Run exactly these values, in this order.\n\nAny scalar JSON value: `[4.0, 6.0, 8.0]` for a cfg,\n`[\"sd15.safetensors\", \"sdxl.safetensors\"]` for a checkpoint. Declared\nas unconstrained values, not objects — `Vec<Object>` would make a\ngenerated client refuse every valid list."
+            "items": {
+              "type": "object"
+            },
+            "description": "Run exactly these values, in this order."
           }
         }
       },

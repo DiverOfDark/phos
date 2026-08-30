@@ -63,6 +63,10 @@ pub(crate) struct StageRow {
     /// Keys this stage leaves to whoever sends it — the *exposed* disposition.
     /// Everything else the stage carries is a decision it made.
     pub exposed: Vec<String>,
+    /// Whether the graph has a loader that can read a clip, taken off the graph
+    /// the way the dispatcher takes it. The contract's roles usually say the
+    /// same thing, but one stored before loaders were recorded says nothing.
+    pub takes_video: bool,
     pub contract: StageContract,
 }
 
@@ -219,6 +223,9 @@ pub(crate) fn stages_of_line(
             source_mode: r.6,
             keep_output: r.7,
             exposed: serde_json::from_str(&r.8).unwrap_or_default(),
+            takes_video: serde_json::from_str::<serde_json::Value>(&r.10)
+                .map(|g| super::loaders::takes_video(&g))
+                .unwrap_or(false),
             contract: contract_of(r.9.as_deref(), &r.10),
         })
         .collect())
@@ -505,10 +512,6 @@ pub(crate) fn start_line_run(
 
     let stage_count = stages.len() as i32;
     conn.transaction::<_, diesel::result::Error, _>(|conn| {
-<<<<<<< HEAD
-        let run_id = open_run(conn, Some(line_id), shot_id, &label, stage_count)?;
-        let plan = stages[0].plan_for(conn, shot_id);
-=======
         let run_id = open_run(
             conn,
             Some(line_id),
@@ -517,13 +520,12 @@ pub(crate) fn start_line_run(
             stage_count,
             stage_values.as_deref(),
         )?;
-        let mut plan = stages[0].plan();
+        let mut plan = stages[0].plan_for(conn, shot_id);
         // Already checked above, so this cannot refuse; applied again because
         // the plan is rebuilt inside the transaction.
         if let Some(supplied) = answers.get("0") {
             let _ = plan.accept(&stages[0].exposed, supplied);
         }
->>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
         let task_ids = queue_stage(conn, &run_id, shot_id, &plan, None, None)
             .map_err(|e| diesel::result::Error::QueryBuilderError(e.into()))?;
         Ok(RunStart {
@@ -668,7 +670,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn a_lines_sweeps_may_not_multiply_past_the_cap() {
         let (_dir, mut conn) = library();
         // Each stage's sweep of 16 passes alone; 16 × 16 = 256 leaves does not.
@@ -681,7 +682,26 @@ mod tests {
                      '{{\"3.seed\":{{\"count\":16,\"mode\":\"increment\"}}}}'), \
                     ('st-2', 'line-1', 1, 'wf-2', '{{\"3.seed\":1}}', \
                      '{{\"3.seed\":{{\"count\":16,\"mode\":\"increment\"}}}}');
-=======
+             INSERT INTO shots (id) VALUES ('shot-1');
+             INSERT INTO files (id, shot_id, path, hash, mime_type, is_original) \
+             VALUES ('file-1', 'shot-1', 'a.jpg', 'h1', 'image/jpeg', 1);",
+            g = IMAGE_GRAPH.replace('\'', "''")
+        ))
+        .unwrap();
+
+        let err =
+            start_line_run(&mut conn, "line-1", "shot-1", &SuppliedByStage::new()).unwrap_err();
+        assert!(
+            matches!(&err, StartError::Rejected(e) if e.stage_idx == 1
+                && e.message.contains("multiply to 256 takes")),
+            "{}",
+            err
+        );
+        let runs_count: i64 = runs::table.count().get_result(&mut conn).unwrap();
+        assert_eq!(runs_count, 0, "refused before anything was queued");
+    }
+
+    #[test]
     fn a_stage_gets_the_answers_it_asked_for_and_refuses_the_ones_it_did_not() {
         let (_dir, mut conn) = library();
         conn.batch_execute(&format!(
@@ -692,7 +712,6 @@ mod tests {
              VALUES ('st-1', 'line-1', 0, 'wf-1', '{{\"3.seed\":1000,\"3.steps\":20}}', \
                      '[\"3.seed\"]'),
                     ('st-2', 'line-1', 1, 'wf-2', '{{}}', '[\"3.cfg\"]');
->>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
              INSERT INTO shots (id) VALUES ('shot-1');
              INSERT INTO files (id, shot_id, path, hash, mime_type, is_original) \
              VALUES ('file-1', 'shot-1', 'a.jpg', 'h1', 'image/jpeg', 1);",
@@ -700,17 +719,6 @@ mod tests {
         ))
         .unwrap();
 
-<<<<<<< HEAD
-        let err = start_line_run(&mut conn, "line-1", "shot-1").unwrap_err();
-        assert!(
-            matches!(&err, StartError::Rejected(e) if e.stage_idx == 1
-                && e.message.contains("multiply to 256 takes")),
-            "{}",
-            err
-        );
-        let runs_count: i64 = runs::table.count().get_result(&mut conn).unwrap();
-        assert_eq!(runs_count, 0, "refused before anything was queued");
-=======
         // What the line pins is not askable, and saying so is the answer.
         let mut refused = SuppliedByStage::new();
         refused.insert(
@@ -809,7 +817,6 @@ mod tests {
         plan.accept(&["3.seed".to_string()], &supplied).unwrap();
         assert_eq!(plan.parameters["3.seed"], serde_json::json!(42));
         assert!(plan.vary.is_empty(), "an answer is a value, not an axis");
->>>>>>> c2f3a68 (feat(api): serve the four questions that building a line asks)
     }
 
     #[test]
