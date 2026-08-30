@@ -191,6 +191,7 @@ use utoipa::OpenApi;
             lines::LinePayload,
             lines::LineStagePayload,
             lines::StartRunPayload,
+            line_editor::StageOptionsPayload,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
@@ -561,7 +562,7 @@ pub fn create_router(state: AppState) -> Router {
         // Production lines: a chain of workflows, and the runs that walk one.
         .route(
             "/api/comfyui/lines/stage-options",
-            get(line_editor::list_stage_options),
+            post(line_editor::list_stage_options),
         )
         .route(
             "/api/comfyui/lines/validate",

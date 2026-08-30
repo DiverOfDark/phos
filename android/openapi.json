@@ -385,45 +385,26 @@
       }
     },
     "/api/comfyui/lines/stage-options": {
-      "get": {
+      "post": {
         "tags": [
           "comfyui"
         ],
         "summary": "Which workflows may go in one slot of a line",
-        "description": "Every workflow, marked with whether it may sit between what `after` produces and what `before` accepts. The refused ones come back too, each with the reason, so the editor can say what it is not offering and why. Both bounds are optional: no `after` is the first stage of a line, no `before` is the last.",
+        "description": "Send the line as it stands and the position being filled; every workflow comes back marked offered or refused. The verdict is `validate_chain` run over the line that each candidate would make, so a stage this offers can never be one that saving then refuses — and the refused ones come back too, each with the reason, so the editor can say what it is not offering and why.",
         "operationId": "list_stage_options",
-        "parameters": [
-          {
-            "name": "after",
-            "in": "query",
-            "description": "What the stage above this slot produces: `image`, `video` or `text`.\nOmit it for the first stage of a line, which has nothing above it.",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StageOptionsPayload"
+              }
             }
           },
-          {
-            "name": "before",
-            "in": "query",
-            "description": "What the stage below this slot accepts: `image`, `video`, `text` or\n`none`. Omit it for the last stage, which has nothing to satisfy.",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          }
-        ],
+          "required": true
+        },
         "responses": {
           "200": {
             "description": "The workflows, offered or refused"
-          },
-          "400": {
-            "description": "`after` or `before` is not a type"
           },
           "503": {
             "description": "ComfyUI not configured"
@@ -4259,6 +4240,31 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "StageOptionsPayload": {
+        "type": "object",
+        "description": "The draft being edited, and where in it a stage is going.\n\nThe whole draft rather than the two types either side of the slot, because\nwhether a stage fits is a question about the *line*: a stage that makes no\nfile is transparent to what flows past it, so the join above position 3 is\nnot necessarily what stage 2 produced. Sending the line and letting\n`validate_chain` answer is the only shape that cannot fall behind that rule.",
+        "properties": {
+          "at": {
+            "type": "integer",
+            "description": "The position being filled, 0-based.",
+            "minimum": 0
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`insert` (the default) pushes whatever is at `at` down; `replace` puts\nthe candidate in its place."
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The workflow ids of the line as it stands, in order. Empty for a line\nwith no stages yet."
           }
         }
       },

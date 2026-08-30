@@ -62,6 +62,10 @@ pub(crate) struct StageRow {
     /// Keys this stage leaves to whoever sends it — the *exposed* disposition.
     /// Everything else the stage carries is a decision it made.
     pub exposed: Vec<String>,
+    /// Whether the graph has a loader that can read a clip, taken off the graph
+    /// the way the dispatcher takes it. The contract's roles usually say the
+    /// same thing, but one stored before loaders were recorded says nothing.
+    pub takes_video: bool,
     pub contract: StageContract,
 }
 
@@ -205,6 +209,9 @@ pub(crate) fn stages_of_line(
             source_mode: r.6,
             keep_output: r.7,
             exposed: serde_json::from_str(&r.8).unwrap_or_default(),
+            takes_video: serde_json::from_str::<serde_json::Value>(&r.10)
+                .map(|g| super::loaders::takes_video(&g))
+                .unwrap_or(false),
             contract: contract_of(r.9.as_deref(), &r.10),
         })
         .collect())
