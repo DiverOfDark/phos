@@ -1,0 +1,91 @@
+{
+  "format": "phos.line",
+  "format_version": 1,
+  "template": {
+    "key": "restore-upscale",
+    "version": 1,
+    "confidence": "high",
+    "summary": "A photograph, run through a 4x ESRGAN-family upscaler.",
+    "notes": "Core ComfyUI nodes only. Install an upscale model into models/upscale_models; any 4x ESRGAN-family .pth works once you point the loader at it."
+  },
+  "line": {
+    "name": "Restore & Upscale",
+    "description": "One stage: a photograph at four times the size.",
+    "stages": [
+      {
+        "workflow": "upscale",
+        "keep_output": true
+      }
+    ]
+  },
+  "workflows": {
+    "upscale": {
+      "name": "Restore & Upscale 4x",
+      "description": "LoadImage -> ImageUpscaleWithModel -> SaveImage. Image in, image out, four times the pixels.",
+      "graph": {
+        "1": {
+          "class_type": "LoadImage",
+          "_meta": {
+            "title": "Source photograph"
+          },
+          "inputs": {
+            "image": "phos-source.png"
+          }
+        },
+        "2": {
+          "class_type": "UpscaleModelLoader",
+          "_meta": {
+            "title": "Upscale model"
+          },
+          "inputs": {
+            "model_name": "4x-UltraSharp.pth"
+          }
+        },
+        "3": {
+          "class_type": "ImageUpscaleWithModel",
+          "_meta": {
+            "title": "Upscale 4x"
+          },
+          "inputs": {
+            "upscale_model": [
+              "2",
+              0
+            ],
+            "image": [
+              "1",
+              0
+            ]
+          }
+        },
+        "4": {
+          "class_type": "SaveImage",
+          "_meta": {
+            "title": "Save"
+          },
+          "inputs": {
+            "images": [
+              "3",
+              0
+            ],
+            "filename_prefix": "phos/restore-upscale"
+          }
+        }
+      }
+    }
+  },
+  "requirements": {
+    "node_classes": [
+      "ImageUpscaleWithModel",
+      "LoadImage",
+      "SaveImage",
+      "UpscaleModelLoader"
+    ],
+    "models": [
+      {
+        "class_type": "UpscaleModelLoader",
+        "field": "model_name",
+        "name": "4x-UltraSharp.pth"
+      }
+    ]
+  }
+}

@@ -7,6 +7,7 @@ mod people;
 pub mod settings;
 mod shots;
 mod stats;
+mod templates;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -114,6 +115,9 @@ use utoipa::OpenApi;
         lines::get_run,
         lines::retry_run,
         lines::cancel_run,
+        // Bundled templates
+        templates::list_templates,
+        templates::install_template,
         // Settings
         settings::get_webdav_settings,
         settings::set_webdav_settings,
@@ -186,6 +190,17 @@ use utoipa::OpenApi;
             lines::LinePayload,
             lines::LineStagePayload,
             lines::StartRunPayload,
+            // Bundled templates
+            crate::comfyui::templates::Confidence,
+            crate::comfyui::templates::Readiness,
+            crate::comfyui::templates::ReadinessState,
+            crate::comfyui::templates::bundle::Requirements,
+            crate::comfyui::templates::bundle::ModelRef,
+            crate::comfyui::templates::bundle::Template,
+            crate::comfyui::templates::readiness::RequirementsReport,
+            crate::comfyui::templates::readiness::InputMismatch,
+            crate::comfyui::templates::install::InstalledState,
+            crate::comfyui::templates::install::InstalledWorkflow,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
@@ -319,6 +334,9 @@ async fn get_or_create_user_pool(
         tracing::error!("Failed to run migrations for user {}: {}", user_sub, e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    // Every library gets the bundled lines, including one that comes into
+    // existence on somebody's first request rather than at startup.
+    crate::comfyui::templates::seed_pool(&pool, user_sub);
     pools.insert(user_sub.to_string(), pool.clone());
     drop(pools);
 
@@ -571,6 +589,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/comfyui/runs/{id}", get(lines::get_run))
         .route("/api/comfyui/runs/{id}/retry", post(lines::retry_run))
         .route("/api/comfyui/runs/{id}/cancel", post(lines::cancel_run))
+        // Bundled templates: the five lines a fresh install already has.
+        .route("/api/comfyui/templates", get(templates::list_templates))
+        .route(
+            "/api/comfyui/templates/{key}/install",
+            post(templates::install_template),
+        )
         .route("/api/version", get(stats::get_version))
         // Settings
         .route(

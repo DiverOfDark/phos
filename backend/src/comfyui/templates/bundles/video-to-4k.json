@@ -1,0 +1,102 @@
+{
+  "format": "phos.line",
+  "format_version": 1,
+  "template": {
+    "key": "video-to-4k",
+    "version": 1,
+    "confidence": "unverified",
+    "summary": "Every frame of a clip through a 4x upscaler, re-encoded as h264.",
+    "notes": "Core upscale nodes, ComfyUI-VideoHelperSuite for reading and writing the clip. The source is resampled to 30 fps on load and written back at 30 fps, so the result plays at the same speed whatever the input rate was. Audio is not carried through."
+  },
+  "line": {
+    "name": "Video to 4K",
+    "description": "One stage: a clip in, the same clip four times the size.",
+    "stages": [
+      {
+        "workflow": "upscale-video",
+        "keep_output": true
+      }
+    ]
+  },
+  "workflows": {
+    "upscale-video": {
+      "name": "Video to 4K",
+      "description": "VHS_LoadVideo -> ImageUpscaleWithModel -> VHS_VideoCombine at 30 fps.",
+      "graph": {
+        "1": {
+          "class_type": "VHS_LoadVideo",
+          "_meta": {
+            "title": "Source clip"
+          },
+          "inputs": {
+            "video": "phos-source.mp4",
+            "force_rate": 30,
+            "custom_width": 0,
+            "custom_height": 0,
+            "frame_load_cap": 0,
+            "skip_first_frames": 0,
+            "select_every_nth": 1
+          }
+        },
+        "2": {
+          "class_type": "UpscaleModelLoader",
+          "_meta": {
+            "title": "Upscale model"
+          },
+          "inputs": {
+            "model_name": "4x-UltraSharp.pth"
+          }
+        },
+        "3": {
+          "class_type": "ImageUpscaleWithModel",
+          "_meta": {
+            "title": "Upscale every frame"
+          },
+          "inputs": {
+            "upscale_model": [
+              "2",
+              0
+            ],
+            "image": [
+              "1",
+              0
+            ]
+          }
+        },
+        "4": {
+          "class_type": "VHS_VideoCombine",
+          "_meta": {
+            "title": "Write the clip"
+          },
+          "inputs": {
+            "images": [
+              "3",
+              0
+            ],
+            "frame_rate": 30,
+            "loop_count": 0,
+            "filename_prefix": "phos/video-to-4k",
+            "format": "video/h264-mp4",
+            "pingpong": false,
+            "save_output": true
+          }
+        }
+      }
+    }
+  },
+  "requirements": {
+    "node_classes": [
+      "ImageUpscaleWithModel",
+      "UpscaleModelLoader",
+      "VHS_LoadVideo",
+      "VHS_VideoCombine"
+    ],
+    "models": [
+      {
+        "class_type": "UpscaleModelLoader",
+        "field": "model_name",
+        "name": "4x-UltraSharp.pth"
+      }
+    ]
+  }
+}

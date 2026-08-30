@@ -16,6 +16,8 @@ import {
   runCount,
   formatDuration,
   stageOf,
+  readinessColor,
+  installedLabel,
   MAX_SAFE_SEED,
 } from "./utils.js";
 
@@ -159,4 +161,31 @@ test("a run says which stage of how many, counting from one", () => {
   assert.equal(stageOf({ current_stage: 1, stage_count: 4, status: "failed" }), "2/4");
   // A lone workflow is a one-stage run, and reads as one.
   assert.equal(stageOf({ current_stage: 0, stage_count: 1, status: "running" }), "1/1");
+});
+
+test("a template's readiness is painted from the status palette", () => {
+  assert.equal(readinessColor("ready"), "var(--status-ready)");
+  assert.equal(readinessColor("missing"), "var(--status-error)");
+  assert.equal(readinessColor("degraded"), "var(--status-degraded)");
+  // Not knowing is neutral, not red: the catalogue could not be read, which is
+  // not evidence that anything is wrong.
+  assert.equal(readinessColor("unchecked"), "var(--status-stopped)");
+  assert.equal(readinessColor(undefined), "var(--status-stopped)");
+});
+
+test("a template says whether it is installed, and whether it is still ours to update", () => {
+  assert.equal(installedLabel({ version: 1 }), "NOT INSTALLED");
+  assert.equal(
+    installedLabel({ version: 2, installed: { version: 2, line_exists: true, customised: false } }),
+    "INSTALLED v2",
+  );
+  // The one that matters: an edited template is the user's, for good.
+  assert.equal(
+    installedLabel({ version: 2, installed: { version: 1, line_exists: true, customised: true } }),
+    "EDITED \u00b7 NOT UPDATED",
+  );
+  assert.equal(
+    installedLabel({ version: 1, installed: { version: 1, line_exists: false, customised: false } }),
+    "LINE DELETED",
+  );
 });
