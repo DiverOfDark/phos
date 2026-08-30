@@ -9,7 +9,7 @@ mod line_io;
 mod lines;
 mod people;
 pub mod settings;
-mod shots;
+pub(crate) mod shots;
 mod stats;
 
 use axum::{

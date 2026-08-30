@@ -98,7 +98,17 @@
 //!   the two strings the stage after it takes. Binding it there is one `text_overrides` entry, because FR5a keys
 //!   prompt slots by exactly the key [`workflow::prepare_workflow`] substitutes
 //!   on.
+//! * **A line can be pointed at a library, not a shot.** A *batch* is a query
+//!   plus a line plus a cursor: [`batch`] re-asks the query each tick, opens
+//!   runs for the next handful, and never inserts fifty thousand rows at once.
+//!   That is what makes STOP instant and the board fast, and it is why a batch
+//!   picks up shots imported after it was sent. The guardrails — a confirm
+//!   sheet before anything queues, a daily cap, a window, a disk floor, and a
+//!   cap on how many runs may sit held at once — are the feature, not settings
+//!   for later: at this scale the failure mode is not a crash, it is generating
+//!   more than anyone will ever look at.
 
+pub mod batch;
 mod client;
 pub mod contract;
 pub mod editor;

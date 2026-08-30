@@ -1,6 +1,33 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
+    batches (id) {
+        id -> Text,
+        line_id -> Text,
+        label -> Text,
+        selection_json -> Text,
+        stage_values -> Nullable<Text>,
+        status -> Text,
+        paused_reason -> Nullable<Text>,
+        skip_if_generated -> Bool,
+        cursor_key -> Nullable<Text>,
+        cursor_shot_id -> Nullable<Text>,
+        matched_total -> Nullable<Integer>,
+        skipped_total -> Nullable<Integer>,
+        est_tasks -> Nullable<Integer>,
+        est_gpu_seconds -> Nullable<Integer>,
+        est_disk_bytes -> Nullable<BigInt>,
+        daily_task_cap -> Nullable<Integer>,
+        window_start_minute -> Nullable<Integer>,
+        window_end_minute -> Nullable<Integer>,
+        disk_floor_bytes -> Nullable<BigInt>,
+        max_outstanding_holds -> Nullable<Integer>,
+        created_at -> Nullable<Timestamp>,
+        finished_at -> Nullable<Timestamp>,
+    }
+}
+
+diesel::table! {
     comfyui_workflows (id) {
         id -> Text,
         name -> Text,
@@ -147,6 +174,19 @@ diesel::table! {
         finished_at -> Nullable<Timestamp>,
         stage_values -> Nullable<Text>,
         held_at_stage -> Nullable<Integer>,
+        batch_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    saved_selections (id) {
+        id -> Text,
+        name -> Text,
+        line_id -> Nullable<Text>,
+        selection_json -> Text,
+        caps_json -> Nullable<Text>,
+        skip_if_generated -> Bool,
+        created_at -> Nullable<Timestamp>,
     }
 }
 
@@ -206,6 +246,7 @@ diesel::joinable!(files -> shots (shot_id));
 diesel::joinable!(line_stages -> comfyui_workflows (workflow_id));
 diesel::joinable!(line_stages -> production_lines (line_id));
 diesel::joinable!(run_holds -> runs (run_id));
+diesel::joinable!(runs -> batches (batch_id));
 diesel::joinable!(runs -> production_lines (line_id));
 diesel::joinable!(runs -> shots (shot_id));
 diesel::joinable!(shots -> people (primary_person_id));
@@ -213,6 +254,7 @@ diesel::joinable!(video_keyframes -> files (video_file_id));
 diesel::joinable!(workflow_presets -> comfyui_workflows (workflow_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
+    batches,
     comfyui_workflows,
     enhancement_tasks,
     faces,
@@ -223,6 +265,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     production_lines,
     run_holds,
     runs,
+    saved_selections,
     settings,
     shots,
     video_keyframes,

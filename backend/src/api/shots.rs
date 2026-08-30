@@ -45,13 +45,106 @@ pub(super) struct SimilarShotsGrouped {
     shots: Vec<SimilarShotItem>,
 }
 
-#[derive(Deserialize, utoipa::IntoParams)]
-pub(super) struct ShotsQuery {
-    q: Option<String>,
-    person_id: Option<String>,
-    status: Option<String>,
-    from: Option<String>,
-    to: Option<String>,
+/// What a person means by "these shots".
+///
+/// This is the *only* filter language in Phos, and FR7's batches reuse it
+/// wholesale rather than growing a second one: a batch is this query plus a
+/// line plus a cursor. Every field is optional and they are ANDed, so an empty
+/// query is the whole library — which is why the batch endpoints make you
+/// confirm a count before anything is queued.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, utoipa::IntoParams, ToSchema)]
+pub struct ShotsQuery {
+    /// Free text: matches a file's path or the shot's description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    /// Exact match on the shot's primary person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_id: Option<String>,
+    /// Review status, or the magic value `unsorted` for "belongs to nobody".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Inclusive lower bound on the shot's timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Inclusive upper bound on the shot's timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+}
+
+/// Turn a query into `WHERE` fragments over `shots s`, appending each one's
+/// binds in the order the `?N` placeholders name them.
+///
+/// Split out of [`get_shots`] so that the batch selector can add its own
+/// conditions (a cursor, an already-generated filter) to the same list rather
+/// than reimplementing the filter language. The caller owns `conditions` and
+/// `binds`, so it decides what else is ANDed in and in what order — the only
+/// contract is that a fragment's `?N` refers to `binds[N-1]`.
+pub(crate) fn shot_conditions(
+    params: &ShotsQuery,
+    conditions: &mut Vec<String>,
+    binds: &mut Vec<String>,
+) {
+    if let Some(ref person_id) = params.person_id {
+        binds.push(person_id.clone());
+        conditions.push(format!("s.primary_person_id = ?{}", binds.len()));
+    }
+
+    if let Some(ref status) = params.status {
+        if status == "unsorted" {
+            // A shot pointing at a person row that is gone is owned by nobody:
+            // it shows in no person's list, so it has to show in this one. Same
+            // rule as `people::browse_graph` and the organize stats.
+            conditions.push(
+                "(s.primary_person_id IS NULL OR NOT EXISTS \
+                 (SELECT 1 FROM people pu WHERE pu.id = s.primary_person_id)) \
+                 AND EXISTS (SELECT 1 FROM files fu WHERE fu.shot_id = s.id)"
+                    .to_string(),
+            );
+        } else {
+            binds.push(status.clone());
+            conditions.push(format!("s.review_status = ?{}", binds.len()));
+        }
+    }
+
+    if let Some(ref q) = params.q {
+        let pattern = format!("%{}%", q);
+        binds.push(pattern.clone());
+        let idx1 = binds.len();
+        binds.push(pattern);
+        let idx2 = binds.len();
+        conditions.push(format!(
+            "(EXISTS (SELECT 1 FROM files fq WHERE fq.shot_id = s.id AND fq.path LIKE ?{}) OR s.description LIKE ?{})",
+            idx1, idx2
+        ));
+    }
+
+    if let Some(ref from) = params.from {
+        binds.push(from.clone());
+        conditions.push(format!("s.timestamp >= ?{}", binds.len()));
+    }
+
+    if let Some(ref to) = params.to {
+        binds.push(to.clone());
+        conditions.push(format!("s.timestamp <= ?{}", binds.len()));
+    }
+}
+
+/// Bind an arbitrary number of text parameters onto a raw query.
+///
+/// `sql_query(..).bind(..)` changes its own static type on every call, so a
+/// loop needs the boxed form. This used to be a `match` on the bind count with
+/// one arm per arity and a `_` arm that silently dropped anything past the
+/// sixth — a ceiling FR7's extra conditions would have walked straight into.
+pub(crate) fn bind_text_all(
+    sql: &str,
+    binds: Vec<String>,
+) -> diesel::query_builder::BoxedSqlQuery<'static, diesel::sqlite::Sqlite, diesel::query_builder::SqlQuery>
+{
+    let mut query = diesel::sql_query(sql.to_string()).into_boxed();
+    for value in binds {
+        query = query.bind::<diesel::sql_types::Text, _>(value);
+    }
+    query
 }
 
 /// GET /api/shots - list shots with query params: person_id, status, q, from, to
@@ -88,50 +181,7 @@ pub(super) async fn get_shots(
     );
     let mut conditions: Vec<String> = Vec::new();
     let mut bind_values: Vec<String> = Vec::new();
-
-    if let Some(ref person_id) = params.person_id {
-        bind_values.push(person_id.clone());
-        conditions.push(format!("s.primary_person_id = ?{}", bind_values.len()));
-    }
-
-    if let Some(ref status) = params.status {
-        if status == "unsorted" {
-            // A shot pointing at a person row that is gone is owned by nobody:
-            // it shows in no person's list, so it has to show in this one. Same
-            // rule as `people::browse_graph` and the organize stats.
-            conditions.push(
-                "(s.primary_person_id IS NULL OR NOT EXISTS \
-                 (SELECT 1 FROM people pu WHERE pu.id = s.primary_person_id)) \
-                 AND EXISTS (SELECT 1 FROM files fu WHERE fu.shot_id = s.id)"
-                    .to_string(),
-            );
-        } else {
-            bind_values.push(status.clone());
-            conditions.push(format!("s.review_status = ?{}", bind_values.len()));
-        }
-    }
-
-    if let Some(ref q) = params.q {
-        let pattern = format!("%{}%", q);
-        bind_values.push(pattern.clone());
-        let idx1 = bind_values.len();
-        bind_values.push(pattern);
-        let idx2 = bind_values.len();
-        conditions.push(format!(
-            "(EXISTS (SELECT 1 FROM files fq WHERE fq.shot_id = s.id AND fq.path LIKE ?{}) OR s.description LIKE ?{})",
-            idx1, idx2
-        ));
-    }
-
-    if let Some(ref from) = params.from {
-        bind_values.push(from.clone());
-        conditions.push(format!("s.timestamp >= ?{}", bind_values.len()));
-    }
-
-    if let Some(ref to) = params.to {
-        bind_values.push(to.clone());
-        conditions.push(format!("s.timestamp <= ?{}", bind_values.len()));
-    }
+    shot_conditions(&params, &mut conditions, &mut bind_values);
 
     if !conditions.is_empty() {
         sql.push_str(" WHERE ");
@@ -164,54 +214,7 @@ pub(super) async fn get_shots(
         synthetic: bool,
     }
 
-    // Build the sql_query and bind parameters dynamically
-    let query = diesel::sql_query(&sql);
-
-    // We need to bind each parameter. Since diesel::sql_query().bind() returns a
-    // different type each time, we need to handle this with a macro-like approach.
-    // Instead, we'll use the boxed approach with raw SQL parameter embedding.
-    // Actually, diesel::sql_query uses positional params (?1, ?2, etc.) for SQLite.
-    // We need to bind them in order.
-
-    // Unfortunately, diesel's sql_query chaining changes the type with each bind,
-    // making dynamic binding difficult. We'll handle up to the maximum number of
-    // parameters we can have (max 5: person_id, status, q_pattern1, q_pattern2, from, to = 6 max).
-    let rows: Result<Vec<ShotRow>, _> = match bind_values.len() {
-        0 => query.load::<ShotRow>(&mut conn),
-        1 => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .load::<ShotRow>(&mut conn),
-        2 => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
-            .load::<ShotRow>(&mut conn),
-        3 => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
-            .load::<ShotRow>(&mut conn),
-        4 => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[3])
-            .load::<ShotRow>(&mut conn),
-        5 => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[3])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[4])
-            .load::<ShotRow>(&mut conn),
-        _ => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[3])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[4])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[5])
-            .load::<ShotRow>(&mut conn),
-    };
+    let rows: Result<Vec<ShotRow>, _> = bind_text_all(&sql, bind_values).load::<ShotRow>(&mut conn);
 
     let shots = match rows {
         Ok(rows) => rows

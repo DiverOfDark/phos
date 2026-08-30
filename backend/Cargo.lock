@@ -3457,6 +3457,7 @@ dependencies = [
  "indicatif",
  "jsonwebtoken",
  "kamadak-exif",
+ "libc",
  "mime_guess",
  "ndarray",
  "notify",

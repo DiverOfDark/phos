@@ -214,7 +214,7 @@ pub(super) async fn describe_shot(
     // board, retries the same way and is cancelled the same way.
     let (run_id, task_id) = conn
         .transaction::<_, diesel::result::Error, _>(|conn| {
-            let run_id = run_store::open_run(conn, None, &payload.shot_id, &label, 1, None)?;
+            let run_id = run_store::open_run(conn, None, &payload.shot_id, &label, 1, None, None)?;
             let task_id = uuid::Uuid::new_v4().to_string();
             diesel::insert_into(enhancement_tasks::table)
                 .values(NewEnhancementTask {
