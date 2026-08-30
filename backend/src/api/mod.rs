@@ -71,6 +71,7 @@ use utoipa::OpenApi;
         files::get_file,
         files::delete_file,
         files::get_file_thumbnail,
+        files::get_file_manifest,
         files::set_file_original,
         files::upload_file_raw,
         files::finalize_import,
@@ -147,6 +148,9 @@ use utoipa::OpenApi;
             faces::DedupeFacesResponse,
             faces::ReassignFacePayload,
             faces::AddManualFacePayload,
+            // Files
+            files::FileManifestResponse,
+            crate::comfyui::ProvenanceManifest,
             // Import
             crate::ingest::IngestStatus,
             // Stats
@@ -466,6 +470,7 @@ pub fn create_router(state: AppState) -> Router {
             get(files::get_file).delete(files::delete_file),
         )
         .route("/api/files/{id}/thumbnail", get(files::get_file_thumbnail))
+        .route("/api/files/{id}/manifest", get(files::get_file_manifest))
         .route("/api/files/{id}/set-original", put(files::set_file_original))
         .route("/api/files/{id}/faces", post(faces::add_manual_face))
         // Stats + organize
