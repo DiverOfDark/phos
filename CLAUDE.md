@@ -62,7 +62,7 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
-- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces) and `line.rs` (whether a chain of them holds together, what happens after a stage lands, and whether a run is over) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
+- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `line.rs` (whether a chain of them holds together, what happens after a stage lands, and whether a run is over) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `api/line_io.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
 
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
@@ -118,6 +118,19 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   `POST`/`PUT`, again on every read, again when a run starts (with the shot's own type), and once
   more at dispatch against the file that actually turned up. A workflow can be re-imported or its
   contract corrected long after a line was built
+- **A line travels as one file, and that file is also the template format.** `comfyui/portable/`
+  defines a `LineBundle`: the line and its ordered stages, **every stage's workflow graph** (a line
+  exported as ids alone is a bundle of broken pointers), the derived contracts, and a requirements
+  manifest of node classes and model files. Import checks those requirements against FR3's
+  `NodeCatalog` and **reports what is missing before anything runs** — never at dispatch — but
+  imports anyway, because the box holding the library is often not the box holding the GPU. An
+  absent catalogue yields `unchecked`, not a wrong answer and not a refusal. There is deliberately
+  **one** format: FR6 seeds bundled templates as `LineBundle`s through the same importer, so
+  everything optional in the file (`contract`, `requirements`, per-stage overrides) can be omitted
+  by a hand-written template. A `requirements` block in the file is documentation — the importer
+  recomputes it from the graphs, because the graphs are what will actually be run. Names collide by
+  suffixing, never overwriting; workflows deduplicate on the **canonical graph** (sorted keys, no
+  whitespace), so a re-import reuses what is there and one changed seed does not
 - **A workflow knows what it takes and what it gives.** `comfyui_workflows.contract_json` holds a
   `comfyui::StageContract`: `accepts` (image / video / text / **none**, because a text-to-image graph
   begins a line rather than continuing one), `produces` (image / video / text), which loader fills
@@ -170,6 +183,8 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `GET /api/comfyui/runs` — The queue board: one row per run, with the stage it is on, of how many, what that stage is running, and its clock. `GET /api/comfyui/runs/{id}` is the drill-down to the tasks underneath
 - `POST /api/comfyui/runs/{id}/retry` — Resume from the stage that failed. What already succeeded is not re-run
 - `GET|POST /api/comfyui/lines`, `GET|PUT|DELETE /api/comfyui/lines/{id}` — Line CRUD. A chain whose stages do not fit together is refused with a message naming the stage; editing or deleting a line is refused with `409` while a run of it is in flight
+- `GET /api/comfyui/lines/{id}/export` — The line as one portable JSON bundle: stages, **the workflow graph behind each one**, the derived contracts, and a manifest of the node classes and model files it needs
+- `POST /api/comfyui/lines/import?dry_run=&name=` — Read a bundle back. `dry_run` writes nothing and answers with the requirements report alone
 - `GET /api/client/version` — Bundled Android APK metadata for the in-app updater (no auth)
 
 ## AI Models

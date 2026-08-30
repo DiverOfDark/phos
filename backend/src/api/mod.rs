@@ -2,6 +2,7 @@ pub mod client;
 mod comfyui;
 mod faces;
 mod files;
+mod line_io;
 mod lines;
 mod people;
 pub mod settings;
@@ -114,6 +115,8 @@ use utoipa::OpenApi;
         lines::get_run,
         lines::retry_run,
         lines::cancel_run,
+        line_io::export_line,
+        line_io::import_line,
         // Settings
         settings::get_webdav_settings,
         settings::set_webdav_settings,
@@ -186,6 +189,14 @@ use utoipa::OpenApi;
             lines::LinePayload,
             lines::LineStagePayload,
             lines::StartRunPayload,
+            // A line as a file — also the format bundled templates ship in.
+            crate::comfyui::LineBundle,
+            crate::comfyui::BundleLine,
+            crate::comfyui::BundleStage,
+            crate::comfyui::BundleWorkflow,
+            crate::comfyui::Requirements,
+            crate::comfyui::RequirementsReport,
+            crate::comfyui::ModelRef,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
@@ -561,12 +572,17 @@ pub fn create_router(state: AppState) -> Router {
             "/api/comfyui/lines",
             get(lines::list_lines).post(lines::create_line),
         )
+        // Before `/lines/{id}`: a literal segment and a path parameter both
+        // match `/lines/import`, and axum takes the literal only if it is
+        // there to take.
+        .route("/api/comfyui/lines/import", post(line_io::import_line))
         .route(
             "/api/comfyui/lines/{id}",
             get(lines::get_line)
                 .put(lines::update_line)
                 .delete(lines::delete_line),
         )
+        .route("/api/comfyui/lines/{id}/export", get(line_io::export_line))
         .route(
             "/api/comfyui/runs",
             get(lines::list_runs).post(lines::start_run),
