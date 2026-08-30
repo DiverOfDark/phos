@@ -8,7 +8,7 @@
 //! What a graph *takes* is [`super::overrides`]' question, because answering it
 //! well needs what ComfyUI says about its own node classes.
 
-use super::loaders::{bind_targets, SourceBinding};
+use super::loaders::BindingPlan;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -142,16 +142,17 @@ fn suffixes_for(kind: SaverKind) -> &'static [&'static str] {
 /// lookup: Phos knows the filename before the run starts, so it can ask `/view`
 /// directly instead of depending on ComfyUI to tell it what it wrote.
 ///
-/// Which loaders get the file is [`bind_targets`]' decision, not this
-/// function's — writing it into *every* `LoadImage`, which is what happened
-/// before, made a start-frame/end-frame workflow impossible to run.
+/// Which loaders get the file is [`super::loaders::bind_targets`]' decision,
+/// not this function's — writing it into *every* `LoadImage`, which is what
+/// happened before, made a start-frame/end-frame workflow impossible to run.
+/// This applies the plan; it does not second-guess it.
 pub(crate) fn prepare_workflow(
     workflow: &Value,
-    binding: &SourceBinding,
+    plan: &BindingPlan,
     text_overrides: &std::collections::HashMap<String, String>,
     output_prefix: Option<&str>,
 ) -> Value {
-    let targets = bind_targets(workflow, binding);
+    let targets = &plan.targets;
     let mut wf = workflow.clone();
     if let Some(nodes) = wf.as_object_mut() {
         for (node_id, node) in nodes.iter_mut() {
@@ -196,21 +197,25 @@ pub(crate) fn prepare_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comfyui::loaders::{LoaderKind, SourceRole};
+    use crate::comfyui::loaders::{bind_targets, LoaderKind, SourceBinding, SourceRole};
     use serde_json::json;
 
-    /// The everyday binding: one uploaded image, into whatever image loader the
+    /// The everyday plan: one uploaded image, into whatever image loader the
     /// graph has, with nothing configured.
-    fn plain_image<'a>(
-        filename: &'a str,
-        no_roles: &'a std::collections::HashMap<String, SourceRole>,
-    ) -> SourceBinding<'a> {
-        SourceBinding {
-            uploaded_filename: filename,
-            kind: LoaderKind::Image,
-            role: SourceRole::Start,
-            role_overrides: no_roles,
-        }
+    fn plain_image(workflow: &Value, filename: &str) -> BindingPlan {
+        plan_for(workflow, filename, LoaderKind::Image)
+    }
+
+    fn plan_for(workflow: &Value, filename: &str, kind: LoaderKind) -> BindingPlan {
+        bind_targets(
+            workflow,
+            &SourceBinding {
+                uploaded_filename: filename,
+                kind,
+                role: SourceRole::Start,
+                role_overrides: &std::collections::HashMap::new(),
+            },
+        )
     }
 
     #[test]
@@ -299,10 +304,9 @@ mod tests {
         let prefix = output_prefix_for_task("task-1234");
         assert_eq!(prefix, "phos/task-1234");
 
-        let no_roles = std::collections::HashMap::new();
         let prepared = prepare_workflow(
             &wf,
-            &plain_image("uploaded.png", &no_roles),
+            &plain_image(&wf, "uploaded.png"),
             &std::collections::HashMap::new(),
             Some(&prefix),
         );
@@ -329,10 +333,10 @@ mod tests {
         let wf = json!({
             "9": { "class_type": "SaveImage", "inputs": { "filename_prefix": ["8", 0] } }
         });
-        let no_roles = std::collections::HashMap::new();
+
         let prepared = prepare_workflow(
             &wf,
-            &plain_image("uploaded.png", &no_roles),
+            &plain_image(&wf, "uploaded.png"),
             &std::collections::HashMap::new(),
             Some("phos/task-1234"),
         );
@@ -349,15 +353,10 @@ mod tests {
             "12": { "class_type": "VHS_VideoCombine",
                     "inputs": { "filename_prefix": "AnimateDiff", "images": ["1", 0] } },
         });
-        let no_roles = std::collections::HashMap::new();
+
         let prepared = prepare_workflow(
             &wf,
-            &SourceBinding {
-                uploaded_filename: "phos_ab_cd_video.mp4",
-                kind: LoaderKind::Video,
-                role: SourceRole::Start,
-                role_overrides: &no_roles,
-            },
+            &plan_for(&wf, "phos_ab_cd_video.mp4", LoaderKind::Video),
             &std::collections::HashMap::new(),
             Some("phos/task-1"),
         );
@@ -383,10 +382,10 @@ mod tests {
             "5": { "class_type": "LoadImage", "inputs": { "image": "author_end.png" },
                    "_meta": { "title": "End Frame" } },
         });
-        let no_roles = std::collections::HashMap::new();
+
         let prepared = prepare_workflow(
             &wf,
-            &plain_image("phos_upload.png", &no_roles),
+            &plain_image(&wf, "phos_upload.png"),
             &std::collections::HashMap::new(),
             None,
         );
@@ -412,13 +411,9 @@ mod tests {
             [("4.image".to_string(), "chosen.png".to_string())]
                 .into_iter()
                 .collect();
-        let no_roles = std::collections::HashMap::new();
-        let prepared = prepare_workflow(
-            &wf,
-            &plain_image("phos_upload.png", &no_roles),
-            &overrides,
-            None,
-        );
+
+        let prepared =
+            prepare_workflow(&wf, &plain_image(&wf, "phos_upload.png"), &overrides, None);
         assert_eq!(
             prepared["4"]["inputs"]["image"].as_str(),
             Some("chosen.png")

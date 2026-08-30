@@ -91,6 +91,11 @@ pub struct LoaderNode {
     /// workflow with one untitled loader needs no configuration at all.
     pub role: SourceRole,
     pub title: Option<String>,
+    /// Whether [`Self::role`] is something the author *said* or merely the
+    /// default. Two nodes that both defaulted are not two start frames — they
+    /// are two nodes the graph told us nothing about, which is a different
+    /// thing and has to be handled differently.
+    pub role_from_title: bool,
     /// True when the field holds a *filesystem path* rather than a name in
     /// ComfyUI's input directory — `VHS_LoadVideoPath` is the one that matters.
     /// An upload only ever yields a name, so such a node is the last one worth
@@ -117,10 +122,7 @@ pub fn detect_loaders(workflow: &Value) -> Vec<LoaderNode> {
             .and_then(|m| m.get("title"))
             .and_then(|t| t.as_str())
             .map(str::to_string);
-        let role = title
-            .as_deref()
-            .and_then(SourceRole::from_title)
-            .unwrap_or(SourceRole::Start);
+        let titled_role = title.as_deref().and_then(SourceRole::from_title);
         let path_style = class_type.to_ascii_lowercase().contains("path")
             || field.ends_with("path")
             || field == "path";
@@ -129,8 +131,9 @@ pub fn detect_loaders(workflow: &Value) -> Vec<LoaderNode> {
             node_type: class_type.to_string(),
             field,
             kind,
-            role,
+            role: titled_role.unwrap_or(SourceRole::Start),
             title,
+            role_from_title: titled_role.is_some(),
             path_style,
         });
     }
@@ -227,60 +230,194 @@ pub(crate) struct BoundInput {
 /// resort rather than a first choice.
 const COMFY_INPUT_DIR: &str = "input";
 
+/// Where one run's upload goes, and what could not be decided on the way.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct BindingPlan {
+    pub targets: Vec<BoundInput>,
+    /// Slots more than one loader claimed, with nothing in the graph to tell
+    /// them apart. The binding takes the first and leaves the rest alone; the
+    /// warning is how a person finds out there was a choice to make.
+    pub warnings: Vec<String>,
+}
+
 /// Which loader inputs to write the uploaded filename into, and what to write.
 ///
-/// Three tiers, narrowest first, so a graph this module failed to read is never
-/// worse off than it was before roles existed:
+/// A precedence ladder, strongest evidence first. At each rung, if it produces
+/// candidates they are the answer and the weaker rungs are not consulted:
 ///
-/// 1. loaders of the right kind in the right slot — the point of the exercise;
-/// 2. failing that, every loader of the right kind — a lone loader titled "end
-///    frame" still has to run when nobody asked for an end frame;
-/// 3. failing that, every loader at all — what Phos did before.
+/// 1. **what the user said** — nodes an explicit `role:<node_id>` puts in this
+///    slot. If they named two, they meant two;
+/// 2. **what the titles said** — nodes whose `_meta.title` puts them here;
+/// 3. **what is left over** — untitled nodes, which is where a `start` request
+///    lands when the author typed nothing;
+/// 4. **anything at all** — better a run than none. A lone loader titled "end
+///    frame" still has to work when nobody asked for an end frame.
 ///
-/// Within a tier, a loader that takes a name beats one that takes a path: an
+/// Below the first rung, **two indistinguishable candidates are not two
+/// answers**. The upload goes into the first (lowest node id) and the rest keep
+/// the value their author saved, with a warning naming what was skipped.
+/// Writing it into both is the bug this whole module exists to fix: an
+/// interpolator whose author typed no titles would get the same frame as its
+/// start *and* its end, and produce a clip that goes nowhere, silently.
+///
+/// Throughout, a loader that takes a name beats one that takes a path: an
 /// upload yields a name, and the path a `VHS_LoadVideoPath` wants can only be
 /// guessed at.
-pub(crate) fn bind_targets(workflow: &Value, binding: &SourceBinding) -> Vec<BoundInput> {
+pub(crate) fn bind_targets(workflow: &Value, binding: &SourceBinding) -> BindingPlan {
     let loaders = detect_loaders(workflow);
-    let effective = |l: &LoaderNode| {
-        binding
-            .role_overrides
-            .get(&l.node_id)
+    let assigned = |l: &LoaderNode| binding.role_overrides.get(&l.node_id).copied();
+
+    // The upload has to land in a node that can read it. Failing that, take
+    // anything — a graph we could not classify is no worse off than before.
+    let mut pool: Vec<&LoaderNode> = loaders.iter().filter(|l| l.kind == binding.kind).collect();
+    if pool.is_empty() {
+        pool = loaders.iter().collect();
+    }
+    let by_name: Vec<&LoaderNode> = pool.iter().copied().filter(|l| !l.path_style).collect();
+    if !by_name.is_empty() {
+        pool = by_name;
+    }
+
+    // Rung 1 — the user pointed at these nodes. Take them all, say nothing.
+    let explicit: Vec<&LoaderNode> = pool
+        .iter()
+        .copied()
+        .filter(|l| assigned(l) == Some(binding.role))
+        .collect();
+    if !explicit.is_empty() {
+        return plan(explicit, binding, Vec::new());
+    }
+
+    // A node the user moved elsewhere is not a candidate for this slot.
+    let pool: Vec<&LoaderNode> = pool.into_iter().filter(|l| assigned(l).is_none()).collect();
+
+    // Rung 2 — the author's titles.
+    let titled: Vec<&LoaderNode> = pool
+        .iter()
+        .copied()
+        .filter(|l| l.role_from_title && l.role == binding.role)
+        .collect();
+    if !titled.is_empty() {
+        return first_only(titled, binding);
+    }
+
+    // Rung 3 — untitled nodes, which is what `start` means by default.
+    if binding.role == SourceRole::Start {
+        let untitled: Vec<&LoaderNode> = pool
+            .iter()
             .copied()
-            .unwrap_or(l.role)
-    };
-
-    let pick = |f: &dyn Fn(&LoaderNode) -> bool| -> Vec<&LoaderNode> {
-        let matched: Vec<&LoaderNode> = loaders.iter().filter(|l| f(l)).collect();
-        // Prefer the ones that take a plain name.
-        let by_name: Vec<&LoaderNode> = matched.iter().copied().filter(|l| !l.path_style).collect();
-        if by_name.is_empty() {
-            matched
-        } else {
-            by_name
+            .filter(|l| !l.role_from_title)
+            .collect();
+        if !untitled.is_empty() {
+            return first_only(untitled, binding);
         }
+    }
+
+    // Rung 4 — nothing fits the slot, so run with what there is.
+    first_only(pool, binding)
+}
+
+/// Bind the first candidate, and say so when there were others.
+fn first_only(candidates: Vec<&LoaderNode>, binding: &SourceBinding) -> BindingPlan {
+    let Some((first, rest)) = candidates.split_first() else {
+        return BindingPlan::default();
     };
-
-    let mut chosen = pick(&|l| l.kind == binding.kind && effective(l) == binding.role);
-    if chosen.is_empty() {
-        chosen = pick(&|l| l.kind == binding.kind);
+    if rest.is_empty() {
+        return plan(vec![*first], binding, Vec::new());
     }
-    if chosen.is_empty() {
-        chosen = pick(&|_| true);
-    }
+    let skipped: Vec<&str> = rest.iter().map(|l| l.node_id.as_str()).collect();
+    let warning = format!(
+        "{} nodes could all be the {} slot and nothing tells them apart: {}. \
+         The source went into node {}{}; {} kept the file the workflow was saved with. \
+         Give the nodes distinct titles in ComfyUI, or say which is which.",
+        candidates.len(),
+        role_word(binding.role),
+        candidates
+            .iter()
+            .map(|l| describe(l))
+            .collect::<Vec<_>>()
+            .join(", "),
+        first.node_id,
+        first
+            .title
+            .as_deref()
+            .map(|t| format!(" ({})", t))
+            .unwrap_or_default(),
+        if skipped.len() == 1 {
+            format!("node {}", skipped[0])
+        } else {
+            format!("nodes {}", skipped.join(", "))
+        },
+    );
+    plan(vec![*first], binding, vec![warning])
+}
 
-    chosen
-        .into_iter()
-        .map(|l| BoundInput {
-            node_id: l.node_id.clone(),
-            field: l.field.clone(),
-            value: if l.path_style {
-                format!("{}/{}", COMFY_INPUT_DIR, binding.uploaded_filename)
-            } else {
-                binding.uploaded_filename.to_string()
+fn describe(l: &LoaderNode) -> String {
+    match &l.title {
+        Some(title) => format!("{} ({}, \"{}\")", l.node_id, l.node_type, title),
+        None => format!("{} ({}, untitled)", l.node_id, l.node_type),
+    }
+}
+
+fn role_word(role: SourceRole) -> &'static str {
+    match role {
+        SourceRole::Start => "start",
+        SourceRole::End => "end",
+        SourceRole::Reference => "reference",
+    }
+}
+
+fn plan(chosen: Vec<&LoaderNode>, binding: &SourceBinding, warnings: Vec<String>) -> BindingPlan {
+    BindingPlan {
+        targets: chosen
+            .into_iter()
+            .map(|l| BoundInput {
+                node_id: l.node_id.clone(),
+                field: l.field.clone(),
+                value: if l.path_style {
+                    format!("{}/{}", COMFY_INPUT_DIR, binding.uploaded_filename)
+                } else {
+                    binding.uploaded_filename.to_string()
+                },
+            })
+            .collect(),
+        warnings,
+    }
+}
+
+/// What a run with no configuration at all would warn about, from the graph
+/// alone — so the question can be asked before the run rather than found in a
+/// log afterwards.
+///
+/// It answers by *doing* the default binding rather than by reimplementing its
+/// reasoning, so the warning a user is shown and the warning a run produces
+/// cannot drift apart.
+pub fn default_binding_warnings(workflow: &Value) -> Vec<String> {
+    let loaders = detect_loaders(workflow);
+    let no_overrides = HashMap::new();
+    let mut out: Vec<String> = Vec::new();
+    for kind in [LoaderKind::Image, LoaderKind::Video] {
+        // Only ask about a kind the graph actually has; otherwise the last rung
+        // would answer about the other kind's nodes and invent a problem.
+        if !loaders.iter().any(|l| l.kind == kind) {
+            continue;
+        }
+        let plan = bind_targets(
+            workflow,
+            &SourceBinding {
+                uploaded_filename: "",
+                kind,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides,
             },
-        })
-        .collect()
+        );
+        for warning in plan.warnings {
+            if !out.contains(&warning) {
+                out.push(warning);
+            }
+        }
+    }
+    out
 }
 
 /// Key under which a task's override map carries the slot the upload fills.
@@ -320,8 +457,8 @@ mod tests {
     }
 
     /// `(node_id, field, value)` triples, which is what the assertions are about.
-    fn bound(targets: &[BoundInput]) -> Vec<(&str, &str, &str)> {
-        targets
+    fn bound(plan: &BindingPlan) -> Vec<(&str, &str, &str)> {
+        plan.targets
             .iter()
             .map(|b| (b.node_id.as_str(), b.field.as_str(), b.value.as_str()))
             .collect()
@@ -473,9 +610,11 @@ mod tests {
     }
 
     #[test]
-    fn an_override_only_moves_the_node_it_names() {
-        // Reassigning 5 does not demote 4, which the title already put in the
-        // start slot — both are start frames, and both get the file.
+    fn pointing_at_one_node_does_not_also_load_the_one_the_title_suggested() {
+        // Rung 1 answers, so rung 2 is never consulted: a user who names a node
+        // has said which one, and quietly loading node 4 as well would put the
+        // same picture in two slots — the failure this whole module exists to
+        // prevent.
         let wf = json!({
             "4": { "class_type": "LoadImage", "inputs": { "image": "a.png" },
                    "_meta": { "title": "Start Frame" } },
@@ -484,7 +623,34 @@ mod tests {
         });
         let overrides: HashMap<String, SourceRole> =
             [("5".to_string(), SourceRole::Start)].into_iter().collect();
-        let targets = bind_targets(
+        let plan = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.png",
+                kind: LoaderKind::Image,
+                role: SourceRole::Start,
+                role_overrides: &overrides,
+            },
+        );
+        assert_eq!(bound(&plan), [("5", "image", "new.png")]);
+        assert!(plan.warnings.is_empty(), "the user was explicit");
+    }
+
+    #[test]
+    fn naming_two_nodes_means_two_nodes() {
+        // The escape hatch for a graph that really does want one picture in
+        // several places: say so, and the ambiguity rule steps aside.
+        let wf = json!({
+            "4": { "class_type": "LoadImage", "inputs": { "image": "a.png" } },
+            "5": { "class_type": "LoadImage", "inputs": { "image": "b.png" } },
+        });
+        let overrides: HashMap<String, SourceRole> = [
+            ("4".to_string(), SourceRole::Start),
+            ("5".to_string(), SourceRole::Start),
+        ]
+        .into_iter()
+        .collect();
+        let plan = bind_targets(
             &wf,
             &SourceBinding {
                 uploaded_filename: "new.png",
@@ -494,9 +660,10 @@ mod tests {
             },
         );
         assert_eq!(
-            bound(&targets),
+            bound(&plan),
             [("4", "image", "new.png"), ("5", "image", "new.png")]
         );
+        assert!(plan.warnings.is_empty());
     }
 
     #[test]
@@ -578,6 +745,194 @@ mod tests {
         // And so is something that is not a graph at all.
         assert!(importable(&json!([])).is_err());
         assert!(importable(&Value::Null).is_err());
+    }
+
+    // === The untitled interpolator ==========================================
+    //
+    // Found by the FR5a agent reviewing this branch: role binding fixed the
+    // "every LoadImage gets the same file" bug only for workflows whose author
+    // typed titles. Two bare `LoadImage` nodes both defaulted to `start`, so
+    // both were bound — the same failure, silently, in the case that needs it
+    // most.
+
+    #[test]
+    fn two_untitled_loaders_do_not_both_get_the_upload() {
+        let wf = json!({
+            "4": { "class_type": "LoadImage", "inputs": { "image": "author_a.png" } },
+            "5": { "class_type": "LoadImage", "inputs": { "image": "author_b.png" } },
+        });
+        let plan = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.png",
+                kind: LoaderKind::Image,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides(),
+            },
+        );
+        assert_eq!(
+            bound(&plan),
+            [("4", "image", "new.png")],
+            "the upload went into both slots, so an interpolator would run \
+             start-to-start and produce a clip that goes nowhere"
+        );
+        assert_eq!(plan.warnings.len(), 1, "and it happened silently");
+        let warning = &plan.warnings[0];
+        // The message has to name both nodes and say what to do about it.
+        assert!(
+            warning.contains('4') && warning.contains('5'),
+            "{}",
+            warning
+        );
+        assert!(warning.contains("untitled"), "{}", warning);
+        assert!(warning.contains("title"), "{}", warning);
+    }
+
+    #[test]
+    fn one_untitled_loader_is_untouched_by_the_ambiguity_rule() {
+        // The overwhelmingly common workflow. Nothing to be ambiguous about.
+        let wf = json!({
+            "4": { "class_type": "LoadImage", "inputs": { "image": "author.png" } },
+        });
+        let plan = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.png",
+                kind: LoaderKind::Image,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides(),
+            },
+        );
+        assert_eq!(bound(&plan), [("4", "image", "new.png")]);
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_titled_node_is_not_made_ambiguous_by_an_untitled_one() {
+        // Rung 2 answers before rung 3 is reached, so the "Start Frame" node
+        // wins outright and the untitled one is not a rival for the slot.
+        let wf = json!({
+            "4": { "class_type": "LoadImage", "inputs": { "image": "a.png" },
+                   "_meta": { "title": "Start Frame" } },
+            "5": { "class_type": "LoadImage", "inputs": { "image": "b.png" } },
+        });
+        let plan = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.png",
+                kind: LoaderKind::Image,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides(),
+            },
+        );
+        assert_eq!(bound(&plan), [("4", "image", "new.png")]);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(
+            wf["5"]["inputs"]["image"].as_str(),
+            Some("b.png"),
+            "the untitled node keeps what its author saved"
+        );
+    }
+
+    #[test]
+    fn two_nodes_the_author_titled_the_same_way_are_still_a_choice() {
+        // Both say "start". The author was not lying, but they did not say
+        // which one, so this is the same question in different clothing.
+        let wf = json!({
+            "4": { "class_type": "LoadImage", "inputs": { "image": "a.png" },
+                   "_meta": { "title": "Start Frame" } },
+            "5": { "class_type": "LoadImage", "inputs": { "image": "b.png" },
+                   "_meta": { "title": "First image" } },
+        });
+        let plan = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.png",
+                kind: LoaderKind::Image,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides(),
+            },
+        );
+        assert_eq!(bound(&plan), [("4", "image", "new.png")]);
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(
+            plan.warnings[0].contains("Start Frame"),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn two_untitled_video_loaders_are_ambiguous_too() {
+        let wf = json!({
+            "1": { "class_type": "VHS_LoadVideo", "inputs": { "video": "a.mp4" } },
+            "2": { "class_type": "VHS_LoadVideo", "inputs": { "video": "b.mp4" } },
+        });
+        let plan = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.mp4",
+                kind: LoaderKind::Video,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides(),
+            },
+        );
+        assert_eq!(bound(&plan), [("1", "video", "new.mp4")]);
+        assert_eq!(plan.warnings.len(), 1);
+    }
+
+    #[test]
+    fn the_ambiguity_a_run_would_hit_can_be_asked_about_beforehand() {
+        // What the workflows list ships to the UI, so the question is put to a
+        // person before the run rather than found in a log after it. FR5a's
+        // role picker is where it gets answered.
+        let ambiguous = json!({
+            "4": { "class_type": "LoadImage", "inputs": { "image": "a.png" } },
+            "5": { "class_type": "LoadImage", "inputs": { "image": "b.png" } },
+        });
+        let warnings = default_binding_warnings(&ambiguous);
+        assert_eq!(warnings.len(), 1);
+        // It is the same sentence the run itself would log — computed by doing
+        // the binding, not by reimplementing its reasoning.
+        let plan = bind_targets(
+            &ambiguous,
+            &SourceBinding {
+                uploaded_filename: "",
+                kind: LoaderKind::Image,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides(),
+            },
+        );
+        assert_eq!(warnings, plan.warnings);
+
+        // The ordinary workflows have nothing to say.
+        assert!(default_binding_warnings(&json!({
+            "4": { "class_type": "LoadImage", "inputs": { "image": "a.png" } },
+        }))
+        .is_empty());
+        assert!(default_binding_warnings(&json!({
+            "4": { "class_type": "LoadImage", "inputs": { "image": "a.png" },
+                   "_meta": { "title": "Start Frame" } },
+            "5": { "class_type": "LoadImage", "inputs": { "image": "b.png" },
+                   "_meta": { "title": "End Frame" } },
+        }))
+        .is_empty());
+        assert!(default_binding_warnings(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn a_lone_video_loader_beside_two_images_does_not_invent_a_problem() {
+        // The video pass must not fall through to the image nodes and report
+        // them as rival video loaders — but the image pass must still see them.
+        let wf = json!({
+            "1": { "class_type": "VHS_LoadVideo", "inputs": { "video": "a.mp4" } },
+            "4": { "class_type": "LoadImage", "inputs": { "image": "a.png" } },
+            "5": { "class_type": "LoadImage", "inputs": { "image": "b.png" } },
+        });
+        let warnings = default_binding_warnings(&wf);
+        assert_eq!(warnings.len(), 1, "{:?}", warnings);
+        assert!(warnings[0].contains("LoadImage"), "{}", warnings[0]);
+        assert!(!warnings[0].contains("VHS_LoadVideo"), "{}", warnings[0]);
     }
 
     /// `VHS_LoadVideoPath` resolves its widget as a filesystem path, not as a
