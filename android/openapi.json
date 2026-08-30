@@ -2633,7 +2633,7 @@
           },
           "vary": {
             "type": "object",
-            "description": "Parameters to sweep rather than pin, keyed like `parameters`. Each entry\nmultiplies the number of tasks queued.\n\nA value is one of three spellings: a count (`{\"3.seed\": 4}` — four runs\nwith four fresh seeds), an explicit list (`{\"3.cfg\": [4.0, 6.0, 8.0]}` —\nthree runs), or a `VarySpec` for the long form. Both of those together is\ntwelve runs; past 64 the request is refused.\n\nEvery value is resolved here, so each task is written with its own\ncomplete parameter map and is replayable from its row.\n\nTyped as a free-form object rather than a `oneOf`: the generated Android\nclient builds every model in the spec even though it calls none of these\nendpoints, and an untagged union is not worth making it compile."
+            "description": "Parameters to sweep rather than pin, keyed like `parameters`. Each entry\nmultiplies the number of tasks queued.\n\nA value is one of three spellings: a count (`{\"3.seed\": 4}` — four runs\nwith four fresh seeds), an explicit list (`{\"3.cfg\": [4.0, 6.0, 8.0]}` —\nthree runs), or a `VarySpec` for the long form. Both of those together is\ntwelve runs; past 64 the request is refused.\n\nEvery value is resolved here, so each task is written with its own\ncomplete parameter map and is replayable from its row.\n\nDescribed as a free-form object rather than as a union of the three: the\ngenerated Android client builds every model in the spec even though it\ncalls none of these endpoints, and an untagged union of a number, an\narray and an object is not worth making it compile."
           },
           "workflow_id": {
             "type": "string"
@@ -3152,13 +3152,17 @@
             ],
             "description": "The name ComfyUI gave the output, before Phos renamed it into the\nlibrary — the last thread back to the run that made it."
           },
+          "parameters": {
+            "type": "object",
+            "description": "The typed values this run ran with, `\"<node_id>.<field_name>\"` → value,\nexactly as the task row carried them.\n\nThis is what makes a fanned-out run reproducible one file at a time: four\ntakes of the same prompt differ only here, and without it their manifests\nare indistinguishable."
+          },
           "seed": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
-            "description": "The seed the sampler actually ran with."
+            "description": "The seed the sampler actually ran with, lifted out of [`Self::parameters`]\nbecause it is the value asked for most often. A graph with two samplers\nhas two seeds; this is the first in key order, and the map beside it is\nthe complete answer."
           },
           "source_file_id": {
             "type": [

@@ -18,7 +18,7 @@
 
 use super::complete::ActiveTask;
 use crate::comfyui::client::ComfyUiClient;
-use crate::comfyui::manifest::ProvenanceManifest;
+use crate::comfyui::manifest::{ComfyuiRun, ProvenanceManifest};
 use crate::comfyui::outputs::OutputRef;
 use crate::comfyui::timestamp::format_ts;
 use crate::db;
@@ -234,15 +234,18 @@ fn build_manifest(
         .ok()
         .flatten();
 
-    ProvenanceManifest::for_comfyui_run(
-        &task.id,
-        &task.workflow_id,
-        &task.text_overrides,
-        Some(&task.prompt_id),
-        source_file_id.as_deref(),
-        Some(&out.filename),
-        format_ts(chrono::Utc::now().naive_utc()),
-    )
+    ProvenanceManifest::for_comfyui_run(&ComfyuiRun {
+        task_id: &task.id,
+        workflow_id: &task.workflow_id,
+        text_overrides: &task.text_overrides,
+        // The values this take ran with. Four takes of one prompt differ here
+        // and nowhere else; without them their manifests are the same record.
+        parameters: &task.parameters,
+        comfyui_prompt_id: Some(&task.prompt_id),
+        source_file_id: source_file_id.as_deref(),
+        output_filename: Some(&out.filename),
+        generated_at: &format_ts(chrono::Utc::now().naive_utc()),
+    })
 }
 
 /// Say, on a row that already exists, that a machine made it.
@@ -366,6 +369,7 @@ mod tests {
             workflow_id: "wf-portrait".to_string(),
             workflow_json: "{}".to_string(),
             text_overrides: r#"{"6":"a lighthouse at dusk"}"#.to_string(),
+            parameters: "{}".to_string(),
             status: "downloading".to_string(),
             output_prefix: Some("phos/task-1234".to_string()),
             settle_until: None,
@@ -718,5 +722,95 @@ mod tests {
             files::table.count().get_result::<i64>(&mut conn).unwrap(),
             "the original and one output",
         );
+    }
+
+    /// The record a fan-out has to leave behind.
+    ///
+    /// Four takes of one prompt land as four files that look alike. Without the
+    /// seed on each one's manifest, "make another like *that* one" has nothing
+    /// to point at — and a manifest that cannot reproduce its file is not doing
+    /// the job the manifest exists for.
+    #[test]
+    fn four_takes_of_one_prompt_each_carry_the_seed_that_made_them() {
+        let (_dir, root, mut conn) = library_with_a_finished_task();
+
+        // Exactly what the enhance endpoint would queue for
+        // `vary: {"3.seed": {"count": 4, "mode": "increment"}}`.
+        let base: crate::comfyui::ParameterMap = [("3.seed".to_string(), serde_json::json!(1000))]
+            .into_iter()
+            .collect();
+        let vary: crate::comfyui::VaryMap = serde_json::from_value(
+            serde_json::json!({ "3.seed": { "count": 4, "mode": "increment" } }),
+        )
+        .unwrap();
+        let runs = crate::comfyui::expand(&base, &vary).unwrap();
+        assert_eq!(runs.len(), 4);
+
+        let mut manifests = Vec::new();
+        for (i, run) in runs.iter().enumerate() {
+            let task_id = format!("fanout-{}", i);
+            let parameters = serde_json::to_string(run).unwrap();
+            conn.batch_execute(&format!(
+                "INSERT INTO enhancement_tasks
+                   (id, shot_id, workflow_id, status, source_file_id, parameters)
+                 VALUES ('{}', 'shot-1', 'wf-portrait', 'downloading', 'file-original', '{}');",
+                task_id, parameters
+            ))
+            .unwrap();
+
+            let task = ActiveTask {
+                id: task_id.clone(),
+                parameters,
+                ..a_task()
+            };
+            let file_id = store_output_file(
+                &mut conn,
+                &task,
+                &an_output(),
+                format!("take {}", i).as_bytes(),
+                &root,
+            )
+            .unwrap();
+            manifests.push(stored_manifest(&mut conn, &file_id));
+        }
+
+        // Every take names the seed it ran with, and they are four seeds.
+        let seeds: Vec<Option<i64>> = manifests.iter().map(|m| m.seed).collect();
+        assert_eq!(seeds, [Some(1000), Some(1001), Some(1002), Some(1003)]);
+
+        // And the seed on the manifest is the seed on the row, not one the
+        // manifest guessed — this is the claim that makes a take reproducible.
+        for (i, manifest) in manifests.iter().enumerate() {
+            let stored: Option<String> = enhancement_tasks::table
+                .filter(enhancement_tasks::id.eq(format!("fanout-{}", i)))
+                .select(enhancement_tasks::parameters)
+                .first(&mut conn)
+                .unwrap();
+            let row: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&stored.expect("the task kept its parameters")).unwrap();
+            assert_eq!(manifest.parameters, row);
+            assert_eq!(manifest.seed, row["3.seed"].as_i64());
+        }
+
+        // Four records, not one record four times.
+        let records: std::collections::HashSet<String> = manifests
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect();
+        assert_eq!(records.len(), 4, "two takes wrote the same manifest");
+    }
+
+    /// A run with nothing typed — every task queued before FR4 — still gets a
+    /// manifest, just one with no seed to name.
+    #[test]
+    fn a_run_that_set_no_parameters_still_carries_a_manifest() {
+        let (_dir, root, mut conn) = library_with_a_finished_task();
+        let file_id =
+            store_output_file(&mut conn, &a_task(), &an_output(), b"generated", &root).unwrap();
+
+        let m = stored_manifest(&mut conn, &file_id);
+        assert!(m.parameters.is_empty());
+        assert_eq!(m.seed, None);
+        assert_eq!("task-1234", m.task_id);
     }
 }
