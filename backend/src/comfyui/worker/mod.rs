@@ -18,6 +18,7 @@
 //! The decisions both paths make are pure functions in [`super::policy`] and
 //! [`super::history`]; what is left here is the IO around them.
 
+pub(super) mod advance;
 mod complete;
 mod contracts;
 mod dispatch;
@@ -84,6 +85,10 @@ pub fn spawn_enhancement_worker(
 
             dispatch::process_pending_tasks(&mut conn, &client, &library_root);
             complete::poll_active_tasks(&mut conn, &client, &library_root);
+            // After completion and before cleanup: a task that just landed
+            // queues the stage after it, and only then can the run it belongs
+            // to be called finished and its intermediates swept.
+            advance::advance_runs(&mut conn, &library_root);
             cleanup_completed_tasks(&mut conn);
 
             // Sleep 3 seconds or until shutdown
@@ -150,16 +155,32 @@ fn recover_interrupted_tasks(conn: &mut SqliteConnection) {
 }
 
 /// Remove completed tasks older than 5 minutes.
+///
+/// A task that is a step of a run is only swept once that whole run has landed.
+/// Sweeping it earlier would take away the thing the next stage reads, the
+/// parent link that says the continuation already happened, and the stage
+/// history the board draws — and on a *failed* run, the intermediate a retry
+/// from the failed stage resumes from. So only a run marked `completed` gives
+/// its finished tasks up, and it gives them up on the same five-minute clock a
+/// lone task always had.
 fn cleanup_completed_tasks(conn: &mut SqliteConnection) {
     let cutoff = (chrono::Utc::now().naive_utc() - chrono::Duration::seconds(300))
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
+    let settled_runs = crate::schema::runs::table
+        .filter(crate::schema::runs::status.eq(crate::comfyui::RunState::Completed.as_str()))
+        .select(crate::schema::runs::id.nullable());
     match diesel::delete(
         enhancement_tasks::table.filter(
             enhancement_tasks::status
                 .eq("completed")
                 .and(enhancement_tasks::completed_at.is_not_null())
-                .and(enhancement_tasks::completed_at.lt(&cutoff)),
+                .and(enhancement_tasks::completed_at.lt(&cutoff))
+                .and(
+                    enhancement_tasks::run_id
+                        .is_null()
+                        .or(enhancement_tasks::run_id.nullable().eq_any(settled_runs)),
+                ),
         ),
     )
     .execute(conn)
