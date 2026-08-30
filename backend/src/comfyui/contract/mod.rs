@@ -976,7 +976,9 @@ mod tests {
                 .into_iter()
                 .collect();
         let no_roles = std::collections::HashMap::new();
-        let prepared = crate::comfyui::workflow::prepare_workflow(
+        // `prepare_workflow` applies a plan rather than deriving one, so the
+        // binding is resolved here — the same call the dispatcher makes.
+        let plan = crate::comfyui::loaders::bind_targets(
             &wf,
             &SourceBinding {
                 uploaded_filename: "new.png",
@@ -984,9 +986,9 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_roles,
             },
-            &overrides,
-            None,
-        );
+        )
+        .unwrap();
+        let prepared = crate::comfyui::workflow::prepare_workflow(&wf, &plan, &overrides, None);
         assert_eq!(
             prepared["7"]["inputs"]["text"].as_str(),
             Some("written by a describe stage")

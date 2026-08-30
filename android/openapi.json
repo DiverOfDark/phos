@@ -6,7 +6,11 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/comfyui-typed-params"
+<<<<<<< HEAD
+    "version": "feat/synthetic-provenance"
+=======
+    "version": "feat/comfyui-stage-contracts"
+>>>>>>> 84d42e3 (feat(api): serve stage contracts, and let a person correct one in place)
   },
   "paths": {
     "/api/auth/callback": {
@@ -250,7 +254,7 @@
           "comfyui"
         ],
         "summary": "Queue enhancement task",
-        "description": "Queue an image enhancement task using a ComfyUI workflow. Creates a background task that processes the shot's original file. A `vary` map queues one task per combination instead, and the response lists them in order.",
+        "description": "Queue an image enhancement task using a ComfyUI workflow. Creates a background task that processes the shot's original file.",
         "operationId": "comfyui_enhance",
         "requestBody": {
           "content": {
@@ -264,10 +268,10 @@
         },
         "responses": {
           "200": {
-            "description": "Enhancement task(s) queued"
+            "description": "Enhancement task queued"
           },
           "400": {
-            "description": "Unrecognised source_mode, one this workflow cannot take, or an unusable sweep"
+            "description": "Unrecognised source_mode"
           },
           "404": {
             "description": "Shot or workflow not found"
@@ -287,7 +291,7 @@
           "comfyui"
         ],
         "summary": "Get shot generation history",
-        "description": "Returns the workflow, text overrides and typed parameters used to generate each non-original file for a shot.",
+        "description": "Returns the workflow and text overrides used to generate each non-original file for a shot.",
         "operationId": "comfyui_shot_generations",
         "parameters": [
           {
@@ -587,7 +591,7 @@
           "comfyui"
         ],
         "summary": "List workflows",
-        "description": "List all imported ComfyUI enhancement workflows available for use.",
+        "description": "List all imported ComfyUI enhancement workflows available for use. Each carries its stage contract: what it accepts (image / video / text / none), what it produces (image / video / text), which loader fills which slot, the prompt slots a person or a describe stage fills, and the typed parameters a line can set.",
         "operationId": "comfyui_list_workflows",
         "responses": {
           "200": {
@@ -656,6 +660,51 @@
         "responses": {
           "200": {
             "description": "Workflow deleted successfully"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/workflows/{id}/contract": {
+      "put": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Correct a workflow's stage contract",
+        "description": "Replace the corrections applied to a workflow's derived stage contract and return the contract that results. The heuristics are wrong on unusual graphs — a title that means something else, a saver Phos cannot classify, a prompt box wired somewhere unexpected — and this is how that is fixed without re-importing. Send an empty object to discard every correction and take the derivation as it stands.",
+        "operationId": "comfyui_correct_contract",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Workflow ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContractCorrections"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The contract after the corrections"
           },
           "404": {
             "description": "Workflow not found"
@@ -2349,6 +2398,16 @@
   },
   "components": {
     "schemas": {
+      "Accepts": {
+        "type": "string",
+        "description": "What a stage consumes.\n\nFour values rather than three, because \"nothing\" is a real answer: a\ntext-to-image graph begins a line instead of continuing one, and a line that\nstarts with it needs no upstream at all.",
+        "enum": [
+          "image",
+          "video",
+          "text",
+          "none"
+        ]
+      },
       "AddManualFacePayload": {
         "type": "object",
         "description": "POST /api/files/:id/faces - manually add a face bounding box.\nThe server computes the embedding from the given bbox coordinates.",
@@ -2564,6 +2623,50 @@
           }
         }
       },
+      "ContractCorrections": {
+        "type": "object",
+        "description": "What a person said the derivation got wrong.\n\nKept beside the derived answer rather than replacing it, so the contract can\nbe re-derived — when ComfyUI comes back and the parameters can finally be\ntyped — without throwing the correction away.",
+        "properties": {
+          "accepts": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Accepts"
+              }
+            ]
+          },
+          "params": {
+            "type": "object",
+            "description": "`\"<node_id>.<field>\"` → the setting it really is (one of [`ParamName`]),\nor `null` for \"that is not one of ours\"."
+          },
+          "produces": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MediaType"
+              }
+            ]
+          },
+          "roles": {
+            "type": "object",
+            "description": "`node_id` → the slot that loader really fills.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SourceRole"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "slots": {
+            "type": "object",
+            "description": "`\"<node_id>.<field>\"` → the prompt slot's name, or `null` for \"that is\nnot a prompt\"."
+          }
+        }
+      },
       "CreatePersonPayload": {
         "type": "object",
         "description": "Create a new person with a name",
@@ -2621,10 +2724,6 @@
           "workflow_id"
         ],
         "properties": {
-          "parameters": {
-            "type": "object",
-            "description": "Typed values for the workflow's non-text inputs, keyed\n`\"<node_id>.<field_name>\"`: `{\"3.seed\": 4242, \"3.cfg\": 6.5,\n\"4.ckpt_name\": \"sd_xl_base_1.0.safetensors\"}`. Each value keeps its own\nJSON type, which is what `text_overrides` cannot do."
-          },
           "shot_id": {
             "type": "string"
           },
@@ -2650,10 +2749,6 @@
             "propertyNames": {
               "type": "string"
             }
-          },
-          "vary": {
-            "type": "object",
-            "description": "Parameters to sweep rather than pin, keyed like `parameters`. Each entry\nmultiplies the number of tasks queued.\n\nA value is one of three spellings: a count (`{\"3.seed\": 4}` — four runs\nwith four fresh seeds), an explicit list (`{\"3.cfg\": [4.0, 6.0, 8.0]}` —\nthree runs), or a `VarySpec` for the long form. Both of those together is\ntwelve runs; past 64 the request is refused.\n\nEvery value is resolved here, so each task is written with its own\ncomplete parameter map and is replayable from its row.\n\nDescribed as a free-form object rather than as a union of the three: the\ngenerated Android client builds every model in the spec even though it\ncalls none of these endpoints, and an untagged union of a number, an\narray and an object is not worth making it compile."
           },
           "workflow_id": {
             "type": "string"
@@ -2910,6 +3005,15 @@
           }
         }
       },
+      "MediaType": {
+        "type": "string",
+        "description": "What flows from one stage to the next.\n\nThree, and `text` is one of them: a text-producing stage writes no file at\nall, so it is not a degenerate image.",
+        "enum": [
+          "image",
+          "video",
+          "text"
+        ]
+      },
       "MergePeoplePayload": {
         "type": "object",
         "description": "Merge two people: move all faces from source to target, then delete source",
@@ -2990,6 +3094,20 @@
             "format": "int64"
           }
         }
+      },
+      "ParamName": {
+        "type": "string",
+        "description": "A knob a line can set on any stage without knowing which node holds it.\n\nA closed vocabulary on purpose. The exhaustive per-node control surface is\n[`detect_inputs`]' job; a contract names only the handful of settings that\nmean the same thing on every stage, so a line can say \"seed 42\" once.",
+        "enum": [
+          "seed",
+          "steps",
+          "cfg",
+          "denoise",
+          "frames",
+          "fps",
+          "width",
+          "height"
+        ]
       },
       "PersonBrief": {
         "type": "object",
@@ -3103,10 +3221,6 @@
           "name": {
             "type": "string"
           },
-          "parameters": {
-            "type": "object",
-            "description": "The preset's typed values, keyed like a task's `parameters`. A preset\nthat can pin a prompt but not a seed or a step count is half a preset."
-          },
           "sort_order": {
             "type": [
               "integer",
@@ -3172,17 +3286,13 @@
             ],
             "description": "The name ComfyUI gave the output, before Phos renamed it into the\nlibrary — the last thread back to the run that made it."
           },
-          "parameters": {
-            "type": "object",
-            "description": "The typed values this run ran with, `\"<node_id>.<field_name>\"` → value,\nexactly as the task row carried them.\n\nThis is what makes a fanned-out run reproducible one file at a time: four\ntakes of the same prompt differ only here, and without it their manifests\nare indistinguishable."
-          },
           "seed": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
-            "description": "The seed the sampler actually ran with, lifted out of [`Self::parameters`]\nbecause it is the value asked for most often. A graph with two samplers\nhas two seeds; this is the first in key order, and the map beside it is\nthe complete answer."
+            "description": "The seed the sampler actually ran with."
           },
           "source_file_id": {
             "type": [
@@ -3590,6 +3700,15 @@
           }
         }
       },
+      "SourceRole": {
+        "type": "string",
+        "description": "Which slot of a multi-input workflow a source fills.\n\nThree is enough for every graph worth running: the frame a clip starts on,\nthe frame it ends on, and a picture that is neither (a style or pose\nreference).",
+        "enum": [
+          "start",
+          "end",
+          "reference"
+        ]
+      },
       "SplitShotPayload": {
         "type": "object",
         "description": "POST /api/shots/:id/split - create new shot from specified files.\nNew shot inherits primary person from faces. Both shots get review_status = 'pending'.",
@@ -3672,53 +3791,6 @@
               "string",
               "null"
             ]
-          }
-        }
-      },
-      "VaryMode": {
-        "type": "string",
-        "description": "How a swept parameter picks its values when no explicit list is given.",
-        "enum": [
-          "random",
-          "increment"
-        ]
-      },
-      "VarySpec": {
-        "type": "object",
-        "description": "The long form of a sweep, for when it needs to say how.",
-        "properties": {
-          "count": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "Or: how many values to generate. Ignored when `values` is given.",
-            "minimum": 0
-          },
-          "max": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
-          },
-          "min": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "The range a generated value stays inside — the node's own bounds, when\nthe catalogue knew them."
-          },
-          "mode": {
-            "$ref": "#/components/schemas/VaryMode",
-            "description": "How to generate them."
-          },
-          "values": {
-            "type": "array",
-            "items": {},
-            "description": "Run exactly these values, in this order.\n\nAny scalar JSON value: `[4.0, 6.0, 8.0]` for a cfg,\n`[\"sd15.safetensors\", \"sdxl.safetensors\"]` for a checkpoint. Declared\nas unconstrained values, not objects — `Vec<Object>` would make a\ngenerated client refuse every valid list."
           }
         }
       },
