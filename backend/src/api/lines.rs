@@ -1115,7 +1115,7 @@ fn decorate_runs(conn: &mut SqliteConnection, rows: &[BoardRow]) -> Vec<serde_js
         .filter(|r| r.status == RunState::Held.as_str())
         .filter_map(|r| r.held_at_stage.map(|at| (r.id.as_str(), at)))
         .collect();
-    let held_takes = super::holds::held_take_counts(conn, &held);
+    let held_takes = crate::comfyui::holds::held_take_counts(conn, &held);
 
     // Who the shot belongs to and what it looks like — the same three batched
     // lookups the task queue makes, for the same reason: a page is fifty rows.

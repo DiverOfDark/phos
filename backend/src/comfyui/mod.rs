@@ -81,7 +81,8 @@
 //!   stage, puts its takes in front of a person, and goes on with the ones they
 //!   keep — so `×4 extend → hold → upscale 4K` spends the hour of upscaling on
 //!   the two clips somebody chose rather than on all four. [`line`] holds the
-//!   verdict rules, [`holds`] reads a hold and writes what was decided, and a
+//!   verdict rules, [`holds`] reads a hold and [`holds::verdict`] writes what
+//!   was decided, and a
 //!   held run is invisible to the advance pass until a verdict releases it, so
 //!   holds accumulate without ever blocking the queue.
 //! * **A video can go in whole.** [`source`] decides what a run consumes — a

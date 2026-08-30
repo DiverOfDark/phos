@@ -13,7 +13,6 @@
 //! (or a list endpoint built beside it) and posts the same `POST`.
 
 use axum::{extract::Path, Json};
-use diesel::prelude::*;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
@@ -174,59 +173,6 @@ pub(super) async fn post_verdict(
         // queued from.
         "queued": outcome.queued,
     })))
-}
-
-/// How many takes each of these runs is holding.
-///
-/// Two queries for a whole page rather than two per row — a library that put
-/// three thousand shots through a hold point has three thousand held runs, and
-/// a board that costs a query each is a board nobody opens twice. The same "not
-/// yet reviewed" rule the hold itself uses: a take an earlier verdict covered
-/// is history, and counting it would make `HELD · 8 TAKES` out of a
-/// regeneration of four.
-pub(super) fn held_take_counts(
-    conn: &mut SqliteConnection,
-    held: &[(&str, i32)],
-) -> std::collections::HashMap<String, usize> {
-    use crate::schema::{enhancement_tasks, run_holds};
-    if held.is_empty() {
-        return std::collections::HashMap::new();
-    }
-    let run_ids: Vec<&str> = held.iter().map(|(id, _)| *id).collect();
-
-    let reviewed: std::collections::HashSet<String> = run_holds::table
-        .filter(run_holds::run_id.eq_any(&run_ids))
-        .select(run_holds::reviewed_task_ids)
-        .load::<String>(conn)
-        .unwrap_or_default()
-        .into_iter()
-        .flat_map(|r| serde_json::from_str::<Vec<String>>(&r).unwrap_or_default())
-        .collect();
-
-    let tasks: Vec<(String, String, Option<i32>)> = enhancement_tasks::table
-        .filter(
-            enhancement_tasks::run_id
-                .eq_any(&run_ids)
-                .and(enhancement_tasks::status.eq("completed")),
-        )
-        .select((
-            enhancement_tasks::id,
-            enhancement_tasks::run_id.assume_not_null(),
-            enhancement_tasks::stage_idx,
-        ))
-        .load(conn)
-        .unwrap_or_default();
-
-    let at: std::collections::HashMap<&str, i32> = held.iter().copied().collect();
-    let mut counts: std::collections::HashMap<String, usize> =
-        run_ids.iter().map(|id| (id.to_string(), 0usize)).collect();
-    for (task_id, run_id, stage_idx) in tasks {
-        if at.get(run_id.as_str()).copied() != stage_idx || reviewed.contains(&task_id) {
-            continue;
-        }
-        *counts.entry(run_id).or_default() += 1;
-    }
-    counts
 }
 
 #[cfg(test)]
