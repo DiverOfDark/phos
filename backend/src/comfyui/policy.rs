@@ -346,6 +346,28 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_out_call_retries_rather_than_killing_the_task() {
+        // A ComfyUI that stopped answering is the definition of a transient
+        // problem, and every HTTP call the worker makes lands on one of these
+        // sites. The Queue case is the one worth pinning: its permanence turns
+        // on a substring match, so a timeout must not trip it.
+        let timeout = "Queue prompt failed: timeout in recv_response after 30s";
+        for site in [
+            FailureSite::Upload,
+            FailureSite::History,
+            FailureSite::Download,
+            FailureSite::Queue,
+        ] {
+            assert_eq!(
+                classify_failure(site, timeout),
+                FailureKind::Transient,
+                "a timeout at {:?} should be retried, not fatal",
+                site
+            );
+        }
+    }
+
+    #[test]
     fn defect_3_a_retry_after_queueing_resumes_the_prompt() {
         // A prompt that already ran should be re-polled, not re-executed —
         // re-running it is expensive and can duplicate the output.

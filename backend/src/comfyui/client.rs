@@ -8,6 +8,7 @@ use super::outputs::OutputRef;
 use super::policy::PROMPT_REJECTED;
 use serde_json::Value;
 use std::sync::OnceLock;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// One client id for the whole process, so ComfyUI can attribute our prompts to
@@ -18,14 +19,75 @@ fn client_id() -> &'static str {
     CLIENT_ID.get_or_init(|| format!("phos-{}", Uuid::new_v4().simple()))
 }
 
+/// How long each kind of call may take.
+///
+/// ureq bounds nothing by default, and the worker is a single blocking loop, so
+/// one call that never returns stops the whole enhancement queue — indefinitely,
+/// with no error and no log line. A paused container, a sleeping host or a
+/// network partition all present that way: the socket is accepted and then
+/// nothing comes back. It also defeats the settle budget, because a `get_history`
+/// that never returns never gets to check its own deadline.
+///
+/// These are generous — ComfyUI is normally on the LAN or the same host, so they
+/// exist to catch a dead server, not to police latency.
+#[derive(Debug, Clone, Copy)]
+struct Timeouts {
+    /// Whole-call budget for the health check, which answers out of memory. If
+    /// it cannot do that promptly, "unreachable" is the honest answer.
+    health: Duration,
+    /// Whole-call budget for the small JSON endpoints.
+    json: Duration,
+    /// Whole-call budget for `/prompt`, which validates the entire graph
+    /// server-side before answering.
+    queue: Duration,
+    /// Whole-call budget for the two calls that move a file. A video can cross
+    /// this connection, so it needs real headroom.
+    transfer: Duration,
+    /// How long any server may take to send *response headers*. This is the
+    /// black-hole guard on the transfer calls: it trips on a host that accepted
+    /// the connection and went silent, without capping a large, healthy body.
+    response: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            health: Duration::from_secs(5),
+            json: Duration::from_secs(15),
+            queue: Duration::from_secs(30),
+            transfer: Duration::from_secs(15 * 60),
+            response: Duration::from_secs(30),
+        }
+    }
+}
+
 pub struct ComfyUiClient {
     base_url: String,
+    timeouts: Timeouts,
 }
 
 impl ComfyUiClient {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
+            timeouts: Timeouts::default(),
+        }
+    }
+
+    /// The same client with every budget shrunk to milliseconds, so the
+    /// black-hole tests finish in a blink instead of half a minute.
+    #[cfg(test)]
+    fn with_tiny_timeouts(base_url: &str) -> Self {
+        let tiny = Duration::from_millis(150);
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            timeouts: Timeouts {
+                health: tiny,
+                json: tiny,
+                queue: tiny,
+                transfer: tiny,
+                response: tiny,
+            },
         }
     }
 
@@ -33,6 +95,9 @@ impl ComfyUiClient {
     pub fn health_check(&self) -> anyhow::Result<()> {
         let url = format!("{}/system_stats", self.base_url);
         let resp = ureq::get(&url)
+            .config()
+            .timeout_global(Some(self.timeouts.health))
+            .build()
             .call()
             .map_err(|e| anyhow::anyhow!("ComfyUI health check failed: {}", e))?;
         if resp.status() != 200 {
@@ -70,6 +135,10 @@ impl ComfyUiClient {
 
         let mut resp = ureq::post(&url)
             .header("Content-Type", &content_type)
+            .config()
+            .timeout_global(Some(self.timeouts.transfer))
+            .timeout_recv_response(Some(self.timeouts.response))
+            .build()
             .send(body.as_slice())
             .map_err(|e| anyhow::anyhow!("Upload failed: {}", e))?;
 
@@ -93,6 +162,7 @@ impl ComfyUiClient {
             .header("Content-Type", "application/json")
             .config()
             .http_status_as_error(false)
+            .timeout_global(Some(self.timeouts.queue))
             .build()
             .send(bytes.as_slice())
             .map_err(|e| anyhow::anyhow!("Queue prompt failed: {}", e))?;
@@ -142,6 +212,9 @@ impl ComfyUiClient {
         let url = format!("{}/interrupt", self.base_url);
         ureq::post(&url)
             .header("Content-Type", "application/json")
+            .config()
+            .timeout_global(Some(self.timeouts.json))
+            .build()
             .send(b"{}".as_slice())
             .map_err(|e| anyhow::anyhow!("Interrupt failed: {}", e))?;
         Ok(())
@@ -154,6 +227,9 @@ impl ComfyUiClient {
         let bytes = serde_json::to_vec(&payload)?;
         ureq::post(&url)
             .header("Content-Type", "application/json")
+            .config()
+            .timeout_global(Some(self.timeouts.json))
+            .build()
             .send(bytes.as_slice())
             .map_err(|e| anyhow::anyhow!("Queue delete failed: {}", e))?;
         Ok(())
@@ -164,6 +240,9 @@ impl ComfyUiClient {
     pub fn is_prompt_running(&self, prompt_id: &str) -> anyhow::Result<bool> {
         let url = format!("{}/queue", self.base_url);
         let mut resp = ureq::get(&url)
+            .config()
+            .timeout_global(Some(self.timeouts.json))
+            .build()
             .call()
             .map_err(|e| anyhow::anyhow!("Queue fetch failed: {}", e))?;
         let json: Value = resp.body_mut().read_json()?;
@@ -174,6 +253,9 @@ impl ComfyUiClient {
     pub(crate) fn get_history(&self, prompt_id: &str) -> anyhow::Result<Option<Value>> {
         let url = format!("{}/history/{}", self.base_url, prompt_id);
         let mut resp = ureq::get(&url)
+            .config()
+            .timeout_global(Some(self.timeouts.json))
+            .build()
             .call()
             .map_err(|e| anyhow::anyhow!("History fetch failed: {}", e))?;
         let json: Value = resp.body_mut().read_json()?;
@@ -188,6 +270,9 @@ impl ComfyUiClient {
     pub(crate) fn is_prompt_in_queue(&self, prompt_id: &str) -> anyhow::Result<bool> {
         let url = format!("{}/queue", self.base_url);
         let mut resp = ureq::get(&url)
+            .config()
+            .timeout_global(Some(self.timeouts.json))
+            .build()
             .call()
             .map_err(|e| anyhow::anyhow!("Queue fetch failed: {}", e))?;
         let json: Value = resp.body_mut().read_json()?;
@@ -202,15 +287,21 @@ impl ComfyUiClient {
     /// which pointed the user at their workflow when the real answer was a 404.
     pub(crate) fn download_output(&self, out: &OutputRef) -> anyhow::Result<Vec<u8>> {
         let url = self.view_url(out);
-        let mut resp = ureq::get(&url).call().map_err(|e| match e {
-            ureq::Error::StatusCode(status) => anyhow::anyhow!(
-                "ComfyUI /view returned HTTP {} for {} ({})",
-                status,
-                out.describe(),
-                url
-            ),
-            other => anyhow::anyhow!("Download of {} failed: {}", out.describe(), other),
-        })?;
+        let mut resp = ureq::get(&url)
+            .config()
+            .timeout_global(Some(self.timeouts.transfer))
+            .timeout_recv_response(Some(self.timeouts.response))
+            .build()
+            .call()
+            .map_err(|e| match e {
+                ureq::Error::StatusCode(status) => anyhow::anyhow!(
+                    "ComfyUI /view returned HTTP {} for {} ({})",
+                    status,
+                    out.describe(),
+                    url
+                ),
+                other => anyhow::anyhow!("Download of {} failed: {}", out.describe(), other),
+            })?;
         let bytes = resp.body_mut().read_to_vec()?;
         // A zero-byte answer means the file exists but is still being written;
         // treat it as a miss so the settle loop keeps waiting instead of saving
@@ -271,5 +362,112 @@ mod tests {
         assert!(!queue_contains(&queue, "queue_running", "pending-id"));
         assert!(queue_contains(&queue, "queue_pending", "pending-id"));
         assert!(!queue_contains(&queue, "queue_pending", "absent-id"));
+    }
+
+    /// A server that accepts the connection and then says nothing, ever — which
+    /// is what a paused container, a sleeping host or a partitioned network all
+    /// look like from this side. Not a closed port: that would fail instantly
+    /// and prove nothing about timeouts.
+    fn black_hole() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Hold every accepted socket open for the life of the process. The
+            // moment one is dropped the client would see a clean EOF and return
+            // early, which is not the case under test.
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => held.push(s),
+                    Err(_) => break,
+                }
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// Run one client call against the black hole on its own thread, and insist
+    /// it comes back. A call with no timeout would block forever; failing the
+    /// test beats hanging CI.
+    fn must_not_hang(
+        label: &str,
+        url: &str,
+        call: impl FnOnce(ComfyUiClient) -> bool + Send + 'static,
+    ) {
+        let url = url.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let client = ComfyUiClient::with_tiny_timeouts(&url);
+            let _ = tx.send(call(client));
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(errored) => assert!(
+                errored,
+                "{} answered Ok against a server that never replied",
+                label
+            ),
+            Err(_) => panic!(
+                "{} never returned. It is unbounded, and because the worker is a \
+                 single blocking loop it would wedge the whole enhancement queue.",
+                label
+            ),
+        }
+    }
+
+    /// Every call the worker makes must be bounded. One that is not stops the
+    /// queue indefinitely, with no error and no log line — and a `get_history`
+    /// that never returns also never gets to check its own settle deadline.
+    #[test]
+    fn no_call_hangs_when_comfyui_stops_answering() {
+        let url = black_hole();
+
+        must_not_hang("health_check", &url, |c| c.health_check().is_err());
+        must_not_hang("get_history", &url, |c| c.get_history("abc").is_err());
+        must_not_hang("is_prompt_in_queue", &url, |c| {
+            c.is_prompt_in_queue("abc").is_err()
+        });
+        must_not_hang("is_prompt_running", &url, |c| {
+            c.is_prompt_running("abc").is_err()
+        });
+        must_not_hang("queue_prompt", &url, |c| {
+            c.queue_prompt(&json!({})).is_err()
+        });
+        must_not_hang("interrupt", &url, |c| c.interrupt().is_err());
+        must_not_hang("delete_queued", &url, |c| c.delete_queued("abc").is_err());
+        must_not_hang("upload_image", &url, |c| {
+            c.upload_image("x.png", &[0u8; 512]).is_err()
+        });
+        must_not_hang("download_output", &url, |c| {
+            c.download_output(&OutputRef {
+                filename: "x.png".to_string(),
+                subfolder: "phos".to_string(),
+                output_type: "output".to_string(),
+            })
+            .is_err()
+        });
+    }
+
+    #[test]
+    fn the_shipped_budgets_are_bounded_and_ordered() {
+        // The black-hole test proves the wiring using tiny budgets; this pins the
+        // values actually shipped, so neither can rot without the other noticing.
+        let t = Timeouts::default();
+        assert!(
+            t.health < t.json,
+            "a health check should give up sooner than a working call"
+        );
+        assert!(t.json <= t.queue, "/prompt validates the whole graph");
+        assert!(
+            t.queue < t.transfer,
+            "moving a video needs the most headroom"
+        );
+        assert!(
+            t.response < t.transfer,
+            "headers must arrive long before a large body finishes"
+        );
+        assert!(
+            t.transfer <= Duration::from_secs(30 * 60),
+            "a budget this large is unbounded in all but name"
+        );
     }
 }
