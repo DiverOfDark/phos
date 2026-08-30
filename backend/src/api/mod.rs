@@ -84,6 +84,7 @@ use utoipa::OpenApi;
         client::client_version,
         // ComfyUI
         comfyui::comfyui_health,
+        comfyui::comfyui_nodes,
         comfyui::comfyui_list_workflows,
         comfyui::comfyui_import_workflow,
         comfyui::comfyui_delete_workflow,
@@ -481,6 +482,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/import/status", get(files::import_status))
         // ComfyUI integration
         .route("/api/comfyui/health", get(comfyui::comfyui_health))
+        .route("/api/comfyui/nodes", get(comfyui::comfyui_nodes))
         .route(
             "/api/comfyui/workflows",
             get(comfyui::comfyui_list_workflows).post(comfyui::comfyui_import_workflow),
