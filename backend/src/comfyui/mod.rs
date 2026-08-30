@@ -75,6 +75,7 @@
 
 mod client;
 pub mod contract;
+pub mod editor;
 mod history;
 pub mod line;
 mod loaders;
@@ -84,6 +85,7 @@ mod outputs;
 mod overrides;
 pub mod params;
 mod policy;
+pub mod promote;
 pub mod runs;
 mod source;
 mod timestamp;
@@ -93,9 +95,7 @@ mod workflow;
 pub use client::ComfyUiClient;
 pub use contract::{Accepts, ContractCorrections, MediaType, ParamName, StageContract};
 pub use line::{validate_chain, LineError, RunState, StageTyping};
-pub use loaders::{
-    default_binding_warnings, detect_loaders, importable, LoaderKind, SourceRole,
-};
+pub use loaders::{default_binding_warnings, detect_loaders, importable, LoaderKind, SourceRole};
 pub use manifest::ProvenanceManifest;
 pub use nodes::NodeCatalog;
 pub use overrides::detect_inputs;
