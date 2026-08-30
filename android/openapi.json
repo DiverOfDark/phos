@@ -4163,6 +4163,17 @@
             "$ref": "#/components/schemas/Requirements",
             "description": "What this line needs installed, as computed where it was exported.\n\nDocumentation, not input: the importer recomputes it from the graphs in\nthis same file, so a stale or hand-edited manifest cannot make an import\nreport something untrue."
           },
+          "template": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Template",
+                "description": "Present on a **bundled template**, absent on somebody's export.\n\nThe one block FR6 adds to this format, and the reason it is declared\nthere rather than here: it says nothing about the line, only about\nPhos's claim on it — the key an upgrade matches and the version it\ncompares. Carried on the document type all the same, so a template\npasted into the import box round-trips as the file it is instead of\nquietly losing its identity on the way through."
+              }
+            ]
+          },
           "workflows": {
             "type": "object",
             "description": "Every workflow the stages name, keyed by whatever they name it.",
@@ -4629,7 +4640,7 @@
           },
           "requirements": {
             "$ref": "#/components/schemas/RequirementsReport",
-            "description": "FR5d's report, verbatim, so a client can render either."
+            "description": "FR5d's own report, unchanged: what is installed and what is not."
           },
           "state": {
             "$ref": "#/components/schemas/ReadinessState"
@@ -4692,12 +4703,13 @@
       },
       "RequirementsReport": {
         "type": "object",
-        "description": "What the catalogue said, and what is missing.\n\nStand-in for `portable::RequirementsReport`, field for field.",
+        "description": "What the catalogue said, and what is missing.\n\nNever a refusal on its own: an import goes through with things missing, so a\nline can be filed on the box that stores the library and run on the box that\nhas the GPU. The report is what the person acts on.",
         "required": [
           "checked",
           "missing_nodes",
           "missing_models",
-          "unverified_models"
+          "unverified_models",
+          "warnings"
         ],
         "properties": {
           "checked": {
@@ -4708,13 +4720,15 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ModelRef"
-            }
+            },
+            "description": "Weights files this ComfyUI's own enum of installed files does not list."
           },
           "missing_nodes": {
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Node classes this ComfyUI does not have. Naming them is the whole point."
           },
           "unverified_models": {
             "type": "array",
@@ -4722,6 +4736,12 @@
               "$ref": "#/components/schemas/ModelRef"
             },
             "description": "Weights files that could be neither confirmed nor denied."
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -5211,7 +5231,7 @@
       },
       "Template": {
         "type": "object",
-        "description": "What makes this line export a *bundled template* rather than somebody's\nexport: an identity that is stable across releases, and a version.\n\nFR6's, and the only field in the document FR5d does not define. Absent on an\nordinary export, which is exactly right — a line somebody sent you is not\nsomething Phos should later overwrite.",
+        "description": "What makes this line export a *bundled template* rather than somebody's\nexport: an identity that is stable across releases, and a version.\n\nThe only field in the document FR5d does not define. Absent on an ordinary\nexport, which is exactly right — a line somebody sent you is not something\nPhos should later overwrite.",
         "required": [
           "key",
           "version"

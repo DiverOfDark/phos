@@ -9,22 +9,15 @@
 //!
 //! # Two halves, and only one of them is FR6's
 //!
-//! **What is missing** is FR5d's question, already answered by
-//! `comfyui::portable::Requirements::derive(graphs).check(catalog)`, and this
-//! module must not answer it a second way — two readiness checks that disagree
-//! is precisely the failure the coordination exists to prevent. FR5d landed in
-//! parallel on the same base, so [`check`] below is a stand-in written to that
-//! exact rule and returning that exact shape.
+//! **What is missing** is FR5d's question, and it is answered in exactly one
+//! place: [`Requirements::derive(bundle.graphs()).check(catalog)`][Requirements::derive].
+//! Two readiness checks that could disagree is precisely the failure the whole
+//! arrangement exists to prevent, so there is one.
 //!
-//! **At integration: delete [`derive_requirements`] and [`check`], and call
-//! FR5d's.** [`assess`] then reads
-//! `portable::Requirements::derive(bundle.graphs()).check(catalog)`, and
-//! everything below the `===== Rendering` line stays as it is.
-//!
-//! Rendering is FR6's half and does not exist in FR5d: the status vocabulary
-//! the console reads (`READY`, `MISSING NODE RIFE VFI`,
-//! `MISSING MODEL wan2.1_i2v_720p.safetensors`, `UNKNOWN`), and one extra
-//! check FR5d has no reason to make.
+//! Everything below the `===== Rendering` line is FR6's, and does not exist in
+//! FR5d: the status vocabulary the console reads (`READY`,
+//! `MISSING NODE RIFE VFI`, `MISSING MODEL wan2.1_i2v_720p.safetensors`,
+//! `UNKNOWN`), and one extra check FR5d has no reason to make.
 //!
 //! # The extra check: does the graph fit the node?
 //!
@@ -44,144 +37,10 @@
 //! `unchecked`, rendered as `UNKNOWN` — never "missing". Nothing is refused on
 //! it either: the template installs, and the run finds out.
 
-use super::bundle::{LineBundle, ModelRef, Requirements};
-use crate::comfyui::nodes::{NodeCatalog, WidgetSpec};
+use crate::comfyui::nodes::NodeCatalog;
+use crate::comfyui::portable::{LineBundle, Requirements, RequirementsReport};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeSet;
-
-// ===== FR5d's half, stood in for ===========================================
-
-/// Suffixes that mean "this string names a weights file".
-///
-/// A property of the *value*, not of the field name or of what the catalogue
-/// says the field is, so the same rule gives the same answer where a line is
-/// exported (ComfyUI possibly down) and where it is imported (a different
-/// ComfyUI entirely). `.png` and `.mp4` are not here: a `LoadImage` default is
-/// not something the target box has to have.
-const MODEL_SUFFIXES: &[&str] = &[
-    ".safetensors",
-    ".ckpt",
-    ".pt",
-    ".pth",
-    ".bin",
-    ".gguf",
-    ".sft",
-    ".onnx",
-];
-
-fn names_a_model(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    MODEL_SUFFIXES.iter().any(|s| lower.ends_with(s))
-}
-
-/// Read the requirements straight off the graphs.
-///
-/// Stand-in for `portable::Requirements::derive`. Derived rather than read out
-/// of the document's own `requirements` block on purpose: the graphs are what
-/// will be sent to ComfyUI, and a hand-written manifest must not be able to
-/// talk a template into claiming something untrue.
-pub fn derive_requirements<'a>(graphs: impl Iterator<Item = &'a Value>) -> Requirements {
-    let mut classes: BTreeSet<String> = BTreeSet::new();
-    let mut models: BTreeSet<ModelRef> = BTreeSet::new();
-    for graph in graphs {
-        let Some(nodes) = graph.as_object() else {
-            continue;
-        };
-        for node in nodes.values() {
-            let Some(class_type) = node.get("class_type").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            classes.insert(class_type.to_string());
-            let Some(inputs) = node.get("inputs").and_then(|v| v.as_object()) else {
-                continue;
-            };
-            for (field, value) in inputs {
-                // A link is `["6", 0]`, never a filename.
-                let Some(text) = value.as_str() else { continue };
-                if names_a_model(text) {
-                    models.insert(ModelRef {
-                        class_type: class_type.to_string(),
-                        field: field.clone(),
-                        name: text.to_string(),
-                    });
-                }
-            }
-        }
-    }
-    Requirements {
-        node_classes: classes.into_iter().collect(),
-        models: models.into_iter().collect(),
-    }
-}
-
-/// What the catalogue said, and what is missing.
-///
-/// Stand-in for `portable::RequirementsReport`, field for field.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, utoipa::ToSchema)]
-pub struct RequirementsReport {
-    /// False when there was no catalogue to check against.
-    pub checked: bool,
-    pub missing_nodes: Vec<String>,
-    pub missing_models: Vec<ModelRef>,
-    /// Weights files that could be neither confirmed nor denied.
-    pub unverified_models: Vec<ModelRef>,
-}
-
-/// Does this box have what the template needs?
-///
-/// Stand-in for `portable::Requirements::check`.
-pub fn check(requirements: &Requirements, catalog: Option<&NodeCatalog>) -> RequirementsReport {
-    let Some(catalog) = catalog.filter(|c| !c.is_empty()) else {
-        return RequirementsReport {
-            checked: false,
-            unverified_models: requirements.models.clone(),
-            ..Default::default()
-        };
-    };
-
-    let missing_nodes: Vec<String> = requirements
-        .node_classes
-        .iter()
-        .filter(|c| catalog.get(c).is_none())
-        .cloned()
-        .collect();
-
-    let mut missing_models = Vec::new();
-    let mut unverified_models = Vec::new();
-    for model in &requirements.models {
-        // A model on a node that is not installed is already reported by the
-        // node being missing; saying it twice would make one problem look like
-        // two.
-        let Some(class) = catalog.get(&model.class_type) else {
-            continue;
-        };
-        match class.input(&model.field).map(|i| &i.widget) {
-            // ComfyUI fills an installed-assets combo with exactly the files it
-            // found, so this is the one case that can be decided.
-            Some(WidgetSpec::Combo {
-                choices, truncated, ..
-            }) => {
-                if choices.iter().any(|c| c == &model.name) {
-                    continue;
-                }
-                if *truncated {
-                    unverified_models.push(model.clone());
-                } else {
-                    missing_models.push(model.clone());
-                }
-            }
-            _ => unverified_models.push(model.clone()),
-        }
-    }
-
-    RequirementsReport {
-        checked: true,
-        missing_nodes,
-        missing_models,
-        unverified_models,
-    }
-}
 
 // ===== Rendering — FR6's half ==============================================
 
@@ -224,16 +83,14 @@ pub struct Readiness {
     pub label: String,
     /// The whole story, for the panel under the label.
     pub detail: String,
-    /// FR5d's report, verbatim, so a client can render either.
+    /// FR5d's own report, unchanged: what is installed and what is not.
     pub requirements: RequirementsReport,
     pub input_mismatches: Vec<InputMismatch>,
 }
 
 /// Ask the catalogue everything, and say what came back.
 pub fn assess(bundle: &LineBundle, catalog: Option<&NodeCatalog>) -> Readiness {
-    // At integration these two lines become
-    // `portable::Requirements::derive(bundle.graphs()).check(catalog)`.
-    let report = check(&derive_requirements(bundle.graphs()), catalog);
+    let report = Requirements::derive(bundle.graphs()).check(catalog);
 
     let mut input_mismatches = Vec::new();
     if let Some(catalog) = catalog.filter(|c| !c.is_empty()) {
@@ -416,7 +273,7 @@ fn join_names(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comfyui::nodes::{NodeClass, NodeInput};
+    use crate::comfyui::nodes::{NodeClass, NodeInput, WidgetSpec};
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -522,10 +379,11 @@ mod tests {
     }
 
     /// The `requirements` block in the file is documentation; what is checked
-    /// comes off the graphs. A `.png` default is not a weights file.
+    /// comes off the graphs, through FR5d's derivation and no other. A `.png`
+    /// default is not a weights file.
     #[test]
     fn requirements_are_read_off_the_graphs_not_the_manifest() {
-        let r = derive_requirements(bundle().graphs());
+        let r = Requirements::derive(bundle().graphs());
         assert_eq!(
             r.node_classes,
             vec![

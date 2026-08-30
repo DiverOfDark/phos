@@ -47,12 +47,14 @@
 //! `phos.line` documents — line, workflow graphs, contracts, requirements —
 //! with one additive `template` block carrying the key and version an upgrade
 //! needs. Paste one into the Lines tab's import box and it imports. See
-//! [`bundle`], which stands in for `comfyui::portable::LineBundle` until the
-//! two branches meet, and says exactly what to delete when they do.
+//! [`crate::comfyui::portable::LineBundle`] — the same type the Lines tab's
+//! export and import use, with the one additive `template` block [`bundle`]
+//! defines.
 //!
 //! # Shape
 //!
-//! * [`bundle`] — the document. FR5d's, plus `template`.
+//! * [`bundle`] — the `template` block FR5d's document does not define, and
+//!   the build-time check on the five shipped files.
 //! * [`marker`] — the `_phos` block, the hash, and the update decision. Pure.
 //! * [`readiness`] — what this ComfyUI is missing, and how it reads. Pure.
 //! * [`install`] — the only part that writes rows.
@@ -62,7 +64,7 @@ pub mod install;
 pub mod marker;
 pub mod readiness;
 
-use bundle::LineBundle;
+use crate::comfyui::portable::LineBundle;
 use diesel::sqlite::SqliteConnection;
 use std::sync::OnceLock;
 
@@ -223,7 +225,7 @@ mod tests {
     fn every_shipped_template_would_survive_its_own_import() {
         for bundle in bundled() {
             assert_eq!(
-                bundle.problems(),
+                bundle::problems(bundle),
                 Vec::<String>::new(),
                 "template {}",
                 bundle.key()
@@ -245,9 +247,9 @@ mod tests {
         struct AsFr5dReadsIt {
             format: String,
             format_version: u32,
-            line: bundle::BundleLine,
-            workflows: std::collections::BTreeMap<String, bundle::BundleWorkflow>,
-            requirements: bundle::Requirements,
+            line: crate::comfyui::portable::BundleLine,
+            workflows: std::collections::BTreeMap<String, crate::comfyui::portable::BundleWorkflow>,
+            requirements: crate::comfyui::portable::Requirements,
         }
 
         for raw in BUNDLED {
@@ -274,7 +276,7 @@ mod tests {
         for bundle in bundled() {
             assert_eq!(
                 bundle.requirements,
-                readiness::derive_requirements(bundle.graphs()),
+                crate::comfyui::portable::Requirements::derive(bundle.graphs()),
                 "template {}",
                 bundle.key()
             );
@@ -350,7 +352,7 @@ mod tests {
                     }
                 }
             }
-            for m in &readiness::derive_requirements(bundle.graphs()).models {
+            for m in &crate::comfyui::portable::Requirements::derive(bundle.graphs()).models {
                 models
                     .entry(m.class_type.clone())
                     .or_default()
