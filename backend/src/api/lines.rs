@@ -70,13 +70,18 @@ pub(super) struct LineStagePayload {
     /// to let the graph decide.
     pub(super) source_mode: Option<String>,
     /// Keep this stage's output once the run completes. The last stage's output
-    /// is the product and is kept regardless.
+    /// is the product and is kept regardless, and so are the takes of a stage
+    /// that holds for review.
     #[serde(default)]
     pub(super) keep_output: bool,
     /// Keys this stage deliberately leaves open — the *exposed* disposition.
     /// Starting a run may supply values for exactly these, and only these.
     #[serde(default)]
     pub(super) exposed: Vec<String>,
+    /// Park the run after this stage and ask which of its takes go on. Refused
+    /// on the last stage, whose output is the product.
+    #[serde(default)]
+    pub(super) hold_for_review: bool,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -98,6 +103,7 @@ impl LineStagePayload {
             source_mode: row.source_mode.clone(),
             keep_output: row.keep_output,
             exposed: row.exposed.clone(),
+            hold_for_review: row.hold_for_review,
         }
     }
 
@@ -116,6 +122,7 @@ impl LineStagePayload {
             source_mode,
             keep_output: false,
             exposed,
+            hold_for_review: false,
         }
     }
 }
@@ -302,6 +309,7 @@ pub(super) fn stage_json(
         "accepts": stage.contract.accepts,
         "produces": stage.contract.produces,
         "keep_output": stage.keep_output,
+        "hold_for_review": stage.hold_for_review,
         "source_mode": stage.source_mode,
         "exposed": stage.exposed,
         "handoff": handoff,
@@ -557,6 +565,20 @@ pub(super) fn check_payload(
             )));
         }
 
+        // A hold point exists to stop the line before the next stage spends an
+        // hour on takes nobody chose. On the last stage there is no next stage:
+        // its output is the product, so a verdict there could only ever mean
+        // "delete some of what you just made", which is what the library is
+        // for. Refused when the line is drawn rather than discovered by a run
+        // that parks and can never be released.
+        if stage.hold_for_review && idx + 1 == payload.stages.len() {
+            return Err(ApiError::bad_request(format!(
+                "Stage {} is the last one, and its output is the product. A hold \
+                 for review goes on a stage that has something after it.",
+                idx + 1
+            )));
+        }
+
         let contract = contract_of(contract_json.as_deref(), &workflow_json);
         typings.push(StageTyping {
             stage_idx: idx as i32,
@@ -595,6 +617,7 @@ pub(super) fn insert_stages(
                 source_mode: stage.source_mode.as_deref(),
                 keep_output: stage.keep_output,
                 exposed: Some(&exposed),
+                hold_for_review: stage.hold_for_review,
             })
             .execute(conn)?;
     }
@@ -659,12 +682,17 @@ pub(super) async fn create_line(
 /// no longer exists. Refused rather than versioned: v1 lines are small and
 /// remaking one is cheap, and FR5b can do better once there is an editor to do
 /// it in.
+///
+/// A **held** run counts. It is stopped, but only until somebody says which
+/// takes go on — and the moment they do, it reads the stages after the hold. A
+/// line edited under it is exactly the change that was refused for a running
+/// one, arriving with a delay.
 pub(super) fn live_run_count(conn: &mut SqliteConnection, line_id: &str) -> i64 {
     runs::table
         .filter(
             runs::line_id
                 .eq(line_id)
-                .and(runs::status.eq(RunState::Running.as_str())),
+                .and(runs::status.eq_any(RunState::live())),
         )
         .count()
         .get_result::<i64>(conn)
@@ -909,6 +937,8 @@ struct BoardRow {
     error_message: Option<String>,
     created_at: Option<String>,
     finished_at: Option<String>,
+    /// Where a held run is parked. `None` for every other status.
+    held_at_stage: Option<i32>,
 }
 
 type RunTuple = (
@@ -921,7 +951,52 @@ type RunTuple = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<i32>,
 );
+
+/// The columns a board row is built out of, in [`BoardRow`]'s own order.
+fn run_columns() -> (
+    runs::id,
+    runs::line_id,
+    runs::shot_id,
+    runs::label,
+    runs::status,
+    runs::stage_count,
+    runs::error_message,
+    runs::created_at,
+    runs::finished_at,
+    runs::held_at_stage,
+) {
+    (
+        runs::id,
+        runs::line_id,
+        runs::shot_id,
+        runs::label,
+        runs::status,
+        runs::stage_count,
+        runs::error_message,
+        runs::created_at,
+        runs::finished_at,
+        runs::held_at_stage,
+    )
+}
+
+impl From<RunTuple> for BoardRow {
+    fn from(t: RunTuple) -> Self {
+        BoardRow {
+            id: t.0,
+            line_id: t.1,
+            shot_id: t.2,
+            label: t.3,
+            status: t.4,
+            stage_count: t.5,
+            error_message: t.6,
+            created_at: t.7,
+            finished_at: t.8,
+            held_at_stage: t.9,
+        }
+    }
+}
 
 /// How long the run has been going, or how long it took. The board reads it as
 /// `HH:MM:SS`, and computing it here keeps it off a browser clock that may not
@@ -959,17 +1034,7 @@ pub(super) async fn list_runs(
 
     let limit = query.limit.unwrap_or(50).min(200);
     let mut q = runs::table
-        .select((
-            runs::id,
-            runs::line_id,
-            runs::shot_id,
-            runs::label,
-            runs::status,
-            runs::stage_count,
-            runs::error_message,
-            runs::created_at,
-            runs::finished_at,
-        ))
+        .select(run_columns())
         .order((runs::created_at.desc(), runs::id.desc()))
         .limit(limit + 1)
         .into_boxed();
@@ -1001,20 +1066,7 @@ pub(super) async fn list_runs(
         tuples.truncate(limit as usize);
     }
 
-    let rows: Vec<BoardRow> = tuples
-        .into_iter()
-        .map(|t| BoardRow {
-            id: t.0,
-            line_id: t.1,
-            shot_id: t.2,
-            label: t.3,
-            status: t.4,
-            stage_count: t.5,
-            error_message: t.6,
-            created_at: t.7,
-            finished_at: t.8,
-        })
-        .collect();
+    let rows: Vec<BoardRow> = tuples.into_iter().map(BoardRow::from).collect();
 
     let items = decorate_runs(&mut conn, &rows);
     let next_cursor = if has_more {
@@ -1054,6 +1106,16 @@ fn decorate_runs(conn: &mut SqliteConnection, rows: &[BoardRow]) -> Vec<serde_js
         .unwrap_or_default()
         .into_iter()
         .collect();
+
+    // How many takes each held run is waiting on — `HELD · 4 TAKES` on the
+    // board. Asked only of the rows that are actually holding, so an ordinary
+    // page costs nothing.
+    let held: Vec<(&str, i32)> = rows
+        .iter()
+        .filter(|r| r.status == RunState::Held.as_str())
+        .filter_map(|r| r.held_at_stage.map(|at| (r.id.as_str(), at)))
+        .collect();
+    let held_takes = super::holds::held_take_counts(conn, &held);
 
     // Who the shot belongs to and what it looks like — the same three batched
     // lookups the task queue makes, for the same reason: a page is fifty rows.
@@ -1140,8 +1202,17 @@ fn decorate_runs(conn: &mut SqliteConnection, rows: &[BoardRow]) -> Vec<serde_js
                 // the tally is how far along that run got.
                 "status": run.status,
                 "stage_count": run.stage_count,
-                "current_stage": tally.current_stage.min(run.stage_count),
-                "stage_label": stage_label,
+                // A held run is *at* the stage it is holding, not past it: the
+                // tally counts its takes as finished, and the board should say
+                // which stage a person is being asked about.
+                "current_stage": run.held_at_stage
+                    .unwrap_or_else(|| tally.current_stage.min(run.stage_count)),
+                "stage_label": run.held_at_stage
+                    .and_then(|at| tasks.iter().find(|t| t.1.unwrap_or(0) == at))
+                    .and_then(|t| workflow_names.get(&t.3).cloned())
+                    .or(stage_label),
+                "held_at_stage": run.held_at_stage,
+                "held_takes": held_takes.get(run.id.as_str()).copied().unwrap_or(0),
                 "task_count": tasks.len(),
                 "in_flight": tally.in_flight,
                 "completed": tally.completed,
@@ -1192,34 +1263,14 @@ pub(super) async fn get_run(
 
     let row: Option<RunTuple> = runs::table
         .filter(runs::id.eq(&id))
-        .select((
-            runs::id,
-            runs::line_id,
-            runs::shot_id,
-            runs::label,
-            runs::status,
-            runs::stage_count,
-            runs::error_message,
-            runs::created_at,
-            runs::finished_at,
-        ))
+        .select(run_columns())
         .first(&mut conn)
         .optional()
         .map_err(|_| ApiError::internal())?;
     let Some(t) = row else {
         return Err(StatusCode::NOT_FOUND.into());
     };
-    let board = BoardRow {
-        id: t.0,
-        line_id: t.1,
-        shot_id: t.2,
-        label: t.3,
-        status: t.4,
-        stage_count: t.5,
-        error_message: t.6,
-        created_at: t.7,
-        finished_at: t.8,
-    };
+    let board = BoardRow::from(t);
 
     let tasks: Vec<serde_json::Value> = enhancement_tasks::table
         .inner_join(comfyui_workflows::table)
@@ -1350,13 +1401,49 @@ pub(super) async fn cancel_run(
     let url = require_comfyui(&state)?;
     let mut conn = state.pool.get().map_err(|_| ApiError::internal())?;
 
-    let exists: i64 = runs::table
+    let status: Option<String> = runs::table
         .filter(runs::id.eq(&id))
-        .count()
-        .get_result(&mut conn)
+        .select(runs::status)
+        .first(&mut conn)
+        .optional()
         .map_err(|_| ApiError::internal())?;
-    if exists == 0 {
+    let Some(status) = status else {
         return Err(StatusCode::NOT_FOUND.into());
+    };
+
+    // Cancelling a *held* run is the hold's own Cancel verdict, and goes
+    // through it: the decision is recorded in `run_holds` like every other, and
+    // the intermediates go, which is what abandoning a run means. There is one
+    // behaviour per state rather than two spellings of cancel that differ by
+    // which button was pressed.
+    //
+    // If it turns out not to be a hold after all — a `held` row with no stage
+    // on it, which nothing writes but a hand could — this falls through to the
+    // ordinary cancel below rather than refusing. Stopping a run is the one
+    // thing that must always work.
+    if status == RunState::Held.as_str() {
+        match crate::comfyui::holds::give_verdict(
+            &mut conn,
+            &state.library_root,
+            &id,
+            crate::comfyui::Verdict::Cancel,
+            &[],
+            None,
+        ) {
+            Ok(outcome) => {
+                return Ok(Json(serde_json::json!({
+                    "status": "cancelled",
+                    "stopped": 0,
+                    "abandoned_takes": outcome.reviewed.len(),
+                })))
+            }
+            Err(e) => tracing::warn!(
+                "Run {} is marked held but is not holding anything ({}); \
+                 cancelling it the ordinary way",
+                id,
+                e
+            ),
+        }
     }
 
     // The prompts to stop on ComfyUI's side, read before the local rows change.
@@ -1455,6 +1542,7 @@ mod tests {
             source_mode: None,
             keep_output: false,
             exposed: Vec::new(),
+            hold_for_review: false,
         }
     }
 
@@ -1502,6 +1590,118 @@ mod tests {
             .get_result(&mut conn)
             .unwrap();
         assert_eq!(stored, 0);
+    }
+
+    #[test]
+    fn a_hold_goes_on_a_stage_that_has_something_after_it() {
+        let (_dir, mut conn) = library(&format!(
+            "{}{}",
+            stated("wf-i2v", "Image to Video", Accepts::Image, MediaType::Video),
+            stated("wf-4k", "Upscale 4K", Accepts::Video, MediaType::Video),
+        ));
+
+        // Held on stage 1, which stage 2 pays for: the whole point.
+        let mut payload = line(vec![stage("wf-i2v"), stage("wf-4k")]);
+        payload.stages[0].hold_for_review = true;
+        assert!(check_payload(&mut conn, &payload).is_ok());
+
+        // Held on the last stage, whose output is the product. Refused when the
+        // line is drawn rather than found out by a run that parks and can never
+        // be released.
+        let mut payload = line(vec![stage("wf-i2v"), stage("wf-4k")]);
+        payload.stages[1].hold_for_review = true;
+        let ApiError(status, message) = check_payload(&mut conn, &payload).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = message.unwrap();
+        assert!(message.contains("Stage 2 is the last one"), "{}", message);
+        assert!(message.contains("hold for review"), "{}", message);
+    }
+
+    #[test]
+    fn the_board_says_how_many_takes_a_held_run_is_waiting_on() {
+        let (_dir, mut conn) = library(&format!(
+            "{}{}",
+            stated("wf-i2v", "Extend Clip", Accepts::Image, MediaType::Video),
+            stated("wf-4k", "Upscale 4K", Accepts::Video, MediaType::Video),
+        ));
+        conn.batch_execute(
+            "INSERT INTO production_lines (id, name) VALUES ('line-1', 'Extend');
+             INSERT INTO line_stages (id, line_id, stage_idx, workflow_id, hold_for_review) \
+               VALUES ('st-0', 'line-1', 0, 'wf-i2v', 1), ('st-1', 'line-1', 1, 'wf-4k', 0);
+             INSERT INTO shots (id) VALUES ('shot-1');
+             INSERT INTO runs (id, line_id, shot_id, label, status, stage_count, held_at_stage) \
+               VALUES ('run-1', 'line-1', 'shot-1', 'Extend', 'held', 2, 0);
+             INSERT INTO enhancement_tasks \
+               (id, shot_id, workflow_id, status, run_id, stage_idx) VALUES \
+               ('t-a', 'shot-1', 'wf-i2v', 'completed', 'run-1', 0),
+               ('t-b', 'shot-1', 'wf-i2v', 'completed', 'run-1', 0),
+               ('t-c', 'shot-1', 'wf-i2v', 'completed', 'run-1', 0),
+               ('t-d', 'shot-1', 'wf-i2v', 'completed', 'run-1', 0);",
+        )
+        .unwrap();
+
+        let board = BoardRow {
+            id: "run-1".to_string(),
+            line_id: Some("line-1".to_string()),
+            shot_id: "shot-1".to_string(),
+            label: "Extend".to_string(),
+            status: "held".to_string(),
+            stage_count: 2,
+            error_message: None,
+            created_at: None,
+            finished_at: None,
+            held_at_stage: Some(0),
+        };
+        let row = decorate_runs(&mut conn, std::slice::from_ref(&board))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(row["held_takes"], serde_json::json!(4), "HELD · 4 TAKES");
+        assert_eq!(
+            row["current_stage"],
+            serde_json::json!(0),
+            "a held run is at the stage it is holding, not past it"
+        );
+        assert_eq!(row["stage_label"], serde_json::json!("Extend Clip"));
+
+        // A verdict has been given over two of them. They are history: the
+        // board counts what is still waiting, not what was ever made.
+        conn.batch_execute(
+            "INSERT INTO run_holds \
+               (id, run_id, stage_idx, verdict, reviewed_task_ids, kept_task_ids) \
+             VALUES ('h-1', 'run-1', 0, 'continue', '[\"t-a\",\"t-b\"]', '[\"t-a\"]');",
+        )
+        .unwrap();
+        let row = decorate_runs(&mut conn, std::slice::from_ref(&board))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(row["held_takes"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn a_held_run_locks_its_line_exactly_as_a_running_one_does() {
+        let (_dir, mut conn) = library(&format!(
+            "{}{}",
+            stated("wf-i2v", "Image to Video", Accepts::Image, MediaType::Video),
+            stated("wf-4k", "Upscale 4K", Accepts::Video, MediaType::Video),
+        ));
+        conn.batch_execute(
+            "INSERT INTO production_lines (id, name) VALUES ('line-1', 'Extend');
+             INSERT INTO shots (id) VALUES ('shot-1');
+             INSERT INTO runs (id, line_id, shot_id, label, status, stage_count) \
+               VALUES ('run-1', 'line-1', 'shot-1', 'Extend', 'held', 2);",
+        )
+        .unwrap();
+        assert_eq!(
+            live_run_count(&mut conn, "line-1"),
+            1,
+            "a verdict puts it straight back to reading the stages after the hold"
+        );
+
+        conn.batch_execute("UPDATE runs SET status = 'completed';")
+            .unwrap();
+        assert_eq!(live_run_count(&mut conn, "line-1"), 0);
     }
 
     #[test]

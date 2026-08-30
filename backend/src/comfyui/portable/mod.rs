@@ -83,6 +83,12 @@ pub struct BundleStage {
     /// would rather not say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exposed: Vec<String>,
+    /// Whether this stage parks its run and asks which of its takes go on —
+    /// FR5c's hold point. Travels for the same reason again: a `×4 → hold →
+    /// upscale` line carried somewhere without the hold is a line that spends
+    /// four hours where the original spent one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold_for_review: bool,
 }
 
 /// The line itself. Stage order is array order — there is no `stage_idx`,
@@ -510,6 +516,7 @@ mod tests {
                     source_mode: None,
                     keep_output: false,
                     exposed: Vec::new(),
+                    hold_for_review: false,
                 }],
             },
             workflows,

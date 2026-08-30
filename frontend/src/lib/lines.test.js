@@ -19,6 +19,8 @@ import {
   toPayload,
   typeTrack,
   askedCount,
+  continuationCost,
+  heldLabel,
 } from "./lines.js";
 
 /** One stage, as `GET /api/comfyui/lines/{id}` serves it. */
@@ -28,6 +30,7 @@ const stage = (name, accepts, produces, extra = {}) => ({
   accepts,
   produces,
   keep_output: false,
+  hold_for_review: false,
   source_mode: null,
   exposed: [],
   text_overrides: {},
@@ -173,6 +176,7 @@ test("the editor's state goes back as the body the endpoint takes", () => {
     source_mode: null,
     keep_output: false,
     exposed: ["6.text"],
+    hold_for_review: false,
   });
   assert.equal(body.stages[1].source_mode, "whole_video");
   assert.equal(body.stages[1].keep_output, true);
@@ -181,6 +185,7 @@ test("the editor's state goes back as the body the endpoint takes", () => {
   // server its own derivation.
   assert.deepEqual(Object.keys(body.stages[1]).sort(), [
     "exposed",
+    "hold_for_review",
     "keep_output",
     "parameters",
     "source_mode",
@@ -188,6 +193,38 @@ test("the editor's state goes back as the body the endpoint takes", () => {
     "vary",
     "workflow_id",
   ]);
+});
+
+test("a hold point travels with the stage that asks for it", () => {
+  const body = toPayload({
+    name: "Extend",
+    stages: [
+      stage("Extend Clip", "video", "video", { hold_for_review: true }),
+      stage("Upscale 4K", "video", "video"),
+    ],
+  });
+  assert.equal(body.stages[0].hold_for_review, true);
+  assert.equal(body.stages[1].hold_for_review, false);
+  // And a stage read back from a library that predates holds is not holding.
+  assert.equal(toPayload({ stages: [{ workflow_id: "wf" }] }).stages[0].hold_for_review, false);
+});
+
+test("keeping two of four does not halve the bill", () => {
+  // A hold is a fan-out point as much as a filter: the estimate the board shows
+  // is per kept take, so it goes up as boxes are ticked.
+  assert.equal(continuationCost(2, 1), 2);
+  assert.equal(continuationCost(2, 4), 8);
+  assert.equal(continuationCost(0, 4), 0, "nothing kept, nothing queued");
+  assert.equal(continuationCost(3, undefined), 0);
+});
+
+test("a held run says how many takes it is waiting on", () => {
+  assert.equal(heldLabel({ held_takes: 4 }), "held · 4 takes");
+  assert.equal(heldLabel({ held_takes: 1 }), "held · 1 take");
+  // Before the count has loaded, or on a run holding nothing, it is just the
+  // status — never `held · 0 takes`, which reads as a bug.
+  assert.equal(heldLabel({ held_takes: 0 }), "held");
+  assert.equal(heldLabel({}), "held");
 });
 
 test("a line reads as what goes in one end and what comes out the other", () => {

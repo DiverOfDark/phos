@@ -35,7 +35,7 @@ use std::collections::HashMap;
 
 /// A `line_stages` row joined to its workflow: position, workflow id and name,
 /// the three override maps, source mode, keep flag, exposed keys, stored
-/// contract and graph.
+/// contract, graph and hold flag.
 type StageTuple = (
     i32,
     String,
@@ -48,6 +48,7 @@ type StageTuple = (
     String,
     Option<String>,
     String,
+    bool,
 );
 
 /// One step of a line, read out of the database with its workflow's contract.
@@ -60,6 +61,9 @@ pub(crate) struct StageRow {
     pub vary: String,
     pub source_mode: Option<String>,
     pub keep_output: bool,
+    /// Whether this stage parks its run and asks a person which of its takes go
+    /// on — FR5c's hold point.
+    pub hold_for_review: bool,
     /// Keys this stage leaves to whoever sends it — the *exposed* disposition.
     /// Everything else the stage carries is a decision it made.
     pub exposed: Vec<String>,
@@ -70,6 +74,9 @@ pub(crate) struct StageRow {
     /// And whether it has one that reads a still — off the graph for the same
     /// reason, so a role-less contract cannot hide the frame-vs-clip choice.
     pub takes_image: bool,
+    /// Every field of this stage that carries a seed, keyed the way a parameter
+    /// map keys it — what *regenerate* moves, and the only thing it moves.
+    pub seed_keys: Vec<String>,
     pub contract: StageContract,
 }
 
@@ -213,30 +220,75 @@ pub(crate) fn stages_of_line(
             diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(line_stages.exposed, '[]')"),
             comfyui_workflows::contract_json,
             comfyui_workflows::workflow_json,
+            line_stages::hold_for_review,
         ))
         .load(conn)?;
 
     Ok(rows
         .into_iter()
-        .map(|r| StageRow {
-            stage_idx: r.0,
-            workflow_id: r.1,
-            workflow_name: r.2,
-            text_overrides: r.3,
-            parameters: r.4,
-            vary: r.5,
-            source_mode: r.6,
-            keep_output: r.7,
-            exposed: serde_json::from_str(&r.8).unwrap_or_default(),
-            takes_video: serde_json::from_str::<serde_json::Value>(&r.10)
-                .map(|g| super::loaders::takes_video(&g))
-                .unwrap_or(false),
-            takes_image: serde_json::from_str::<serde_json::Value>(&r.10)
-                .map(|g| super::loaders::takes_image(&g))
-                .unwrap_or(false),
-            contract: contract_of(r.9.as_deref(), &r.10),
+        .map(|r| {
+            let graph: serde_json::Value =
+                serde_json::from_str(&r.10).unwrap_or(serde_json::Value::Null);
+            let contract = contract_of(r.9.as_deref(), &r.10);
+            StageRow {
+                stage_idx: r.0,
+                workflow_id: r.1,
+                workflow_name: r.2,
+                text_overrides: r.3,
+                parameters: r.4,
+                vary: r.5,
+                source_mode: r.6,
+                keep_output: r.7,
+                hold_for_review: r.11,
+                exposed: serde_json::from_str(&r.8).unwrap_or_default(),
+                takes_video: super::loaders::takes_video(&graph),
+                takes_image: super::loaders::takes_image(&graph),
+                seed_keys: seed_keys_of(&graph, &contract),
+                contract,
+            }
         })
         .collect())
+}
+
+/// Every field of a stage that carries a seed, keyed `"<node_id>.<field>"`.
+///
+/// Two sources, because either can be the only one that knows.
+///
+/// The **contract** is authoritative wherever it was derived against a real
+/// `/object_info`: it carries the corrections a person made, and it catches a
+/// seed ComfyUI marks `control_after_generate` under a name nobody guessed.
+///
+/// The **graph** catches what the contract cannot. A custom node class this
+/// server's catalogue does not contain is typed by the offline heuristics,
+/// which surface prompts and image inputs and nothing numeric at all — so every
+/// stage of a line built on a video pack would have no seed, and *regenerate*
+/// would be a button that changes nothing. The graph is what actually runs, so
+/// it is the honest second opinion.
+fn seed_keys_of(graph: &serde_json::Value, contract: &StageContract) -> Vec<String> {
+    use super::contract::ParamName;
+    let mut keys: Vec<String> = contract
+        .params_named(ParamName::Seed)
+        .map(|p| p.override_key())
+        .collect();
+
+    if let Some(nodes) = graph.as_object() {
+        for (node_id, node) in nodes {
+            let Some(inputs) = node.get("inputs").and_then(|i| i.as_object()) else {
+                continue;
+            };
+            for (field, value) in inputs {
+                // A wired socket is an array, and rewriting one breaks the
+                // graph. Only a literal number is a seed somebody can set.
+                if value.is_number() && ParamName::Seed.names_field(field) {
+                    keys.push(format!("{}.{}", node_id, field));
+                }
+            }
+        }
+    }
+
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 /// Write the instruction Phos composed into a describe stage's prompt box.

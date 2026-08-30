@@ -169,6 +169,7 @@ export function toPayload(line) {
       source_mode: stage.source_mode ?? null,
       keep_output: !!stage.keep_output,
       exposed: stage.exposed || [],
+      hold_for_review: !!stage.hold_for_review,
     })),
   };
 }
@@ -189,4 +190,33 @@ export function typeTrack(line) {
 /** How many of a stage's settings the line leaves to whoever sends it. */
 export function askedCount(line) {
   return (line?.stages || []).reduce((total, s) => total + (s.exposed || []).length, 0);
+}
+
+// ===== What a hold costs ===================================================
+
+/**
+ * How many tasks continuing with `kept` takes will queue, stage by stage.
+ *
+ * The same arithmetic the backend does, and it is here for one reason only: the
+ * number has to move as boxes are ticked, and a round trip per tick would make
+ * the estimate feel like a page load. The backend sends `tasks_per_take` with
+ * the hold — the sum for one take — and this multiplies it out. If the two ever
+ * disagree the backend is right; it is the one that queues them.
+ */
+export function continuationCost(kept, tasksPerTake) {
+  const takes = Math.max(0, Math.trunc(Number(kept) || 0));
+  const each = Math.max(0, Math.trunc(Number(tasksPerTake) || 0));
+  return takes * each;
+}
+
+/**
+ * What a held run says on the board: `HELD · 4 TAKES`.
+ *
+ * Uppercase mono, like every other count on this screen — the register the
+ * whole board reads in.
+ */
+export function heldLabel(run) {
+  const takes = Number(run?.held_takes) || 0;
+  if (!takes) return "held";
+  return `held · ${takes} take${takes === 1 ? "" : "s"}`;
 }

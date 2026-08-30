@@ -22,12 +22,30 @@
 //!   rule — the same function FR5b's stage picker calls, so a line the editor
 //!   offers and a line the validator accepts can never disagree.
 //! * **What happens after a stage finishes?** [`advance_after`]. One step, and
-//!   deliberately dull: v1 lines are linear, fan-out propagates by each
-//!   completed task spawning its own continuation, and fan-*in* waits for FR5c.
+//!   deliberately dull for a stage nobody is reviewing: v1 lines are linear and
+//!   fan-out propagates by each completed task spawning its own continuation.
+//!   A stage marked **hold for review** is where that stops being a function of
+//!   position alone — see below.
 //! * **Is the run over, and how did it end?** [`tally`]. A run is running while
 //!   any of its tasks is still moving, and then it is however its tasks ended.
 //!   The stage it is "on" is the earliest one still unfinished, which is the
 //!   honest answer when a fan-out has runners at two stages at once.
+//!
+//! # A hold point is where fan-in happens
+//!
+//! [`advance_after`] used to be a total, local rule: a completed task that is
+//! not at the last stage continues, always. FR5c's hold point breaks that, and
+//! it is the only thing in v1 that does. Four takes at a held stage converge on
+//! **one verdict** — that is the fan-in — and the verdict then fans back out to
+//! the subset a person kept, each of which walks the rest of the line for
+//! itself.
+//!
+//! So the question stopped being "where is this task in the line" and became
+//! "where is this task, and what has been decided about it": [`HoldGate`]
+//! carries the second half, and [`Advance`] gained a [`Advance::Hold`] answer
+//! for "park the run, this take is waiting to be looked at". Everything else
+//! about fan-out is untouched, because a verdict that keeps two takes is
+//! exactly two ordinary continuations.
 //!
 //! # Failure is not cancellation
 //!
@@ -360,20 +378,181 @@ pub fn media_type_of_mime(mime: &str) -> Option<MediaType> {
 pub enum Advance {
     /// Queue this stage next, reading the completed task's output.
     Next(i32),
-    /// That was the last stage: this branch of the run is done.
+    /// The stage it completed at asks for a verdict. The run parks at this
+    /// stage and the take waits to be looked at.
+    Hold(i32),
+    /// This branch of the run is done — either because that was the last stage
+    /// and its output is the product, or because a person looked at this take
+    /// and chose another one. Both mean the same thing to the pass: queue
+    /// nothing, and stop owing this task anything.
     Finished,
 }
 
-/// One step along the line. Fan-out needs nothing here — four completed tasks
-/// at stage 2 each ask this question for themselves and each get `Next(3)`, so
-/// four takes become four independent continuations without the runtime ever
-/// holding the idea of a branch.
-pub fn advance_after(stage_idx: i32, stage_count: i32) -> Advance {
-    if stage_idx + 1 < stage_count {
-        Advance::Next(stage_idx + 1)
-    } else {
-        Advance::Finished
+/// What is known about one completed take, beyond where it sits in the line.
+///
+/// The three fields answer one question between them — *may this take go on?* —
+/// and they are separate because the run's behaviour differs in all three ways:
+/// a take at an ordinary stage continues, a kept take continues, a passed-over
+/// take stops, and a take nobody has looked at yet parks the whole run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HoldGate {
+    /// The stage it completed at is marked `hold_for_review`.
+    pub holds: bool,
+    /// A verdict named this take among the ones that continue.
+    pub kept: bool,
+    /// A verdict was given over this take at all — kept, or passed over in
+    /// favour of another. Set on every take a verdict covered, which is what
+    /// stops a passed-over take from parking its run forever.
+    pub reviewed: bool,
+}
+
+impl HoldGate {
+    /// The gate at a stage nobody is reviewing, which is every stage of a line
+    /// with no hold point in it.
+    pub fn open() -> Self {
+        HoldGate::default()
     }
+}
+
+/// One step along the line.
+///
+/// Fan-out needs nothing here — four completed tasks at stage 2 each ask this
+/// question for themselves and each get `Next(3)`, so four takes become four
+/// independent continuations without the runtime ever holding the idea of a
+/// branch. A hold point does not change that; it changes *which* of the four
+/// get to ask.
+///
+/// The last stage wins over everything, hold flag included: its output is the
+/// product, so there is nothing after it to hold for. (A line is refused when
+/// it is drawn if it marks its last stage, so this is a belt on top of braces —
+/// but a line edited by hand should not be able to park a run at a stage no
+/// verdict could ever release.)
+pub fn advance_after(stage_idx: i32, stage_count: i32, gate: HoldGate) -> Advance {
+    if stage_idx + 1 >= stage_count {
+        return Advance::Finished;
+    }
+    if !gate.holds || gate.kept {
+        return Advance::Next(stage_idx + 1);
+    }
+    if gate.reviewed {
+        // Looked at, and another take was chosen. This branch ends here, and
+        // its output stays in the library as one of the takes somebody was
+        // shown.
+        return Advance::Finished;
+    }
+    Advance::Hold(stage_idx)
+}
+
+// ===== Runtime: what a person said about a hold =============================
+
+/// The three things a person can say about a held run.
+///
+/// Three, and only three, on purpose. "Continue but with a different prompt" is
+/// an edit and a new run; folding it in here would make the verdict a form
+/// rather than a button, and the whole value of a hold point is that looking at
+/// four clips and picking two is one gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Proceed with the takes named. More than one is ordinary: keep two of
+    /// four and both run the remainder of the line, independently.
+    Continue,
+    /// Run the held stage again with fresh seeds and nothing else changed. The
+    /// run stays alive and holds again on the new takes.
+    Regenerate,
+    /// Abandon the run.
+    Cancel,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Continue => "continue",
+            Verdict::Regenerate => "regenerate",
+            Verdict::Cancel => "cancel",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Verdict> {
+        match s {
+            "continue" => Some(Verdict::Continue),
+            "regenerate" => Some(Verdict::Regenerate),
+            "cancel" => Some(Verdict::Cancel),
+            _ => None,
+        }
+    }
+}
+
+/// Why a verdict was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerdictError {
+    pub message: String,
+}
+
+/// Which of a hold's takes a verdict actually applies to.
+///
+/// Pure, so the rules about what a verdict may name are testable without a
+/// database: `waiting` is what the hold is offering, `named` is what the caller
+/// asked to keep. A verdict is given over **all** the waiting takes, whether or
+/// not it keeps them — that is what makes the passed-over ones stop holding the
+/// run — so `reviewed` is always the whole set.
+pub fn settle_verdict(
+    verdict: Verdict,
+    waiting: &[String],
+    named: &[String],
+) -> Result<Vec<String>, VerdictError> {
+    // Abandoning is never refused. A run somebody wants rid of should not need
+    // its takes to still exist to be got rid of — that is the one verdict that
+    // has to work on a run in any state at all, or a library ends up with rows
+    // nothing can clear.
+    if verdict == Verdict::Cancel {
+        return Ok(Vec::new());
+    }
+    if waiting.is_empty() {
+        return Err(VerdictError {
+            message: "This run is not holding anything for review.".to_string(),
+        });
+    }
+    if verdict == Verdict::Regenerate {
+        // Regenerate is about the hold, not about a selection. Naming takes for
+        // it would read as though it changed something.
+        return Ok(Vec::new());
+    }
+    if named.is_empty() {
+        return Err(VerdictError {
+            message: "Continuing needs at least one take. To drop them all, \
+                      regenerate or cancel."
+                .to_string(),
+        });
+    }
+    let mut kept = Vec::with_capacity(named.len());
+    for take in named {
+        if !waiting.contains(take) {
+            return Err(VerdictError {
+                message: format!("{} is not one of the takes this run is holding.", take),
+            });
+        }
+        if !kept.contains(take) {
+            kept.push(take.clone());
+        }
+    }
+    Ok(kept)
+}
+
+/// How many tasks continuing from a hold will queue, stage by stage.
+///
+/// A hold is a fan-out point as much as a filter: `fanouts[i]` is how many
+/// takes the stage `held_at + 1 + i` expands to, so keeping two of four does
+/// not halve the bill — it doubles whatever one take costs from here on. The
+/// estimate is what turns "keep two" from a guess into a decision.
+pub fn continuation_tasks(kept: usize, fanouts: &[usize]) -> Vec<usize> {
+    let mut running = kept;
+    fanouts
+        .iter()
+        .map(|&width| {
+            running = running.saturating_mul(width.max(1));
+            running
+        })
+        .collect()
 }
 
 // ===== Runtime: is the run over, and how did it end? ========================
@@ -404,6 +583,14 @@ pub fn phase_of(status: &str) -> TaskPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Running,
+    /// Parked at a hold point, waiting for a person. Not a terminal state and
+    /// not an expiring one: a hold with no verdict stays held, for as long as
+    /// that takes. Nothing sweeps a held run and nothing settles it.
+    ///
+    /// [`tally`] never answers this — it folds *task* statuses, and every task
+    /// of a held run has completed. Holding is a fact about the line and the
+    /// verdicts, so it is decided in the advance pass and written on the row.
+    Held,
     Completed,
     Failed,
     Cancelled,
@@ -413,14 +600,27 @@ impl RunState {
     pub fn as_str(self) -> &'static str {
         match self {
             RunState::Running => "running",
+            RunState::Held => "held",
             RunState::Completed => "completed",
             RunState::Failed => "failed",
             RunState::Cancelled => "cancelled",
         }
     }
 
+    /// Is this run over? A held run is not: it is waiting, and the GPU has
+    /// moved on to other work while it does.
     pub fn is_terminal(self) -> bool {
-        self != RunState::Running
+        !matches!(self, RunState::Running | RunState::Held)
+    }
+
+    /// The statuses that mean "this run has not finished with its line yet".
+    ///
+    /// What "a run of this line is still walking it" means for the editor lock:
+    /// a held run will read its later stages the moment a verdict lands, so
+    /// editing the line under it is exactly the change that was refused for a
+    /// running one. Spelled as a slice because the callers are SQL filters.
+    pub fn live() -> &'static [&'static str] {
+        &["running", "held"]
     }
 }
 
@@ -517,16 +717,22 @@ fn min_opt(current: Option<i32>, candidate: i32) -> i32 {
 // ===== Runtime: does this stage's output survive the run? ===================
 
 /// What is known about a stage when the run it belongs to has finished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StageDisposition {
     /// The user ticked "keep" on this stage.
     pub keep_flag: bool,
     /// This is the last stage: its output is the thing that was asked for.
     pub is_final: bool,
-    // FR5c adds `feeds_hold`: a stage whose output a person is going to be
-    // shown must survive whatever the flag says. It is a third `||` term here
-    // and nothing else, which is why this is a function rather than a column
-    // read at the call site.
+    /// This stage feeds a hold point, and the choosing still stands: its
+    /// outputs are the takes a person was shown and decided between. Choosing
+    /// among them is the entire point of the stage, so they survive whatever
+    /// the keep flag says.
+    ///
+    /// False on the two paths where the choosing does **not** stand — a run
+    /// abandoned at its hold, and the previous generation of a regenerate.
+    /// Nobody is going to pick one of those now, so only the stage's own flag
+    /// saves them.
+    pub feeds_hold: bool,
 }
 
 /// Does this stage's output stay in the library once the run is over?
@@ -537,7 +743,7 @@ pub struct StageDisposition {
 /// exactly as long as they are useful — the next stage needs them, and a
 /// failure wants them for inspection — and are swept when the run lands.
 pub fn keeps_output(d: StageDisposition) -> bool {
-    d.is_final || d.keep_flag
+    d.is_final || d.keep_flag || d.feeds_hold
 }
 
 #[cfg(test)]
@@ -916,11 +1122,146 @@ mod tests {
 
     #[test]
     fn a_stage_advances_until_the_line_runs_out() {
-        assert_eq!(advance_after(0, 4), Advance::Next(1));
-        assert_eq!(advance_after(2, 4), Advance::Next(3));
-        assert_eq!(advance_after(3, 4), Advance::Finished);
+        let open = HoldGate::open();
+        assert_eq!(advance_after(0, 4, open), Advance::Next(1));
+        assert_eq!(advance_after(2, 4, open), Advance::Next(3));
+        assert_eq!(advance_after(3, 4, open), Advance::Finished);
         // A single-workflow run is a one-stage line, and finishes at once.
-        assert_eq!(advance_after(0, 1), Advance::Finished);
+        assert_eq!(advance_after(0, 1, open), Advance::Finished);
+    }
+
+    // === FR5c — a hold point ================================================
+
+    #[test]
+    fn a_take_at_a_hold_point_parks_its_run_until_somebody_looks_at_it() {
+        let holding = HoldGate {
+            holds: true,
+            ..HoldGate::open()
+        };
+        assert_eq!(advance_after(1, 4, holding), Advance::Hold(1));
+        // The same stage without the flag is the ordinary rule, untouched.
+        assert_eq!(advance_after(1, 4, HoldGate::open()), Advance::Next(2));
+    }
+
+    #[test]
+    fn one_verdict_lets_the_takes_it_kept_through_and_stops_the_rest() {
+        // The whole of "continue with two of four": the gate is asked once per
+        // take, and answers differently for the two the person kept and the two
+        // they passed over. That is the fan-in — four takes, one verdict — and
+        // the fan-out back out of it needs no code at all.
+        let kept = HoldGate {
+            holds: true,
+            kept: true,
+            reviewed: true,
+        };
+        let passed = HoldGate {
+            holds: true,
+            kept: false,
+            reviewed: true,
+        };
+        assert_eq!(advance_after(1, 4, kept), Advance::Next(2));
+        assert_eq!(
+            advance_after(1, 4, passed),
+            Advance::Finished,
+            "a take somebody looked at and did not choose is a branch that ends"
+        );
+    }
+
+    #[test]
+    fn the_last_stage_is_the_product_and_cannot_be_held() {
+        // A line is refused at draw time for marking its last stage; a line
+        // edited by hand around that check must still not park a run at a stage
+        // no verdict could release.
+        let holding = HoldGate {
+            holds: true,
+            ..HoldGate::open()
+        };
+        assert_eq!(advance_after(3, 4, holding), Advance::Finished);
+    }
+
+    #[test]
+    fn a_verdict_is_given_over_every_take_it_was_shown() {
+        let waiting = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        // Continue keeps what it names…
+        assert_eq!(
+            settle_verdict(Verdict::Continue, &waiting, &["a".into(), "c".into()]),
+            Ok(vec!["a".to_string(), "c".to_string()])
+        );
+        // …and the same take twice is one take.
+        assert_eq!(
+            settle_verdict(Verdict::Continue, &waiting, &["a".into(), "a".into()]),
+            Ok(vec!["a".to_string()])
+        );
+        // Regenerate and cancel keep nothing, and naming takes for them changes
+        // nothing rather than reading as though it did.
+        assert_eq!(
+            settle_verdict(Verdict::Regenerate, &waiting, &["a".into()]),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            settle_verdict(Verdict::Cancel, &waiting, &[]),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn abandoning_is_the_one_verdict_that_is_never_refused() {
+        // A run whose takes were deleted by hand still has to be clearable, or
+        // the library keeps a row nothing can ever move.
+        assert_eq!(settle_verdict(Verdict::Cancel, &[], &[]), Ok(Vec::new()));
+        assert!(settle_verdict(Verdict::Regenerate, &[], &[]).is_err());
+        assert!(settle_verdict(Verdict::Continue, &[], &["a".into()]).is_err());
+    }
+
+    #[test]
+    fn a_verdict_that_names_nothing_or_names_a_stranger_is_refused() {
+        let waiting = vec!["a".to_string(), "b".to_string()];
+        let err = settle_verdict(Verdict::Continue, &waiting, &[]).unwrap_err();
+        assert!(err.message.contains("at least one take"), "{}", err.message);
+
+        let err = settle_verdict(Verdict::Continue, &waiting, &["z".into()]).unwrap_err();
+        assert!(
+            err.message.contains("not one of the takes"),
+            "{}",
+            err.message
+        );
+
+        // And a run holding nothing has no verdict to give.
+        let err = settle_verdict(Verdict::Continue, &[], &["a".into()]).unwrap_err();
+        assert!(err.message.contains("not holding"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_verdict_reads_and_writes_the_same_word() {
+        for v in [Verdict::Continue, Verdict::Regenerate, Verdict::Cancel] {
+            assert_eq!(Verdict::parse(v.as_str()), Some(v));
+        }
+        assert_eq!(Verdict::parse("maybe"), None);
+    }
+
+    #[test]
+    fn keeping_two_of_four_still_pays_for_every_stage_after_it() {
+        // The `×4 extend → hold → upscale` line the feature exists for: two
+        // kept takes, one upscale each.
+        assert_eq!(continuation_tasks(2, &[1]), vec![2]);
+        // And a hold is a fan-out point in its own right — the stage after it
+        // sweeping four seeds means eight upscales, not two.
+        assert_eq!(continuation_tasks(2, &[4]), vec![8]);
+        // Stage by stage down a longer tail.
+        assert_eq!(continuation_tasks(1, &[2, 1, 3]), vec![2, 2, 6]);
+        // A hold on the last stage has no tail, and costs nothing to continue.
+        assert_eq!(continuation_tasks(4, &[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_held_run_is_neither_over_nor_idle() {
+        assert!(!RunState::Held.is_terminal(), "a hold is not an ending");
+        assert_eq!(RunState::Held.as_str(), "held");
+        // And the line stays locked: a verdict puts it straight back to
+        // reading the stages after the hold.
+        assert!(RunState::live().contains(&RunState::Held.as_str()));
+        assert!(RunState::live().contains(&RunState::Running.as_str()));
+        assert!(!RunState::live().contains(&RunState::Completed.as_str()));
     }
 
     #[test]
@@ -1031,10 +1372,7 @@ mod tests {
 
     #[test]
     fn an_intermediate_is_swept_unless_it_was_asked_for() {
-        let discard = StageDisposition {
-            keep_flag: false,
-            is_final: false,
-        };
+        let discard = StageDisposition::default();
         assert!(!keeps_output(discard));
         assert!(keeps_output(StageDisposition {
             keep_flag: true,
@@ -1043,6 +1381,13 @@ mod tests {
         // The last stage is the product, whatever the flag says.
         assert!(keeps_output(StageDisposition {
             is_final: true,
+            ..discard
+        }));
+        // And so are the takes somebody chose between: they are what the hold
+        // point was for, and a run that landed does not throw away the
+        // alternatives it was picked out of.
+        assert!(keeps_output(StageDisposition {
+            feeds_hold: true,
             ..discard
         }));
     }

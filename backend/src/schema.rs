@@ -106,6 +106,7 @@ diesel::table! {
         keep_output -> Bool,
         created_at -> Nullable<Timestamp>,
         exposed -> Nullable<Text>,
+        hold_for_review -> Bool,
     }
 }
 
@@ -132,6 +133,19 @@ diesel::table! {
 }
 
 diesel::table! {
+    run_holds (id) {
+        id -> Text,
+        run_id -> Text,
+        stage_idx -> Integer,
+        verdict -> Text,
+        reviewed_task_ids -> Text,
+        kept_task_ids -> Text,
+        note -> Nullable<Text>,
+        decided_at -> Nullable<Timestamp>,
+    }
+}
+
+diesel::table! {
     runs (id) {
         id -> Text,
         line_id -> Nullable<Text>,
@@ -143,6 +157,7 @@ diesel::table! {
         created_at -> Nullable<Timestamp>,
         finished_at -> Nullable<Timestamp>,
         stage_values -> Nullable<Text>,
+        held_at_stage -> Nullable<Integer>,
     }
 }
 
@@ -202,6 +217,7 @@ diesel::joinable!(faces -> people (person_id));
 diesel::joinable!(files -> shots (shot_id));
 diesel::joinable!(line_stages -> comfyui_workflows (workflow_id));
 diesel::joinable!(line_stages -> production_lines (line_id));
+diesel::joinable!(run_holds -> runs (run_id));
 diesel::joinable!(runs -> production_lines (line_id));
 diesel::joinable!(runs -> shots (shot_id));
 diesel::joinable!(shots -> people (primary_person_id));
@@ -218,6 +234,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     line_stages,
     people,
     production_lines,
+    run_holds,
     runs,
     settings,
     shots,

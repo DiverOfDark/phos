@@ -6,7 +6,7 @@ import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
 import WorkflowContract from '@/components/WorkflowContract.vue'
 import LineEditor from '@/components/LineEditor.vue'
 import { controlKind, isParameterInput, isTextInput, inputKey, parameterValue, formatDuration, stageOf, readinessColor, installedLabel } from '@/lib/utils'
-import { typeTrack } from '@/lib/lines'
+import { typeTrack, continuationCost, heldLabel } from '@/lib/lines'
 
 // --- Connection health ---
 const comfyuiHealthy = ref(false)
@@ -407,6 +407,70 @@ async function cancelTask(taskId) {
   }
 }
 
+// ===== HOLD POINTS — the verdict, from the board =====
+//
+// Enough surface for a person to actually give a verdict, and no more: the
+// takes of one run, tick the ones worth the stages below, and the three
+// buttons. The curation lane — every held run at once, keyboard-driven, big
+// pictures — is FR10b, and it reads these same two endpoints.
+const openHoldId = ref(null)
+const hold = ref(null)
+const keptTakes = ref([])
+const holdBusy = ref(false)
+const holdError = ref('')
+
+/** How many tasks continuing with what is ticked will queue. */
+const holdCost = computed(() => continuationCost(keptTakes.value.length, hold.value?.tasks_per_take))
+
+async function toggleHold(runId) {
+  if (openHoldId.value === runId) {
+    openHoldId.value = null
+    hold.value = null
+    return
+  }
+  openHoldId.value = runId
+  hold.value = null
+  keptTakes.value = []
+  holdError.value = ''
+  try {
+    const res = await fetch(`/api/comfyui/runs/${runId}/hold`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    hold.value = await res.json()
+  } catch (e) {
+    console.error('Failed to fetch hold', e)
+    holdError.value = 'Could not read what this run is holding.'
+  }
+}
+
+function toggleTake(taskId) {
+  keptTakes.value = keptTakes.value.includes(taskId)
+    ? keptTakes.value.filter(id => id !== taskId)
+    : [...keptTakes.value, taskId]
+}
+
+async function giveVerdict(runId, verdict) {
+  if (holdBusy.value) return
+  holdBusy.value = true
+  holdError.value = ''
+  try {
+    const res = await fetch(`/api/comfyui/runs/${runId}/hold`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ verdict, keep: verdict === 'continue' ? keptTakes.value : [] }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+    openHoldId.value = null
+    hold.value = null
+    keptTakes.value = []
+    await fetchRuns()
+  } catch (e) {
+    holdError.value = String(e.message || e)
+  } finally {
+    holdBusy.value = false
+  }
+}
+
 // ===== LINES TAB =====
 //
 // Three ways to get a line, and blank is the last of them. Fork a template and
@@ -679,14 +743,20 @@ function isInFlight(status) {
 }
 
 /**
- * A run has four states, not nine: it is walking its line, or it is however it
- * ended. The nine belong to the tasks underneath.
+ * A run has five states, not nine: it is walking its line, it is parked at a
+ * hold waiting for a person, or it is however it ended. The nine belong to the
+ * tasks underneath.
+ *
+ * `held` gets the degraded amber — the colour this system already uses for
+ * "this needs somebody", which is exactly what a hold is. It is not an error
+ * and it is not progress.
  */
 function runStatusColor(status) {
   switch (status) {
     case 'completed': return 'var(--status-ready)'
     case 'failed': return 'var(--status-error)'
     case 'cancelled': return 'var(--status-stopped)'
+    case 'held': return 'var(--status-degraded)'
     default: return 'var(--status-building)'
   }
 }
@@ -1486,6 +1556,8 @@ defineExpose({ loadData: fetchWorkflows })
 
             <span class="font-mono text-xs text-ink-tertiary tabular-nums">{{ formatDuration(run.elapsed_seconds) }}</span>
 
+            <!-- A held run says what it is waiting on, because the number is
+                 the whole decision: HELD · 4 TAKES. -->
             <span
               class="flex items-center gap-1.5 font-mono text-[11px] tracking-[0.08em] uppercase"
               :style="{ color: runStatusColor(run.status) }"
@@ -1496,12 +1568,19 @@ defineExpose({ loadData: fetchWorkflows })
                 style="width:6px;height:6px"
                 :style="{ background: runStatusColor(run.status) }"
               ></span>
-              {{ run.status }}
+              {{ run.status === 'held' ? heldLabel(run) : run.status }}
             </span>
 
             <span class="flex gap-3 justify-end">
               <button
-                v-if="run.status === 'running'"
+                v-if="run.status === 'held'"
+                class="font-mono text-[11px] transition-colors"
+                :style="{ color: 'var(--status-degraded)' }"
+                title="Look at this run's takes and say which of them are worth the stages below."
+                @click="toggleHold(run.id)"
+              >{{ openHoldId === run.id ? 'close' : 'review' }}</button>
+              <button
+                v-else-if="run.status === 'running'"
                 class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
                 @click="cancelRun(run.id)"
               >cancel</button>
@@ -1516,6 +1595,90 @@ defineExpose({ loadData: fetchWorkflows })
                 @click="toggleRun(run.id)"
               >{{ openRunId === run.id ? 'hide' : 'stages' }}</button>
             </span>
+          </div>
+
+          <!-- The takes, and the three things a person can say about them.
+               Curation as a step inside the pipeline rather than a bin at the
+               end of it. -->
+          <div
+            v-if="openHoldId === run.id"
+            class="px-4 py-3 border-b bg-base min-w-[860px] flex flex-col gap-3"
+            style="border-color: var(--status-degraded)"
+          >
+            <div class="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+              <span class="label" style="color: var(--status-degraded)">
+                Held at stage {{ (hold?.stage_idx ?? 0) + 1 }} / {{ hold?.stage_count ?? run.stage_count }}
+              </span>
+              <span class="font-mono text-[11px] text-ink-secondary">{{ hold?.stage_label || run.stage_label || '' }}</span>
+              <span class="font-mono text-[11px] text-ink-tertiary">
+                {{ (hold?.takes || []).length }} take(s) waiting · nothing below this stage has run
+              </span>
+            </div>
+
+            <div v-if="holdError" class="font-mono text-[11px]" style="color: var(--status-error)">{{ holdError }}</div>
+            <div v-if="!hold && !holdError" class="font-mono text-[11px] text-ink-tertiary">loading takes…</div>
+
+            <div v-if="hold" class="flex flex-wrap gap-2">
+              <button
+                v-for="take in hold.takes"
+                :key="take.task_id"
+                class="w-[132px] text-left border rounded-sm overflow-hidden bg-surface transition-colors"
+                :style="{ borderColor: keptTakes.includes(take.task_id) ? 'var(--accent)' : 'var(--border)' }"
+                @click="toggleTake(take.task_id)"
+              >
+                <span class="block w-full h-[88px] bg-raised">
+                  <img
+                    v-if="take.thumbnail_url"
+                    :src="take.thumbnail_url"
+                    class="w-full h-full object-cover"
+                    loading="lazy"
+                  />
+                  <!-- A describe stage's take is a sentence, and there is
+                       nothing to photograph. -->
+                  <span
+                    v-else
+                    class="block w-full h-full p-2 font-mono text-[10px] leading-tight text-ink-secondary overflow-hidden"
+                  >{{ take.text_output || '—' }}</span>
+                </span>
+                <span class="flex items-center justify-between gap-1 px-2 py-1 border-t border-line">
+                  <span class="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-tertiary truncate">
+                    seed {{ take.parameters?.['3.seed'] ?? shortId(take.task_id) }}
+                  </span>
+                  <span
+                    class="signal-dot flex-none"
+                    style="width:6px;height:6px"
+                    :style="{ background: keptTakes.includes(take.task_id) ? 'var(--accent)' : 'var(--border-strong)' }"
+                  ></span>
+                </span>
+              </button>
+            </div>
+
+            <div v-if="hold" class="flex flex-wrap items-center gap-4">
+              <button
+                class="border rounded-sm px-4 py-1.5 font-mono text-[11px] uppercase tracking-[0.08em] transition-colors disabled:opacity-40"
+                style="border-color: var(--accent); color: var(--accent)"
+                :disabled="holdBusy || !keptTakes.length"
+                @click="giveVerdict(run.id, 'continue')"
+              >continue</button>
+              <!-- The cost moves as boxes are ticked. That is the reason to
+                   stop here at all. -->
+              <span class="font-mono text-[11px] text-ink-tertiary">
+                {{ keptTakes.length }} kept → {{ holdCost }} task(s) below
+              </span>
+              <span class="flex-1"></span>
+              <button
+                class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors disabled:opacity-40"
+                :disabled="holdBusy"
+                title="Run this stage again with fresh seeds. Same prompt, same parameters, same source."
+                @click="giveVerdict(run.id, 'regenerate')"
+              >regenerate</button>
+              <button
+                class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors disabled:opacity-40"
+                :disabled="holdBusy"
+                title="Abandon the run. Intermediates go, except where a stage says keep."
+                @click="giveVerdict(run.id, 'cancel')"
+              >abandon</button>
+            </div>
           </div>
 
           <!-- The tasks underneath: reachable, but not the top-level unit. -->

@@ -3,6 +3,7 @@ mod comfyui;
 mod describe;
 mod faces;
 mod files;
+mod holds;
 mod line_editor;
 mod line_io;
 mod lines;
@@ -118,6 +119,8 @@ use utoipa::OpenApi;
         lines::get_run,
         lines::retry_run,
         lines::cancel_run,
+        holds::get_hold,
+        holds::post_verdict,
         line_io::export_line,
         line_io::import_line,
         describe::describe_shot,
@@ -201,6 +204,7 @@ use utoipa::OpenApi;
             lines::LinePayload,
             lines::LineStagePayload,
             lines::StartRunPayload,
+            holds::VerdictPayload,
             // A line as a file — also the format bundled templates ship in.
             crate::comfyui::LineBundle,
             crate::comfyui::BundleLine,
@@ -646,6 +650,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/comfyui/runs/{id}", get(lines::get_run))
         .route("/api/comfyui/runs/{id}/retry", post(lines::retry_run))
         .route("/api/comfyui/runs/{id}/cancel", post(lines::cancel_run))
+        // A run parked at a hold point, and the verdict that releases it.
+        .route(
+            "/api/comfyui/runs/{id}/hold",
+            get(holds::get_hold).post(holds::post_verdict),
+        )
         // The prompt a shot's own contents compile to.
         .route("/api/comfyui/describe", post(describe::describe_shot))
         .route(

@@ -62,14 +62,18 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
-- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what happens after a stage lands, and whether a run is over), `editor.rs` (what the line editor may offer, and what a join has to be asked), `promote.rs` (which chains somebody has been running by hand often enough to be worth saving) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `templates/` holds the five bundled lines a fresh install ships with; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `api/line_io.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
+- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what travels along each join, what happens after a stage lands, what a verdict on a hold point may say, and whether a run is over), `editor.rs` (what the line editor may offer, and what a join has to be asked), `promote.rs` (which chains somebody has been running by hand often enough to be worth saving) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `holds.rs`, `api/line_io.rs` and `worker/` hold the DB writes and the background loop; `templates/` holds the five bundled lines a fresh install ships with. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
 
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
 - **`components/ReviewDesk.vue`** — One screen, three lanes (`?lane=` → shots / duplicates / faces); `/variations` redirects into it
 - **`components/WorkflowsPage.vue`** — Four tabs: templates, workflows, lines, and a queue that is a schedule
   board of **runs** — one row per run saying `STAGE 2/4 · UPSCALE · 00:03:12`, with the tasks
-  underneath one click away. A four-stage run as four unrelated rows is what it replaced
+  underneath one click away. A four-stage run as four unrelated rows is what it replaced. A run
+  parked at a hold point reads `HELD · 4 TAKES` and opens a review strip: its takes, tick the ones
+  worth the stages below, and the three verdicts. That strip is deliberately just enough to give a
+  verdict from — the keyboard-driven contact sheet over every held run at once is FR10b, and reads
+  the same two endpoints
 - **`components/LineEditor.vue`** — A line, read as a route board and built as a vertical list.
   Read-only it draws like `WorkflowContract.vue`; under edit it is a list whose `Add stage` picker
   only offers what fits. `lib/lines.js` holds its bookkeeping and none of its rules
@@ -113,9 +117,34 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   re-running an hour of upscaling because stage 4 hiccupped is not something the code *can* do
 - **Intermediates live exactly as long as they are useful.** Kept while the run is live (the next
   stage reads them, a failure wants them), swept when it *completes* — never when it fails.
-  `line_stages.keep_output` overrides that per stage, and the last stage's output is the product and
-  is always kept. `keeps_output` is a function of a `StageDisposition` rather than a column read,
-  because FR5c adds a third case (a stage feeding a hold point always keeps)
+  `line_stages.keep_output` overrides that per stage, the last stage's output is the product and is
+  always kept, and a hold point's takes are kept because choosing among them is the entire point of
+  the stage. `keeps_output` is a function of a `StageDisposition` (`is_final || keep_flag ||
+  feeds_hold`) rather than a column read, so the two paths where the choosing does *not* stand — a
+  run abandoned at its hold, and the generation a regenerate replaced — pass `feeds_hold: false`
+  and get the keep flag's answer instead
+- **A stage can park its run and ask.** `line_stages.hold_for_review` stops the line *after* that
+  stage, puts its takes in front of a person, and goes on with the ones they keep — so
+  `×4 extend → hold → upscale 4K` spends the hour of upscaling on the two clips somebody chose
+  rather than on all four. Three verdicts and no fourth: **continue** with a selection (more than
+  one is ordinary — a hold is a fan-*out* point as much as a filter), **regenerate** the held stage
+  with fresh seeds and nothing else changed, **cancel** the run. Wanting different parameters is an
+  edit and a new run, which is what keeps the verdict a button rather than a form
+- **A hold is where fan-in happens, and `advance_after` is where the shape gave.** It used to be a
+  total, local rule — a completed task not at the last stage continues, always. It now takes a
+  `HoldGate` (*does this stage hold; was this take kept; was it reviewed at all*) and can answer
+  `Advance::Hold`. Four takes converge on **one verdict**, which is the fan-in; the verdict fans
+  back out to the kept subset, and that needs no new code because each kept take is an ordinary
+  continuation. `run_holds` is append-only and carries **two** id lists: `kept_task_ids` and
+  `reviewed_task_ids`. The second is not redundant — without it a passed-over take is
+  indistinguishable from one nobody has seen, and the run parks again on it forever. It has exactly
+  `parent_task_id`'s property: it exists precisely when the thing it marks happened
+- **A held run parks; it never blocks.** Both halves of the advance pass filter on
+  `status = running`, so a held run is read by nothing until a verdict releases it — 3,329 shots
+  through a hold point park 3,329 runs and the queue keeps feeding the GPU from everything else.
+  Held runs are never expired and never silently discarded: a hold with no verdict stays held.
+  `runs.status = 'held'` and `runs.held_at_stage` survive a restart because they are columns rather
+  than timers, and `RunState::live()` is what stops a line being edited under a held run
 - **A bundled template is an exported line, and stops being Phos's the moment you edit it.** The
   five in `backend/src/comfyui/templates/bundles/` are `phos.line` documents — line, workflow
   graphs, contracts, requirements — with one additive `template` block carrying a key and a
@@ -259,6 +288,8 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `POST /api/comfyui/runs` — Start a line against a shot: `{ line_id, shot_id }`, plus optional `stage_values` answering what each stage left open. Queues stage 1; the worker queues each stage after it as the one before lands. FR7 replaces `shot_id` with a query and adds a cursor, which is why the handler already resolves a *set* of shots and answers with a list of runs
 - `GET /api/comfyui/runs` — The queue board: one row per run, with the stage it is on, of how many, what that stage is running, and its clock. `GET /api/comfyui/runs/{id}` is the drill-down to the tasks underneath
 - `POST /api/comfyui/runs/{id}/retry` — Resume from the stage that failed. What already succeeded is not re-run
+- `GET /api/comfyui/runs/{id}/hold` — The takes a held run is waiting on, and what continuing from one of them costs in tasks. `null` for a run that is not holding
+- `POST /api/comfyui/runs/{id}/hold` — The verdict: `continue` with the takes named (each walks the rest of the line for itself), `regenerate` the held stage with fresh seeds, or `cancel` the run. `POST /runs/{id}/cancel` on a held run goes through this same path, so an abandoned hold is recorded like every other verdict
 - `GET|POST /api/comfyui/lines`, `GET|PUT|DELETE /api/comfyui/lines/{id}` — Line CRUD. A chain whose stages do not fit together is refused with a message naming the stage; editing or deleting a line is refused with `409` while a run of it is in flight
 - `GET /api/comfyui/lines/{id}/export` — The line as one portable JSON bundle: stages, **the workflow graph behind each one**, the derived contracts, and a manifest of the node classes and model files it needs
 - `POST /api/comfyui/lines/import?dry_run=&name=` — Read a bundle back. `dry_run` writes nothing and answers with the requirements report alone

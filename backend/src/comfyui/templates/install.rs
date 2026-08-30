@@ -237,6 +237,7 @@ pub fn install(
                     // The template format predates the exposed disposition;
                     // a seeded stage asks for nothing until somebody edits it.
                     exposed: None,
+                    hold_for_review: stage.hold_for_review,
                 })
                 .execute(conn)?;
         }

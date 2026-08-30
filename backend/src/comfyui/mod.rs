@@ -77,6 +77,13 @@
 //!   is flagged on its row and carries a [`manifest::ProvenanceManifest`]. The
 //!   flag keeps machine-made faces out of the person model; the manifest is how
 //!   anyone, years from now, can still tell which memories were real.
+//! * **A stage can park its run and ask.** A *hold point* stops the run after a
+//!   stage, puts its takes in front of a person, and goes on with the ones they
+//!   keep — so `×4 extend → hold → upscale 4K` spends the hour of upscaling on
+//!   the two clips somebody chose rather than on all four. [`line`] holds the
+//!   verdict rules, [`holds`] reads a hold and writes what was decided, and a
+//!   held run is invisible to the advance pass until a verdict releases it, so
+//!   holds accumulate without ever blocking the queue.
 //! * **A video can go in whole.** [`source`] decides what a run consumes — a
 //!   frame of the clip (the first, the last, one at a timestamp, one of the
 //!   indexed keyframes) or the file itself, which is the default whenever the
@@ -95,6 +102,7 @@ mod client;
 pub mod contract;
 pub mod editor;
 mod history;
+pub mod holds;
 pub mod line;
 mod loaders;
 mod manifest;
@@ -115,7 +123,7 @@ mod workflow;
 
 pub use client::ComfyUiClient;
 pub use contract::{Accepts, ContractCorrections, MediaType, ParamName, StageContract};
-pub use line::{validate_chain, LineError, RunState, StageTyping};
+pub use line::{validate_chain, LineError, RunState, StageTyping, Verdict};
 pub use loaders::{
     check_source_kind, default_binding_warnings, detect_loaders, importable, takes_image,
     takes_video, LoaderKind, SourceRole,

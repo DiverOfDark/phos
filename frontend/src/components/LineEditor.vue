@@ -183,6 +183,7 @@ function chooseStage(option) {
     exposed: [],
     source_mode: null,
     keep_output: false,
+    hold_for_review: false,
   }
   const list = [...draft.value.stages]
   if (picker.value.mode === 'replace') list.splice(picker.value.index, 1, fresh)
@@ -506,6 +507,7 @@ watch(
           <span></span>
           <span class="flex flex-wrap items-center gap-2 px-0.5 font-mono text-[10px] uppercase tracking-[0.08em]">
             <span v-if="st.keep_output" class="text-signal">keep</span>
+            <span v-if="st.hold_for_review" class="text-degraded">hold for review</span>
             <span v-if="askedCountOf(st)" class="text-ink-tertiary">{{ askedCountOf(st) }} asked</span>
             <span v-if="variedCountOf(st)" class="text-ink-tertiary">{{ variedCountOf(st) }} varied</span>
           </span>
@@ -632,6 +634,19 @@ watch(
               <label class="flex items-center gap-1.5" title="Keep this stage's output once the run completes. The last stage's is kept regardless.">
                 <input v-model="st.keep_output" type="checkbox" class="w-3 h-3 rounded-none border border-line bg-surface" style="accent-color: var(--accent)" />
                 keep output
+              </label>
+              <!-- The one thing that turns a fan-out from four bills into one:
+                   stop here, and let a person say which takes are worth the
+                   stages below. Not offered on the last stage, whose output is
+                   the product — the server refuses that, and offering it would
+                   be offering a refusal. -->
+              <label
+                v-if="i < draft.stages.length - 1"
+                class="flex items-center gap-1.5"
+                title="Park the run after this stage and ask which of its takes go on. Its takes are always kept."
+              >
+                <input v-model="st.hold_for_review" type="checkbox" class="w-3 h-3 rounded-none border border-line bg-surface" style="accent-color: var(--status-degraded)" />
+                hold for review
               </label>
               <span v-if="askedCountOf(st)" class="text-ink-secondary" :title="askedNames(st).join(', ')">
                 {{ askedCountOf(st) }} asked at send time
