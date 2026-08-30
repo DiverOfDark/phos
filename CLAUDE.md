@@ -82,6 +82,21 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   does not get a vote
 
 ### Key Design Decisions
+- **Generated media never enters the person model.** `files.synthetic` is the rule and the whole
+  face pipeline reads it: `scanner.rs` skips detection, `cluster_faces` filters those faces out,
+  the overlap sweep ignores those files, and a generated box cannot decide a shot's primary person.
+  `purge_faces_on_synthetic_files` is the repair path for boxes that got in anyway (the watcher can
+  index the bytes before the generator claims the row), and it recomputes the centroids they pulled
+  on. A generated face averaged into an ArcFace centroid means re-clustering the whole library
+- `files.manifest_json` holds a `comfyui::ProvenanceManifest` — a **versioned object with optional
+  fields**, so later stages of the pipeline (line id, stage index, seed, compiled prompt) add to it
+  without a migration. Unknown keys round-trip through `extra` rather than being dropped
+- **The generated file's row is written before its bytes.** `files.path` is `UNIQUE`, so
+  `comfyui/worker/store.rs` claims a name by inserting and treats the constraint failure as an
+  answer, not an error. Checking for a free name and inserting later leaves a window that the write
+  itself opens — once bytes are on disk a scan or the watcher can index the path first, and the
+  task then fails with `UNIQUE constraint failed: files.path`. Reserving first also means the row
+  already says `synthetic` by the time anything can find the file
 - No global database — each root directory gets its own `.phos.db`
 - AI models (ONNX) are auto-downloaded from Hugging Face (`public-data/insightface`) on first run and cached locally by `hf-hub`; startup fails hard if download fails (unless `PHOS_DUMMY_AI=1`)
 - Backend serves the built frontend as static files via `fallback_service`
@@ -99,6 +114,7 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `PUT /api/import/upload` — Store an uploaded file and queue it for analysis (`202`; the analysis runs on the per-library ingest worker, not on the request)
 - `GET /api/import/status` — Ingest queue depth for the caller's library, polled by the import UI
 - `POST /api/faces/dedupe?dry_run=` — Collapse overlapping boxes drawn on one face (never merges two boxes assigned to different people; skips reviewed shots). Also runs at startup and after each upload batch is analyzed
+- `GET /api/files/{id}/manifest` — Whether a file was generated, and the provenance manifest recording how. Answers for any file; a photograph comes back `synthetic: false` with no manifest
 - `GET /api/client/version` — Bundled Android APK metadata for the in-app updater (no auth)
 
 ## AI Models

@@ -59,10 +59,15 @@
 //!   frame of the clip (the first, the last, one at a timestamp, one of the
 //!   indexed keyframes) or the file itself, which is the default whenever the
 //!   graph has a video loader to read it.
+//! * **Everything this module creates is marked synthetic.** A generated file
+//!   is flagged on its row and carries a [`manifest::ProvenanceManifest`]. The
+//!   flag keeps machine-made faces out of the person model; the manifest is how
+//!   anyone, years from now, can still tell which memories were real.
 
 mod client;
 mod history;
 mod loaders;
+mod manifest;
 pub mod nodes;
 mod outputs;
 mod overrides;
@@ -74,6 +79,7 @@ mod workflow;
 
 pub use client::ComfyUiClient;
 pub use loaders::{detect_loaders, importable, LoaderKind};
+pub use manifest::ProvenanceManifest;
 pub use nodes::NodeCatalog;
 pub use overrides::detect_inputs;
 pub use source::SourceMode;
