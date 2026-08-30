@@ -33,6 +33,9 @@ diesel::table! {
         next_attempt_at -> Nullable<Timestamp>,
         source_mode -> Nullable<Text>,
         parameters -> Nullable<Text>,
+        run_id -> Nullable<Text>,
+        stage_idx -> Nullable<Integer>,
+        parent_task_id -> Nullable<Text>,
     }
 }
 
@@ -79,6 +82,21 @@ diesel::table! {
 }
 
 diesel::table! {
+    line_stages (id) {
+        id -> Text,
+        line_id -> Text,
+        stage_idx -> Integer,
+        workflow_id -> Text,
+        text_overrides -> Nullable<Text>,
+        parameters -> Nullable<Text>,
+        vary -> Nullable<Text>,
+        source_mode -> Nullable<Text>,
+        keep_output -> Bool,
+        created_at -> Nullable<Timestamp>,
+    }
+}
+
+diesel::table! {
     people (id) {
         id -> Text,
         name -> Nullable<Text>,
@@ -87,6 +105,30 @@ diesel::table! {
         folder_name -> Nullable<Text>,
         created_at -> Nullable<Timestamp>,
         updated_at -> Nullable<Timestamp>,
+    }
+}
+
+diesel::table! {
+    production_lines (id) {
+        id -> Text,
+        name -> Text,
+        description -> Nullable<Text>,
+        created_at -> Nullable<Timestamp>,
+        updated_at -> Nullable<Timestamp>,
+    }
+}
+
+diesel::table! {
+    runs (id) {
+        id -> Text,
+        line_id -> Nullable<Text>,
+        shot_id -> Text,
+        label -> Text,
+        status -> Text,
+        stage_count -> Integer,
+        error_message -> Nullable<Text>,
+        created_at -> Nullable<Timestamp>,
+        finished_at -> Nullable<Timestamp>,
     }
 }
 
@@ -137,10 +179,15 @@ diesel::table! {
 }
 
 diesel::joinable!(enhancement_tasks -> comfyui_workflows (workflow_id));
+diesel::joinable!(enhancement_tasks -> runs (run_id));
 diesel::joinable!(enhancement_tasks -> shots (shot_id));
 diesel::joinable!(faces -> files (file_id));
 diesel::joinable!(faces -> people (person_id));
 diesel::joinable!(files -> shots (shot_id));
+diesel::joinable!(line_stages -> comfyui_workflows (workflow_id));
+diesel::joinable!(line_stages -> production_lines (line_id));
+diesel::joinable!(runs -> production_lines (line_id));
+diesel::joinable!(runs -> shots (shot_id));
 diesel::joinable!(shots -> people (primary_person_id));
 diesel::joinable!(video_keyframes -> files (video_file_id));
 diesel::joinable!(workflow_presets -> comfyui_workflows (workflow_id));
@@ -151,7 +198,10 @@ diesel::allow_tables_to_appear_in_same_query!(
     faces,
     files,
     ignored_merges,
+    line_stages,
     people,
+    production_lines,
+    runs,
     settings,
     shots,
     video_keyframes,

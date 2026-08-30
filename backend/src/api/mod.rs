@@ -2,6 +2,7 @@ pub mod client;
 mod comfyui;
 mod faces;
 mod files;
+mod lines;
 mod people;
 pub mod settings;
 mod shots;
@@ -102,6 +103,17 @@ use utoipa::OpenApi;
         comfyui::comfyui_create_preset,
         comfyui::comfyui_update_preset,
         comfyui::comfyui_delete_preset,
+        // Production lines and runs
+        lines::list_lines,
+        lines::get_line,
+        lines::create_line,
+        lines::update_line,
+        lines::delete_line,
+        lines::start_run,
+        lines::list_runs,
+        lines::get_run,
+        lines::retry_run,
+        lines::cancel_run,
         // Settings
         settings::get_webdav_settings,
         settings::set_webdav_settings,
@@ -171,6 +183,9 @@ use utoipa::OpenApi;
             crate::comfyui::MediaType,
             crate::comfyui::ParamName,
             crate::comfyui::SourceRole,
+            lines::LinePayload,
+            lines::LineStagePayload,
+            lines::StartRunPayload,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
@@ -538,6 +553,24 @@ pub fn create_router(state: AppState) -> Router {
             "/api/comfyui/tasks/{id}/cancel",
             post(comfyui::comfyui_cancel_task),
         )
+        // Production lines: a chain of workflows, and the runs that walk one.
+        .route(
+            "/api/comfyui/lines",
+            get(lines::list_lines).post(lines::create_line),
+        )
+        .route(
+            "/api/comfyui/lines/{id}",
+            get(lines::get_line)
+                .put(lines::update_line)
+                .delete(lines::delete_line),
+        )
+        .route(
+            "/api/comfyui/runs",
+            get(lines::list_runs).post(lines::start_run),
+        )
+        .route("/api/comfyui/runs/{id}", get(lines::get_run))
+        .route("/api/comfyui/runs/{id}/retry", post(lines::retry_run))
+        .route("/api/comfyui/runs/{id}/cancel", post(lines::cancel_run))
         .route("/api/version", get(stats::get_version))
         // Settings
         .route(

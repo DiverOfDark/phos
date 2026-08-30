@@ -59,6 +59,11 @@
 //! * **Failures are split by site.** A refused graph or a node exception fails
 //!   at once with the real message; a dropped connection backs off and tries
 //!   again.
+//! * **A task is a step of a run.** One workflow against one photo is a
+//!   one-stage run; photo → clip → interpolate → 4K upscale is a four-stage
+//!   one, and the difference is a row in `line_stages`. [`line`] decides what
+//!   a line may be and what happens after a stage lands, [`runs`] puts runs on
+//!   disk, and [`worker::advance`] is the pass that walks one along.
 //! * **A video can go in whole.** [`source`] decides what a run consumes — a
 //!   frame of the clip (the first, the last, one at a timestamp, one of the
 //!   indexed keyframes) or the file itself, which is the default whenever the
@@ -71,6 +76,7 @@
 mod client;
 pub mod contract;
 mod history;
+pub mod line;
 mod loaders;
 mod manifest;
 pub mod nodes;
@@ -78,6 +84,7 @@ mod outputs;
 mod overrides;
 pub mod params;
 mod policy;
+pub mod runs;
 mod source;
 mod timestamp;
 mod worker;
@@ -85,6 +92,7 @@ mod workflow;
 
 pub use client::ComfyUiClient;
 pub use contract::{Accepts, ContractCorrections, MediaType, ParamName, StageContract};
+pub use line::{validate_chain, LineError, RunState, StageTyping};
 pub use loaders::{
     default_binding_warnings, detect_loaders, importable, LoaderKind, SourceRole,
 };
@@ -93,6 +101,7 @@ pub use nodes::NodeCatalog;
 pub use overrides::detect_inputs;
 pub use params::{expand, ParameterMap, VaryMap, VaryMode, VarySpec};
 pub use source::SourceMode;
+pub(crate) use worker::advance::{cancel_run, retry_run};
 pub use worker::spawn_enhancement_worker;
 pub use workflow::detect_outputs;
 

@@ -14,6 +14,8 @@ import {
   parseValueList,
   randomSeed,
   runCount,
+  formatDuration,
+  stageOf,
   MAX_SAFE_SEED,
 } from "./utils.js";
 
@@ -137,4 +139,24 @@ test("the run count is the product of the axes", () => {
   );
   // The short spellings the API also accepts count the same.
   assert.equal(runCount({ "3.seed": 4, "3.cfg": [4, 6, 8] }), 12);
+});
+
+test("a run's clock reads as a schedule, not as a number of seconds", () => {
+  assert.equal(formatDuration(192), "00:03:12");
+  assert.equal(formatDuration(0), "00:00:00");
+  assert.equal(formatDuration(3661), "01:01:01");
+  // A run whose start the server could not parse still gets a clock-shaped gap.
+  assert.equal(formatDuration(null), "--:--:--");
+});
+
+test("a run says which stage of how many, counting from one", () => {
+  // Stage index 1 of a four-stage line is the second stage.
+  assert.equal(stageOf({ current_stage: 1, stage_count: 4, status: "running" }), "2/4");
+  assert.equal(stageOf({ current_stage: 0, stage_count: 4, status: "running" }), "1/4");
+  // A finished run reads 4/4, never 5/4.
+  assert.equal(stageOf({ current_stage: 4, stage_count: 4, status: "completed" }), "4/4");
+  // A failure names the stage it stopped at, so it can be resumed from there.
+  assert.equal(stageOf({ current_stage: 1, stage_count: 4, status: "failed" }), "2/4");
+  // A lone workflow is a one-stage run, and reads as one.
+  assert.equal(stageOf({ current_stage: 0, stage_count: 1, status: "running" }), "1/1");
 });
