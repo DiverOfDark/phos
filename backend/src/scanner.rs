@@ -1661,25 +1661,7 @@ where
                 continue;
             }
 
-            // Convert RGB frame data to DynamicImage
-            let w = rgb_frame.width();
-            let h = rgb_frame.height();
-            let stride = rgb_frame.stride(0);
-            let data = rgb_frame.data(0);
-
-            // The frame data may have padding (stride > width*3), so we need to
-            // copy row by row
-            let mut rgb_data = Vec::with_capacity((w * h * 3) as usize);
-            for row in 0..h {
-                let start = (row as usize) * stride;
-                let end = start + (w as usize) * 3;
-                if end <= data.len() {
-                    rgb_data.extend_from_slice(&data[start..end]);
-                }
-            }
-
-            if let Some(img_buf) = RgbImage::from_raw(w, h, rgb_data) {
-                let dynamic_img = DynamicImage::ImageRgb8(img_buf);
+            if let Some(dynamic_img) = rgb_frame_to_image(&rgb_frame) {
                 on_keyframe(timestamp_ms, dynamic_img);
                 // dynamic_img is dropped here — only one frame in memory at a time
                 *count += 1;
@@ -1715,8 +1697,68 @@ where
     Ok(count)
 }
 
+/// Which frame of a video to pull out.
+///
+/// [`FrameTarget::Last`] is the one that makes extending a clip possible, and
+/// the one that needs care: the trailing frames of a stream sit in the
+/// decoder's reorder buffer until it is flushed, so a loop that stops when the
+/// packets run out stops one or more frames short of the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameTarget {
+    /// The first decodable frame.
+    First,
+    /// The final decodable frame.
+    Last,
+    /// The first frame at or after this position, clamped to the final frame
+    /// when the video is shorter than that.
+    AtMs(i64),
+}
+
+/// How far before the end to land before decoding forward for [`FrameTarget::Last`].
+///
+/// A backward seek lands on a keyframe, so this only has to be longer than one
+/// group of pictures; decoding a couple of seconds beats decoding an hour.
+const LAST_FRAME_LOOKBACK_US: i64 = 5_000_000;
+
 /// Extract the first frame from a video file and return it as a DynamicImage.
 pub fn extract_first_video_frame(path: &Path) -> anyhow::Result<DynamicImage> {
+    extract_video_frame(path, FrameTarget::First)
+}
+
+/// Extract one frame from a video file and return it as a DynamicImage.
+///
+/// Seeking is treated as an optimisation, never as a correctness requirement:
+/// containers lie about their duration and some are not seekable at all, so a
+/// seek that yields no frame falls back to decoding from the start.
+pub fn extract_video_frame(path: &Path, target: FrameTarget) -> anyhow::Result<DynamicImage> {
+    if matches!(target, FrameTarget::Last | FrameTarget::AtMs(_)) {
+        match decode_target(path, target, true) {
+            Ok(Some(img)) => return Ok(img),
+            Ok(None) => debug!(
+                "Seek-assisted decode of {:?} for {:?} found no frame; decoding from the start",
+                path, target
+            ),
+            Err(e) => debug!(
+                "Seek-assisted decode of {:?} for {:?} failed ({}); decoding from the start",
+                path, target, e
+            ),
+        }
+    }
+    decode_target(path, target, false)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Could not extract any frame from {:?} for {:?}",
+            path,
+            target
+        )
+    })
+}
+
+/// Decode `path` until `target` is satisfied, optionally seeking there first.
+fn decode_target(
+    path: &Path,
+    target: FrameTarget,
+    allow_seek: bool,
+) -> anyhow::Result<Option<DynamicImage>> {
     let mut ictx = ffmpeg::format::input(&path)?;
 
     let stream = ictx
@@ -1724,6 +1766,7 @@ pub fn extract_first_video_frame(path: &Path) -> anyhow::Result<DynamicImage> {
         .best(ffmpeg::media::Type::Video)
         .ok_or_else(|| anyhow::anyhow!("No video stream found in {:?}", path))?;
     let video_stream_index = stream.index();
+    let time_base = stream.time_base();
 
     let context_decoder = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
     let mut decoder = context_decoder.decoder().video()?;
@@ -1750,40 +1793,102 @@ pub fn extract_first_video_frame(path: &Path) -> anyhow::Result<DynamicImage> {
         ffmpeg::software::scaling::Flags::BILINEAR,
     )?;
 
+    if allow_seek {
+        // `duration()` is in AV_TIME_BASE units (microseconds), and is 0 or
+        // negative when the container does not know.
+        let seek_us = match target {
+            FrameTarget::First => None,
+            FrameTarget::Last => {
+                let duration = ictx.duration();
+                (duration > LAST_FRAME_LOOKBACK_US).then(|| duration - LAST_FRAME_LOOKBACK_US)
+            }
+            FrameTarget::AtMs(ms) => (ms > 0).then(|| ms.saturating_mul(1000)),
+        };
+        // Nothing worth seeking to — say so rather than repeating the unseeked
+        // pass the caller is about to run anyway.
+        let Some(seek_us) = seek_us else {
+            return Ok(None);
+        };
+        // Land on the keyframe at or before the mark, then decode forward.
+        if ictx.seek(seek_us, ..seek_us).is_err() {
+            return Ok(None);
+        }
+        decoder.flush();
+    }
+
+    let mut best: Option<DynamicImage> = None;
+    let mut satisfied = false;
+
+    let collect = |decoder: &mut ffmpeg::decoder::Video,
+                   scaler: &mut ffmpeg::software::scaling::Context,
+                   best: &mut Option<DynamicImage>,
+                   satisfied: &mut bool| {
+        let mut decoded = ffmpeg::frame::Video::empty();
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            if *satisfied {
+                // Keep draining so the decoder stays in a sane state, but the
+                // answer is already decided.
+                continue;
+            }
+            let pts = decoded.timestamp().unwrap_or(0);
+            let timestamp_ms = (pts as f64 * f64::from(time_base) * 1000.0) as i64;
+
+            let mut rgb_frame = ffmpeg::frame::Video::empty();
+            if scaler.run(&decoded, &mut rgb_frame).is_err() {
+                continue;
+            }
+            let Some(img) = rgb_frame_to_image(&rgb_frame) else {
+                continue;
+            };
+
+            // Every target keeps the newest frame and they differ only in when
+            // that frame is good enough to stop on. `Last` never stops, which
+            // is why the EOF drain below matters.
+            *best = Some(img);
+            match target {
+                FrameTarget::First => *satisfied = true,
+                FrameTarget::Last => {}
+                FrameTarget::AtMs(ms) => *satisfied = timestamp_ms >= ms,
+            }
+        }
+    };
+
     for (stream, packet) in ictx.packets() {
         if stream.index() == video_stream_index {
             decoder.send_packet(&packet)?;
-
-            let mut decoded = ffmpeg::frame::Video::empty();
-            if decoder.receive_frame(&mut decoded).is_ok() {
-                let mut rgb_frame = ffmpeg::frame::Video::empty();
-                scaler.run(&decoded, &mut rgb_frame)?;
-
-                let w = rgb_frame.width();
-                let h = rgb_frame.height();
-                let stride = rgb_frame.stride(0);
-                let data = rgb_frame.data(0);
-
-                let mut rgb_data = Vec::with_capacity((w * h * 3) as usize);
-                for row in 0..h {
-                    let start = (row as usize) * stride;
-                    let end = start + (w as usize) * 3;
-                    if end <= data.len() {
-                        rgb_data.extend_from_slice(&data[start..end]);
-                    }
-                }
-
-                if let Some(img_buf) = RgbImage::from_raw(w, h, rgb_data) {
-                    return Ok(DynamicImage::ImageRgb8(img_buf));
-                }
+            collect(&mut decoder, &mut scaler, &mut best, &mut satisfied);
+            if satisfied {
+                return Ok(best);
             }
         }
     }
+    // Flush: the frames still inside the decoder are exactly the ones a loop
+    // that stops at the last packet loses, and for `Last` one of them is the
+    // answer.
+    decoder.send_eof()?;
+    collect(&mut decoder, &mut scaler, &mut best, &mut satisfied);
 
-    Err(anyhow::anyhow!(
-        "Could not extract any frame from {:?}",
-        path
-    ))
+    Ok(best)
+}
+
+/// Copy an RGB24 frame into a `DynamicImage`, dropping the row padding ffmpeg
+/// leaves behind when the stride is wider than the picture.
+fn rgb_frame_to_image(rgb_frame: &ffmpeg::frame::Video) -> Option<DynamicImage> {
+    let w = rgb_frame.width();
+    let h = rgb_frame.height();
+    let stride = rgb_frame.stride(0);
+    let data = rgb_frame.data(0);
+
+    let mut rgb_data = Vec::with_capacity((w as usize) * (h as usize) * 3);
+    for row in 0..h {
+        let start = (row as usize) * stride;
+        let end = start + (w as usize) * 3;
+        if end <= data.len() {
+            rgb_data.extend_from_slice(&data[start..end]);
+        }
+    }
+
+    RgbImage::from_raw(w, h, rgb_data).map(DynamicImage::ImageRgb8)
 }
 
 /// Extract EXIF metadata from an image file.
@@ -2246,5 +2351,267 @@ mod tests {
             DynamicImage::ImageRgb8(RgbImage::from_fn(100, 100, |_, _| image::Rgb([42, 42, 42])));
         let hash = compute_dhash(&img);
         assert_eq!(hash, [0u8; 8]);
+    }
+}
+
+/// A real, encoded video whose every frame says which frame it is.
+///
+/// Frame extraction cannot be tested against a mock: the interesting failures
+/// (the reorder buffer swallowing the tail, a seek landing on the wrong
+/// keyframe) only exist inside a real decoder. So the tests encode one.
+///
+/// Each frame is eight vertical bars, black or white, spelling the frame index
+/// in binary. Large flat blocks survive lossy encoding intact, so reading the
+/// index back out is exact — where a gradient or a grey ramp would be a
+/// tolerance argument.
+#[cfg(test)]
+mod video_fixture {
+    use super::*;
+    use ffmpeg::util::rational::Rational;
+    use image::Rgb;
+
+    pub const WIDTH: u32 = 128;
+    pub const HEIGHT: u32 = 64;
+    const BARS: u32 = 8;
+    const BAR_W: u32 = WIDTH / BARS;
+
+    /// The frame that says `index`.
+    fn frame_image(index: u8) -> DynamicImage {
+        DynamicImage::ImageRgb8(RgbImage::from_fn(WIDTH, HEIGHT, |x, _| {
+            let bit = x / BAR_W;
+            if index & (1 << bit) != 0 {
+                Rgb([255, 255, 255])
+            } else {
+                Rgb([0, 0, 0])
+            }
+        }))
+    }
+
+    /// Read the index back out of a decoded frame.
+    pub fn index_of(img: &DynamicImage) -> u8 {
+        let rgb = img.to_rgb8();
+        let (w, h) = rgb.dimensions();
+        assert_eq!((w, h), (WIDTH, HEIGHT), "unexpected frame size");
+        let mut index = 0u8;
+        for bit in 0..BARS {
+            // Sample the middle of the bar, away from any ringing at the edges.
+            let px = rgb.get_pixel(bit * BAR_W + BAR_W / 2, h / 2);
+            if px[0] > 127 {
+                index |= 1 << bit;
+            }
+        }
+        index
+    }
+
+    /// Encode `frames` frames at `fps` into `path`. Returns the frame indices
+    /// written, in order.
+    pub fn write(path: &Path, frames: u8, fps: i32) -> anyhow::Result<Vec<u8>> {
+        ffmpeg::init()?;
+        let mut octx = ffmpeg::format::output(&path)?;
+        let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::MPEG4)
+            .ok_or_else(|| anyhow::anyhow!("this ffmpeg build has no mpeg4 encoder"))?;
+        let global_header = octx
+            .format()
+            .flags()
+            .contains(ffmpeg::format::Flags::GLOBAL_HEADER);
+
+        let time_base = Rational::new(1, fps);
+        let mut enc = ffmpeg::codec::context::Context::new_with_codec(codec)
+            .encoder()
+            .video()?;
+        enc.set_width(WIDTH);
+        enc.set_height(HEIGHT);
+        enc.set_format(ffmpeg::format::Pixel::YUV420P);
+        enc.set_time_base(time_base);
+        enc.set_frame_rate(Some(Rational::new(fps, 1)));
+        // A short GOP and real B-frames: the point is to make the decoder hold
+        // frames back, so the flush in `decode_target` has something to find.
+        enc.set_gop(6);
+        enc.set_max_b_frames(2);
+        enc.set_bit_rate(4_000_000);
+        if global_header {
+            enc.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
+        }
+        let mut encoder = enc.open()?;
+
+        let stream_index = {
+            let mut ost = octx.add_stream(codec)?;
+            ost.set_parameters(&encoder);
+            ost.set_time_base(time_base);
+            ost.index()
+        };
+        octx.write_header()?;
+        let ost_time_base = octx.stream(stream_index).unwrap().time_base();
+
+        let mut scaler = ffmpeg::software::scaling::Context::get(
+            ffmpeg::format::Pixel::RGB24,
+            WIDTH,
+            HEIGHT,
+            ffmpeg::format::Pixel::YUV420P,
+            WIDTH,
+            HEIGHT,
+            ffmpeg::software::scaling::Flags::BILINEAR,
+        )?;
+
+        let written: Vec<u8> = (0..frames).collect();
+        for (i, index) in written.iter().enumerate() {
+            let rgb = frame_image(*index).to_rgb8();
+            let mut src = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::RGB24, WIDTH, HEIGHT);
+            let stride = src.stride(0);
+            {
+                let data = src.data_mut(0);
+                for row in 0..HEIGHT as usize {
+                    let start = row * stride;
+                    let line = &rgb.as_raw()[row * WIDTH as usize * 3..][..WIDTH as usize * 3];
+                    data[start..start + line.len()].copy_from_slice(line);
+                }
+            }
+            let mut yuv = ffmpeg::frame::Video::empty();
+            scaler.run(&src, &mut yuv)?;
+            yuv.set_pts(Some(i as i64));
+            encoder.send_frame(&yuv)?;
+            drain(
+                &mut encoder,
+                &mut octx,
+                stream_index,
+                time_base,
+                ost_time_base,
+            )?;
+        }
+        encoder.send_eof()?;
+        drain(
+            &mut encoder,
+            &mut octx,
+            stream_index,
+            time_base,
+            ost_time_base,
+        )?;
+        octx.write_trailer()?;
+        Ok(written)
+    }
+
+    fn drain(
+        encoder: &mut ffmpeg::encoder::Video,
+        octx: &mut ffmpeg::format::context::Output,
+        stream_index: usize,
+        enc_time_base: Rational,
+        ost_time_base: Rational,
+    ) -> anyhow::Result<()> {
+        let mut packet = ffmpeg::Packet::empty();
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(stream_index);
+            packet.rescale_ts(enc_time_base, ost_time_base);
+            packet.write_interleaved(octx)?;
+        }
+        Ok(())
+    }
+}
+
+/// Frame extraction, against a video this test encodes itself.
+#[cfg(test)]
+mod frame_target_tests {
+    use super::video_fixture as fixture;
+    use super::*;
+    use tempfile::tempdir;
+
+    /// 96 frames at 12fps — eight seconds, comfortably longer than the
+    /// five-second lookback, so `Last` really does exercise the seek path.
+    const FRAMES: u8 = 96;
+    const FPS: i32 = 12;
+
+    struct Clip {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        frames: Vec<u8>,
+    }
+
+    fn clip() -> Clip {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("counting.mp4");
+        let frames = fixture::write(&path, FRAMES, FPS).expect("encode fixture video");
+        assert!(path.exists());
+        Clip {
+            _dir: dir,
+            path,
+            frames,
+        }
+    }
+
+    #[test]
+    fn the_fixture_round_trips_its_own_frame_numbers() {
+        // If this fails nothing below means anything: the assertion is that a
+        // frame survives encode → decode still naming itself.
+        let clip = clip();
+        let first = extract_video_frame(&clip.path, FrameTarget::First).unwrap();
+        assert_eq!(fixture::index_of(&first), clip.frames[0]);
+        assert_eq!(
+            (first.width(), first.height()),
+            (fixture::WIDTH, fixture::HEIGHT)
+        );
+    }
+
+    #[test]
+    fn first_frame_is_unchanged_by_the_rewrite() {
+        let clip = clip();
+        assert_eq!(
+            fixture::index_of(&extract_first_video_frame(&clip.path).unwrap()),
+            0
+        );
+    }
+
+    /// The one the whole feature turns on: extending a clip needs its *last*
+    /// frame, and the naive loop returns the last frame the decoder happened to
+    /// have emitted, which with B-frames is not the last frame of the video.
+    #[test]
+    fn last_frame_is_the_last_frame_not_the_one_before_the_flush() {
+        let clip = clip();
+        let last = extract_video_frame(&clip.path, FrameTarget::Last).unwrap();
+        assert_eq!(
+            fixture::index_of(&last),
+            *clip.frames.last().unwrap(),
+            "last frame extraction stopped short of the end"
+        );
+    }
+
+    #[test]
+    fn at_time_lands_on_the_frame_that_covers_that_moment() {
+        let clip = clip();
+        // Frame n is shown at n/FPS seconds. Ask for 4s into an 8s clip.
+        let ms = 4_000;
+        let img = extract_video_frame(&clip.path, FrameTarget::AtMs(ms)).unwrap();
+        let got = fixture::index_of(&img);
+        let want = (ms as f64 / 1000.0 * FPS as f64).round() as u8;
+        assert!(
+            got.abs_diff(want) <= 1,
+            "asked for {}ms (frame {}), got frame {}",
+            ms,
+            want,
+            got
+        );
+    }
+
+    #[test]
+    fn at_time_zero_is_the_first_frame() {
+        let clip = clip();
+        let img = extract_video_frame(&clip.path, FrameTarget::AtMs(0)).unwrap();
+        assert_eq!(fixture::index_of(&img), 0);
+    }
+
+    /// A timestamp past the end is a user typo, not an error: give them the
+    /// closest thing that exists rather than failing the whole task.
+    #[test]
+    fn at_time_past_the_end_clamps_to_the_last_frame() {
+        let clip = clip();
+        let img = extract_video_frame(&clip.path, FrameTarget::AtMs(999_000)).unwrap();
+        assert_eq!(fixture::index_of(&img), *clip.frames.last().unwrap());
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_video_is_an_error_not_a_panic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"not a video").unwrap();
+        assert!(extract_video_frame(&path, FrameTarget::Last).is_err());
+        assert!(extract_video_frame(&path, FrameTarget::AtMs(10)).is_err());
     }
 }
