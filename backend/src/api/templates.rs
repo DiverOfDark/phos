@@ -19,7 +19,8 @@
 
 use axum::{extract::Path, http::StatusCode, Json};
 
-use crate::comfyui::templates::{self, bundle::LineBundle, install, readiness};
+use crate::comfyui::portable::LineBundle;
+use crate::comfyui::templates::{self, install, readiness};
 
 use super::comfyui::{node_catalog, require_comfyui, ApiError};
 use super::UState;
@@ -47,7 +48,7 @@ fn template_json(
         "produces": typings.last().map(|t| t.produces),
         // Read off the graphs, not out of the document's own `requirements`
         // block: what will run is what the graphs say.
-        "requirements": readiness::derive_requirements(bundle.graphs()),
+        "requirements": crate::comfyui::portable::Requirements::derive(bundle.graphs()),
         "readiness": readiness,
         "installed": installed,
     })

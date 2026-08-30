@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/comfyui-line-editor"
+    "version": "integ/wave-d-reconcile"
   },
   "paths": {
     "/api/auth/callback": {
@@ -381,7 +381,7 @@
             "description": "Enhancement task(s) queued"
           },
           "400": {
-            "description": "Unrecognised source_mode, one this workflow cannot take, or an unusable sweep"
+            "description": "Unrecognised source_mode, or an unusable sweep"
           },
           "404": {
             "description": "Shot or workflow not found"
@@ -401,7 +401,7 @@
           "comfyui"
         ],
         "summary": "Get shot generation history",
-        "description": "Returns the workflow, text overrides and typed parameters used to generate each non-original file for a shot.",
+        "description": "Returns the workflow and text overrides used to generate each non-original file for a shot.",
         "operationId": "comfyui_shot_generations",
         "parameters": [
           {
@@ -812,7 +812,7 @@
           "comfyui"
         ],
         "summary": "Get ComfyUI node definitions",
-        "description": "What ComfyUI says its installed node classes take: every input's name, type, default and range, and for an enum its contents — the checkpoints, samplers, schedulers and LoRAs installed on that server. Cached in memory for five minutes and re-read when ComfyUI comes back after being down; `refresh=true` re-reads it now. Always 200: a server that is unreachable or too old to have /object_info answers `available: false`, and the console falls back to plain text boxes.",
+        "description": "What ComfyUI says its installed node classes take: every input's name, type, default and range, and for an enum its contents — the checkpoints, samplers, schedulers and LoRAs installed on that server. Cached in memory and re-read when ComfyUI comes back after being down. Always 200: a server that is unreachable or too old to have /object_info answers `available: false`, and the console falls back to plain text boxes.",
         "operationId": "comfyui_nodes",
         "parameters": [
           {
@@ -825,15 +825,6 @@
                 "string",
                 "null"
               ]
-            }
-          },
-          {
-            "name": "refresh",
-            "in": "query",
-            "description": "Read `/object_info` from ComfyUI now instead of serving the cached\ncopy. For after installing a model or a node pack.",
-            "required": false,
-            "schema": {
-              "type": "boolean"
             }
           }
         ],
@@ -883,7 +874,7 @@
           {
             "name": "cursor",
             "in": "query",
-            "description": "Cursor: `next_cursor` from the previous page — `created_at|id` of its\nlast run. The id is the tie-breaker: a migrated backlog can put dozens\nof runs on the same second, and a timestamp alone would skip the rest\nof them.",
+            "description": "Cursor: `created_at` of the last run from the previous page",
             "required": false,
             "schema": {
               "type": [
@@ -1243,6 +1234,62 @@
         }
       }
     },
+    "/api/comfyui/templates": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "List bundled templates",
+        "description": "The templates this build ships, what this library already has of each, and whether this ComfyUI has the nodes and models to run it. Readiness is `unknown` — never `missing` — when the node catalogue cannot be read.",
+        "operationId": "list_templates",
+        "responses": {
+          "200": {
+            "description": "Bundled templates with readiness"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/templates/{key}/install": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Install a bundled template",
+        "description": "Write this template's workflows and its line into the library. Installing one that is already installed gives a fresh copy and leaves the existing rows alone — they may have been edited, and they are the user's.",
+        "operationId": "install_template",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Template key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Installed"
+          },
+          "404": {
+            "description": "No such template"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
     "/api/comfyui/workflows": {
       "get": {
         "tags": [
@@ -1321,9 +1368,6 @@
           },
           "404": {
             "description": "Workflow not found"
-          },
-          "409": {
-            "description": "A production line still uses this workflow"
           },
           "500": {
             "description": "Internal server error"
@@ -1689,9 +1733,6 @@
           "404": {
             "description": "Face or target person not found"
           },
-          "409": {
-            "description": "Face is on a machine-generated file and cannot join the person model"
-          },
           "500": {
             "description": "Internal server error"
           }
@@ -1881,9 +1922,6 @@
           },
           "404": {
             "description": "File not found"
-          },
-          "409": {
-            "description": "File is machine-generated; faces on it are not accepted"
           },
           "500": {
             "description": "Internal server error"
@@ -3210,8 +3248,7 @@
         "required": [
           "id",
           "is_original",
-          "thumbnail_url",
-          "synthetic"
+          "thumbnail_url"
         ],
         "properties": {
           "file_size": {
@@ -3232,10 +3269,6 @@
               "string",
               "null"
             ]
-          },
-          "synthetic": {
-            "type": "boolean",
-            "description": "A workflow made this file, not a camera. The client says so."
           },
           "thumbnail_url": {
             "type": "string"
@@ -3309,7 +3342,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Keys this stage leaves to whoever sends the line — the *exposed*\ndisposition. Optional, like everything else a hand-written template\nwould rather not say."
+            "description": "The keys this stage deliberately left open — FR5b's *exposed*\ndisposition. Travels with the stage for the same reason `parameters`\ndoes: a line that asks the sender for a seed is not the same line once\nit has been carried somewhere that pins one."
           },
           "keep_output": {
             "type": "boolean"
@@ -3424,6 +3457,14 @@
             "type": "string"
           }
         }
+      },
+      "Confidence": {
+        "type": "string",
+        "description": "How much Phos claims to know about whether this template runs.\n\nStated because the shipped graphs were built from published node definitions\nrather than exported from a running ComfyUI, and saying so is better than\nimplying otherwise. The readiness check is the machine-readable half of the\nsame honesty.",
+        "enum": [
+          "high",
+          "unverified"
+        ]
       },
       "ContractCorrections": {
         "type": "object",
@@ -3955,6 +3996,116 @@
           }
         }
       },
+      "InputMismatch": {
+        "type": "object",
+        "description": "A field a graph sets that its node does not take, or one the node requires\nand the graph does not set.",
+        "required": [
+          "workflow_key",
+          "node_id",
+          "node_class",
+          "field",
+          "kind",
+          "message"
+        ],
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`unexpected` — the graph sets it and the node has no such input.\n`absent` — the node requires it and the graph does not set it."
+          },
+          "message": {
+            "type": "string",
+            "description": "The same thing in a sentence, so a UI never has to compose one."
+          },
+          "node_class": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "workflow_key": {
+            "type": "string"
+          }
+        }
+      },
+      "InstalledState": {
+        "type": "object",
+        "description": "What a library has of one template.",
+        "required": [
+          "version",
+          "line_exists",
+          "workflows",
+          "customised"
+        ],
+        "properties": {
+          "customised": {
+            "type": "boolean",
+            "description": "At least one workflow is present and no longer managed: somebody edited\nit, so this template will not be updated over their work."
+          },
+          "line_exists": {
+            "type": "boolean",
+            "description": "The line row is still there. `false` once the user deletes it."
+          },
+          "line_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The version last seeded.",
+            "minimum": 0
+          },
+          "workflows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstalledWorkflow"
+            }
+          }
+        }
+      },
+      "InstalledWorkflow": {
+        "type": "object",
+        "description": "What one seeded workflow looks like right now.",
+        "required": [
+          "key",
+          "workflow_id",
+          "managed"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "The bundle-local key, so a reader can line it up with the template."
+          },
+          "managed": {
+            "type": "boolean",
+            "description": "Still carries this template's marker, so an upgrade may still update it."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`None` when the row has been deleted."
+          },
+          "version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The template version the marker records.",
+            "minimum": 0
+          },
+          "workflow_id": {
+            "type": "string"
+          }
+        }
+      },
       "Intent": {
         "type": "object",
         "description": "What the person asked for, as opposed to what is in the photograph.",
@@ -4011,6 +4162,17 @@
           "requirements": {
             "$ref": "#/components/schemas/Requirements",
             "description": "What this line needs installed, as computed where it was exported.\n\nDocumentation, not input: the importer recomputes it from the graphs in\nthis same file, so a stale or hand-edited manifest cannot make an import\nreport something untrue."
+          },
+          "template": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Template",
+                "description": "Present on a **bundled template**, absent on somebody's export.\n\nThe one block FR6 adds to this format, and the reason it is declared\nthere rather than here: it says nothing about the line, only about\nPhos's claim on it — the key an upgrade matches and the version it\ncompares. Carried on the document type all the same, so a template\npasted into the import box round-trips as the file it is instead of\nquietly losing its identity on the way through."
+              }
+            ]
           },
           "workflows": {
             "type": "object",
@@ -4450,6 +4612,50 @@
         "additionalProperties": {
           "description": "Anything a newer Phos wrote that this one has no field for. Kept so a\nround trip through an older binary does not quietly drop provenance.\n\nFlattened, so it has no name of its own in the JSON and nothing to\npublish in the schema — a client generated from an older spec simply\ndoes not see the newer keys, which is the point."
         }
+      },
+      "Readiness": {
+        "type": "object",
+        "description": "What a template's readiness comes to.",
+        "required": [
+          "state",
+          "label",
+          "detail",
+          "requirements",
+          "input_mismatches"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "The whole story, for the panel under the label."
+          },
+          "input_mismatches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InputMismatch"
+            }
+          },
+          "label": {
+            "type": "string",
+            "description": "The one-line verdict, in the status vocabulary the rest of the console\nuses: `READY`, `MISSING NODE RIFE VFI`, `MISSING 2 MODELS`, `UNKNOWN`."
+          },
+          "requirements": {
+            "$ref": "#/components/schemas/RequirementsReport",
+            "description": "FR5d's own report, unchanged: what is installed and what is not."
+          },
+          "state": {
+            "$ref": "#/components/schemas/ReadinessState"
+          }
+        }
+      },
+      "ReadinessState": {
+        "type": "string",
+        "description": "How ready, in one word. FR5d's three, plus one.",
+        "enum": [
+          "ready",
+          "missing",
+          "degraded",
+          "unchecked"
+        ]
       },
       "ReassignFacePayload": {
         "type": "object",
@@ -5023,6 +5229,42 @@
           }
         }
       },
+      "Template": {
+        "type": "object",
+        "description": "What makes this line export a *bundled template* rather than somebody's\nexport: an identity that is stable across releases, and a version.\n\nThe only field in the document FR5d does not define. Absent on an ordinary\nexport, which is exactly right — a line somebody sent you is not something\nPhos should later overwrite.",
+        "required": [
+          "key",
+          "version"
+        ],
+        "properties": {
+          "confidence": {
+            "$ref": "#/components/schemas/Confidence"
+          },
+          "key": {
+            "type": "string",
+            "description": "Stable across releases; the identity an upgrade matches on."
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What a person should know before running it: which custom node packs,\nwhich weights, what the frame rates mean."
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Bumped whenever the shipped content changes.",
+            "minimum": 0
+          }
+        }
+      },
       "TokenExchangeRequest": {
         "type": "object",
         "required": [
@@ -5112,8 +5354,10 @@
           },
           "values": {
             "type": "array",
-            "items": {},
-            "description": "Run exactly these values, in this order.\n\nAny scalar JSON value: `[4.0, 6.0, 8.0]` for a cfg,\n`[\"sd15.safetensors\", \"sdxl.safetensors\"]` for a checkpoint. Declared\nas unconstrained values, not objects — `Vec<Object>` would make a\ngenerated client refuse every valid list."
+            "items": {
+              "type": "object"
+            },
+            "description": "Run exactly these values, in this order."
           }
         }
       },

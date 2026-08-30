@@ -126,6 +126,16 @@ pub struct LineBundle {
     /// When it left, for a human reading the file. Never read by the importer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exported_at: Option<String>,
+    /// Present on a **bundled template**, absent on somebody's export.
+    ///
+    /// The one block FR6 adds to this format, and the reason it is declared
+    /// there rather than here: it says nothing about the line, only about
+    /// Phos's claim on it — the key an upgrade matches and the version it
+    /// compares. Carried on the document type all the same, so a template
+    /// pasted into the import box round-trips as the file it is instead of
+    /// quietly losing its identity on the way through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<super::templates::bundle::Template>,
     pub line: BundleLine,
     /// Every workflow the stages name, keyed by whatever they name it.
     #[serde(default)]
@@ -140,6 +150,30 @@ pub struct LineBundle {
 }
 
 impl LineBundle {
+    /// The template block, on a document that has one.
+    pub fn template(&self) -> Option<&super::templates::bundle::Template> {
+        self.template.as_ref()
+    }
+
+    /// The key an upgrade matches on. Empty for an ordinary export, which is
+    /// nothing a template sync ever looks at.
+    pub fn key(&self) -> &str {
+        self.template.as_ref().map_or("", |t| t.key.as_str())
+    }
+
+    pub fn version(&self) -> u32 {
+        self.template.as_ref().map_or(0, |t| t.version)
+    }
+
+    pub fn workflow(&self, key: &str) -> Option<&BundleWorkflow> {
+        self.workflows.get(key)
+    }
+
+    /// The graphs, for anything that derives from all of them at once.
+    pub fn graphs(&self) -> impl Iterator<Item = &Value> {
+        self.workflows.values().map(|w| &w.graph)
+    }
+
     /// Read a bundle out of arbitrary JSON, with the refusals worth wording.
     ///
     /// Checks the discriminator before anything else, so pasting a ComfyUI
@@ -237,6 +271,8 @@ impl LineBundle {
             format: BUNDLE_FORMAT.to_string(),
             format_version: BUNDLE_VERSION,
             exported_at: None,
+            // A line somebody exports is theirs, not one Phos tracks.
+            template: None,
             line,
             workflows,
             requirements,

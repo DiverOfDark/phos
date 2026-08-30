@@ -4,7 +4,7 @@
 //! decides it asks [`super::marker`] first, which is pure and tested without
 //! one.
 //!
-//! # Install is an import
+//! # Install is an import, but it is not the importer
 //!
 //! A template is a `phos.line` document, so installing one is importing one:
 //! resolve each stage's workflow key to a row, build a `LinePayload`, check it,
@@ -12,17 +12,28 @@
 //! the same four in `api::line_io` — `resolve_workflows` + `check_payload` +
 //! `insert_stages`.
 //!
-//! **At integration, [`install`] should call FR5d's `resolve_workflows` rather
-//! than write `comfyui_workflows` rows itself**, which gets graph
-//! deduplication, name-collision handling and the requirements report for free.
-//! It needs two things of it that the import path does not need today:
+//! This module was written expecting [`install`] to call that
+//! `resolve_workflows` once the two branches met. It does not, and the three
+//! reasons are worth writing down so nobody re-litigates them:
 //!
-//! * the graph it stores must be the **marked** one, so pass
-//!   [`super::marker::with_marker`]'s output in the bundle it is handed — that
-//!   also stops dedup from silently reusing an unmarked hand-imported copy of
-//!   the same graph, which would leave nothing for an upgrade to find;
-//! * `resolve_workflows`' returned `key -> id` map is what
-//!   `bundled_templates.workflow_ids` records, so it has to be `pub(crate)`.
+//! * **Deduplication is wrong here.** `resolve_workflows` reuses any row whose
+//!   canonical graph matches. `POST /templates/{key}/install` promises the
+//!   opposite — *a fresh copy, leaving the existing rows alone, because they
+//!   may have been edited and they are the user's* — and reusing the previous
+//!   install's rows would quietly make two lines share one workflow.
+//! * **The marker cuts both ways.** What is stored must carry the `_phos`
+//!   block; what the contract, inputs and outputs are derived from must not
+//!   (see [`derive_columns`]), so that what is analysed is exactly what will be
+//!   dispatched. `resolve_workflows` derives from the graph it stores, and
+//!   giving it two graphs would make it a shared shell around two behaviours.
+//! * **The layering only runs one way.** `api` depends on `comfyui`, never the
+//!   reverse; calling into `api::line_io` from here would be the first
+//!   exception, and moving the function down instead would contradict
+//!   `portable`'s own "nothing in this module touches a database".
+//!
+//! What the two paths actually share is the format itself — one
+//! [`LineBundle`], one requirements derivation, one readiness check — and that
+//! is shared.
 //!
 //! # Sync
 //!
@@ -48,9 +59,9 @@ use diesel::sqlite::SqliteConnection;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-use super::bundle::LineBundle;
 use super::marker::{self, Verdict};
 use crate::comfyui::nodes::NodeCatalog;
+use crate::comfyui::portable::LineBundle;
 use crate::comfyui::runs::contract_of;
 use crate::comfyui::{detect_inputs, detect_outputs, StageContract, StageTyping};
 use crate::models::{NewBundledTemplate, NewComfyuiWorkflow, NewLineStage, NewProductionLine};
