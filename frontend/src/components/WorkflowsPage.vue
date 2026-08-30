@@ -1762,7 +1762,10 @@ defineExpose({ loadData: fetchWorkflows })
         <div
           v-for="b in batches"
           :key="b.id"
-          class="grid gap-3 items-center px-4 py-2.5 border-b border-line last:border-0 min-w-[880px]"
+          class="border-b border-line last:border-0 min-w-[880px]"
+        >
+        <div
+          class="grid gap-3 items-center px-4 py-2.5"
           style="grid-template-columns: minmax(0,1fr) 132px 148px 132px 96px 84px"
         >
           <span class="min-w-0">
@@ -1771,13 +1774,6 @@ defineExpose({ loadData: fetchWorkflows })
               {{ selectionShorthand(b.selection) }}
               <template v-if="!b.skip_if_generated"> · redo</template>
             </span>
-            <!-- Why nothing is happening, said on the batch it is happening to. -->
-            <span
-              v-if="b.paused_note"
-              class="block text-[12px] font-light truncate"
-              style="color: var(--status-degraded)"
-              :title="b.paused_note"
-            >{{ b.paused_note }}</span>
           </span>
 
           <!-- Against the number agreed at Send, not against a total that moves. -->
@@ -1828,6 +1824,20 @@ defineExpose({ loadData: fetchWorkflows })
               @click="stopBatch(b.id)"
             >{{ stoppingId === b.id ? '…' : 'Stop' }}</button>
           </span>
+        </div>
+
+        <!-- Why nothing is happening, on its own full-width row.
+             It used to sit in the Batch column, where a 196px cell at the
+             board's minimum width showed about thirty characters of a
+             hundred-and-ten-character sentence — cutting it off at "waiting on
+             a v…", which is precisely before the cap and before the half that
+             says whose move it is. The sentence is the answer to "why has
+             nothing happened for six hours"; it does not belong in a cell. -->
+        <div
+          v-if="b.paused_note"
+          class="px-4 pb-2.5 -mt-1 text-[12px] font-light"
+          style="color: var(--status-degraded)"
+        >{{ b.paused_note }}</div>
         </div>
 
         <div v-if="!batches.length" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
