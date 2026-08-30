@@ -17,7 +17,6 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-vue-next": "^1.0.0",
-    "playwright": "^1.58.2",
     "radix-vue": "^1.9.17",
     "reka-ui": "^2.8.0",
     "tailwind-animate": "^0.2.10",
@@ -30,6 +29,7 @@
     "@tailwindcss/vite": "^4.2.2",
     "@vitejs/plugin-vue": "^6.0.5",
     "autoprefixer": "^10.4.27",
+    "playwright": "^1.58.2",
     "postcss": "^8.5.8",
     "tailwindcss": "^4.2.2",
     "vite": "^8.0.0"
