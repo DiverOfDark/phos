@@ -217,3 +217,40 @@ export function stageOf(run) {
   const at = run?.status === "completed" ? count : (run?.current_stage ?? 0) + 1;
   return `${Math.min(at, count)}/${count}`;
 }
+
+/**
+ * The status colour a template's readiness gets.
+ *
+ * Readiness is exactly what the status palette is for, so it uses the palette
+ * rather than a colour of its own. `unchecked` — FR5d's word for "the catalogue
+ * could not be read", rendered as UNKNOWN — is the neutral one on purpose: not
+ * knowing is not a fault, and painting it red would send people looking for a
+ * problem that may not exist.
+ */
+export function readinessColor(state) {
+  switch (state) {
+    case "ready":
+      return "var(--status-ready)";
+    case "degraded":
+      return "var(--status-degraded)";
+    case "missing":
+      return "var(--status-error)";
+    default:
+      return "var(--status-stopped)";
+  }
+}
+
+/**
+ * What this library holds of a bundled template, in the schedule register.
+ *
+ * The one that matters is `EDITED`: a template whose workflow somebody has
+ * changed is theirs now, and no upgrade will ever write over it again. Saying
+ * so is the difference between a promise and a surprise.
+ */
+export function installedLabel(template) {
+  const installed = template && template.installed;
+  if (!installed) return "NOT INSTALLED";
+  if (installed.customised) return "EDITED · NOT UPDATED";
+  if (!installed.line_exists) return "LINE DELETED";
+  return `INSTALLED v${installed.version}`;
+}

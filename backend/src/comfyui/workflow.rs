@@ -154,6 +154,13 @@ fn suffixes_for(kind: SaverKind) -> &'static [&'static str] {
 /// binding (a user who names a file means it), a typed parameter beats a text
 /// override (it is the channel that knows what the field is), and the pinned
 /// prefix beats everything, because Phos has to be able to find what it made.
+///
+/// It also drops the `_phos` block a seeded workflow carries. ComfyUI reads
+/// every top-level key of a prompt as a node and refuses one with no
+/// `class_type`, so the marker has to come off somewhere; this is the single
+/// funnel every dispatch goes through, and taking it off here means the
+/// provenance stays in the stored graph — where an upgrade and an export can
+/// both still read it — rather than in a column that would not travel.
 pub(crate) fn prepare_workflow(
     workflow: &Value,
     plan: &BindingPlan,
@@ -162,7 +169,7 @@ pub(crate) fn prepare_workflow(
     output_prefix: Option<&str>,
 ) -> Value {
     let targets = &plan.targets;
-    let mut wf = workflow.clone();
+    let mut wf = super::templates::marker::strip_marker(workflow);
     if let Some(nodes) = wf.as_object_mut() {
         for (node_id, node) in nodes.iter_mut() {
             if let Some(bound) = targets.iter().find(|b| &b.node_id == node_id) {
@@ -593,5 +600,36 @@ mod tests {
             })
             .collect();
         assert_eq!(seeds, [1000, 1001, 1002, 1003]);
+    }
+
+    /// A seeded workflow's provenance block is not a node, and ComfyUI reads
+    /// every top-level key of a prompt as one. It has to come off here, because
+    /// this is the only thing that runs before `/prompt`.
+    #[test]
+    fn the_template_marker_never_reaches_comfyui() {
+        let marked = crate::comfyui::templates::marker::with_marker(
+            &sampler_graph(),
+            "restore-upscale",
+            "upscale",
+            1,
+        );
+        assert!(marked.get("_phos").is_some(), "the stored graph keeps it");
+
+        let prepared = prepare_workflow(
+            &marked,
+            &plain_image(&marked, "uploaded.png"),
+            &std::collections::HashMap::new(),
+            &no_params(),
+            Some("phos/task-1"),
+        );
+        assert!(prepared.get("_phos").is_none(), "the submitted one does not");
+        // And every key that is left is a node ComfyUI can execute.
+        for (key, node) in prepared.as_object().unwrap() {
+            assert!(
+                node.get("class_type").is_some(),
+                "{} would be refused as a node with no class_type",
+                key
+            );
+        }
     }
 }

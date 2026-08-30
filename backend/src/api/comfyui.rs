@@ -104,7 +104,9 @@ pub(super) async fn comfyui_health(
 /// `None` covers every way ComfyUI can decline to describe itself — down, too
 /// old to have `/object_info`, or answering something unparseable — and every
 /// caller treats that as ordinary rather than as an error.
-pub(super) async fn node_catalog(url: &str) -> Option<std::sync::Arc<crate::comfyui::NodeCatalog>> {
+pub(super) async fn node_catalog(
+    url: &str,
+) -> Option<std::sync::Arc<crate::comfyui::NodeCatalog>> {
     let url = url.to_string();
     tokio::task::spawn_blocking(move || {
         let client = crate::comfyui::ComfyUiClient::new(&url);
