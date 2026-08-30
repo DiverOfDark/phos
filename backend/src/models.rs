@@ -162,6 +162,72 @@ pub struct NewEnhancementTask<'a> {
     /// resolved — a swept seed is drawn before the row is written. `None` is a
     /// run that set none, which is every task queued before FR4.
     pub parameters: Option<&'a str>,
+    /// The run this task is a step of. Every task queued since FR5 has one:
+    /// a single-workflow enhance is a one-stage run, so the board has one kind
+    /// of row rather than two.
+    pub run_id: Option<&'a str>,
+    /// Which step of the run's line this is, 0-based.
+    pub stage_idx: Option<i32>,
+    /// The task whose output this one eats. `None` at stage 0. It is also the
+    /// marker that says a completed task has already been advanced: a row
+    /// naming it as parent exists exactly when its continuation was queued.
+    pub parent_task_id: Option<&'a str>,
+}
+
+// ── Production Lines ──
+
+#[derive(Insertable)]
+#[diesel(table_name = production_lines)]
+pub struct NewProductionLine<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub description: Option<&'a str>,
+}
+
+/// One step of a line: a workflow, plus everything one run of it needs that
+/// the workflow itself does not carry.
+#[derive(Insertable)]
+#[diesel(table_name = line_stages)]
+pub struct NewLineStage<'a> {
+    pub id: &'a str,
+    pub line_id: &'a str,
+    pub stage_idx: i32,
+    pub workflow_id: &'a str,
+    /// Prompt bindings and `role:<node>` directives, as a task's are.
+    pub text_overrides: Option<&'a str>,
+    /// Typed parameter overrides, as a task's are.
+    pub parameters: Option<&'a str>,
+    /// The fan-out spec, expanded once per continuation.
+    pub vary: Option<&'a str>,
+    /// Which part of an upstream video this stage consumes. `None` lets the
+    /// graph decide.
+    pub source_mode: Option<&'a str>,
+    /// Whether this stage's intermediate survives the run.
+    pub keep_output: bool,
+}
+
+// ── Runs ──
+
+#[derive(Insertable)]
+#[diesel(table_name = runs)]
+pub struct NewRun<'a> {
+    pub id: &'a str,
+    /// `None` for a single-workflow enhance, which is a one-stage run with no
+    /// line behind it.
+    pub line_id: Option<&'a str>,
+    pub shot_id: &'a str,
+    /// The line's name, or the workflow's — snapshotted, so the run still reads
+    /// correctly after the line is renamed or deleted.
+    pub label: &'a str,
+    pub stage_count: i32,
+}
+
+#[derive(AsChangeset, Default)]
+#[diesel(table_name = runs)]
+pub struct RunChangeset<'a> {
+    pub status: Option<&'a str>,
+    pub error_message: Option<Option<&'a str>>,
+    pub finished_at: Option<Option<&'a str>>,
 }
 
 #[derive(AsChangeset)]

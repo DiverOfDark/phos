@@ -14,7 +14,7 @@ use crate::schema::{comfyui_workflows, enhancement_tasks, files, people, shots, 
 use super::{AppState, UState};
 
 /// Helper: return 503 if ComfyUI is not configured.
-fn require_comfyui(state: &AppState) -> Result<String, StatusCode> {
+pub(super) fn require_comfyui(state: &AppState) -> Result<String, StatusCode> {
     state
         .comfyui_url
         .clone()
@@ -26,14 +26,21 @@ fn require_comfyui(state: &AppState) -> Result<String, StatusCode> {
 /// Import is the one endpoint here where a bare 400 is actively unhelpful: the
 /// user pasted a graph and needs to know which part of it Phos could not use.
 /// The UI already reads `error` out of a JSON body.
-pub(super) struct ApiError(StatusCode, Option<String>);
+pub(super) struct ApiError(pub(super) StatusCode, pub(super) Option<String>);
 
 impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(super) fn bad_request(message: impl Into<String>) -> Self {
         Self(StatusCode::BAD_REQUEST, Some(message.into()))
     }
 
-    fn internal() -> Self {
+    /// The request was well formed and refused anyway: editing a line while a
+    /// run of it is still walking, say. Worth its own status, because the
+    /// caller's fix is to wait rather than to change what they sent.
+    pub(super) fn conflict(message: impl Into<String>) -> Self {
+        Self(StatusCode::CONFLICT, Some(message.into()))
+    }
+
+    pub(super) fn internal() -> Self {
         Self(StatusCode::INTERNAL_SERVER_ERROR, None)
     }
 }
@@ -662,11 +669,22 @@ pub(super) async fn comfyui_enhance(
     let text_overrides_json =
         serde_json::to_string(&text_overrides).unwrap_or_else(|_| "{}".to_string());
 
+    // A single-workflow enhance is a one-stage run. Modelling it that way costs
+    // one row and buys a board with one kind of entry on it rather than two,
+    // and an advance pass with no special case for "a task that belongs to
+    // nothing".
+    let label: String = comfyui_workflows::table
+        .filter(comfyui_workflows::id.eq(&payload.workflow_id))
+        .select(comfyui_workflows::name)
+        .first(&mut conn)
+        .unwrap_or_else(|_| "Enhancement".to_string());
+
     // One transaction for the whole fan-out. Four tasks that are four separate
     // rows are still one thing the user asked for; queueing two of them and
     // then failing would leave a sweep with holes in it.
-    let task_ids: Vec<String> = conn
+    let (run_id, task_ids): (String, Vec<String>) = conn
         .transaction::<_, diesel::result::Error, _>(|conn| {
+            let run_id = crate::comfyui::runs::open_run(conn, None, &payload.shot_id, &label, 1)?;
             let mut ids = Vec::with_capacity(runs.len());
             for run in &runs {
                 let task_id = uuid::Uuid::new_v4().to_string();
@@ -681,11 +699,14 @@ pub(super) async fn comfyui_enhance(
                         source_file_id: payload.source_file_id.as_deref(),
                         source_mode: payload.source_mode.as_deref(),
                         parameters: Some(&parameters_json),
+                        run_id: Some(&run_id),
+                        stage_idx: Some(0),
+                        parent_task_id: None,
                     })
                     .execute(conn)?;
                 ids.push(task_id);
             }
-            Ok(ids)
+            Ok((run_id, ids))
         })
         .map_err(|e| {
             tracing::error!("Failed to insert enhancement task(s): {}", e);
@@ -693,13 +714,14 @@ pub(super) async fn comfyui_enhance(
         })?;
 
     // `id` and `status` are what a single-task caller has always read; `tasks`
-    // is the ordered list a sweep produced, which is also where FR5 will hang a
-    // run over the same rows.
+    // is the ordered list a sweep produced, and `run_id` is what the board
+    // groups them under.
     Ok(Json(serde_json::json!({
         "id": task_ids.first(),
         "status": "pending",
         "tasks": task_ids,
         "count": task_ids.len(),
+        "run_id": run_id,
     })))
 }
 
@@ -761,6 +783,10 @@ struct TaskRow {
     started_at: Option<String>,
     completed_at: Option<String>,
     source_file_id: Option<String>,
+    /// The run this task is a step of, and which step. Every task queued since
+    /// FR5 has both: a lone enhance is a one-stage run.
+    run_id: Option<String>,
+    stage_idx: Option<i32>,
     main_file_id: Option<String>,
     /// Who the source shot belongs to, and the file the thumbnail shows.
     person_name: Option<String>,
@@ -780,6 +806,8 @@ type TaskTuple = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<i32>,
 );
 
 fn task_tuple_to_row(
@@ -801,6 +829,8 @@ fn task_tuple_to_row(
         started_at: t.9,
         completed_at: t.10,
         source_file_id: t.11,
+        run_id: t.12,
+        stage_idx: t.13,
         main_file_id,
         person_name,
         source_name,
@@ -824,6 +854,8 @@ fn task_row_to_json(row: TaskRow) -> serde_json::Value {
         "created_at": row.created_at,
         "started_at": row.started_at,
         "completed_at": row.completed_at,
+        "run_id": row.run_id,
+        "stage_idx": row.stage_idx,
         "thumbnail_url": thumbnail_url,
         "person_name": row.person_name,
         "source_name": row.source_name,
@@ -849,6 +881,8 @@ fn query_tasks(
         enhancement_tasks::started_at,
         enhancement_tasks::completed_at,
         enhancement_tasks::source_file_id,
+        enhancement_tasks::run_id,
+        enhancement_tasks::stage_idx,
     );
 
     // Fetch limit+1 to detect if there's a next page
@@ -1013,6 +1047,8 @@ pub(super) async fn comfyui_get_task(
             enhancement_tasks::started_at,
             enhancement_tasks::completed_at,
             enhancement_tasks::source_file_id,
+            enhancement_tasks::run_id,
+            enhancement_tasks::stage_idx,
         ))
         .filter(enhancement_tasks::id.eq(&id))
         .first(&mut conn)
@@ -1108,7 +1144,33 @@ pub(super) async fn comfyui_retry_task(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // Its run is walking again. Without this the run stays `failed`, and the
+    // advance pass — which only looks at running runs — would never queue the
+    // stage after this one when it finally lands.
+    reopen_run_of(&mut conn, &id);
+
     Ok(Json(serde_json::json!({"status": "pending"})))
+}
+
+/// Put a task's run back into `running`.
+///
+/// A single task retried by hand is a run resumed, and the advance pass only
+/// looks at running runs. Nothing happens for a run that is already walking.
+fn reopen_run_of(conn: &mut diesel::SqliteConnection, task_id: &str) {
+    let run_id: Option<Option<String>> = enhancement_tasks::table
+        .filter(enhancement_tasks::id.eq(task_id))
+        .select(enhancement_tasks::run_id)
+        .first(conn)
+        .optional()
+        .unwrap_or(None);
+    let Some(Some(run_id)) = run_id else { return };
+    let _ = diesel::update(crate::schema::runs::table.filter(crate::schema::runs::id.eq(&run_id)))
+        .set((
+            crate::schema::runs::status.eq(crate::comfyui::RunState::Running.as_str()),
+            crate::schema::runs::error_message.eq(None::<String>),
+            crate::schema::runs::finished_at.eq(None::<String>),
+        ))
+        .execute(conn);
 }
 
 /// POST /api/comfyui/tasks/:id/cancel — stop a task, on both sides
@@ -1559,6 +1621,27 @@ pub(super) async fn comfyui_delete_task(
         "failed" | "completed" | crate::comfyui::STATUS_CANCELLED
     ) {
         return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // A step of a run that is still walking is not spare: the stage after it
+    // reads what it made, and the row is what says that continuation already
+    // happened. Deleting it would strand the run halfway.
+    let live_run: i64 = enhancement_tasks::table
+        .inner_join(
+            crate::schema::runs::table.on(crate::schema::runs::id
+                .nullable()
+                .eq(enhancement_tasks::run_id)),
+        )
+        .filter(
+            enhancement_tasks::id
+                .eq(&id)
+                .and(crate::schema::runs::status.eq(crate::comfyui::RunState::Running.as_str())),
+        )
+        .count()
+        .get_result(&mut conn)
+        .unwrap_or(0);
+    if live_run > 0 {
+        return Err(StatusCode::CONFLICT);
     }
 
     diesel::delete(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&id)))
