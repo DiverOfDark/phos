@@ -9,6 +9,7 @@ diesel::table! {
         inputs_json -> Nullable<Text>,
         outputs_json -> Nullable<Text>,
         created_at -> Nullable<Timestamp>,
+        contract_json -> Nullable<Text>,
     }
 }
 

@@ -73,14 +73,14 @@ fn is_output_node(class_type: &str, node: &Value) -> bool {
 /// settle budget is long), and the counter suffix differs — the video
 /// combiners append `_00001`, everything else `_00001_`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SaverKind {
+pub(super) enum SaverKind {
     Image,
     Animated,
     Video,
     Audio,
 }
 
-fn saver_kind(node_type: &str) -> SaverKind {
+pub(super) fn saver_kind(node_type: &str) -> SaverKind {
     let t = node_type.to_ascii_lowercase();
     if t.contains("video") || t.contains("webm") {
         SaverKind::Video

@@ -7,7 +7,7 @@ use diesel::prelude::*;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::comfyui::{ParameterMap, VaryMap};
+use crate::comfyui::{ContractCorrections, ParameterMap, StageContract, VaryMap};
 use crate::models::{NewComfyuiWorkflow, NewEnhancementTask, NewWorkflowPreset};
 use crate::schema::{comfyui_workflows, enhancement_tasks, files, people, shots, workflow_presets};
 
@@ -168,13 +168,34 @@ pub(super) async fn comfyui_nodes(
     })))
 }
 
+/// What a stored workflow accepts and produces, ready to put on the wire.
+///
+/// The column is the answer; deriving here is the fallback for a row imported
+/// before contracts existed and not yet reached by the worker's backfill pass.
+/// That derivation deliberately does *not* fetch `/object_info`: a workflow list
+/// must not stall for however long a dead ComfyUI takes to refuse a connection.
+/// It comes back carrying `no_catalog`, and the worker replaces it with a typed
+/// one within a few minutes.
+fn contract_json_of(stored: Option<&str>, workflow_json: &str) -> serde_json::Value {
+    if let Some(parsed) = stored.and_then(|s| serde_json::from_str::<StageContract>(s).ok()) {
+        return serde_json::to_value(parsed).unwrap_or(serde_json::Value::Null);
+    }
+    let graph: serde_json::Value =
+        serde_json::from_str(workflow_json).unwrap_or(serde_json::Value::Null);
+    serde_json::to_value(StageContract::derive(&graph, None)).unwrap_or(serde_json::Value::Null)
+}
+
 /// GET /api/comfyui/workflows
 #[utoipa::path(
     get,
     path = "/api/comfyui/workflows",
     tag = "comfyui",
     summary = "List workflows",
-    description = "List all imported ComfyUI enhancement workflows available for use.",
+    description = "List all imported ComfyUI enhancement workflows available for use. \
+                   Each carries its stage contract: what it accepts (image / video / text / \
+                   none), what it produces (image / video / text), which loader fills which \
+                   slot, the prompt slots a person or a describe stage fills, and the typed \
+                   parameters a line can set.",
     responses(
         (status = 200, description = "List of workflows"),
         (status = 500, description = "Internal server error"),
@@ -228,6 +249,7 @@ pub(super) async fn comfyui_list_workflows(
                 .outputs_json
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(serde_json::Value::Array(vec![]));
+            let contract = contract_json_of(wf.contract_json.as_deref(), &wf.workflow_json);
             serde_json::json!({
                 "id": wf.id,
                 "name": wf.name,
@@ -237,6 +259,7 @@ pub(super) async fn comfyui_list_workflows(
                 "loaders": loaders,
                 "takes_video": takes_video,
                 "warnings": warnings,
+                "contract": contract,
                 "created_at": wf.created_at,
             })
         })
@@ -298,11 +321,18 @@ pub(super) async fn comfyui_import_workflow(
     let inputs = crate::comfyui::detect_inputs(&payload.workflow, catalog.as_deref());
     let outputs = crate::comfyui::detect_outputs(&payload.workflow);
 
+    // What this workflow accepts and produces, so it can be a stage in a line.
+    // Derived here rather than on read because the answer depends on what
+    // ComfyUI said at this moment, and because a person may then correct it —
+    // a correction has to have somewhere to live.
+    let contract = StageContract::derive(&payload.workflow, catalog.as_deref());
+
     let id = uuid::Uuid::new_v4().to_string();
     let workflow_json = serde_json::to_string(&payload.workflow)
         .map_err(|_| ApiError::bad_request("The workflow is not serialisable JSON."))?;
     let inputs_json = serde_json::to_string(&inputs).map_err(|_| ApiError::internal())?;
     let outputs_json = serde_json::to_string(&outputs).map_err(|_| ApiError::internal())?;
+    let contract_json = serde_json::to_string(&contract).map_err(|_| ApiError::internal())?;
 
     let mut conn = state.pool.get().map_err(|_| ApiError::internal())?;
 
@@ -314,6 +344,7 @@ pub(super) async fn comfyui_import_workflow(
             workflow_json: &workflow_json,
             inputs_json: Some(&inputs_json),
             outputs_json: Some(&outputs_json),
+            contract_json: Some(&contract_json),
         })
         .execute(&mut conn)
         .map_err(|e| {
@@ -327,6 +358,7 @@ pub(super) async fn comfyui_import_workflow(
         "description": payload.description,
         "inputs": inputs,
         "outputs": outputs,
+        "contract": contract,
     })))
 }
 
@@ -384,7 +416,85 @@ pub(super) async fn comfyui_workflow_graph(
         "graph": graph,
         "inputs": inputs,
         "outputs": outputs,
+        "contract": contract_json_of(wf.contract_json.as_deref(), &wf.workflow_json),
     })))
+}
+
+/// PUT /api/comfyui/workflows/:id/contract — correct what Phos worked out
+///
+/// The body is the *whole* set of corrections, not a patch: a PUT replaces
+/// them. `{}` therefore means "forget what I said and derive it again", which
+/// is the one thing a correction UI must never make people re-import to get.
+///
+/// Corrections are stored beside the derived contract rather than instead of
+/// it, and take part in the next derivation instead of being applied over its
+/// result — so saying "node 7 is the negative prompt" can name a text box the
+/// heuristics never offered, and still holds after ComfyUI comes back and the
+/// parameters can finally be typed.
+#[utoipa::path(
+    put,
+    path = "/api/comfyui/workflows/{id}/contract",
+    tag = "comfyui",
+    summary = "Correct a workflow's stage contract",
+    description = "Replace the corrections applied to a workflow's derived stage contract \
+                   and return the contract that results. The heuristics are wrong on \
+                   unusual graphs — a title that means something else, a saver Phos cannot \
+                   classify, a prompt box wired somewhere unexpected — and this is how that \
+                   is fixed without re-importing. Send an empty object to discard every \
+                   correction and take the derivation as it stands.",
+    params(("id" = String, Path, description = "Workflow ID")),
+    request_body = ContractCorrections,
+    responses(
+        (status = 200, description = "The contract after the corrections"),
+        (status = 404, description = "Workflow not found"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
+pub(super) async fn comfyui_correct_contract(
+    Path(id): Path<String>,
+    UState(state): UState,
+    Json(corrections): Json<ContractCorrections>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let url = require_comfyui(&state)?;
+
+    let workflow_json: String = {
+        let mut conn = state
+            .pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        comfyui_workflows::table
+            .filter(comfyui_workflows::id.eq(&id))
+            .select(comfyui_workflows::workflow_json)
+            .first(&mut conn)
+            .map_err(|_| StatusCode::NOT_FOUND)?
+    };
+
+    // Worth the round trip here, unlike on a list: a person is waiting on the
+    // answer to one workflow, and a correction should be re-derived against the
+    // best information available rather than against a blind guess.
+    let catalog = node_catalog(&url).await;
+    let graph: serde_json::Value =
+        serde_json::from_str(&workflow_json).unwrap_or(serde_json::Value::Null);
+    let contract = StageContract::derive_with(&graph, catalog.as_deref(), corrections);
+    let encoded =
+        serde_json::to_string(&contract).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    diesel::update(comfyui_workflows::table.filter(comfyui_workflows::id.eq(&id)))
+        .set(comfyui_workflows::contract_json.eq(&encoded))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to store contract for workflow {}: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(
+        serde_json::to_value(contract).unwrap_or(serde_json::Value::Null),
+    ))
 }
 
 /// DELETE /api/comfyui/workflows/:id
@@ -523,20 +633,34 @@ pub(super) async fn comfyui_enhance(
         return Err(StatusCode::NOT_FOUND.into());
     }
 
-    // Verify workflow exists
-    let wf_exists: bool = comfyui_workflows::table
+    // Verify workflow exists, and pick up any loader roles a person corrected on
+    // its contract.
+    let stored_contract: Option<Option<String>> = comfyui_workflows::table
         .filter(comfyui_workflows::id.eq(&payload.workflow_id))
-        .count()
-        .get_result::<i64>(&mut conn)
-        .map(|c| c > 0)
-        .unwrap_or(false);
+        .select(comfyui_workflows::contract_json)
+        .first(&mut conn)
+        .optional()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    if !wf_exists {
+    let Some(stored_contract) = stored_contract else {
         return Err(StatusCode::NOT_FOUND.into());
+    };
+
+    // A role the workflow's author mistitled is corrected once, on the
+    // contract, and every run then binds the upload to the loader it really
+    // belongs in. The binder already reads `role:<node_id>` out of the task's
+    // override map, so the correction rides in there — and anything the caller
+    // said explicitly wins, because they meant it.
+    let mut text_overrides = payload.text_overrides;
+    if let Some(contract) = stored_contract
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<StageContract>(s).ok())
+    {
+        contract.apply_role_corrections(&mut text_overrides);
     }
 
     let text_overrides_json =
-        serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
+        serde_json::to_string(&text_overrides).unwrap_or_else(|_| "{}".to_string());
 
     // One transaction for the whole fan-out. Four tasks that are four separate
     // rows are still one thing the user asked for; queueing two of them and
@@ -613,7 +737,12 @@ pub(super) async fn comfyui_list_tasks(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let limit = query.limit.unwrap_or(50).min(200);
-    let result = query_tasks(&mut conn, query.shot_id.as_ref(), query.cursor.as_ref(), limit)?;
+    let result = query_tasks(
+        &mut conn,
+        query.shot_id.as_ref(),
+        query.cursor.as_ref(),
+        limit,
+    )?;
 
     Ok(Json(result))
 }
@@ -639,9 +768,17 @@ struct TaskRow {
 }
 
 type TaskTuple = (
-    String, String, String, String, String,
-    Option<String>, Option<i32>, Option<String>,
-    Option<String>, Option<String>, Option<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
     Option<String>,
 );
 
@@ -732,12 +869,10 @@ fn query_tasks(
         query = query.filter(enhancement_tasks::created_at.lt(c));
     }
 
-    let mut tuples: Vec<TaskTuple> = query
-        .load(conn)
-        .map_err(|e| {
-            tracing::error!("Failed to query tasks: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let mut tuples: Vec<TaskTuple> = query.load(conn).map_err(|e| {
+        tracing::error!("Failed to query tasks: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let has_more = tuples.len() as i64 > limit;
     if has_more {
@@ -768,8 +903,12 @@ fn query_tasks(
         .map(|(id, _, pid)| (id.clone(), pid.clone()))
         .collect();
 
-    let person_ids: Vec<String> = shot_rows.iter().filter_map(|(_, _, pid)| pid.clone()).collect();
-    let person_names: std::collections::HashMap<String, Option<String>> = if !person_ids.is_empty() {
+    let person_ids: Vec<String> = shot_rows
+        .iter()
+        .filter_map(|(_, _, pid)| pid.clone())
+        .collect();
+    let person_names: std::collections::HashMap<String, Option<String>> = if !person_ids.is_empty()
+    {
         people::table
             .filter(people::id.eq_any(&person_ids))
             .select((people::id, people::name))
@@ -811,12 +950,11 @@ fn query_tasks(
                 .cloned()
                 .flatten()
                 .and_then(|pid| person_names.get(&pid).cloned().flatten());
-            let source_name = t
-                .11
-                .clone()
-                .or_else(|| main_fid.clone())
-                .and_then(|fid| file_paths.get(&fid).cloned())
-                .and_then(|path| path.rsplit('/').next().map(|s| s.to_string()));
+            let source_name =
+                t.11.clone()
+                    .or_else(|| main_fid.clone())
+                    .and_then(|fid| file_paths.get(&fid).cloned())
+                    .and_then(|path| path.rsplit('/').next().map(|s| s.to_string()));
             task_tuple_to_row(t, main_fid, person_name, source_name)
         })
         .collect();

@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/comfyui-typed-params"
+    "version": "integrate/wave-b"
   },
   "paths": {
     "/api/auth/callback": {
@@ -578,7 +578,7 @@
           "comfyui"
         ],
         "summary": "List workflows",
-        "description": "List all imported ComfyUI enhancement workflows available for use.",
+        "description": "List all imported ComfyUI enhancement workflows available for use. Each carries its stage contract: what it accepts (image / video / text / none), what it produces (image / video / text), which loader fills which slot, the prompt slots a person or a describe stage fills, and the typed parameters a line can set.",
         "operationId": "comfyui_list_workflows",
         "responses": {
           "200": {
@@ -647,6 +647,51 @@
         "responses": {
           "200": {
             "description": "Workflow deleted successfully"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/workflows/{id}/contract": {
+      "put": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Correct a workflow's stage contract",
+        "description": "Replace the corrections applied to a workflow's derived stage contract and return the contract that results. The heuristics are wrong on unusual graphs — a title that means something else, a saver Phos cannot classify, a prompt box wired somewhere unexpected — and this is how that is fixed without re-importing. Send an empty object to discard every correction and take the derivation as it stands.",
+        "operationId": "comfyui_correct_contract",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Workflow ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContractCorrections"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The contract after the corrections"
           },
           "404": {
             "description": "Workflow not found"
@@ -2334,6 +2379,16 @@
   },
   "components": {
     "schemas": {
+      "Accepts": {
+        "type": "string",
+        "description": "What a stage consumes.\n\nFour values rather than three, because \"nothing\" is a real answer: a\ntext-to-image graph begins a line instead of continuing one, and a line that\nstarts with it needs no upstream at all.",
+        "enum": [
+          "image",
+          "video",
+          "text",
+          "none"
+        ]
+      },
       "AddManualFacePayload": {
         "type": "object",
         "description": "POST /api/files/:id/faces - manually add a face bounding box.\nThe server computes the embedding from the given bbox coordinates.",
@@ -2541,6 +2596,50 @@
           "version_name": {
             "type": "string",
             "description": "`versionName` of the bundled APK — a tag (`1.2.3`) or `master+<sha>`.\n\nEmpty when `available` is `false`. Display only: version *names* are not\nordered and must never be compared."
+          }
+        }
+      },
+      "ContractCorrections": {
+        "type": "object",
+        "description": "What a person said the derivation got wrong.\n\nKept beside the derived answer rather than replacing it, so the contract can\nbe re-derived — when ComfyUI comes back and the parameters can finally be\ntyped — without throwing the correction away.",
+        "properties": {
+          "accepts": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Accepts"
+              }
+            ]
+          },
+          "params": {
+            "type": "object",
+            "description": "`\"<node_id>.<field>\"` → the setting it really is (one of [`ParamName`]),\nor `null` for \"that is not one of ours\"."
+          },
+          "produces": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MediaType"
+              }
+            ]
+          },
+          "roles": {
+            "type": "object",
+            "description": "`node_id` → the slot that loader really fills.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SourceRole"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "slots": {
+            "type": "object",
+            "description": "`\"<node_id>.<field>\"` → the prompt slot's name, or `null` for \"that is\nnot a prompt\"."
           }
         }
       },
@@ -2890,6 +2989,15 @@
           }
         }
       },
+      "MediaType": {
+        "type": "string",
+        "description": "What flows from one stage to the next.\n\nThree, and `text` is one of them: a text-producing stage writes no file at\nall, so it is not a degenerate image.",
+        "enum": [
+          "image",
+          "video",
+          "text"
+        ]
+      },
       "MergePeoplePayload": {
         "type": "object",
         "description": "Merge two people: move all faces from source to target, then delete source",
@@ -2970,6 +3078,20 @@
             "format": "int64"
           }
         }
+      },
+      "ParamName": {
+        "type": "string",
+        "description": "A knob a line can set on any stage without knowing which node holds it.\n\nA closed vocabulary on purpose. The exhaustive per-node control surface is\n[`detect_inputs`]' job; a contract names only the handful of settings that\nmean the same thing on every stage, so a line can say \"seed 42\" once.",
+        "enum": [
+          "seed",
+          "steps",
+          "cfg",
+          "denoise",
+          "frames",
+          "fps",
+          "width",
+          "height"
+        ]
       },
       "PersonBrief": {
         "type": "object",
@@ -3569,6 +3691,15 @@
             }
           }
         }
+      },
+      "SourceRole": {
+        "type": "string",
+        "description": "Which slot of a multi-input workflow a source fills.\n\nThree is enough for every graph worth running: the frame a clip starts on,\nthe frame it ends on, and a picture that is neither (a style or pose\nreference).",
+        "enum": [
+          "start",
+          "end",
+          "reference"
+        ]
       },
       "SplitShotPayload": {
         "type": "object",

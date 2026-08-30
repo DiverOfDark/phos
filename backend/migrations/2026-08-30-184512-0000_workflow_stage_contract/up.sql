@@ -1,0 +1,21 @@
+-- What a workflow takes and what it hands on, so it can be a stage in a line.
+--
+-- A workflow on its own is a graph. Before one can be chained to another, Phos
+-- has to know that this one wants a photograph and gives back a clip, that its
+-- second loader is the end frame rather than another start frame, and which of
+-- its fields are the prompt and the seed. Everything downstream — validating a
+-- chain at design time, filtering the stage picker to what fits, binding a
+-- description into the next stage's prompt — is that one fact asked differently.
+--
+-- Holds a `comfyui::StageContract` (see src/comfyui/contract/mod.rs): a
+-- versioned object whose every field is optional on read, so later work adds to
+-- it without another migration. It carries both the *derived* answer and the
+-- corrections a person made to it, because the derivation is heuristic and will
+-- be wrong on an unusual graph — re-deriving must not throw away what a person
+-- said.
+--
+-- NULL means "not worked out yet": every workflow imported before this
+-- migration. The worker fills those in at start, and the API derives one on the
+-- fly for any row it still finds empty, so a contract is never missing from a
+-- response.
+ALTER TABLE comfyui_workflows ADD COLUMN contract_json TEXT;

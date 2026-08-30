@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import WorkflowGraph from '@/components/WorkflowGraph.vue'
 import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
+import WorkflowContract from '@/components/WorkflowContract.vue'
 import { controlKind, isParameterInput, isTextInput, inputKey, parameterValue } from '@/lib/utils'
 
 // --- Connection health ---
@@ -505,6 +506,9 @@ defineExpose({ loadData: fetchWorkflows })
         >
           <span class="font-mono text-[13px] font-medium text-ink">{{ wf.name }}</span>
           <span v-if="wf.description" class="text-xs font-light text-ink-secondary">{{ wf.description }}</span>
+          <span class="font-mono text-[11px] text-ink uppercase tracking-[0.08em]">
+            {{ wf.contract?.accepts || '?' }} → {{ wf.contract?.produces || '?' }}
+          </span>
           <span class="font-mono text-[11px] text-ink-tertiary">
             {{ editableInputsOf(wf).length }} input(s) · {{ (wf.outputs || []).length }} output(s)
           </span>
@@ -696,6 +700,16 @@ defineExpose({ loadData: fetchWorkflows })
         select a workflow, or import one
       </div>
     </div>
+
+    <!-- What this workflow is, before what it does: a line can only be built
+         out of what each stage takes and gives back. -->
+    <WorkflowContract
+      v-if="activeTab === 'workflows' && selectedWorkflow && !showImportForm"
+      :workflow-id="selectedWorkflow.id"
+      :workflow-name="selectedWorkflow.name"
+      :contract="selectedWorkflow.contract"
+      @updated="fetchWorkflows"
+    />
 
     <!-- The graph: what actually runs, and in what order. Full width, because a
          node diagram is the widest thing on this page and the least useful when

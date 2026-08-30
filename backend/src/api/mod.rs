@@ -90,6 +90,7 @@ use utoipa::OpenApi;
         comfyui::comfyui_import_workflow,
         comfyui::comfyui_delete_workflow,
         comfyui::comfyui_workflow_graph,
+        comfyui::comfyui_correct_contract,
         comfyui::comfyui_enhance,
         comfyui::comfyui_list_tasks,
         comfyui::comfyui_get_task,
@@ -165,6 +166,11 @@ use utoipa::OpenApi;
             comfyui::PresetPayload,
             crate::comfyui::VarySpec,
             crate::comfyui::VaryMode,
+            crate::comfyui::ContractCorrections,
+            crate::comfyui::Accepts,
+            crate::comfyui::MediaType,
+            crate::comfyui::ParamName,
+            crate::comfyui::SourceRole,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
@@ -501,6 +507,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/comfyui/workflows/{id}/graph",
             get(comfyui::comfyui_workflow_graph),
+        )
+        .route(
+            "/api/comfyui/workflows/{id}/contract",
+            put(comfyui::comfyui_correct_contract),
         )
         .route(
             "/api/comfyui/workflows/{id}/presets",
