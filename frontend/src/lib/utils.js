@@ -217,3 +217,59 @@ export function stageOf(run) {
   const at = run?.status === "completed" ? count : (run?.current_stage ?? 0) + 1;
   return `${Math.min(at, count)}/${count}`;
 }
+
+/**
+ * Does this workflow hand on a sentence rather than a file?
+ *
+ * A *describe* stage: it reads a photograph and its whole product is text, so
+ * it writes no file and its answer binds into the next stage's prompt. The
+ * contract says so — `produces: text` — and that is the only thing that does.
+ */
+export function isDescribeWorkflow(wf) {
+  return wf?.contract?.produces === "text";
+}
+
+/** The `text_overrides` key that fills a named prompt slot of this workflow. */
+export function slotKey(wf, name) {
+  const slot = (wf?.contract?.slots || []).find((s) => s.name === name);
+  return slot ? `${slot.node_id}.${slot.field}` : null;
+}
+
+/**
+ * Put a compiled prompt into a workflow's override map.
+ *
+ * The same two rules the backend applies when a describe stage feeds the next
+ * stage of a line (`comfyui::prompt::bind_description`), because a person
+ * pressing "use this prompt" in the dialog and a line doing it for them have to
+ * produce the same run: the positive slot is *replaced* — the description is
+ * the prompt, which is why it was compiled — and the constraints are *appended*
+ * to the negative one, which is usually a tuned list somebody meant.
+ *
+ * Returns a new map; the one passed in is left alone.
+ */
+export function applyCompiledPrompt(wf, overrides, prompt) {
+  const next = { ...(overrides || {}) };
+  const positiveKey = slotKey(wf, "positive");
+  if (positiveKey && prompt?.positive) next[positiveKey] = prompt.positive;
+
+  const negativeKey = slotKey(wf, "negative");
+  if (negativeKey && prompt?.negative) {
+    next[negativeKey] = mergeConstraints(next[negativeKey], prompt.negative);
+  }
+  return next;
+}
+
+/** A negative prompt is comma-separated by convention; never repeat a term. */
+export function mergeConstraints(existing, added) {
+  const split = (raw) =>
+    String(raw ?? "")
+      .split(/[,\n]/)
+      .map((t) => t.trim().replace(/[.,]+$/, "").trim())
+      .filter((t) => t.length > 0);
+  const kept = [];
+  for (const term of [...split(existing), ...split(added)]) {
+    if (kept.some((k) => k.toLowerCase() === term.toLowerCase())) continue;
+    kept.push(term);
+  }
+  return kept.join(", ");
+}

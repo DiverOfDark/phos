@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/comfyui-production-lines"
+    "version": "feat/comfyui-prompt-compiler"
   },
   "paths": {
     "/api/auth/callback": {
@@ -242,6 +242,120 @@
         "security": [
           {}
         ]
+      }
+    },
+    "/api/comfyui/describe": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Describe a shot, and compile a prompt from it",
+        "description": "Run a describe workflow against one shot and compile a prompt from what it says, together with the person names, EXIF date and place, and caption the library already holds. Answers immediately from the shot's cached description unless `refresh` is set. The compiled prompt is meant to be shown and edited before the costly stage is queued.",
+        "operationId": "describe_shot",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DescribePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The description, or the run that will produce one",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DescribeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No workflow that produces text"
+          },
+          "404": {
+            "description": "Shot or workflow not found"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/describe/{shot_id}": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "The description a shot carries, and the prompt it compiles to",
+        "description": "Poll for a describe run, or read the description a shot already carries. `intent`, `style` and `do_not` re-compile the prompt without describing the photograph again.",
+        "operationId": "get_description",
+        "parameters": [
+          {
+            "name": "shot_id",
+            "in": "path",
+            "description": "Shot ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "intent",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "style",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "do_not",
+            "in": "query",
+            "description": "Constraints, one per line or separated by `;`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Where the description has got to",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DescribeResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Shot not found"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
       }
     },
     "/api/comfyui/enhance": {
@@ -2783,6 +2897,34 @@
           }
         }
       },
+      "Analysis": {
+        "type": "object",
+        "description": "The structured description a describe stage returns.\n\nStructured on purpose: a paragraph is a thing to read, and this is a thing\nto *use* — the fields are recombined per stage, the constraints become a\nnegative prompt, and the whole is cached and re-read by later runs.",
+        "properties": {
+          "camera": {
+            "type": "string"
+          },
+          "do_not": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "One constraint per entry. A model that answers with a single string\ninstead of a list is still answering; see [`StringOrList`]."
+          },
+          "lighting": {
+            "type": "string"
+          },
+          "motion_affordance": {
+            "type": "string"
+          },
+          "setting": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          }
+        }
+      },
       "AuthConfigResponse": {
         "type": "object",
         "description": "Response for the auth config endpoint.",
@@ -2948,6 +3090,22 @@
           }
         }
       },
+      "CompiledPrompt": {
+        "type": "object",
+        "description": "The two strings a generation stage takes.",
+        "required": [
+          "positive",
+          "negative"
+        ],
+        "properties": {
+          "negative": {
+            "type": "string"
+          },
+          "positive": {
+            "type": "string"
+          }
+        }
+      },
       "ContractCorrections": {
         "type": "object",
         "description": "What a person said the derivation got wrong.\n\nKept beside the derived answer rather than replacing it, so the contract can\nbe re-derived — when ComfyUI comes back and the parameters can finally be\ntyped — without throwing the correction away.",
@@ -3040,6 +3198,146 @@
             "minimum": 0
           }
         }
+      },
+      "DescribePayload": {
+        "type": "object",
+        "description": "What the caller wants described, and what for.",
+        "required": [
+          "shot_id"
+        ],
+        "properties": {
+          "do_not": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What the run must not do. Reaches the model as a rule and the generation\nstage as a negative prompt."
+          },
+          "intent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The user's one line about what they are after."
+          },
+          "refresh": {
+            "type": "boolean",
+            "description": "Describe it again even though the shot already carries a description."
+          },
+          "shot_id": {
+            "type": "string"
+          },
+          "style": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A style preset, in the preset's own words."
+          },
+          "workflow_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which describe workflow to run. Omit it and the first workflow whose\ncontract says `produces: text` is used."
+          }
+        }
+      },
+      "DescribeResponse": {
+        "type": "object",
+        "description": "The description, the prompt it compiles to, and everything that went into\nboth — which is what makes the prompt correctable rather than magic.",
+        "required": [
+          "shot_id",
+          "state",
+          "cached",
+          "facts"
+        ],
+        "properties": {
+          "analysis": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Analysis",
+                "description": "Its structured form, when the model produced one."
+              }
+            ]
+          },
+          "cached": {
+            "type": "boolean",
+            "description": "Answered from `shots.analysis_json` rather than from a run."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "facts": {
+            "$ref": "#/components/schemas/ShotFacts",
+            "description": "What Phos knew and the model could not see."
+          },
+          "instruction": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The instruction that was, or would be, sent into the describe workflow."
+          },
+          "prompt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CompiledPrompt",
+                "description": "The two strings a generation stage takes. Editable: the dialog sends\nwhatever the person left in the box as an ordinary `text_overrides`\nentry."
+              }
+            ]
+          },
+          "run_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "shot_id": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DescribeState"
+          },
+          "task_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Exactly what the describe stage published, unedited."
+          },
+          "workflow_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "DescribeState": {
+        "type": "string",
+        "description": "Where the description for one shot has got to.",
+        "enum": [
+          "none",
+          "running",
+          "ready",
+          "failed"
+        ]
       },
       "EnhancePayload": {
         "type": "object",
@@ -3335,6 +3633,33 @@
             "type": "integer",
             "description": "Files waiting for the worker.",
             "minimum": 0
+          }
+        }
+      },
+      "Intent": {
+        "type": "object",
+        "description": "What the person asked for, as opposed to what is in the photograph.",
+        "properties": {
+          "do_not": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What the run must not do. Reaches the model as a rule *and* the\ngeneration stage as a negative prompt, because a model told not to do\nsomething is not the same as a sampler steered away from it."
+          },
+          "intent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One line: \"a slow push-in as the light fades\"."
+          },
+          "style": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A style preset: \"35mm film, muted palette\"."
           }
         }
       },
@@ -3992,6 +4317,54 @@
               "null"
             ],
             "format": "int64"
+          }
+        }
+      },
+      "ShotFacts": {
+        "type": "object",
+        "description": "What the library already holds about one photograph.\n\nEvery field is what a vision model cannot get from the pixels: who these\npeople are, when this was, where it was, and the caption search already\nmatches on. Read from the database by [`shot_facts`]; a pure value here so\nthe wording can be exercised without one.",
+        "required": [
+          "people"
+        ],
+        "properties": {
+          "caption": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Florence-2 library caption from `shots.description`. Read as one\ninput among several: it is what search matches on, and it is emphatically\nnot the prompt."
+          },
+          "people": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The named people clustered onto this shot, primary person first.\nUnnamed clusters are left out: \"person 4f2a\" helps nobody."
+          },
+          "place": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": false,
+            "prefixItems": [
+              {
+                "type": "number",
+                "format": "float"
+              },
+              {
+                "type": "number",
+                "format": "float"
+              }
+            ],
+            "description": "EXIF coordinates. Phos has no geocoder, so this is degrees and says so\n— a model that recognises the place from the pixels can still use them\nas corroboration."
+          },
+          "taken_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The EXIF capture time, as stored (`YYYY-MM-DD HH:MM:SS`)."
           }
         }
       },
