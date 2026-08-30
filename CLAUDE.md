@@ -62,7 +62,7 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
-- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what travels along each join, what happens after a stage lands, what a verdict on a hold point may say, and whether a run is over), `editor.rs` (what the line editor may offer, and what a join has to be asked), `promote.rs` (which chains somebody has been running by hand often enough to be worth saving) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `holds/` (`mod.rs` reads a hold, `verdict.rs` writes what was decided), `takes/` (the curation lane's read model over *every* held run, plus what a verdict deletes and how far it reaches — `bulk.rs` is the pure rule for that), `api/line_io.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
+- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what travels along each join, what happens after a stage lands, what a verdict on a hold point may say, and whether a run is over), `editor.rs` (what the line editor may offer, and what a join has to be asked), `promote.rs` (which chains somebody has been running by hand often enough to be worth saving), `queue.rs` (what order the pending queue drains in, and what a task's priority means — pure, and the dispatcher's `ORDER BY` is built from it), `batch/` (a whole library sent to one line: `plan.rs` is the cursor, the caps and the estimate with no database anywhere near them, `selection.rs` is what was pointed at, `store.rs` is the row and the counts, `feed.rs` is the tick and STOP) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `holds/` (`mod.rs` reads a hold, `verdict.rs` writes what was decided), `takes/` (the curation lane's read model over *every* held run, plus what a verdict deletes and how far it reaches — `bulk.rs` is the pure rule for that), `api/line_io.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
 
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
@@ -184,6 +184,33 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   this reuses it: `api::shots::shot_conditions` builds the SQL for the gallery
   and for the batch alike. Nothing runs on a timer — a batch exists because
   somebody pressed Send, and a window only *paces* work already queued
+- **The queue drains by stage, not by run.** `comfyui/queue.rs` holds the order and nothing else,
+  pure and with no database near it: **interactive before batch**, then lower `stage_idx` first,
+  then grouped by `workflow_id`, then oldest, then by id so it is total. `worker/dispatch.rs` builds
+  its `ORDER BY` from the same two SQL fragments, and `DrainKey`'s `Ord` says the same thing a
+  second time — so "the database returns the order this module describes" is a test rather than two
+  files read side by side. A batch therefore walks its runs along **in lockstep**: every describe,
+  then every video generation, then every upscale. That loads each model once per pass instead of
+  once per task, and puts a whole pass in front of a person at once, which is what makes bulk
+  review in the Takes lane possible at all. The cost is deliberate and is per-run latency — no
+  single run finishes early — which is exactly why `priority` is the **first** key
+- **`enhancement_tasks.priority` says what used to be inferred.** Two values, `interactive` and
+  `batch`, and no third: the question is "is a person waiting", not "how important is this". It
+  replaces reading FR7's `runs.batch_id` — a fact about *provenance* — as a fact about *urgency*,
+  through a join, in the one query that runs every three seconds. Written at every insert rather
+  than left to the column default, and the default is `interactive`, so a row that forgets to say
+  fails towards the person. A continuation inherits its parent's, so a run's hurry is the run's
+  and not the stage it happens to be on. Retry, and a verdict given on the run in front of you,
+  promote what they release — a batch-scoped verdict does **not**, because three thousand runs
+  cutting the line is not a fast lane
+- **The lead is spent on the wave, not on the batch.** `plan::wave_lead` holds a batch's lead at
+  zero while any of its runs is past the first stage. That is what makes a pass complete as a unit
+  — topping the lead back up mid-wave would put brand-new first-stage tasks *in front of* a run one
+  task from done — and it is the starvation bound: while a wave is in flight the batch adds no work
+  at any stage, so the set of tasks that can outrank a given one is fixed when it is queued and only
+  shrinks. A **held** run does not count as advanced (it queued no later stage), so a batch keeps
+  describing while its takes wait for a person; what limits *that* pile is `max_outstanding_holds`.
+  `advanced_runs` is a `COUNT(*)` over `enhancement_tasks`, like every other number the caps read
 - **A batch's caps are the feature, not settings for later.** At this scale the
   failure mode is not a crash, it is generating more than anyone will look at.
   A confirm sheet before anything queues; a daily task cap; an optional window;
