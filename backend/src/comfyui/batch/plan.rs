@@ -116,6 +116,10 @@ pub struct Pulse {
     pub outstanding_holds: i64,
     /// Runs of this batch that are not finished — running *and* held.
     pub live_runs: i64,
+    /// Of those, how many have left the first stage: a run with at least one
+    /// task at `stage_idx > 0`. Counted, never remembered — see [`wave_lead`],
+    /// which is the whole reason it is here.
+    pub advanced_runs: i64,
 }
 
 /// Why a batch is not feeding.
@@ -250,6 +254,45 @@ pub fn in_window(minute: i32, start: i32, end: i32) -> bool {
         minute >= start && minute < end
     } else {
         minute >= start || minute < end
+    }
+}
+
+/// How many runs a batch may have open, given where the ones it has got to.
+///
+/// FR8 drains the pending queue by **stage**, so a run opened now is queued in
+/// front of a run that is already three stages down. That buys the two things
+/// stage ordering exists for — the model is loaded once per pass, and a whole
+/// pass lands in front of a person at once — but only if the batch stops
+/// pouring new first-stage work in behind it. A batch that tops itself up every
+/// time one run finishes keeps a fresh supply of stage-0 tasks permanently
+/// ahead of the stage-3 tasks it opened an hour ago, and *that* is the one way
+/// a stage-ordered queue could starve a late stage.
+///
+/// So: a batch opens runs while its wave is still on the first stage, and stops
+/// the moment any of them has left it. When the wave lands, `advanced_runs`
+/// falls back to zero and the next one opens.
+///
+/// Two consequences worth stating out loud:
+///
+/// * **It is the starvation bound.** While a wave is in flight the batch adds
+///   no new work at any stage, so the set of tasks that can outrank a given one
+///   is fixed at the moment it is queued and only shrinks. Nothing can be
+///   pushed back indefinitely, because nothing new arrives to push it.
+/// * **A held run does not count as advanced.** A run parked at a hold after
+///   stage 1 produced no stage-2 task, so a batch whose wave is waiting on a
+///   person keeps describing — which is exactly the composition FR8 asks for:
+///   every description finishes, they are reviewed in bulk, and only then does
+///   any video generation start. What limits *that* pile is
+///   [`Caps::max_outstanding_holds`], which is FR7's job and not this one's.
+///
+/// The cost is a short idle at each wave boundary, while the last few runs of a
+/// wave finish and nothing new is opened. On a line whose stages are minutes
+/// long that is under a percent; it is the price of the pass being a unit.
+pub fn wave_lead(lead: i64, advanced_runs: i64) -> i64 {
+    if advanced_runs > 0 {
+        0
+    } else {
+        lead
     }
 }
 
@@ -798,8 +841,111 @@ mod tests {
             free_disk_bytes: Some(0),
             outstanding_holds: 0,
             live_runs: 0,
+            advanced_runs: 0,
         };
         assert_eq!(decide(&caps, &pulse, true, 1), Feed::Done);
+    }
+
+    // ── The wave ──
+
+    #[test]
+    fn a_batch_stops_opening_the_moment_its_wave_leaves_the_first_stage() {
+        // One run has reached stage 2. Nothing new goes in front of it.
+        assert_eq!(wave_lead(DEFAULT_LEAD, 1), 0);
+        assert_eq!(wave_lead(DEFAULT_LEAD, 0), DEFAULT_LEAD);
+    }
+
+    #[test]
+    fn a_lead_of_zero_idles_rather_than_pausing() {
+        // "The wave is still going" is not a fault, and the batch must not read
+        // as paused on a screen — there is nothing for anybody to lift.
+        let caps = Caps {
+            lead: Some(wave_lead(DEFAULT_LEAD, 7)),
+            ..Default::default()
+        };
+        let pulse = Pulse {
+            live_runs: 20,
+            advanced_runs: 7,
+            ..Default::default()
+        };
+        assert_eq!(decide(&caps, &pulse, false, 1), Feed::Idle);
+    }
+
+    #[test]
+    fn the_wave_that_landed_lets_the_next_one_open() {
+        let caps = Caps {
+            lead: Some(wave_lead(DEFAULT_LEAD, 0)),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&caps, &Pulse::default(), false, 1),
+            Feed::Open(DEFAULT_CHUNK)
+        );
+    }
+
+    #[test]
+    fn a_batch_still_filling_its_first_stage_keeps_filling_it() {
+        // Twenty-five runs opened last tick, none of them past stage 0 yet.
+        // The wave is still being built, so the lead is the ordinary one.
+        let caps = Caps {
+            lead: Some(wave_lead(DEFAULT_LEAD, 0)),
+            ..Default::default()
+        };
+        let pulse = Pulse {
+            live_runs: 25,
+            advanced_runs: 0,
+            ..Default::default()
+        };
+        assert_eq!(decide(&caps, &pulse, false, 1), Feed::Open(DEFAULT_CHUNK));
+    }
+
+    #[test]
+    fn a_wave_parked_at_a_hold_does_not_stop_the_batch_describing() {
+        // The composition FR8 names: every description finishes, they are
+        // reviewed in bulk, and only then does any generation start. A run held
+        // after stage 1 has queued no stage-2 task, so it is not "advanced" and
+        // the batch keeps opening descriptions — up to the hold cap, which is
+        // the guardrail that actually limits the pile.
+        let caps = Caps {
+            lead: Some(wave_lead(DEFAULT_LEAD, 0)),
+            max_outstanding_holds: Some(50),
+            ..Default::default()
+        };
+        let holding = Pulse {
+            live_runs: 30,
+            outstanding_holds: 30,
+            advanced_runs: 0,
+            ..Default::default()
+        };
+        assert_eq!(decide(&caps, &holding, false, 1), Feed::Open(DEFAULT_CHUNK));
+
+        let at_the_cap = Pulse {
+            outstanding_holds: 50,
+            ..holding
+        };
+        assert_eq!(
+            decide(&caps, &at_the_cap, false, 1),
+            Feed::Pause(PauseReason::HoldCap)
+        );
+    }
+
+    #[test]
+    fn the_wave_never_overrides_a_cap_that_actually_bites() {
+        // `wave_lead` only ever *lowers* the lead, and the lead is asked last.
+        // A batch outside its window is outside its window, wave or no wave.
+        let caps = Caps {
+            window: Some((0, 7 * 60)),
+            lead: Some(wave_lead(DEFAULT_LEAD, 0)),
+            ..Default::default()
+        };
+        let pulse = Pulse {
+            minute_of_day: 12 * 60,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&caps, &pulse, false, 1),
+            Feed::Pause(PauseReason::OutsideWindow)
+        );
     }
 
     // ── Estimate ──

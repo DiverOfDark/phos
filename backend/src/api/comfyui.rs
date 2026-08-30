@@ -818,6 +818,8 @@ fn queue_enhancement(
                         run_id: Some(&run_id),
                         stage_idx: Some(0),
                         parent_task_id: None,
+                        // Somebody pressed Enhance on one shot and is watching.
+                        priority: "interactive",
                     })
                     .execute(conn)?;
                 ids.push(task_id);

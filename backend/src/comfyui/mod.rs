@@ -107,6 +107,13 @@
 //!   cap on how many runs may sit held at once — are the feature, not settings
 //!   for later: at this scale the failure mode is not a crash, it is generating
 //!   more than anyone will ever look at.
+//! * **The queue drains by stage, not by run.** [`queue`] holds the order and
+//!   nothing else: interactive before batch, then lower stage first, then
+//!   grouped by workflow. A batch therefore walks its runs along in lockstep —
+//!   every description, then every video, then every upscale — which loads each
+//!   model once per pass instead of once per task and puts a whole pass in
+//!   front of a person at once. It costs per-run latency, which is why
+//!   `priority` is the *first* key: a click never queues behind a farm.
 
 pub mod batch;
 mod client;
@@ -125,6 +132,7 @@ mod policy;
 pub mod portable;
 pub mod promote;
 pub mod prompt;
+pub(crate) mod queue;
 pub mod runs;
 mod source;
 pub mod takes;

@@ -172,6 +172,12 @@ pub struct NewEnhancementTask<'a> {
     /// marker that says a completed task has already been advanced: a row
     /// naming it as parent exists exactly when its continuation was queued.
     pub parent_task_id: Option<&'a str>,
+    /// Whether a person is waiting for this, in the words
+    /// `comfyui::queue::Priority` uses. Written at every insert rather than
+    /// left to the column default, because the default is the *safe* answer
+    /// (`interactive`) and not necessarily the true one — a batch's task that
+    /// forgot to say would cut the line ahead of the click it exists to serve.
+    pub priority: &'a str,
 }
 
 // ── Production Lines ──

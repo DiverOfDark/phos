@@ -148,6 +148,31 @@ pub(crate) fn apply(
     // The run somebody actually looked at. Its failure is the request's.
     let outcome = holds::give_verdict(conn, library_root, run_id, ask.verdict, ask.keep, ask.note)?;
 
+    // FR8: a verdict given on the run in front of you is a person waiting, so
+    // what it releases cuts the line ahead of the batch it came from. The takes
+    // named are already completed — promoting them is what makes the *stages
+    // after them* interactive, because a continuation inherits the priority of
+    // the task it continues. `regenerate` queues its rows here and now, so
+    // those are promoted directly.
+    //
+    // Only at `Scope::Run`. A batch verdict is a decision about three thousand
+    // runs nobody opened, and three thousand runs cutting the line is not a
+    // queue with a fast lane, it is a queue.
+    if ask.scope == Scope::Run {
+        let waiting: Vec<String> = outcome
+            .kept
+            .iter()
+            .chain(outcome.queued.iter())
+            .cloned()
+            .collect();
+        if let Err(e) = crate::comfyui::runs::promote_to_interactive(conn, &waiting) {
+            // The verdict itself is committed and correct; this only decides
+            // how soon it is acted on. A batch-priority continuation is a
+            // slower answer, not a wrong one.
+            tracing::warn!("Could not prioritise the verdict on run {}: {}", run_id, e);
+        }
+    }
+
     // And only now the bytes, so a refused verdict has deleted nothing.
     let rejected = ask.reject.to_vec();
     if !rejected.is_empty() {

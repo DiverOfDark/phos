@@ -27,6 +27,7 @@ use super::editor;
 use super::line::{self, LineError, StageTyping};
 use super::params::{ParameterMap, VaryMap};
 use super::prompt;
+use crate::comfyui::queue::Priority;
 use crate::models::{NewEnhancementTask, NewRun};
 use crate::schema::{comfyui_workflows, enhancement_tasks, files, line_stages, runs, shots};
 use diesel::prelude::*;
@@ -375,6 +376,11 @@ pub(crate) fn shot_media_type(conn: &mut SqliteConnection, shot_id: &str) -> Opt
 ///
 /// Returns the ids in the order [`super::params::expand`] produced them, which
 /// is the order a sweep's takes are numbered in.
+///
+/// `priority` is asked of the caller rather than looked up, because the callers
+/// are the three places that actually know: a run opened for a batch is batch
+/// work, a continuation is whatever the task it continues was, and a verdict is
+/// a person. Nothing here infers it from a join.
 pub(crate) fn queue_stage(
     conn: &mut SqliteConnection,
     run_id: &str,
@@ -382,6 +388,7 @@ pub(crate) fn queue_stage(
     plan: &StagePlan<'_>,
     source_file_id: Option<&str>,
     parent_task_id: Option<&str>,
+    priority: Priority,
 ) -> Result<Vec<String>, String> {
     let expanded = super::params::expand(&plan.parameters, &plan.vary)?;
     let text_overrides_json =
@@ -403,12 +410,38 @@ pub(crate) fn queue_stage(
                 run_id: Some(run_id),
                 stage_idx: Some(plan.stage_idx),
                 parent_task_id,
+                priority: priority.as_str(),
             })
             .execute(conn)
             .map_err(|e| format!("Failed to queue stage {}: {}", plan.stage_idx, e))?;
         ids.push(task_id);
     }
     Ok(ids)
+}
+
+/// Say that a person is waiting on these tasks, and on whatever follows them.
+///
+/// Used where somebody has acted on **one** run — a verdict given on the take
+/// in front of them. The tasks named are usually already `completed`: promoting
+/// them is not about dispatching them again, it is about what the advance pass
+/// will queue *next*, which inherits its priority from the task it continues.
+/// So marking the takes a person kept is exactly marking the stages they are
+/// now waiting for.
+///
+/// Deliberately not applied to a batch-scoped verdict. Letting one keystroke
+/// promote three thousand runs would invert FR8 rather than honour it: the
+/// point of `interactive` is that the thing somebody is looking at cuts the
+/// line, and everything cutting the line is the same as nothing doing so.
+pub(crate) fn promote_to_interactive(
+    conn: &mut SqliteConnection,
+    task_ids: &[String],
+) -> QueryResult<usize> {
+    if task_ids.is_empty() {
+        return Ok(0);
+    }
+    diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq_any(task_ids)))
+        .set(enhancement_tasks::priority.eq(Priority::Interactive.as_str()))
+        .execute(conn)
 }
 
 /// Open a run row. Callers queue its first stage in the same transaction.
@@ -625,8 +658,19 @@ pub(crate) fn start_line_run_for_batch(
         let plan = stages[0]
             .plan_for(conn, shot_id, &first)
             .map_err(|e| diesel::result::Error::QueryBuilderError(e.message.into()))?;
-        let task_ids = queue_stage(conn, &run_id, shot_id, &plan, None, None)
-            .map_err(|e| diesel::result::Error::QueryBuilderError(e.into()))?;
+        // The one place the distinction is decided: a run a batch opened is
+        // batch work and a run anybody else opened is somebody's click. Every
+        // task of the run inherits it from here, down every stage.
+        let task_ids = queue_stage(
+            conn,
+            &run_id,
+            shot_id,
+            &plan,
+            None,
+            None,
+            Priority::of_batch(batch_id),
+        )
+        .map_err(|e| diesel::result::Error::QueryBuilderError(e.into()))?;
         Ok(RunStart {
             run_id,
             task_ids,

@@ -118,6 +118,11 @@ struct Continuation {
     /// run — the later stages are queued here, hours after the request that
     /// carried them.
     stage_values: Option<String>,
+    /// Whether a person is waiting on this run, carried down the chain from the
+    /// task that is being continued. A run's hurry is a property of the run and
+    /// not of the stage it happens to be on, so stage 4 of somebody's click is
+    /// still somebody's click — and a batch's stage 4 is still the farm's.
+    priority: String,
 }
 
 type ContinuationRow = (
@@ -132,6 +137,7 @@ type ContinuationRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    String,
 );
 
 /// What a completed stage hands the one after it.
@@ -170,6 +176,7 @@ fn queue_continuations(conn: &mut SqliteConnection) -> Result<Pass, diesel::resu
             enhancement_tasks::text_output,
             enhancement_tasks::text_overrides,
             runs::stage_values,
+            enhancement_tasks::priority,
         ))
         .load(conn)?;
 
@@ -187,6 +194,7 @@ fn queue_continuations(conn: &mut SqliteConnection) -> Result<Pass, diesel::resu
             text_output: r.8,
             text_overrides: r.9,
             stage_values: r.10,
+            priority: r.11,
         })
         .collect();
 
@@ -389,6 +397,7 @@ fn continue_one(
         &plan,
         source_file_id,
         Some(&c.task_id),
+        crate::comfyui::queue::Priority::parse(&c.priority),
     )?;
     info!(
         "Run {}: stage {}/{} queued as {} task(s) from {}",
@@ -758,6 +767,11 @@ pub(crate) fn retry_run(conn: &mut SqliteConnection, run_id: &str) -> QueryResul
         enhancement_tasks::settle_until.eq(None::<String>),
         enhancement_tasks::next_attempt_at.eq(None::<String>),
         enhancement_tasks::comfyui_prompt_id.eq(None::<String>),
+        // Somebody pressed Retry on one run and is watching the board. That is
+        // the definition of interactive, whoever opened the run originally —
+        // and the stages after it inherit it, because they are the rest of what
+        // that person asked to see.
+        enhancement_tasks::priority.eq(crate::comfyui::queue::Priority::Interactive.as_str()),
     ))
     .execute(conn)?;
 

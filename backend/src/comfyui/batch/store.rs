@@ -685,7 +685,36 @@ pub fn pulse(
             .and_then(|_| free_disk_bytes(library_root)),
         outstanding_holds: counts.held,
         live_runs: counts.live(),
+        advanced_runs: advanced_runs(conn, &batch.id)?,
     })
+}
+
+/// Live runs of this batch that have left the first stage.
+///
+/// A `COUNT(*)` over the tasks themselves, like every other number the caps
+/// read, so it cannot disagree with the queue it describes. "Left the first
+/// stage" is *a task exists at `stage_idx > 0`* rather than anything on the run
+/// row: it is the same fact the dispatcher sorts on, asked of the same table.
+///
+/// A held run counts only if it had already queued a later stage. A run parked
+/// at a hold after stage 1 has not — which is deliberate, and is what lets a
+/// batch keep describing while its takes wait for a person. See
+/// [`super::plan::wave_lead`].
+pub fn advanced_runs(conn: &mut SqliteConnection, batch_id: &str) -> QueryResult<i64> {
+    #[derive(QueryableByName)]
+    struct N {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let row: N = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM runs r \
+         WHERE r.batch_id = ?1 AND r.status IN ('running', 'held') \
+           AND EXISTS (SELECT 1 FROM enhancement_tasks t \
+                       WHERE t.run_id = r.id AND t.stage_idx > 0)",
+    )
+    .bind::<diesel::sql_types::Text, _>(batch_id)
+    .get_result(conn)?;
+    Ok(row.n)
 }
 
 /// Build the estimate a confirm sheet shows, and the one a batch is created

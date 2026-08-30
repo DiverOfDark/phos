@@ -228,6 +228,9 @@ pub(super) async fn describe_shot(
                     run_id: Some(&run_id),
                     stage_idx: Some(0),
                     parent_task_id: None,
+                    // `POST /describe` is a person asking about one photograph
+                    // and polling for the answer.
+                    priority: "interactive",
                 })
                 .execute(conn)?;
             Ok((run_id, task_id))

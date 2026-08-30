@@ -21,13 +21,21 @@ use diesel::sqlite::SqliteConnection;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// A take's own row, as [`regenerate`] reads it: id, parent, source, directives.
-type SourceRow = (String, Option<String>, Option<String>, Option<String>);
+/// A take's own row, as [`regenerate`] reads it: id, parent, source,
+/// directives, and the hurry it was queued with.
+type SourceRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
 
-/// Where one take came from: the task it continued, the file it read, and the
-/// directives that were compiled into it. Two takes agreeing on the first two
-/// are the same generation, and regenerate re-runs the stage once per group.
-type TakeSource = (Option<String>, Option<String>, Option<String>);
+/// Where one take came from: the task it continued, the file it read, the
+/// directives that were compiled into it, and its priority. Two takes agreeing
+/// on the first two are the same generation, and regenerate re-runs the stage
+/// once per group.
+type TakeSource = (Option<String>, Option<String>, Option<String>, String);
 
 /// Give a verdict on a held run.
 ///
@@ -224,11 +232,14 @@ fn regenerate(
             enhancement_tasks::parent_task_id,
             enhancement_tasks::source_file_id,
             enhancement_tasks::text_overrides,
+            enhancement_tasks::priority,
         ))
         .load(conn)?;
     let by_id: HashMap<String, TakeSource> = rows
         .into_iter()
-        .map(|(id, parent, source, overrides)| (id, (parent, source, overrides)))
+        .map(|(id, parent, source, overrides, priority)| {
+            (id, (parent, source, overrides, priority))
+        })
         .collect();
     let mut groups: Vec<TakeSource> = Vec::new();
     for take_id in &take_ids {
@@ -242,7 +253,7 @@ fn regenerate(
 
     let supplied = supplied_for(stage_values.as_deref(), hold.stage_idx);
     let mut queued = Vec::new();
-    for (parent, source, text_overrides) in &groups {
+    for (parent, source, text_overrides, priority) in &groups {
         let mut plan = stage
             .plan_for(conn, &hold.shot_id, &supplied)
             .map_err(|e| HoldError::Refused(e.message))?;
@@ -263,6 +274,7 @@ fn regenerate(
             &plan,
             source.as_deref(),
             parent.as_deref(),
+            crate::comfyui::queue::Priority::parse(priority),
         )
         .map_err(HoldError::Refused)?;
         queued.extend(ids);

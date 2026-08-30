@@ -64,6 +64,7 @@ diesel::table! {
         stage_idx -> Nullable<Integer>,
         parent_task_id -> Nullable<Text>,
         text_output -> Nullable<Text>,
+        priority -> Text,
     }
 }
 

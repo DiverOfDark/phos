@@ -19,7 +19,9 @@ use crate::comfyui::line::RunState;
 use crate::comfyui::runs::{start_line_run_for_batch, StartError, SuppliedByStage};
 use crate::models::BatchChangeset;
 
-use super::plan::{advance_cursor, decide, tasks_by_stage, Feed};
+use super::plan::{
+    advance_cursor, decide, tasks_by_stage, wave_lead, Caps, Feed, DEFAULT_LEAD,
+};
 use super::selection::{next_page, Narrowing};
 use super::store::{self, BatchRow, BatchState};
 
@@ -85,10 +87,24 @@ pub fn feed_one(
     let tasks_per_shot: i64 = tasks_by_stage(&costs).iter().sum();
     let pulse = store::pulse(conn, batch, library_root, now)?;
 
+    // FR8: the lead is spent on the *wave*, not on the batch. A run opened now
+    // is dispatched in front of one already three stages down, so a batch stops
+    // opening the moment its wave has left the first stage and starts again
+    // when it lands. This is the only change FR8 makes to the feeder, and it is
+    // a substitution into a cap that was already an `Option` for it — nothing
+    // below re-derives what `decide` netted out.
+    let caps = Caps {
+        lead: Some(wave_lead(
+            batch.caps.lead.unwrap_or(DEFAULT_LEAD),
+            pulse.advanced_runs,
+        )),
+        ..batch.caps.clone()
+    };
+
     // Asked first as "the query still has shots", because that is true almost
     // always and costs no query to assume. An empty page below re-asks with
     // `exhausted`, which is the only case where the answer differs.
-    let room = match decide(&batch.caps, &pulse, false, tasks_per_shot) {
+    let room = match decide(&caps, &pulse, false, tasks_per_shot) {
         Feed::Open(n) => n,
         Feed::Idle => return settle(conn, batch, BatchState::Running, None, 0, 0),
         Feed::Pause(reason) => {
@@ -115,7 +131,7 @@ pub fn feed_one(
     if page.is_empty() {
         // The query has no more shots past the cursor. Whether that is "done"
         // depends on whether anything this batch already opened is still going.
-        let state = match decide(&batch.caps, &pulse, true, tasks_per_shot) {
+        let state = match decide(&caps, &pulse, true, tasks_per_shot) {
             Feed::Done => BatchState::Completed,
             _ => BatchState::Running,
         };

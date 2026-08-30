@@ -24,6 +24,7 @@ use crate::comfyui::loaders::{
 use crate::comfyui::params::ParameterMap;
 use crate::comfyui::policy::FailureSite;
 use crate::comfyui::prompt;
+use crate::comfyui::queue;
 use crate::comfyui::source::{read_source, resolve_source_file, SourceMode};
 use crate::comfyui::timestamp::format_ts;
 use crate::comfyui::workflow::{fresh_attempt_id, output_prefix_for_task, prepare_workflow};
@@ -33,6 +34,12 @@ use diesel::sqlite::SqliteConnection;
 use serde_json::Value;
 use std::path::Path;
 use tracing::{error, info, warn};
+
+/// How many tasks one pass takes off the queue.
+///
+/// Small on purpose, and unchanged by FR8: the pass runs every three seconds
+/// and each task here is an upload. What FR8 changed is *which* five.
+const DISPATCH_CHUNK: i64 = 5;
 
 /// A task waiting to be sent to ComfyUI.
 struct PendingTask {
@@ -58,6 +65,26 @@ struct PendingTask {
     /// The workflow's name, so a stage handed something it cannot read can
     /// say which stage and what it wanted.
     workflow_name: String,
+    /// The three columns that, with `id` and `stage_idx`, are this task's place
+    /// in the queue. Read back rather than assumed, so the order the database
+    /// returned can be checked against the pure one.
+    workflow_id: String,
+    created_at: String,
+    priority: String,
+}
+
+impl PendingTask {
+    /// Where this task sits in the drain order, as
+    /// [`crate::comfyui::queue`] describes it with no database involved.
+    fn drain_key(&self) -> queue::DrainKey {
+        queue::DrainKey {
+            priority: queue::Priority::parse(&self.priority),
+            stage_idx: self.stage_idx.unwrap_or(0),
+            workflow_id: self.workflow_id.clone(),
+            created_at: self.created_at.clone(),
+            id: self.id.clone(),
+        }
+    }
 }
 
 type PendingRow = (
@@ -71,6 +98,9 @@ type PendingRow = (
     Option<String>,
     i32,
     Option<i32>,
+    String,
+    String,
+    String,
     String,
 );
 
@@ -98,7 +128,7 @@ pub(super) fn process_pending_tasks(
 ) {
     let now = format_ts(chrono::Utc::now().naive_utc());
 
-    let tasks = match pending_tasks(conn, &now) {
+    let tasks = match pending_tasks(conn, &now, DISPATCH_CHUNK) {
         Ok(tasks) => tasks,
         Err(e) => {
             error!("Failed to query pending tasks: {}", e);
@@ -119,7 +149,14 @@ pub(super) fn process_pending_tasks(
     }
 }
 
-/// The next few tasks waiting to go out, oldest first.
+/// The next few tasks waiting to go out, in drain order.
+///
+/// **Not** oldest first, and that is FR8. The order is
+/// [`crate::comfyui::queue`]'s and is expressed there twice — once as the SQL
+/// fragments this builds its `ORDER BY` from, once as [`queue::DrainKey`]'s
+/// [`Ord`] — so what this returns can be checked against a sort that needs no
+/// database. Interactive before batch, then lower stage first, then grouped by
+/// workflow, then oldest, then by id so it is total.
 ///
 /// Every nullable column a run needs is read through `COALESCE`, so a row
 /// written before the column existed answers with the empty map rather than
@@ -127,6 +164,7 @@ pub(super) fn process_pending_tasks(
 fn pending_tasks(
     conn: &mut SqliteConnection,
     now: &str,
+    limit: i64,
 ) -> Result<Vec<PendingTask>, diesel::result::Error> {
     let rows: Vec<PendingRow> = enhancement_tasks::table
         .inner_join(
@@ -141,8 +179,14 @@ fn pending_tasks(
                     .or(enhancement_tasks::next_attempt_at.le(now)),
             ),
         )
-        .order(enhancement_tasks::created_at.asc())
-        .limit(5)
+        .order((
+            diesel::dsl::sql::<diesel::sql_types::Integer>(queue::PRIORITY_RANK_SQL),
+            diesel::dsl::sql::<diesel::sql_types::Integer>(queue::STAGE_RANK_SQL),
+            enhancement_tasks::workflow_id.asc(),
+            enhancement_tasks::created_at.asc(),
+            enhancement_tasks::id.asc(),
+        ))
+        .limit(limit)
         .select((
             enhancement_tasks::id,
             enhancement_tasks::shot_id,
@@ -161,6 +205,11 @@ fn pending_tasks(
             ),
             enhancement_tasks::stage_idx,
             comfyui_workflows::name,
+            enhancement_tasks::workflow_id,
+            diesel::dsl::sql::<diesel::sql_types::Text>(
+                "COALESCE(enhancement_tasks.created_at, '')",
+            ),
+            enhancement_tasks::priority,
         ))
         .load::<PendingRow>(conn)?;
 
@@ -178,6 +227,9 @@ fn pending_tasks(
             retry_count: row.8,
             stage_idx: row.9,
             workflow_name: row.10,
+            workflow_id: row.11,
+            created_at: row.12,
+            priority: row.13,
         })
         .collect())
 }
@@ -528,7 +580,7 @@ mod tests {
                        '{"3.seed":4242,"3.steps":28,"3.cfg":6.5}');"#,
         );
 
-        let tasks = pending_tasks(&mut conn, "2026-08-30 12:00:00").unwrap();
+        let tasks = pending_tasks(&mut conn, "2026-08-30 12:00:00", DISPATCH_CHUNK).unwrap();
         assert_eq!(tasks.len(), 1);
         let prepared = submitted(&tasks[0]);
         assert_eq!(prepared["3"]["inputs"]["seed"], json!(4242));
@@ -550,7 +602,7 @@ mod tests {
                VALUES ('task-old', 'shot-1', 'wf-1', 'pending', '{"6.text":"unchanged"}');"#,
         );
 
-        let tasks = pending_tasks(&mut conn, "2026-08-30 12:00:00").unwrap();
+        let tasks = pending_tasks(&mut conn, "2026-08-30 12:00:00", DISPATCH_CHUNK).unwrap();
         assert_eq!(tasks[0].parameters, "{}", "NULL must read as no parameters");
         let prepared = submitted(&tasks[0]);
         assert_eq!(prepared["3"]["inputs"]["seed"], json!(1));
@@ -629,7 +681,7 @@ mod tests {
             .collect();
         let (_dir, mut conn) = library(&inserts);
 
-        let seeds: Vec<i64> = pending_tasks(&mut conn, "2026-08-30 13:00:00")
+        let seeds: Vec<i64> = pending_tasks(&mut conn, "2026-08-30 13:00:00", DISPATCH_CHUNK)
             .unwrap()
             .iter()
             .map(|task| submitted(task)["3"]["inputs"]["seed"].as_i64().unwrap())
@@ -671,7 +723,7 @@ mod tests {
 
     /// The one pending task, in the shape `dispatch_one` reads it.
     fn the_task(conn: &mut diesel::SqliteConnection) -> PendingTask {
-        pending_tasks(conn, "2099-01-01 00:00:00")
+        pending_tasks(conn, "2099-01-01 00:00:00", DISPATCH_CHUNK)
             .unwrap()
             .pop()
             .expect("a pending task")
