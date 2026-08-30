@@ -111,10 +111,22 @@ export function batchOf(sheet, batches = {}) {
 /**
  * The sentence to print when a batch is paused, or `null`.
  *
- * FR7's own `paused_note` wherever there is one. When there is not, the lane
- * says something only for the pause it can actually do something about —
- * `holds` — and stays quiet about a disk floor or a time window, which no
- * verdict here will lift.
+ * FR7's own `paused_note` wherever there is one — never a paraphrase, and the
+ * reason for that is not the obvious one. "One string so two screens cannot
+ * disagree" is true but did not earn its place; what earned it is that when
+ * this string grew from 62 characters to 111 it broke the layout of *both*
+ * screens rendering it, and neither author noticed until one of them measured.
+ * Sharing the string is what gave that bug a single place to surface. The cost
+ * of forking copy is not maintenance, it is that a forked bug has nowhere to
+ * show up.
+ *
+ * Every reason gets its note, including the ones no verdict here can lift.
+ * The hazard was never "this pause has no sentence" — it was a sentence that
+ * implies reviewing helps, and FR7's wording names what actually lifts each
+ * one ("It picks up again then.", "Only freeing disk lifts this."). A still
+ * lane with no explanation is the worse failure. The fallback below fires only
+ * when there is no note at all, and then only for `holds`, which is the one
+ * pause this screen is the cure for.
  */
 export function batchNotice(batch) {
   if (!batch?.paused) return null;
