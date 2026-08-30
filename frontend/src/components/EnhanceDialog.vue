@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
+import { isTextInput } from '@/lib/utils'
 
 const props = defineProps({
   open: Boolean,
@@ -122,8 +123,8 @@ watch(selectedWorkflow, (wf) => {
   const overrides = {}
   const inputs = wf.inputs || []
   for (const input of inputs) {
-    if (input.node_type !== 'LoadImage') {
-      overrides[`${input.node_id}.${input.field_name}`] = typeof input.current_value === 'string' ? input.current_value : ''
+    if (isTextInput(input)) {
+      overrides[`${input.node_id}.${input.field_name}`] = String(input.current_value ?? '')
     }
   }
   textOverrides.value = overrides
@@ -154,8 +155,8 @@ function selectPreset(preset) {
     const overrides = {}
     const inputs = selectedWorkflow.value?.inputs || []
     for (const input of inputs) {
-      if (input.node_type !== 'LoadImage') {
-        overrides[`${input.node_id}.${input.field_name}`] = typeof input.current_value === 'string' ? input.current_value : ''
+      if (isTextInput(input)) {
+        overrides[`${input.node_id}.${input.field_name}`] = String(input.current_value ?? '')
       }
     }
     textOverrides.value = overrides
@@ -171,9 +172,7 @@ function selectPreset(preset) {
 
 const textInputs = computed(() => {
   if (!selectedWorkflow.value) return []
-  return (selectedWorkflow.value.inputs || []).filter(
-    i => i.node_type !== 'LoadImage'
-  )
+  return (selectedWorkflow.value.inputs || []).filter(isTextInput)
 })
 
 const outputType = computed(() => {
