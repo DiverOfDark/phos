@@ -49,37 +49,37 @@ use super::UState;
 /// which is why a stage of a line and an ad-hoc run cannot drift apart.
 #[derive(Deserialize, ToSchema)]
 pub(super) struct LineStagePayload {
-    workflow_id: String,
+    pub(super) workflow_id: String,
     /// Prompt bindings, plus the `role:<node_id>` directives the loader binder
     /// reads.
     #[serde(default)]
-    text_overrides: HashMap<String, String>,
+    pub(super) text_overrides: HashMap<String, String>,
     /// Typed values for this stage's non-text inputs, keyed
     /// `"<node_id>.<field_name>"`.
     #[serde(default)]
     #[schema(value_type = Object)]
-    parameters: ParameterMap,
+    pub(super) parameters: ParameterMap,
     /// Parameters to sweep rather than pin. Expanded once per continuation, so
     /// a count of 4 here means four takes and four independent runners through
     /// every stage after this one.
     #[serde(default)]
     #[schema(value_type = Object)]
-    vary: VaryMap,
+    pub(super) vary: VaryMap,
     /// Which part of an upstream video this stage consumes: `first_frame`,
     /// `last_frame`, `at_time:<ms>`, `keyframe:<n>` or `whole_video`. Omit it
     /// to let the graph decide.
-    source_mode: Option<String>,
+    pub(super) source_mode: Option<String>,
     /// Keep this stage's output once the run completes. The last stage's output
     /// is the product and is kept regardless.
     #[serde(default)]
-    keep_output: bool,
+    pub(super) keep_output: bool,
 }
 
 #[derive(Deserialize, ToSchema)]
 pub(super) struct LinePayload {
-    name: String,
-    description: Option<String>,
-    stages: Vec<LineStagePayload>,
+    pub(super) name: String,
+    pub(super) description: Option<String>,
+    pub(super) stages: Vec<LineStagePayload>,
 }
 
 /// What starts a run.
@@ -113,7 +113,7 @@ type RunTaskRow = (String, Option<i32>, String, String, Option<String>);
 
 /// A line's stages, with each workflow's contract folded in — what the editor
 /// draws and what validation reads.
-fn stage_json(stage: &StageRow) -> serde_json::Value {
+pub(super) fn stage_json(stage: &StageRow) -> serde_json::Value {
     serde_json::json!({
         "stage_idx": stage.stage_idx,
         "workflow_id": stage.workflow_id,
@@ -131,7 +131,7 @@ fn stage_json(stage: &StageRow) -> serde_json::Value {
     })
 }
 
-fn line_json(
+pub(super) fn line_json(
     id: &str,
     name: &str,
     description: Option<&str>,
@@ -255,7 +255,7 @@ pub(super) async fn get_line(
 ///
 /// The order matters to the message a person gets: a typo in a workflow id is
 /// reported as a missing workflow, not as an unfittable chain.
-fn check_payload(
+pub(super) fn check_payload(
     conn: &mut SqliteConnection,
     payload: &LinePayload,
 ) -> Result<Vec<StageTyping>, ApiError> {
@@ -316,7 +316,7 @@ fn check_payload(
 }
 
 /// Write a line's stages. The caller has already emptied the old ones.
-fn insert_stages(
+pub(super) fn insert_stages(
     conn: &mut SqliteConnection,
     line_id: &str,
     payload: &LinePayload,

@@ -26,6 +26,7 @@ pub(super) fn require_comfyui(state: &AppState) -> Result<String, StatusCode> {
 /// Import is the one endpoint here where a bare 400 is actively unhelpful: the
 /// user pasted a graph and needs to know which part of it Phos could not use.
 /// The UI already reads `error` out of a JSON body.
+#[derive(Debug)]
 pub(super) struct ApiError(pub(super) StatusCode, pub(super) Option<String>);
 
 impl ApiError {
@@ -103,7 +104,7 @@ pub(super) async fn comfyui_health(
 /// `None` covers every way ComfyUI can decline to describe itself — down, too
 /// old to have `/object_info`, or answering something unparseable — and every
 /// caller treats that as ordinary rather than as an error.
-async fn node_catalog(url: &str) -> Option<std::sync::Arc<crate::comfyui::NodeCatalog>> {
+pub(super) async fn node_catalog(url: &str) -> Option<std::sync::Arc<crate::comfyui::NodeCatalog>> {
     let url = url.to_string();
     tokio::task::spawn_blocking(move || {
         let client = crate::comfyui::ComfyUiClient::new(&url);

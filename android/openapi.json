@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/comfyui-production-lines"
+    "version": "feat/comfyui-line-portability"
   },
   "paths": {
     "/api/auth/callback": {
@@ -384,6 +384,60 @@
         }
       }
     },
+    "/api/comfyui/lines/import": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Import a production line",
+        "description": "Read a line out of an exported bundle — the same format bundled templates ship in. Its workflows are created, or reused where an identical graph is already here, and its requirements are checked against what this ComfyUI has installed. A line whose nodes or models are missing is still imported; the response says what is missing. A name already in use is suffixed, never overwritten. Pass `dry_run=true` for the report alone.",
+        "operationId": "import_line",
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "description": "Check the bundle and report what it needs, writing nothing. Defaults to\n`false`.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Name the imported line this rather than what the file calls it. A name\nalready in use is still suffixed rather than overwritten.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LineBundle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The imported line, and what it needs"
+          },
+          "400": {
+            "description": "The file is not a readable line export, or its chain does not fit together here"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
     "/api/comfyui/lines/{id}": {
       "get": {
         "tags": [
@@ -486,6 +540,45 @@
           },
           "409": {
             "description": "A run of this line is still in flight"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/{id}/export": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Export a production line",
+        "description": "The line, its stages, the workflow graph behind every stage, and a manifest of the node classes and model files it needs — as one JSON document that can be imported into another library or another Phos install. This is the same format bundled templates ship in.",
+        "operationId": "export_line",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Line ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The line as a portable bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LineBundle"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Line not found"
           },
           "503": {
             "description": "ComfyUI not configured"
@@ -2908,6 +3001,96 @@
           }
         }
       },
+      "BundleLine": {
+        "type": "object",
+        "description": "The line itself. Stage order is array order — there is no `stage_idx`,\nbecause two sources of truth for one ordering is one too many.",
+        "required": [
+          "name",
+          "stages"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BundleStage"
+            }
+          }
+        }
+      },
+      "BundleStage": {
+        "type": "object",
+        "description": "One step of a line, as it travels.\n\nField for field this is what line CRUD already takes, with one difference:\n`workflow` is a key into this bundle's own `workflows` map rather than a\nlibrary id, because a library id is meaningless in the library it is being\ncarried to.",
+        "required": [
+          "workflow"
+        ],
+        "properties": {
+          "keep_output": {
+            "type": "boolean"
+          },
+          "parameters": {
+            "type": "object"
+          },
+          "source_mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text_overrides": {
+            "type": "object",
+            "description": "Prompt bindings, plus the `role:<node_id>` directives the loader binder\nreads.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "vary": {
+            "type": "object"
+          },
+          "workflow": {
+            "type": "string",
+            "description": "Which entry of `workflows` this stage runs. Any string: an export uses\nthe source library's workflow id, a hand-written template can use a\nreadable name."
+          }
+        }
+      },
+      "BundleWorkflow": {
+        "type": "object",
+        "description": "A workflow, carried whole.",
+        "required": [
+          "name",
+          "graph"
+        ],
+        "properties": {
+          "contract": {
+            "type": "object",
+            "description": "The contract this workflow carried where it came from.\n\nOptional, and re-derived on import against the *target* box's node\ncatalogue — only the `corrections` inside it survive verbatim, because a\ncorrection is the one part of a contract that cannot be worked out\nagain. A hand-written template can leave it out entirely."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "graph": {
+            "type": "object",
+            "description": "The ComfyUI API-format graph, exactly as the library stores it."
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "ClientVersionResponse": {
         "type": "object",
         "description": "`GET /api/client/version` response — the bundled Android build.\n\nEvery field is non-nullable, so a generated client needs no null-handling at\nall: \"no APK bundled\" is expressed by `available: false` with\n`version_code: 0`, not by absent fields and not by an error status.",
@@ -3338,6 +3521,48 @@
           }
         }
       },
+      "LineBundle": {
+        "type": "object",
+        "description": "A line, its stages, its workflows and what it needs installed.",
+        "required": [
+          "line"
+        ],
+        "properties": {
+          "exported_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it left, for a human reading the file. Never read by the importer."
+          },
+          "format": {
+            "type": "string",
+            "description": "Always [`BUNDLE_FORMAT`]."
+          },
+          "format_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "line": {
+            "$ref": "#/components/schemas/BundleLine"
+          },
+          "requirements": {
+            "$ref": "#/components/schemas/Requirements",
+            "description": "What this line needs installed, as computed where it was exported.\n\nDocumentation, not input: the importer recomputes it from the graphs in\nthis same file, so a stale or hand-edited manifest cannot make an import\nreport something untrue."
+          },
+          "workflows": {
+            "type": "object",
+            "description": "Every workflow the stages name, keyed by whatever they name it.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/BundleWorkflow"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "LinePayload": {
         "type": "object",
         "required": [
@@ -3446,6 +3671,26 @@
             "type": "string"
           },
           "target_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ModelRef": {
+        "type": "object",
+        "description": "One weights file a graph names, and where it names it.\n\nThe node class and field are carried because \"sd_xl.safetensors is missing\"\nis not actionable and \"CheckpointLoaderSimple wants sd_xl.safetensors in\nckpt_name\" is: it says which of ComfyUI's model directories to put it in.",
+        "required": [
+          "class_type",
+          "field",
+          "name"
+        ],
+        "properties": {
+          "class_type": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "name": {
             "type": "string"
           }
         }
@@ -3759,6 +4004,70 @@
         "properties": {
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "Requirements": {
+        "type": "object",
+        "description": "What a line needs installed on the ComfyUI that will run it.",
+        "properties": {
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelRef"
+            },
+            "description": "Every weights file the graphs name, sorted."
+          },
+          "node_classes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Every distinct `class_type` in the line's graphs, sorted."
+          }
+        }
+      },
+      "RequirementsReport": {
+        "type": "object",
+        "description": "What the catalogue said, and what is missing.\n\nNever a refusal on its own: an import goes through with things missing, so a\nline can be filed on the box that stores the library and run on the box that\nhas the GPU. The report is what the person acts on.",
+        "required": [
+          "checked",
+          "missing_nodes",
+          "missing_models",
+          "unverified_models",
+          "warnings"
+        ],
+        "properties": {
+          "checked": {
+            "type": "boolean",
+            "description": "False when there was no catalogue to check against."
+          },
+          "missing_models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelRef"
+            },
+            "description": "Weights files this ComfyUI's own enum of installed files does not list."
+          },
+          "missing_nodes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Node classes this ComfyUI does not have. Naming them is the whole point."
+          },
+          "unverified_models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelRef"
+            },
+            "description": "Weights files that could be neither confirmed nor denied."
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
