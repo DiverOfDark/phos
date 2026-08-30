@@ -368,6 +368,22 @@ pub fn align_face(
 }
 
 impl AiPipeline {
+    /// A pipeline with no models loaded, for tests.
+    ///
+    /// Detection and embedding then take the same path `PHOS_DUMMY_AI=1` takes —
+    /// one fixed box per image, a deterministic embedding — without setting a
+    /// process-wide env var the rest of the test binary would also see.
+    #[cfg(test)]
+    pub fn dummy() -> Self {
+        Self {
+            face_detector: None,
+            face_recognizer: None,
+            logged_outputs: AtomicBool::new(false),
+            caption_models: Mutex::new(None),
+            caption_load_attempted: AtomicBool::new(false),
+        }
+    }
+
     pub fn new() -> Result<Self> {
         if std::env::var("PHOS_DUMMY_AI")
             .ok()
