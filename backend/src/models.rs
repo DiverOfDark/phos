@@ -127,6 +127,10 @@ pub struct ComfyuiWorkflow {
     pub inputs_json: Option<String>,
     pub outputs_json: Option<String>,
     pub created_at: Option<String>,
+    /// What this workflow accepts and produces — a `comfyui::StageContract`.
+    /// `None` on a row imported before contracts existed; the worker backfills
+    /// those, and the API derives one on the fly meanwhile.
+    pub contract_json: Option<String>,
 }
 
 #[derive(Insertable)]
@@ -138,6 +142,7 @@ pub struct NewComfyuiWorkflow<'a> {
     pub workflow_json: &'a str,
     pub inputs_json: Option<&'a str>,
     pub outputs_json: Option<&'a str>,
+    pub contract_json: Option<&'a str>,
 }
 
 // ── Enhancement Tasks ──
