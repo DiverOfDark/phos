@@ -104,15 +104,6 @@ fn tick(conn: &mut SqliteConnection, root: &std::path::Path, id: &str) -> super:
     tick_full(conn, root, id, 3, None)
 }
 
-fn tick_at(
-    conn: &mut SqliteConnection,
-    root: &std::path::Path,
-    id: &str,
-    hour: u32,
-) -> super::feed::FedBatch {
-    tick_full(conn, root, id, hour, None)
-}
-
 /// A fixed local wall-clock time, so nothing here depends on when it is run.
 fn fake_now(hour: u32) -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 8, 31)

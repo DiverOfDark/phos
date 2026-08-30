@@ -73,7 +73,4 @@ pub mod store;
 #[cfg(test)]
 mod tests;
 
-pub use feed::{feed_batches, stop, FedBatch, Stopped};
-pub use plan::{Caps, Cursor, Estimate, Feed, PauseReason, Pulse, StageCost};
-pub use selection::Selection;
-pub use store::{BatchRow, BatchState, RunCounts};
+pub use feed::{feed_batches, stop};

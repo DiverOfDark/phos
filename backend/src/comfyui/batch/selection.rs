@@ -95,7 +95,7 @@ fn short_date(s: &str) -> String {
 }
 
 /// What else the selection is narrowed by when it is resolved.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Narrowing<'a> {
     /// Skip shots that already have output from this line: a completed run of
     /// it, or a file made by its last stage's workflow. At batch scale this is
@@ -108,17 +108,6 @@ pub struct Narrowing<'a> {
     pub after: Option<&'a Cursor>,
     /// At most this many rows. `None` counts instead of listing.
     pub limit: Option<i64>,
-}
-
-impl Default for Narrowing<'_> {
-    fn default() -> Self {
-        Narrowing {
-            skip_line_id: None,
-            skip_workflow_id: None,
-            after: None,
-            limit: None,
-        }
-    }
 }
 
 #[derive(QueryableByName)]
@@ -283,8 +272,8 @@ mod tests {
             conditions_for(&Selection::Query { query }, &Narrowing::default());
         assert_eq!(binds, vec!["p-1", "1900", "1990"]);
         assert!(conditions[0].contains("s.primary_person_id = ?1"));
-        assert!(conditions[1].contains("s.timestamp >= ?2"));
-        assert!(conditions[2].contains("s.timestamp <= ?3"));
+        assert!(conditions[1].contains("CAST(s.timestamp AS TEXT) >= ?2"));
+        assert!(conditions[2].contains("CAST(s.timestamp AS TEXT) <= ?3"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod client;
 mod comfyui;
 mod describe;
 mod faces;
+mod batches;
 mod files;
 mod holds;
 mod line_editor;
@@ -120,6 +121,15 @@ use utoipa::OpenApi;
         lines::cancel_run,
         holds::get_hold,
         holds::post_verdict,
+        // Batches: a whole library sent to one line
+        batches::preview_batch,
+        batches::create_batch,
+        batches::list_batches,
+        batches::get_batch,
+        batches::stop_batch,
+        batches::save_selection,
+        batches::list_selections,
+        batches::delete_selection,
         line_io::export_line,
         line_io::import_line,
         describe::describe_shot,
@@ -201,6 +211,17 @@ use utoipa::OpenApi;
             lines::LineStagePayload,
             lines::StartRunPayload,
             holds::VerdictPayload,
+            // Batches
+            batches::BatchPayload,
+            batches::BatchPreview,
+            batches::BatchBrief,
+            batches::StagePreview,
+            batches::CapsPayload,
+            batches::SavedSelectionPayload,
+            batches::SavedSelectionBrief,
+            crate::comfyui::batch::selection::Selection,
+            crate::comfyui::batch::plan::Estimate,
+            crate::api::shots::ShotsQuery,
             // A line as a file.
             crate::comfyui::LineBundle,
             crate::comfyui::BundleLine,
@@ -631,6 +652,26 @@ pub fn create_router(state: AppState) -> Router {
             get(lines::list_runs).post(lines::start_run),
         )
         .route("/api/comfyui/runs/{id}", get(lines::get_run))
+        // Batches. `preview` is registered before `{id}` so the literal path
+        // wins the match, and it writes nothing: it is the confirm sheet.
+        .route(
+            "/api/comfyui/batches/preview",
+            post(batches::preview_batch),
+        )
+        .route(
+            "/api/comfyui/batches",
+            get(batches::list_batches).post(batches::create_batch),
+        )
+        .route("/api/comfyui/batches/{id}", get(batches::get_batch))
+        .route("/api/comfyui/batches/{id}/stop", post(batches::stop_batch))
+        .route(
+            "/api/comfyui/selections",
+            get(batches::list_selections).post(batches::save_selection),
+        )
+        .route(
+            "/api/comfyui/selections/{id}",
+            delete(batches::delete_selection),
+        )
         .route("/api/comfyui/runs/{id}/retry", post(lines::retry_run))
         .route("/api/comfyui/runs/{id}/cancel", post(lines::cancel_run))
         // A run parked at a hold point, and the verdict that releases it.

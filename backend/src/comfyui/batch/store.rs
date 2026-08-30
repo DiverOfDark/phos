@@ -107,7 +107,9 @@ type BatchTuple = (
     Option<String>,
 );
 
-fn columns() -> (
+/// The `batches` columns, in the order [`BatchTuple`] names them. A `type` so
+/// the two cannot drift, and so clippy stops counting parentheses.
+type BatchColumns = (
     batches::id,
     batches::line_id,
     batches::label,
@@ -130,7 +132,9 @@ fn columns() -> (
     batches::max_outstanding_holds,
     batches::created_at,
     batches::finished_at,
-) {
+);
+
+fn columns() -> BatchColumns {
     (
         batches::id,
         batches::line_id,
@@ -415,16 +419,18 @@ pub fn save_selection(
     Ok(id)
 }
 
+type SavedSelectionTuple = (
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    bool,
+    Option<String>,
+);
+
 pub fn list_selections(conn: &mut SqliteConnection) -> QueryResult<Vec<SavedSelectionRow>> {
-    let rows: Vec<(
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-        bool,
-        Option<String>,
-    )> = saved_selections::table
+    let rows: Vec<SavedSelectionTuple> = saved_selections::table
         .order(saved_selections::created_at.desc())
         .select((
             saved_selections::id,

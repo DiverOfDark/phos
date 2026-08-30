@@ -118,14 +118,22 @@ pub(crate) fn shot_conditions(
         ));
     }
 
+    // `CAST(... AS TEXT)` rather than a bare column reference, and it is not
+    // decoration. `shots.timestamp` is declared `TIMESTAMP`, which gives it
+    // SQLite's NUMERIC affinity, and comparing it to a bound that happens to
+    // parse as a number converts the *bound* to an integer — after which every
+    // stored value, being text, sorts above it and the filter matches nothing.
+    // A bare year is exactly such a bound, so `to=1990` silently returned an
+    // empty gallery. The cast pins both sides to text, which is the comparison
+    // these ISO-ish strings were always meant to get.
     if let Some(ref from) = params.from {
         binds.push(from.clone());
-        conditions.push(format!("s.timestamp >= ?{}", binds.len()));
+        conditions.push(format!("CAST(s.timestamp AS TEXT) >= ?{}", binds.len()));
     }
 
     if let Some(ref to) = params.to {
         binds.push(to.clone());
-        conditions.push(format!("s.timestamp <= ?{}", binds.len()));
+        conditions.push(format!("CAST(s.timestamp AS TEXT) <= ?{}", binds.len()));
     }
 }
 
@@ -1609,4 +1617,118 @@ pub(super) async fn get_similar_shot_groups(
         offset,
         limit,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::connection::SimpleConnection;
+
+    fn library() -> (tempfile::TempDir, SqliteConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".phos.db");
+        crate::db::init_and_migrate(&db_path).unwrap();
+        let mut conn = crate::db::open_diesel_connection(&db_path).unwrap();
+        conn.batch_execute(
+            "INSERT INTO people (id, name) VALUES ('p-1', 'Grandma');
+             INSERT INTO shots (id, timestamp, primary_person_id) VALUES
+               ('s-1', '1950-01-01 00:00:00', 'p-1'),
+               ('s-2', '1975-06-01 00:00:00', 'p-1'),
+               ('s-3', '2005-06-01 00:00:00', 'p-1'),
+               ('s-4', '2020-06-01 00:00:00', NULL);",
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn matching(conn: &mut SqliteConnection, query: &ShotsQuery) -> Vec<String> {
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            id: String,
+        }
+        let mut conditions = Vec::new();
+        let mut binds = Vec::new();
+        shot_conditions(query, &mut conditions, &mut binds);
+        let sql = if conditions.is_empty() {
+            "SELECT s.id AS id FROM shots s ORDER BY s.id".to_string()
+        } else {
+            format!(
+                "SELECT s.id AS id FROM shots s WHERE {} ORDER BY s.id",
+                conditions.join(" AND ")
+            )
+        };
+        bind_text_all(&sql, binds)
+            .load::<Row>(conn)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect()
+    }
+
+    #[test]
+    fn a_bare_year_bound_actually_filters() {
+        // `shots.timestamp` is declared TIMESTAMP, so it carries SQLite's
+        // NUMERIC affinity: comparing it to a bound that parses as a number
+        // converts the *bound* to an integer, and every stored value — text —
+        // then sorts above it. `to=1990` used to match nothing at all, which is
+        // "everything of Grandma before 1990" returning an empty gallery.
+        let (_dir, mut conn) = library();
+        let before_1990 = ShotsQuery {
+            to: Some("1990".into()),
+            ..Default::default()
+        };
+        assert_eq!(matching(&mut conn, &before_1990), vec!["s-1", "s-2"]);
+
+        let since_2000 = ShotsQuery {
+            from: Some("2000".into()),
+            ..Default::default()
+        };
+        assert_eq!(matching(&mut conn, &since_2000), vec!["s-3", "s-4"]);
+    }
+
+    #[test]
+    fn a_full_date_bound_still_works() {
+        let (_dir, mut conn) = library();
+        let query = ShotsQuery {
+            from: Some("1960-01-01".into()),
+            to: Some("2010-12-31".into()),
+            ..Default::default()
+        };
+        assert_eq!(matching(&mut conn, &query), vec!["s-2", "s-3"]);
+    }
+
+    #[test]
+    fn the_filters_are_anded_and_their_binds_stay_in_step() {
+        let (_dir, mut conn) = library();
+        let query = ShotsQuery {
+            person_id: Some("p-1".into()),
+            to: Some("1990".into()),
+            ..Default::default()
+        };
+        assert_eq!(matching(&mut conn, &query), vec!["s-1", "s-2"]);
+    }
+
+    #[test]
+    fn more_than_six_binds_no_longer_falls_off_the_end() {
+        // The old hand-written bind ladder had one arm per arity and a `_` arm
+        // that bound exactly six, so a seventh condition would have been
+        // dropped — or panicked on an index it never reached. The boxed query
+        // binds however many there are.
+        let (_dir, mut conn) = library();
+        let query = ShotsQuery {
+            person_id: Some("p-1".into()),
+            status: Some("kept".into()),
+            q: Some("nothing".into()),
+            from: Some("1900".into()),
+            to: Some("2100".into()),
+        };
+        // Six binds (q contributes two) and no panic; nothing matches because
+        // no shot is `kept`.
+        let mut conditions = Vec::new();
+        let mut binds = Vec::new();
+        shot_conditions(&query, &mut conditions, &mut binds);
+        assert_eq!(binds.len(), 6);
+        assert!(matching(&mut conn, &query).is_empty());
+    }
 }

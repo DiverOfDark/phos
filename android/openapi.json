@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/comfyui-hold-points"
+    "version": "feat/comfyui-batch-by-query"
   },
   "paths": {
     "/api/auth/callback": {
@@ -242,6 +242,169 @@
         "security": [
           {}
         ]
+      }
+    },
+    "/api/comfyui/batches": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Every batch, newest first",
+        "operationId": "list_batches",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BatchBrief"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Send a selection of shots to a line",
+        "description": "Writes one batch row holding the query and a cursor. No runs are opened here: the worker pulls the next handful each tick, which is what makes STOP instant and keeps the queue board a board.",
+        "operationId": "create_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchBrief"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The selection cannot be sent"
+          },
+          "404": {
+            "description": "No such line"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/batches/preview": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "What sending this selection to this line would cost",
+        "description": "Counts what the selection matches, how much of it already has output from this line, and what the rest comes to in tasks, GPU seconds and disk. Writes nothing: this is what the confirm sheet shows before Send.",
+        "operationId": "preview_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchPreview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The selection cannot be sent"
+          },
+          "404": {
+            "description": "No such line"
+          }
+        }
+      }
+    },
+    "/api/comfyui/batches/{id}": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "One batch",
+        "operationId": "get_batch",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchBrief"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such batch"
+          }
+        }
+      }
+    },
+    "/api/comfyui/batches/{id}/stop": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Stop a batch, and purge what it has queued on ComfyUI",
+        "description": "Instant, because most of the batch was never rows. The batch is marked stopped first — so a worker tick running at the same moment opens nothing behind the cancel — and only then are its live runs cancelled and their prompts dropped from ComfyUI's own queue.",
+        "operationId": "stop_batch",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stopped"
+          },
+          "404": {
+            "description": "No such batch"
+          }
+        }
       }
     },
     "/api/comfyui/describe": {
@@ -1111,6 +1274,87 @@
           },
           "503": {
             "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/selections": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Saved selections",
+        "operationId": "list_selections",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SavedSelectionBrief"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Save a selection for re-sending",
+        "description": "A query plus the line you usually send it to, so a repeat is one click. It never fires on its own: a batch exists because a person pressed Send.",
+        "operationId": "save_selection",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SavedSelectionPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedSelectionBrief"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/comfyui/selections/{id}": {
+      "delete": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Forget a saved selection",
+        "operationId": "delete_selection",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "No such selection"
           }
         }
       }
@@ -2648,6 +2892,7 @@
           {
             "name": "q",
             "in": "query",
+            "description": "Free text: matches a file's path or the shot's description.",
             "required": false,
             "schema": {
               "type": [
@@ -2659,6 +2904,7 @@
           {
             "name": "person_id",
             "in": "query",
+            "description": "Exact match on the shot's primary person.",
             "required": false,
             "schema": {
               "type": [
@@ -2670,6 +2916,7 @@
           {
             "name": "status",
             "in": "query",
+            "description": "Review status, or the magic value `unsorted` for \"belongs to nobody\".",
             "required": false,
             "schema": {
               "type": [
@@ -2681,6 +2928,7 @@
           {
             "name": "from",
             "in": "query",
+            "description": "Inclusive lower bound on the shot's timestamp.",
             "required": false,
             "schema": {
               "type": [
@@ -2692,6 +2940,7 @@
           {
             "name": "to",
             "in": "query",
+            "description": "Inclusive upper bound on the shot's timestamp.",
             "required": false,
             "schema": {
               "type": [
@@ -3249,6 +3498,142 @@
           }
         }
       },
+      "BatchBrief": {
+        "type": "object",
+        "description": "One batch on the board.",
+        "required": [
+          "id",
+          "line_id",
+          "label",
+          "status",
+          "skip_if_generated",
+          "selection",
+          "caps",
+          "runs_running",
+          "runs_held",
+          "runs_completed",
+          "runs_failed",
+          "runs_cancelled",
+          "runs_opened"
+        ],
+        "properties": {
+          "caps": {
+            "$ref": "#/components/schemas/CapsPayload"
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cursor_shot_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How far the query has been walked. `null` before the first tick."
+          },
+          "est_disk_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "est_gpu_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "est_tasks": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "line_id": {
+            "type": "string"
+          },
+          "matched_total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "What the sheet said when Send was pressed."
+          },
+          "paused_note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The same reason as a sentence, so a board can say why nothing has\nhappened for six hours without inventing its own wording."
+          },
+          "paused_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`window`, `daily_cap`, `disk_floor` or `holds` when paused."
+          },
+          "runs_cancelled": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "runs_completed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "runs_failed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "runs_held": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "runs_opened": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "runs_running": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Runs of this batch, by state. These are *counted*, so they cannot\ndisagree with the runs they describe."
+          },
+          "selection": {
+            "$ref": "#/components/schemas/Selection"
+          },
+          "skip_if_generated": {
+            "type": "boolean"
+          },
+          "skipped_total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
       "BatchConfirmPayload": {
         "type": "object",
         "description": "POST /api/shots/batch/confirm - batch set review_status = 'confirmed'",
@@ -3263,6 +3648,83 @@
             }
           }
         }
+      },
+      "BatchPayload": {
+        "type": "object",
+        "description": "What to send, and where.",
+        "required": [
+          "line_id",
+          "selection"
+        ],
+        "properties": {
+          "caps": {
+            "$ref": "#/components/schemas/CapsPayload"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Overrides the generated one, which reads `<line> · <what was selected>`."
+          },
+          "line_id": {
+            "type": "string"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/Selection",
+            "description": "Either `{\"kind\":\"ids\",\"ids\":[...]}` or `{\"kind\":\"query\",\"query\":{...}}`,\nwhere the query is exactly what `GET /api/shots` takes."
+          },
+          "skip_if_generated": {
+            "type": "boolean",
+            "description": "Skip shots that already have output from this line. On by default: at\nbatch scale this is a filter, not a warning."
+          },
+          "stage_values": {
+            "type": "object",
+            "description": "What each stage of the line left open, same shape as `POST /runs`."
+          }
+        }
+      },
+      "BatchPreview": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Estimate"
+          },
+          {
+            "type": "object",
+            "required": [
+              "line_id",
+              "line_name",
+              "label",
+              "stages"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "line_id": {
+                "type": "string"
+              },
+              "line_name": {
+                "type": "string"
+              },
+              "refused": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Present when the batch cannot be sent at all, with the reason."
+              },
+              "stages": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/StagePreview"
+                },
+                "description": "What each stage is expected to cost per task, and whether that came from\nthis library's own history or from a guess. The sheet says so out loud\nrather than presenting an invented number as a measurement."
+              }
+            }
+          }
+        ],
+        "description": "The confirm sheet, in one object."
       },
       "BatchReassignPayload": {
         "type": "object",
@@ -3448,6 +3910,51 @@
           },
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "CapsPayload": {
+        "type": "object",
+        "description": "The caps a batch is sent with. Every one is optional; a small selection\nsensibly has none.",
+        "properties": {
+          "daily_task_cap": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Tasks this batch may open per day. The day is the *user's*, not\nGreenwich's."
+          },
+          "disk_floor_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Pause while free space on the library volume is at or below this."
+          },
+          "max_outstanding_holds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Pause while this many of the batch's runs are waiting for a verdict."
+          },
+          "window_end_minute": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "window_start_minute": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Minutes from local midnight at which the batch may feed. `[start, end)`,\nand it may wrap midnight — `1320`/`360` is 22:00 to 06:00. A window only\npaces work; it never starts a batch that was not sent."
           }
         }
       },
@@ -3784,6 +4291,73 @@
           },
           "workflow_id": {
             "type": "string"
+          }
+        }
+      },
+      "Estimate": {
+        "type": "object",
+        "description": "What the confirm sheet shows.",
+        "required": [
+          "matched",
+          "skipped",
+          "to_run",
+          "tasks",
+          "gpu_seconds",
+          "disk_bytes",
+          "tasks_per_shot",
+          "measured_stages",
+          "guessed_stages",
+          "has_hold"
+        ],
+        "properties": {
+          "disk_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes this batch will leave behind, counting only output that survives\nthe run's own sweep."
+          },
+          "gpu_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds of GPU, summed over every task."
+          },
+          "guessed_stages": {
+            "type": "integer",
+            "description": "How many were guessed.",
+            "minimum": 0
+          },
+          "has_hold": {
+            "type": "boolean",
+            "description": "Whether the line holds anywhere. If it does, everything above is an\nupper bound: a person choosing two takes of four cuts the stages below\nit by half, and no estimate can know what they will choose."
+          },
+          "matched": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Shots the selection names."
+          },
+          "measured_stages": {
+            "type": "integer",
+            "description": "How many of the line's stages were costed from measured history.",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Of those, how many already have output from this line."
+          },
+          "tasks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Tasks those shots come to, fan-out included."
+          },
+          "tasks_per_shot": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Tasks one shot comes to. What the daily cap is spent in."
+          },
+          "to_run": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What would actually run."
           }
         }
       },
@@ -4660,6 +5234,72 @@
           }
         }
       },
+      "SavedSelectionBrief": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "selection",
+          "caps",
+          "skip_if_generated"
+        ],
+        "properties": {
+          "caps": {
+            "$ref": "#/components/schemas/CapsPayload"
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "line_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/Selection"
+          },
+          "skip_if_generated": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SavedSelectionPayload": {
+        "type": "object",
+        "required": [
+          "name",
+          "selection"
+        ],
+        "properties": {
+          "caps": {
+            "$ref": "#/components/schemas/CapsPayload"
+          },
+          "line_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/Selection"
+          },
+          "skip_if_generated": {
+            "type": "boolean"
+          }
+        }
+      },
       "ScanParams": {
         "type": "object",
         "required": [
@@ -4670,6 +5310,51 @@
             "type": "string"
           }
         }
+      },
+      "Selection": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "These exact shots.",
+            "required": [
+              "ids",
+              "kind"
+            ],
+            "properties": {
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "ids"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Whatever matches, now and every tick from here on. A batch built this\nway picks up shots imported after it was sent, as long as they sort\nafter its cursor.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "query"
+                ]
+              },
+              "query": {
+                "$ref": "#/components/schemas/ShotsQuery"
+              }
+            }
+          }
+        ],
+        "description": "Either a list or a question."
       },
       "SessionClaims": {
         "type": "object",
@@ -4906,6 +5591,47 @@
           }
         }
       },
+      "ShotsQuery": {
+        "type": "object",
+        "description": "What a person means by \"these shots\".\n\nThis is the *only* filter language in Phos, and FR7's batches reuse it\nwholesale rather than growing a second one: a batch is this query plus a\nline plus a cursor. Every field is optional and they are ANDed, so an empty\nquery is the whole library — which is why the batch endpoints make you\nconfirm a count before anything is queued.",
+        "properties": {
+          "from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Inclusive lower bound on the shot's timestamp."
+          },
+          "person_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Exact match on the shot's primary person."
+          },
+          "q": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free text: matches a file's path or the shot's description."
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Review status, or the magic value `unsorted` for \"belongs to nobody\"."
+          },
+          "to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Inclusive upper bound on the shot's timestamp."
+          }
+        }
+      },
       "SimilarGroupsResponse": {
         "type": "object",
         "required": [
@@ -5063,6 +5789,50 @@
               "type": "string"
             },
             "description": "The workflow ids of the line as it stands, in order. Empty for a line\nwith no stages yet."
+          }
+        }
+      },
+      "StagePreview": {
+        "type": "object",
+        "required": [
+          "stage_idx",
+          "workflow_name",
+          "fanout",
+          "seconds_per_task",
+          "bytes_per_task",
+          "measured",
+          "keeps_output",
+          "holds"
+        ],
+        "properties": {
+          "bytes_per_task": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "fanout": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Tasks each upstream task becomes — 1 ordinarily, 4 for `×4 seeds`."
+          },
+          "holds": {
+            "type": "boolean"
+          },
+          "keeps_output": {
+            "type": "boolean"
+          },
+          "measured": {
+            "type": "boolean"
+          },
+          "seconds_per_task": {
+            "type": "number",
+            "format": "double"
+          },
+          "stage_idx": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "workflow_name": {
+            "type": "string"
           }
         }
       },
