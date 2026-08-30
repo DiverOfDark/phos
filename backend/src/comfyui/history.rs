@@ -8,8 +8,14 @@
 //! [`HistoryVerdict::NoOutputs`] and leaves the waiting to [`super::policy`].
 //! Errors are checked before completion, because ComfyUI has shipped builds
 //! that set `completed: true` alongside an `execution_error`.
+//!
+//! The second rule, learned later: a finished prompt that names no file may
+//! still have said something. A describe stage's whole product is a sentence
+//! published inline in `outputs`, and the refusal to hard-code output keys that
+//! [`super::outputs`] applies to files applies to text as well — see
+//! [`HistoryVerdict::Text`].
 
-use super::outputs::{collect_output_refs, OutputRef};
+use super::outputs::{collect_output_refs, collect_text_values, OutputRef};
 use serde_json::Value;
 
 /// What a `/history/{prompt_id}` entry means for the task that queued it.
@@ -19,6 +25,10 @@ pub(crate) enum HistoryVerdict {
     Running,
     /// Finished, and named these files.
     Outputs(Vec<OutputRef>),
+    /// Finished, and published text but no file. A describe stage's whole
+    /// product: FR5a's `produces: text` writes no `files` row, so this is not a
+    /// degenerate [`HistoryVerdict::Outputs`] and must not be settled as one.
+    Text(Vec<String>),
     /// Finished, but named no files (yet). Caller decides whether to keep
     /// waiting — this is a state, not a verdict.
     NoOutputs,
@@ -54,11 +64,27 @@ pub(crate) fn interpret_history(entry: &Value) -> HistoryVerdict {
     }
 
     let refs = collect_output_refs(entry.get("outputs"));
-    if refs.is_empty() {
-        HistoryVerdict::NoOutputs
-    } else {
-        HistoryVerdict::Outputs(refs)
+    if !refs.is_empty() {
+        return HistoryVerdict::Outputs(refs);
     }
+    // No file, but perhaps a sentence. A graph that both saves a picture and
+    // shows a caption is a picture stage whose caption is a preview, so files
+    // are asked about first; a stage whose contract says `produces: text` reads
+    // the text directly with `text_outputs` and never gets here.
+    let text = collect_text_values(entry.get("outputs"));
+    if !text.is_empty() {
+        return HistoryVerdict::Text(text);
+    }
+    HistoryVerdict::NoOutputs
+}
+
+/// The inline text a finished entry published, whatever else it published.
+///
+/// Read by the completion path when the task's stage is declared
+/// `produces: text`: such a graph may well preview the photograph it read, and
+/// that preview is not the product.
+pub(crate) fn text_outputs(entry: &Value) -> Vec<String> {
+    collect_text_values(entry.get("outputs"))
 }
 
 /// The user-facing message for an `execution_error` in `status.messages`.
@@ -229,14 +255,66 @@ mod tests {
 
     #[test]
     fn defect_1_ignores_arrays_that_name_no_file() {
-        // `animated` is an array of bools; `text` an array of strings. Neither is
-        // downloadable, and mistaking them for files would be worse than missing
-        // them.
+        // `animated` is an array of bools; `text` an array of strings. Neither
+        // is downloadable, and mistaking either for a file would be worse than
+        // missing it. The caption is still read — as text, which is what it is.
         let entry = history(
             json!({ "9": { "animated": [false], "text": ["a caption"] } }),
             true,
         );
+        assert_eq!(
+            interpret_history(&entry),
+            HistoryVerdict::Text(vec!["a caption".to_string()])
+        );
+        let entry = history(json!({ "9": { "animated": [false] } }), true);
         assert_eq!(interpret_history(&entry), HistoryVerdict::NoOutputs);
+    }
+
+    // === FR9 / a describe stage's product is inline text ====================
+    #[test]
+    fn a_finished_run_that_published_only_text_is_a_text_verdict() {
+        for key in ["text", "string", "qwen_output"] {
+            let entry = history(json!({ "9": { key: ["a woman on a jetty"] } }), true);
+            assert_eq!(
+                interpret_history(&entry),
+                HistoryVerdict::Text(vec!["a woman on a jetty".to_string()]),
+                "text under {:?} was not recognised",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_string_is_as_good_as_an_array_of_one() {
+        let entry = history(json!({ "9": { "text": "a woman on a jetty" } }), true);
+        assert_eq!(
+            interpret_history(&entry),
+            HistoryVerdict::Text(vec!["a woman on a jetty".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_file_still_wins_over_a_caption_beside_it() {
+        // A generation graph that previews a caption is not a describe stage.
+        let entry = history(
+            json!({
+                "9":  { "images": [file("a.png")] },
+                "12": { "text": ["a caption"] },
+            }),
+            true,
+        );
+        assert!(matches!(
+            interpret_history(&entry),
+            HistoryVerdict::Outputs(_)
+        ));
+        // And the caption is still readable by a stage that wants it.
+        assert_eq!(text_outputs(&entry), vec!["a caption".to_string()]);
+    }
+
+    #[test]
+    fn a_running_prompt_is_not_text_however_much_it_has_printed() {
+        let entry = history(json!({ "9": { "text": ["partial"] } }), false);
+        assert_eq!(interpret_history(&entry), HistoryVerdict::Running);
     }
 
     #[test]

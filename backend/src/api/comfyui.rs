@@ -667,6 +667,15 @@ pub(super) async fn comfyui_enhance(
         .and_then(|s| serde_json::from_str::<StageContract>(s).ok())
     {
         contract.apply_role_corrections(&mut text_overrides);
+        // A describe stage run on its own still gets the instruction Phos
+        // composed — the names, the date, the place — unless the caller wrote
+        // one into its prompt box themselves.
+        crate::comfyui::runs::compile_describe_instruction(
+            &mut conn,
+            &payload.shot_id,
+            &contract,
+            &mut text_overrides,
+        );
     }
 
     let text_overrides_json =
@@ -790,6 +799,9 @@ struct TaskRow {
     /// FR5 has both: a lone enhance is a one-stage run.
     run_id: Option<String>,
     stage_idx: Option<i32>,
+    /// What a describe stage said. `None` on every stage that makes a file,
+    /// which is all of them but one.
+    text_output: Option<String>,
     main_file_id: Option<String>,
     /// Who the source shot belongs to, and the file the thumbnail shows.
     person_name: Option<String>,
@@ -811,6 +823,7 @@ type TaskTuple = (
     Option<String>,
     Option<String>,
     Option<i32>,
+    Option<String>,
 );
 
 fn task_tuple_to_row(
@@ -834,6 +847,7 @@ fn task_tuple_to_row(
         source_file_id: t.11,
         run_id: t.12,
         stage_idx: t.13,
+        text_output: t.14,
         main_file_id,
         person_name,
         source_name,
@@ -859,6 +873,7 @@ fn task_row_to_json(row: TaskRow) -> serde_json::Value {
         "completed_at": row.completed_at,
         "run_id": row.run_id,
         "stage_idx": row.stage_idx,
+        "text_output": row.text_output,
         "thumbnail_url": thumbnail_url,
         "person_name": row.person_name,
         "source_name": row.source_name,
@@ -886,6 +901,7 @@ fn query_tasks(
         enhancement_tasks::source_file_id,
         enhancement_tasks::run_id,
         enhancement_tasks::stage_idx,
+        enhancement_tasks::text_output,
     );
 
     // Fetch limit+1 to detect if there's a next page
@@ -1052,6 +1068,7 @@ pub(super) async fn comfyui_get_task(
             enhancement_tasks::source_file_id,
             enhancement_tasks::run_id,
             enhancement_tasks::stage_idx,
+            enhancement_tasks::text_output,
         ))
         .filter(enhancement_tasks::id.eq(&id))
         .first(&mut conn)

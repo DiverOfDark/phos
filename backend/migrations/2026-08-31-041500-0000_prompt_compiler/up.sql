@@ -1,0 +1,29 @@
+-- The prompt compiled from what Phos already knows, and the text a stage
+-- produced instead of a file.
+--
+-- Phos knows what is in every photograph — a caption, faces clustered to named
+-- people, the EXIF time and place — and until now a person retyped all of it
+-- into a prompt box for every shot. FR9 makes a *describe* stage a workflow
+-- like any other: a vision-language model runs inside ComfyUI, is handed the
+-- photograph and an instruction Phos wrote, and answers with a sentence. Two
+-- columns carry that.
+--
+-- `enhancement_tasks.text_output` is where a text-producing stage's answer
+-- lands. FR5a already modelled `produces: text`, and the point of it is that
+-- such a stage writes no `files` row at all: there is no file. The value binds
+-- into the next stage's prompt slot instead, which is one `text_overrides`
+-- entry keyed `"<node_id>.<field>"` — the same key `prepare_workflow` already
+-- substitutes on.
+--
+-- `shots.analysis_json` is the per-shot cache. A description costs a GPU
+-- round-trip; a second line over the same photograph should not pay for it
+-- again. It holds a small envelope — the raw text the describe stage returned,
+-- which workflow returned it, and when — so a reader can tell a stale
+-- description from a fresh one, and so the structured form can be re-parsed
+-- more cleverly later without another describe run.
+--
+-- Deliberately *not* `shots.description`: that column is the Florence-2
+-- library-search caption, it is what search matches on, and the prompt compiler
+-- reads it as one input among several rather than replacing it.
+ALTER TABLE enhancement_tasks ADD COLUMN text_output TEXT;
+ALTER TABLE shots ADD COLUMN analysis_json TEXT;

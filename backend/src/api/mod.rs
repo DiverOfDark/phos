@@ -1,5 +1,6 @@
 pub mod client;
 mod comfyui;
+mod describe;
 mod faces;
 mod files;
 mod line_io;
@@ -121,6 +122,8 @@ use utoipa::OpenApi;
         // Bundled templates
         templates::list_templates,
         templates::install_template,
+        describe::describe_shot,
+        describe::get_description,
         // Settings
         settings::get_webdav_settings,
         settings::set_webdav_settings,
@@ -209,6 +212,13 @@ use utoipa::OpenApi;
             crate::comfyui::templates::readiness::InputMismatch,
             crate::comfyui::templates::install::InstalledState,
             crate::comfyui::templates::install::InstalledWorkflow,
+            describe::DescribePayload,
+            describe::DescribeResponse,
+            describe::DescribeState,
+            crate::comfyui::Analysis,
+            crate::comfyui::CompiledPrompt,
+            crate::comfyui::Intent,
+            crate::comfyui::ShotFacts,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
@@ -607,6 +617,12 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/comfyui/templates/{key}/install",
             post(templates::install_template),
+        )
+        // The prompt a shot's own contents compile to.
+        .route("/api/comfyui/describe", post(describe::describe_shot))
+        .route(
+            "/api/comfyui/describe/{shot_id}",
+            get(describe::get_description),
         )
         .route("/api/version", get(stats::get_version))
         // Settings

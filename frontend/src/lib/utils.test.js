@@ -18,6 +18,10 @@ import {
   stageOf,
   readinessColor,
   installedLabel,
+  isDescribeWorkflow,
+  slotKey,
+  applyCompiledPrompt,
+  mergeConstraints,
   MAX_SAFE_SEED,
 } from "./utils.js";
 
@@ -188,4 +192,60 @@ test("a template says whether it is installed, and whether it is still ours to u
     installedLabel({ version: 1, installed: { version: 1, line_exists: false, customised: false } }),
     "LINE DELETED",
   );
+// --- FR9: the prompt is compiled, and putting it in must match the backend ---
+
+/** A generation workflow the way the list endpoint serves one. */
+const CLIP_WORKFLOW = {
+  id: "wf-gen",
+  contract: {
+    accepts: "image",
+    produces: "video",
+    slots: [
+      { name: "positive", node_id: "6", field: "text" },
+      { name: "negative", node_id: "7", field: "text" },
+    ],
+  },
+};
+
+const DESCRIBE_WORKFLOW = {
+  id: "wf-describe",
+  contract: { accepts: "image", produces: "text", slots: [{ name: "positive", node_id: "2", field: "prompt" }] },
+};
+
+test("a describe workflow is the one whose contract hands on text", () => {
+  assert.equal(isDescribeWorkflow(DESCRIBE_WORKFLOW), true);
+  assert.equal(isDescribeWorkflow(CLIP_WORKFLOW), false);
+  // A workflow imported before contracts existed says nothing, not "yes".
+  assert.equal(isDescribeWorkflow({ id: "wf-old" }), false);
+});
+
+test("a prompt slot is addressed by the key the backend substitutes on", () => {
+  assert.equal(slotKey(CLIP_WORKFLOW, "positive"), "6.text");
+  assert.equal(slotKey(CLIP_WORKFLOW, "negative"), "7.text");
+  assert.equal(slotKey(CLIP_WORKFLOW, "scene"), null);
+});
+
+test("using a compiled prompt replaces the positive and grows the negative", () => {
+  const before = { "6.text": "a leftover default", "7.text": "blurry, watermark" };
+  const after = applyCompiledPrompt(CLIP_WORKFLOW, before, {
+    positive: "Anna on a jetty at dusk.",
+    negative: "change face, add people",
+  });
+  assert.equal(after["6.text"], "Anna on a jetty at dusk.");
+  assert.equal(after["7.text"], "blurry, watermark, change face, add people");
+  // And nothing was written into the map the dialog is still holding.
+  assert.equal(before["6.text"], "a leftover default");
+});
+
+test("a constraint already in the negative prompt is not repeated", () => {
+  assert.equal(mergeConstraints("blurry, Change Face", "change face, warp hands"),
+    "blurry, Change Face, warp hands");
+  assert.equal(mergeConstraints("", "change face"), "change face");
+  assert.equal(mergeConstraints("blurry.", ""), "blurry");
+});
+
+test("a workflow with no negative slot still takes the prompt", () => {
+  const wf = { contract: { slots: [{ name: "positive", node_id: "6", field: "text" }] } };
+  const after = applyCompiledPrompt(wf, {}, { positive: "a cat.", negative: "change face" });
+  assert.deepEqual(after, { "6.text": "a cat." });
 });

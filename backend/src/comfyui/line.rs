@@ -76,6 +76,27 @@ fn human(stage_idx: i32) -> i32 {
 /// [`Accepts::admits`] and nothing else — including the case where a stage
 /// consumes nothing at all, which `admits` answers `false` to, and which reads
 /// as "that can only be the first stage of a line".
+///
+/// # A text stage is transparent
+///
+/// A describe stage makes no file: FR5a's `produces: text` writes no `files`
+/// row, and there is nothing for the stage after it to load. What flows down
+/// the line is therefore *unchanged* by it — the photograph the describe stage
+/// read is the photograph the generation stage after it reads — and its
+/// sentence binds into that stage's prompt slot instead.
+///
+/// Which is why the line the whole feature exists for validates at all:
+///
+/// ```text
+///   [1]  DESCRIBE (QWEN-VL)     image → text
+///    │   text → positive
+///   [2]  PHOTO → 5S CLIP        image + text → video
+/// ```
+///
+/// Stage 2 accepts `image`, and asking it to admit stage 1's `text` would
+/// refuse a line that is obviously correct. So each join is checked against the
+/// last stage that actually made a file, and a line of nothing but text stages
+/// leaves every join reading the run's own source.
 pub fn validate_chain(stages: &[StageTyping]) -> Result<(), LineError> {
     if stages.is_empty() {
         return Err(LineError {
@@ -84,35 +105,77 @@ pub fn validate_chain(stages: &[StageTyping]) -> Result<(), LineError> {
         });
     }
 
-    for window in stages.windows(2) {
-        let (up, down) = (&window[0], &window[1]);
-        if down.accepts.admits(up.produces) {
-            continue;
+    // The last stage that made a file, and what it made. `None` until one has:
+    // every stage until then reads the run's source, which is checked when the
+    // run starts and the shot is known.
+    let mut carried: Option<&StageTyping> = None;
+
+    for (position, down) in stages.iter().enumerate() {
+        match carried {
+            _ if position == 0 => {}
+            Some(up) if down.accepts.admits(up.produces) => {}
+            Some(up) => {
+                return Err(LineError {
+                    stage_idx: down.stage_idx,
+                    message: if down.accepts.starts_a_line() {
+                        starts_a_line_message(down)
+                    } else {
+                        format!(
+                            "Stage {} ({}) takes {}, but stage {} ({}) produces {}.",
+                            human(down.stage_idx),
+                            down.name,
+                            down.accepts.as_str(),
+                            human(up.stage_idx),
+                            up.name,
+                            up.produces.as_str()
+                        )
+                    },
+                });
+            }
+            // Only describe stages so far, so this one reads the run's source
+            // like the first stage does. Nothing to check here — except that a
+            // stage consuming nothing at all still cannot follow anything.
+            None if down.accepts.starts_a_line() => {
+                return Err(LineError {
+                    stage_idx: down.stage_idx,
+                    message: starts_a_line_message(down),
+                });
+            }
+            None => {}
         }
-        let message = if down.accepts.starts_a_line() {
-            format!(
-                "Stage {} ({}) consumes nothing, so it can only be the first stage of a line.",
-                human(down.stage_idx),
-                down.name
-            )
-        } else {
-            format!(
-                "Stage {} ({}) takes {}, but stage {} ({}) produces {}.",
-                human(down.stage_idx),
-                down.name,
-                down.accepts.as_str(),
-                human(up.stage_idx),
-                up.name,
-                up.produces.as_str()
-            )
-        };
-        return Err(LineError {
-            stage_idx: down.stage_idx,
-            message,
-        });
+
+        if down.produces != MediaType::Text {
+            carried = Some(down);
+        }
     }
 
     Ok(())
+}
+
+fn starts_a_line_message(stage: &StageTyping) -> String {
+    format!(
+        "Stage {} ({}) consumes nothing, so it can only be the first stage of a line.",
+        human(stage.stage_idx),
+        stage.name
+    )
+}
+
+/// The stages that read the run's own source rather than an upstream output.
+///
+/// Normally just the first. A line that opens with one or more describe stages
+/// has several, because none of them made a file for the next one to read, and
+/// every one of them has to fit the shot the run is against.
+pub fn source_readers(stages: &[StageTyping]) -> Vec<&StageTyping> {
+    let mut readers = Vec::new();
+    for stage in stages {
+        if reads_source(stage.accepts) {
+            readers.push(stage);
+        }
+        if stage.produces != MediaType::Text {
+            break;
+        }
+    }
+    readers
 }
 
 /// Does this stage read the run's source at all?
@@ -431,6 +494,80 @@ mod tests {
             stage(1, "Text to Image", Accepts::None, MediaType::Image),
         ])
         .unwrap_err();
+        assert_eq!(err.stage_idx, 1);
+        assert!(
+            err.message.contains("only be the first stage"),
+            "{}",
+            err.message
+        );
+    }
+
+    // === FR9 — a describe stage is transparent to the media flow ============
+
+    /// The line the whole prompt compiler exists for.
+    fn describe_then_clip() -> Vec<StageTyping> {
+        vec![
+            stage(0, "Describe", Accepts::Image, MediaType::Text),
+            stage(1, "Photo to clip", Accepts::Image, MediaType::Video),
+        ]
+    }
+
+    #[test]
+    fn a_describe_stage_does_not_break_the_chain_after_it() {
+        // Stage 2 takes an image and stage 1 produced text, and yet this line
+        // is obviously correct: a describe stage makes no file, so the
+        // photograph it read is the photograph the stage after it reads.
+        assert_eq!(validate_chain(&describe_then_clip()), Ok(()));
+    }
+
+    #[test]
+    fn a_join_is_checked_against_the_last_stage_that_made_a_file() {
+        let line = vec![
+            stage(0, "Image to Video", Accepts::Image, MediaType::Video),
+            stage(1, "Describe", Accepts::Video, MediaType::Text),
+            stage(2, "Upscale", Accepts::Image, MediaType::Image),
+        ];
+        let err = validate_chain(&line).unwrap_err();
+        assert_eq!(err.stage_idx, 2);
+        // Stage 2 made nothing, so stage 1 is what stage 3 is refused against.
+        assert_eq!(
+            err.message,
+            "Stage 3 (Upscale) takes image, but stage 1 (Image to Video) produces video."
+        );
+    }
+
+    #[test]
+    fn every_stage_before_the_first_file_reads_the_shot() {
+        let line = describe_then_clip();
+        assert_eq!(
+            source_readers(&line).len(),
+            2,
+            "both stages read the photograph itself"
+        );
+        // And once something has made a file, nothing after it does.
+        let line = restore_4k();
+        let readers = source_readers(&line);
+        assert_eq!(readers.len(), 1);
+        assert_eq!(readers[0].stage_idx, 0);
+    }
+
+    #[test]
+    fn a_shot_the_describe_stage_cannot_read_is_still_refused() {
+        // The describe stage takes a still; so does the clip stage after it.
+        // A video shot fits neither, and both say so.
+        let line = describe_then_clip();
+        for reader in source_readers(&line) {
+            assert!(admits_source(reader, MediaType::Video).is_err());
+        }
+    }
+
+    #[test]
+    fn a_stage_that_consumes_nothing_cannot_hide_behind_a_describe_stage() {
+        let line = vec![
+            stage(0, "Describe", Accepts::Image, MediaType::Text),
+            stage(1, "Text to Image", Accepts::None, MediaType::Image),
+        ];
+        let err = validate_chain(&line).unwrap_err();
         assert_eq!(err.stage_idx, 1);
         assert!(
             err.message.contains("only be the first stage"),

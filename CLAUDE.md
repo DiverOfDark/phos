@@ -58,7 +58,7 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
-- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `line.rs` (whether a chain of them holds together, what happens after a stage lands, and whether a run is over) and `portable/` (a line as a file, and what it needs installed) take values in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `api/line_io.rs` and `worker/` hold the DB writes and the background loop; `templates/` holds the five bundled lines a fresh install ships with. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
+- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what happens after a stage lands, and whether a run is over) and `portable/` (a line as a file, and what it needs installed) take values in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `api/line_io.rs` and `worker/` hold the DB writes and the background loop; `templates/` holds the five bundled lines a fresh install ships with. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
 
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
@@ -152,8 +152,33 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   begins a line rather than continuing one), `produces` (image / video / text), which loader fills
   which slot, the prompt slots a person or a describe stage writes into, and the canonical settings
   (seed, steps, cfg, frames…) with the node's own ranges. It is what lets one workflow be chained
-  after another. `text` is modelled although nothing produces it yet — a describe stage creates no
-  file at all, and a type system that learns that later has to be reshaped later
+  after another. `text` is not a degenerate image: a describe stage creates no `files` row at all,
+  its answer lands on `enhancement_tasks.text_output`, and it binds into the next stage's prompt
+- **The prompt is compiled from the library, not retyped.** A *describe* stage is a workflow like
+  any other — a vision-language model running inside ComfyUI, editable there like every other graph;
+  there is no second service, no `PHOS_LLM_URL` and no LLM client in this tree. Phos writes its
+  **instruction** (`comfyui/prompt/`): the person names clustering found, the EXIF date and place,
+  the Florence-2 caption, the user's one-line intent, the style preset and the stage's `do_not`
+  constraints. The model supplies the looking; Phos supplies the knowing. It answers with
+  `{subject, setting, lighting, camera, motion_affordance, do_not}`, and that compiles to a positive
+  prompt and a negative one — constraints never reach the positive prompt, because "do not add
+  people" in a positive prompt adds people. Everything but the two DB reads is a pure function, so
+  the wording, the parsing and the binding are tested with no ComfyUI and no GPU
+- **A text stage is transparent to the media flowing down a line.** `describe → generate` type-checks
+  because the describe stage made no file: the photograph it read is the photograph the stage after
+  it reads, so a join is validated against the last stage that actually produced one and the
+  continuation inherits its parent's `source_file_id`. The sentence goes in as **one `text_overrides`
+  entry** — `StageContract::slot("positive").override_key()` is exactly the `"<node_id>.<field>"` key
+  `prepare_workflow` already substitutes on, so binding a description needed no new plumbing at all
+- **A description is paid for once per shot.** `shots.analysis_json` caches what a describe stage
+  said (with which workflow, and when), and `dispatch` completes a describe task straight from it —
+  no upload, no queued prompt, no GPU. A run that wants a fresh look sets the `phos:refresh`
+  directive. The compiler's directives (`phos:intent`, `phos:style`, `phos:do_not`, `phos:slot`,
+  `phos:refresh`) ride in `text_overrides` beside the `role:<node>` ones, so they are already stored
+  on the stage, stored on the task, exported with a line and read by both the dispatch path and the
+  advance pass. A stage inherits anything it did not say from the describe stage that fed it
+- **Florence-2 stays where it is.** `shots.description` is the library-search caption and the prompt
+  compiler *reads* it as one input among several. It is never the prompt, and nothing here writes it
 - **A contract is derived, then corrected — never the other way round.** The derivation is
   heuristic and *will* be wrong on an unusual graph, so `contract_json` stores the corrections a
   person made alongside the derived answer, and `StageContract::derive_with` folds them back into
@@ -203,6 +228,7 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `POST /api/comfyui/lines/import?dry_run=&name=` — Read a bundle back. `dry_run` writes nothing and answers with the requirements report alone
 - `GET /api/comfyui/templates` — The bundled templates, what this library has of each, and whether this ComfyUI has the nodes and models to run it. Readiness is `unchecked` — never `missing` — when the node catalogue cannot be read
 - `POST /api/comfyui/templates/{key}/install` — Write a template's workflows and line into the library. Installing one that is already installed gives a *fresh copy* and leaves the existing rows alone; they may have been edited, and they are the user's
+- `POST /api/comfyui/describe` — Describe one shot and compile a prompt from it, together with the person names, EXIF and caption the library already holds. Answers instantly from `shots.analysis_json` unless `refresh` is set; otherwise queues a one-stage describe run. `GET /api/comfyui/describe/{shot_id}` polls it, and re-compiles for a different `intent`/`style`/`do_not` without describing the photograph again
 - `GET /api/client/version` — Bundled Android APK metadata for the in-app updater (no auth)
 
 ## AI Models
