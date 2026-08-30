@@ -11,10 +11,15 @@
 //!   `awaiting_output`, to `completed` — or to `failed`, but only once the
 //!   settle budget is spent and a retry could not help.
 //!
+//! It also carries the one piece of housekeeping that needs both a database and
+//! a ComfyUI: [`contracts`] works out what each stored workflow accepts and
+//! produces, for the rows imported before Phos asked that question.
+//!
 //! The decisions both paths make are pure functions in [`super::policy`] and
 //! [`super::history`]; what is left here is the IO around them.
 
 mod complete;
+mod contracts;
 mod dispatch;
 mod status;
 mod store;
@@ -28,6 +33,10 @@ use diesel::sqlite::SqliteConnection;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
+
+/// How many three-second ticks between attempts to finish deriving contracts.
+/// Five minutes: the only thing that changes the answer is ComfyUI coming back.
+const CONTRACT_RETRY_TICKS: u64 = 100;
 
 /// Spawn the enhancement worker. Returns a JoinHandle.
 /// Follows the scanner.rs pattern: uses `spawn_blocking` with its own DB connection.
@@ -51,12 +60,26 @@ pub fn spawn_enhancement_worker(
         // Recover tasks that were mid-processing when we last shut down
         recover_interrupted_tasks(&mut conn);
 
+        // Work out what the stored workflows accept and produce. A server that
+        // is down right now leaves some of them under-typed, so keep asking on
+        // a slow cadence rather than waiting for the next restart.
+        let mut contracts_settled = contracts::backfill_contracts(&mut conn, &client);
+        let mut contracts_due_in = CONTRACT_RETRY_TICKS;
+
         let (lock, cvar) = &*shutdown;
         loop {
             // Check shutdown
             if *lock.lock().unwrap() {
                 info!("ComfyUI worker shutting down");
                 break;
+            }
+
+            if !contracts_settled {
+                contracts_due_in -= 1;
+                if contracts_due_in == 0 {
+                    contracts_due_in = CONTRACT_RETRY_TICKS;
+                    contracts_settled = contracts::backfill_contracts(&mut conn, &client);
+                }
             }
 
             dispatch::process_pending_tasks(&mut conn, &client, &library_root);
