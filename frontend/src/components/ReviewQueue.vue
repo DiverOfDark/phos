@@ -768,6 +768,7 @@ defineExpose({ loadData: fetchShots })
           >
             <img :src="`/api/files/${file.id}/thumbnail`" class="w-full h-full object-cover" loading="lazy" />
             <span v-if="file.is_original" class="absolute top-1 left-1 w-1.5 h-1.5 rounded-full bg-signal"></span>
+            <span v-if="file.synthetic" class="absolute bottom-0.5 left-1 font-mono text-[9px] tracking-[0.08em] text-ink-tertiary">GEN</span>
             <span v-if="splitSelection.has(file.id)" class="absolute top-0.5 right-1 font-mono text-[11px] text-signal">✓</span>
           </button>
           <div class="flex-1"></div>
@@ -900,6 +901,12 @@ defineExpose({ loadData: fetchShots })
                 >✓</button>
                 <span class="flex-1 font-mono text-xs text-ink-secondary truncate">{{ baseName(file.path) }}</span>
                 <span v-if="file.mime_type?.startsWith('video/')" class="font-mono text-[10px] tracking-[0.08em] text-building">VID</span>
+                <!-- An attribute of the file, not a status: the label register, no colour. -->
+                <span
+                  v-if="file.synthetic"
+                  class="font-mono text-[10px] tracking-[0.08em] text-ink-tertiary border border-line rounded-sm px-1"
+                  title="Made by a workflow, not a camera. Kept out of face recognition."
+                >GENERATED</span>
                 <span
                   v-if="file.is_original"
                   class="font-mono text-[10px] tracking-[0.08em] text-signal border rounded-sm px-1"
