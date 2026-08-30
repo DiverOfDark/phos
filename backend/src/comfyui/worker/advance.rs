@@ -2064,6 +2064,21 @@ mod tests {
         park(&mut lib, &run);
         assert_eq!(lib.run_status(&run.run_id).0, "held");
 
+        // The data-loss bug the pass's order exists to prevent, in the shape a
+        // hold gives it. Every task of this run has completed, so a settle that
+        // did not know about the hold would call it *finished* — and the sweep
+        // that follows a finished run would delete the stage-1 clip that the
+        // upscale a person is about to ask for reads. It is still there.
+        let feeds_the_takes: String = enhancement_tasks::table
+            .filter(enhancement_tasks::id.eq(&run.task_ids[0]))
+            .select(enhancement_tasks::output_file_id.assume_not_null())
+            .first(&mut lib.conn)
+            .unwrap();
+        assert!(
+            lib.file_exists(&feeds_the_takes),
+            "a held run is not settled, so nothing sweeps what its next stage will read"
+        );
+
         // The process comes back. Recovery touches tasks by status, and a held
         // run's are all completed, so it has nothing to say about them.
         super::super::recover_interrupted_tasks(&mut lib.conn);
@@ -2231,6 +2246,69 @@ mod tests {
 
         lib.verdict(&run.run_id, Verdict::Cancel, &[]);
         assert_eq!(lib.run_status(&run.run_id).0, "cancelled");
+    }
+
+    #[test]
+    fn a_held_row_with_no_stage_on_it_is_still_stoppable() {
+        // The fall-through in the API's cancel handler, at the level the
+        // handler decides on. Cancelling a held run goes through the hold's own
+        // Cancel verdict, so an abandoned hold is recorded like every other;
+        // but if the run turns out not to be holding anything the handler must
+        // go on to the ordinary cancel rather than refusing, because stopping a
+        // run is the one thing that has to work in every state.
+        //
+        // Nothing writes this row: `park_run` and `release` set the status and
+        // the stage together, and the verdict's writes are one transaction. A
+        // hand on the database can, which is the whole reason the branch exists.
+        let (mut lib, run) = extend_then_upscale();
+        park(&mut lib, &run);
+        lib.sql("UPDATE runs SET held_at_stage = NULL;");
+
+        // Still `held`, so the handler tries the verdict — and gets back the
+        // one error that means "go on", rather than a refusal to report.
+        assert_eq!(lib.run_status(&run.run_id).0, "held");
+        assert!(
+            lib.hold(&run.run_id).is_none(),
+            "a held row with no stage is holding nothing, and says so"
+        );
+        let root = lib.dir.path().to_path_buf();
+        let err = crate::comfyui::holds::give_verdict(
+            &mut lib.conn,
+            &root,
+            &run.run_id,
+            Verdict::Cancel,
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::comfyui::holds::HoldError::NotHeld),
+            "{}",
+            err
+        );
+        assert!(
+            lib.verdict_rows().is_empty(),
+            "and it recorded no verdict on the way out"
+        );
+
+        // The ordinary cancel finishes the job, and takes the stale marker with
+        // it: a cancelled run is holding nothing.
+        crate::comfyui::cancel_run(&mut lib.conn, &run.run_id).unwrap();
+        assert_eq!(lib.run_status(&run.run_id).0, "cancelled");
+        assert_eq!(
+            runs::table
+                .filter(runs::id.eq(&run.run_id))
+                .select(runs::held_at_stage)
+                .first::<Option<i32>>(&mut lib.conn)
+                .unwrap(),
+            None
+        );
+
+        // And it stays stopped: the advance pass reads running runs only, so
+        // nothing re-parks it and nothing upscales its takes.
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "cancelled");
+        assert_eq!(lib.pending_at(2), Vec::<String>::new());
     }
 
     #[test]
