@@ -62,12 +62,12 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
-- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what happens after a stage lands, and whether a run is over) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `api/line_io.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
+- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what happens after a stage lands, and whether a run is over) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `templates/` holds the five bundled lines a fresh install ships with; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `api/line_io.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
 
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
 - **`components/ReviewDesk.vue`** — One screen, three lanes (`?lane=` → shots / duplicates / faces); `/variations` redirects into it
-- **`components/WorkflowsPage.vue`** — Three tabs: workflows, lines, and a queue that is a schedule
+- **`components/WorkflowsPage.vue`** — Four tabs: templates, workflows, lines, and a queue that is a schedule
   board of **runs** — one row per run saying `STAGE 2/4 · UPSCALE · 00:03:12`, with the tasks
   underneath one click away. A four-stage run as four unrelated rows is what it replaced
 - **`components/SettingsPage.vue`** — Settings as a route (library path, WebDAV, S3, dedupe maintenance, APK)
@@ -113,6 +113,26 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   `line_stages.keep_output` overrides that per stage, and the last stage's output is the product and
   is always kept. `keeps_output` is a function of a `StageDisposition` rather than a column read,
   because FR5c adds a third case (a stage feeding a hold point always keeps)
+- **A bundled template is an exported line, and stops being Phos's the moment you edit it.** The
+  five in `backend/src/comfyui/templates/bundles/` are `phos.line` documents — line, workflow
+  graphs, contracts, requirements — with one additive `template` block carrying a key and a
+  version. They are seeded into every library at startup, into the ordinary `comfyui_workflows` /
+  `production_lines` / `line_stages` tables, so a seeded line is exactly as editable, runnable and
+  deletable as a hand-drawn one. Each seeded graph carries a `_phos` block holding a **hash of the
+  graph exactly as shipped**; on upgrade it is rehashed, and a match means untouched (the new
+  version is written over it) while a difference means the user edited it (the block is dropped and
+  no later upgrade ever looks again). The hash is the mechanism — nothing depends on an editor
+  clearing a flag. `bundled_templates` is only the *claim* on a key: which templates this library
+  has seen, at what version, and which rows they wrote, so an abandoned template is not re-seeded
+  as a duplicate. `_phos` is not a node, so `prepare_workflow` strips it — the single funnel every
+  dispatch goes through
+- **A template says what is missing before it is run, never at dispatch.** `templates/readiness.rs`
+  asks `/object_info` — the only description of a ComfyUI that comes from the ComfyUI — and answers
+  `READY` / `MISSING NODE RIFE VFI` / `MISSING MODEL wan2.1_i2v_720p.safetensors`, plus a check
+  FR5d has no reason to make: whether each graph's fields match what *this* server's copy of each
+  node declares, which is how a graph written against another release of a node pack is caught
+  before a run rather than by one. A catalogue that could not be read is `unchecked`, never
+  `missing`, and never a refusal
 - **A line is rejected when it is drawn.** Every join is checked with `Accepts::admits` — the same
   function FR5b's stage picker will call, so the editor and the validator cannot disagree — on
   `POST`/`PUT`, again on every read, again when a run starts (with the shot's own type), and once
@@ -215,6 +235,8 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `GET /api/comfyui/lines/{id}/export` — The line as one portable JSON bundle: stages, **the workflow graph behind each one**, the derived contracts, and a manifest of the node classes and model files it needs
 - `POST /api/comfyui/lines/import?dry_run=&name=` — Read a bundle back. `dry_run` writes nothing and answers with the requirements report alone
 - `POST /api/comfyui/describe` — Describe one shot and compile a prompt from it, together with the person names, EXIF and caption the library already holds. Answers instantly from `shots.analysis_json` unless `refresh` is set; otherwise queues a one-stage describe run. `GET /api/comfyui/describe/{shot_id}` polls it, and re-compiles for a different `intent`/`style`/`do_not` without describing the photograph again
+- `GET /api/comfyui/templates` — The bundled templates, what this library has of each, and whether this ComfyUI has the nodes and models to run it. Readiness is `unchecked` — never `missing` — when the node catalogue cannot be read
+- `POST /api/comfyui/templates/{key}/install` — Write a template's workflows and line into the library. Installing one that is already installed gives a *fresh copy* and leaves the existing rows alone; they may have been edited, and they are the user's
 - `GET /api/client/version` — Bundled Android APK metadata for the in-app updater (no auth)
 
 ## AI Models

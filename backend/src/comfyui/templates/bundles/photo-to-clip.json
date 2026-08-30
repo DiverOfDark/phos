@@ -1,0 +1,266 @@
+{
+  "format": "phos.line",
+  "format_version": 1,
+  "template": {
+    "key": "photo-to-clip",
+    "version": 1,
+    "confidence": "unverified",
+    "summary": "A still photograph becomes five seconds of 720p motion (Wan 2.1 image-to-video).",
+    "notes": "Built from published node definitions, not exported from a running server. 81 frames at 16 fps is 5.06s at 1280x720. Needs the Wan 2.1 I2V 720p weights, the umt5 text encoder, the Wan VAE and CLIP-Vision H, plus ComfyUI-VideoHelperSuite for the video writer."
+  },
+  "line": {
+    "name": "Photo to 5s clip",
+    "description": "One stage: a photograph in, five seconds of 720p video out.",
+    "stages": [
+      {
+        "workflow": "wan-i2v",
+        "keep_output": true
+      }
+    ]
+  },
+  "workflows": {
+    "wan-i2v": {
+      "name": "Photo to clip (Wan 2.1 I2V 720p)",
+      "description": "A photograph as the first frame, 81 frames at 16 fps written out as h264 mp4.",
+      "graph": {
+        "1": {
+          "class_type": "UNETLoader",
+          "_meta": {
+            "title": "Wan 2.1 I2V 720p"
+          },
+          "inputs": {
+            "unet_name": "wan2.1_i2v_720p_14B_fp8_scaled.safetensors",
+            "weight_dtype": "default"
+          }
+        },
+        "2": {
+          "class_type": "CLIPLoader",
+          "_meta": {
+            "title": "Text encoder"
+          },
+          "inputs": {
+            "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+            "type": "wan"
+          }
+        },
+        "3": {
+          "class_type": "VAELoader",
+          "_meta": {
+            "title": "Wan VAE"
+          },
+          "inputs": {
+            "vae_name": "wan_2.1_vae.safetensors"
+          }
+        },
+        "4": {
+          "class_type": "CLIPVisionLoader",
+          "_meta": {
+            "title": "CLIP Vision"
+          },
+          "inputs": {
+            "clip_name": "clip_vision_h.safetensors"
+          }
+        },
+        "5": {
+          "class_type": "LoadImage",
+          "_meta": {
+            "title": "Start frame"
+          },
+          "inputs": {
+            "image": "phos-source.png"
+          }
+        },
+        "6": {
+          "class_type": "CLIPVisionEncode",
+          "_meta": {
+            "title": "Encode the start frame"
+          },
+          "inputs": {
+            "clip_vision": [
+              "4",
+              0
+            ],
+            "image": [
+              "5",
+              0
+            ],
+            "crop": "none"
+          }
+        },
+        "7": {
+          "class_type": "CLIPTextEncode",
+          "_meta": {
+            "title": "Positive prompt"
+          },
+          "inputs": {
+            "clip": [
+              "2",
+              0
+            ],
+            "text": "gentle natural camera movement, the scene comes alive, cinematic lighting, sharp focus"
+          }
+        },
+        "8": {
+          "class_type": "CLIPTextEncode",
+          "_meta": {
+            "title": "Negative prompt"
+          },
+          "inputs": {
+            "clip": [
+              "2",
+              0
+            ],
+            "text": "static, blurry, low quality, distorted faces, extra limbs, watermark, text overlay"
+          }
+        },
+        "9": {
+          "class_type": "WanImageToVideo",
+          "_meta": {
+            "title": "Image to video"
+          },
+          "inputs": {
+            "positive": [
+              "7",
+              0
+            ],
+            "negative": [
+              "8",
+              0
+            ],
+            "vae": [
+              "3",
+              0
+            ],
+            "clip_vision_output": [
+              "6",
+              0
+            ],
+            "start_image": [
+              "5",
+              0
+            ],
+            "width": 1280,
+            "height": 720,
+            "length": 81,
+            "batch_size": 1
+          }
+        },
+        "10": {
+          "class_type": "ModelSamplingSD3",
+          "_meta": {
+            "title": "Sampling shift"
+          },
+          "inputs": {
+            "model": [
+              "1",
+              0
+            ],
+            "shift": 8.0
+          }
+        },
+        "11": {
+          "class_type": "KSampler",
+          "_meta": {
+            "title": "Sample"
+          },
+          "inputs": {
+            "model": [
+              "10",
+              0
+            ],
+            "positive": [
+              "9",
+              0
+            ],
+            "negative": [
+              "9",
+              1
+            ],
+            "latent_image": [
+              "9",
+              2
+            ],
+            "seed": 0,
+            "steps": 20,
+            "cfg": 6.0,
+            "sampler_name": "uni_pc",
+            "scheduler": "simple",
+            "denoise": 1.0
+          }
+        },
+        "12": {
+          "class_type": "VAEDecode",
+          "_meta": {
+            "title": "Decode"
+          },
+          "inputs": {
+            "samples": [
+              "11",
+              0
+            ],
+            "vae": [
+              "3",
+              0
+            ]
+          }
+        },
+        "13": {
+          "class_type": "VHS_VideoCombine",
+          "_meta": {
+            "title": "Write the clip"
+          },
+          "inputs": {
+            "images": [
+              "12",
+              0
+            ],
+            "frame_rate": 16,
+            "loop_count": 0,
+            "filename_prefix": "phos/photo-to-clip",
+            "format": "video/h264-mp4",
+            "pingpong": false,
+            "save_output": true
+          }
+        }
+      }
+    }
+  },
+  "requirements": {
+    "node_classes": [
+      "CLIPLoader",
+      "CLIPTextEncode",
+      "CLIPVisionEncode",
+      "CLIPVisionLoader",
+      "KSampler",
+      "LoadImage",
+      "ModelSamplingSD3",
+      "UNETLoader",
+      "VAEDecode",
+      "VAELoader",
+      "VHS_VideoCombine",
+      "WanImageToVideo"
+    ],
+    "models": [
+      {
+        "class_type": "CLIPLoader",
+        "field": "clip_name",
+        "name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+      },
+      {
+        "class_type": "CLIPVisionLoader",
+        "field": "clip_name",
+        "name": "clip_vision_h.safetensors"
+      },
+      {
+        "class_type": "UNETLoader",
+        "field": "unet_name",
+        "name": "wan2.1_i2v_720p_14B_fp8_scaled.safetensors"
+      },
+      {
+        "class_type": "VAELoader",
+        "field": "vae_name",
+        "name": "wan_2.1_vae.safetensors"
+      }
+    ]
+  }
+}

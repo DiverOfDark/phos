@@ -179,6 +179,11 @@ async fn run_server() {
     let pool = db::establish_pool(&db_path).expect("Failed to create connection pool");
     db::run_migrations(&pool).expect("Failed to run Diesel migrations");
 
+    // The five bundled lines, seeded on first run and brought up to date on
+    // every one after. Deliberately not gated on ComfyUI being configured: a
+    // library that gains a ComfyUI next week should already have them.
+    comfyui::templates::seed_pool(&pool, "library");
+
     // Shutdown coordination: a condvar that the blocking background task
     // can wait on, and the signal handler sets.
     let shutdown_flag = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));

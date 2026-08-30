@@ -1,0 +1,94 @@
+{
+  "format": "phos.line",
+  "format_version": 1,
+  "template": {
+    "key": "interpolate-60fps",
+    "version": 1,
+    "confidence": "unverified",
+    "summary": "RIFE invents the frames between the frames: 30 fps in, 60 fps out.",
+    "notes": "Needs ComfyUI-Frame-Interpolation (the 'RIFE VFI' node, class name has a space in it) and ComfyUI-VideoHelperSuite. The source is resampled to 30 fps on load and doubled, so the answer is exactly 60 fps whatever the input rate was."
+  },
+  "line": {
+    "name": "Interpolate to 60fps",
+    "description": "One stage: a clip in, the same clip at sixty frames a second.",
+    "stages": [
+      {
+        "workflow": "rife-60fps",
+        "keep_output": true
+      }
+    ]
+  },
+  "workflows": {
+    "rife-60fps": {
+      "name": "Interpolate to 60fps (RIFE)",
+      "description": "VHS_LoadVideo at 30 fps -> RIFE VFI x2 -> VHS_VideoCombine at 60 fps.",
+      "graph": {
+        "1": {
+          "class_type": "VHS_LoadVideo",
+          "_meta": {
+            "title": "Source clip"
+          },
+          "inputs": {
+            "video": "phos-source.mp4",
+            "force_rate": 30,
+            "custom_width": 0,
+            "custom_height": 0,
+            "frame_load_cap": 0,
+            "skip_first_frames": 0,
+            "select_every_nth": 1
+          }
+        },
+        "2": {
+          "class_type": "RIFE VFI",
+          "_meta": {
+            "title": "Interpolate x2"
+          },
+          "inputs": {
+            "frames": [
+              "1",
+              0
+            ],
+            "ckpt_name": "rife47.pth",
+            "clear_cache_after_n_frames": 10,
+            "multiplier": 2,
+            "fast_mode": true,
+            "ensemble": true,
+            "scale_factor": 1.0
+          }
+        },
+        "3": {
+          "class_type": "VHS_VideoCombine",
+          "_meta": {
+            "title": "Write the clip"
+          },
+          "inputs": {
+            "images": [
+              "2",
+              0
+            ],
+            "frame_rate": 60,
+            "loop_count": 0,
+            "filename_prefix": "phos/interpolate-60fps",
+            "format": "video/h264-mp4",
+            "pingpong": false,
+            "save_output": true
+          }
+        }
+      }
+    }
+  },
+  "requirements": {
+    "node_classes": [
+      "RIFE VFI",
+      "VHS_LoadVideo",
+      "VHS_VideoCombine"
+    ],
+    "models": [
+      {
+        "class_type": "RIFE VFI",
+        "field": "ckpt_name",
+        "name": "rife47.pth"
+      }
+    ]
+  }
+}
