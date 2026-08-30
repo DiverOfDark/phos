@@ -1,14 +1,21 @@
 //! `pending` → `uploading` → `queued`.
 //!
-//! Read the shot's source image, push it to ComfyUI, rewrite the graph for this
-//! run, and queue the prompt. Every step that can fail is tagged with a
+//! Read the shot's source, push it to ComfyUI, rewrite the graph for this run,
+//! and queue the prompt. Every step that can fail is tagged with a
 //! [`FailureSite`] so [`super::complete::handle_failure`] can tell a dropped
 //! connection (worth another go) from a graph ComfyUI refuses (never is).
+//!
+//! The graph is parsed *before* the source is read, because what the graph can
+//! load is what decides the source's shape: a workflow with a video loader gets
+//! the clip, one with only image loaders gets a frame of it.
 
 use super::status::{handle_failure, live_task};
 use crate::comfyui::client::ComfyUiClient;
+use crate::comfyui::loaders::{
+    role_directives, takes_video, LoaderKind, SourceBinding, SourceRole,
+};
 use crate::comfyui::policy::FailureSite;
-use crate::comfyui::source::get_source_image;
+use crate::comfyui::source::{read_source, resolve_source_file, SourceMode};
 use crate::comfyui::timestamp::format_ts;
 use crate::comfyui::workflow::{fresh_attempt_id, output_prefix_for_task, prepare_workflow};
 use crate::schema::{comfyui_workflows, enhancement_tasks};
@@ -25,10 +32,19 @@ struct PendingTask {
     workflow_json: String,
     text_overrides: String,
     source_file_id: Option<String>,
+    source_mode: Option<String>,
     retry_count: i32,
 }
 
-type PendingRow = (String, String, String, String, Option<String>, i32);
+type PendingRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i32,
+);
 
 /// A step that failed, tagged with where it failed. The site is what decides
 /// whether trying again could possibly help.
@@ -77,6 +93,7 @@ pub(super) fn process_pending_tasks(
                 "COALESCE(enhancement_tasks.text_overrides, '{}')",
             ),
             enhancement_tasks::source_file_id,
+            enhancement_tasks::source_mode,
             diesel::dsl::sql::<diesel::sql_types::Integer>(
                 "COALESCE(enhancement_tasks.retry_count, 0)",
             ),
@@ -97,7 +114,8 @@ pub(super) fn process_pending_tasks(
             workflow_json: row.2,
             text_overrides: row.3,
             source_file_id: row.4,
-            retry_count: row.5,
+            source_mode: row.5,
+            retry_count: row.6,
         };
         if let Err(failure) = dispatch_one(conn, client, library_root, &task, &now) {
             handle_failure(
@@ -134,32 +152,53 @@ fn dispatch_one(
         return Ok(());
     }
 
-    // 1. Get source image (use specific file if provided, otherwise original)
-    let (image_data, upload_name) = get_source_image(
+    // 1. Parse the workflow first: what the graph can load decides what the
+    // source step should hand it.
+    let workflow: Value = serde_json::from_str(&task.workflow_json)
+        .map_err(|e| StepFailure::new(FailureSite::WorkflowJson, "Invalid workflow JSON", e))?;
+    let text_overrides: std::collections::HashMap<String, String> =
+        serde_json::from_str(&task.text_overrides).unwrap_or_default();
+
+    // 2. Read the source in whatever shape this run asked for: a frame of the
+    // video, or the video itself.
+    let source = resolve_source_file(
         conn,
         &task.shot_id,
         task.source_file_id.as_deref(),
         library_root,
     )
-    .map_err(|e| {
+    .map_err(|e| StepFailure::new(FailureSite::SourceImage, "Source file lookup failed", e))?;
+    let mode = SourceMode::resolve(
+        task.source_mode.as_deref(),
+        takes_video(&workflow),
+        source.is_video(),
+    );
+    let upload = read_source(conn, &source, mode).map_err(|e| {
         StepFailure::new(
             FailureSite::SourceImage,
-            "Source image extraction failed",
+            &format!("Source extraction failed ({})", mode),
             e,
         )
     })?;
 
-    // 2. Upload to ComfyUI
+    // 3. Upload to ComfyUI
     let uploaded_name = client
-        .upload_image(&upload_name, &image_data)
+        .upload_file(&upload.filename, &upload.content_type, &upload.bytes)
         .map_err(|e| StepFailure::new(FailureSite::Upload, "Upload failed", e))?;
 
-    // 3. Parse workflow and prepare
-    let workflow: Value = serde_json::from_str(&task.workflow_json)
-        .map_err(|e| StepFailure::new(FailureSite::WorkflowJson, "Invalid workflow JSON", e))?;
-
-    let text_overrides: std::collections::HashMap<String, String> =
-        serde_json::from_str(&task.text_overrides).unwrap_or_default();
+    // 4. Bind the upload to the loader nodes it belongs in. Writing it into
+    // every loader is what made a start-frame/end-frame workflow impossible.
+    let (target_role, role_overrides) = role_directives(&text_overrides);
+    let binding = SourceBinding {
+        uploaded_filename: &uploaded_name,
+        kind: if mode == SourceMode::WholeVideo {
+            LoaderKind::Video
+        } else {
+            LoaderKind::Image
+        },
+        role: target_role.unwrap_or(SourceRole::Start),
+        role_overrides: &role_overrides,
+    };
 
     // Pin the output names before the run starts, and record the prefix so a
     // later poll can find the files even if history never mentions them. The
@@ -167,19 +206,14 @@ fn dispatch_one(
     // advances the counter for the next one, so a reused prefix would let the
     // by-name probe import the stale first result.
     let output_prefix = output_prefix_for_task(&task.id, &fresh_attempt_id());
-    let prepared = prepare_workflow(
-        &workflow,
-        &uploaded_name,
-        &text_overrides,
-        Some(&output_prefix),
-    );
+    let prepared = prepare_workflow(&workflow, &binding, &text_overrides, Some(&output_prefix));
 
-    // 4. Queue prompt
+    // 5. Queue prompt
     let prompt_id = client
         .queue_prompt(&prepared)
         .map_err(|e| StepFailure::new(FailureSite::Queue, "Queue failed", e))?;
 
-    // 5. Set queued with comfyui_prompt_id. If the task was cancelled while we
+    // 6. Set queued with comfyui_prompt_id. If the task was cancelled while we
     // were uploading, the row refuses the write — and the prompt we just queued
     // is one nobody will ever poll, so take it back off ComfyUI's queue.
     let still_ours = diesel::update(live_task(&task.id))

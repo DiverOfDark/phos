@@ -281,6 +281,7 @@ impl Library {
                 workflow_id,
                 text_overrides: Some(&overrides),
                 source_file_id: None,
+                source_mode: None,
             })
             .execute(&mut self.conn())
             .unwrap();
