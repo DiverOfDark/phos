@@ -31,7 +31,7 @@ use utoipa::ToSchema;
 
 use crate::comfyui::line::{self, RunState};
 use crate::comfyui::runs::{contract_of, StageRow, SuppliedByStage};
-use crate::comfyui::{MediaType, ParameterMap, StageTyping, VaryMap};
+use crate::comfyui::{ParameterMap, StageTyping, VaryMap};
 use crate::models::{NewLineStage, NewProductionLine};
 use crate::schema::{
     comfyui_workflows, enhancement_tasks, files, line_stages, people, production_lines, runs, shots,
@@ -163,18 +163,19 @@ pub(super) fn draft_stages_json(
     specs: &[(&str, Option<&str>)],
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::with_capacity(specs.len());
-    let mut above: Vec<MediaType> = Vec::with_capacity(specs.len());
+    let mut above: Vec<StageTyping> = Vec::with_capacity(specs.len());
     for (idx, (workflow_id, source_mode)) in specs.iter().enumerate() {
-        let row: Option<(Option<String>, String)> = comfyui_workflows::table
+        let row: Option<(String, Option<String>, String)> = comfyui_workflows::table
             .filter(comfyui_workflows::id.eq(workflow_id))
             .select((
+                comfyui_workflows::name,
                 comfyui_workflows::contract_json,
                 comfyui_workflows::workflow_json,
             ))
             .first(conn)
             .optional()
             .unwrap_or(None);
-        let Some((contract_json, workflow_json)) = row else {
+        let Some((name, contract_json, workflow_json)) = row else {
             // A stage naming a workflow this library does not have. The
             // refusal says so; there is nothing to draw for it, and nothing is
             // known about what it would have handed on.
@@ -184,14 +185,28 @@ pub(super) fn draft_stages_json(
         };
         let contract = contract_of(contract_json.as_deref(), &workflow_json);
         let takes_video = graph_takes_video(&workflow_json);
-        let handoff = crate::comfyui::editor::carried_into(&above).map(|carries| {
-            let h = crate::comfyui::editor::handoff(carries, &contract, takes_video, *source_mode);
+        above.push(StageTyping {
+            stage_idx: idx as i32,
+            name,
+            accepts: contract.accepts,
+            produces: contract.produces,
+            source_mode: source_mode.map(str::to_string),
+            takes_video,
+        });
+        let carried = line::carried_into(&above, above.len() - 1);
+        let handoff = carried.map(|c| {
+            let h =
+                crate::comfyui::editor::handoff(c.produced, &contract, takes_video, *source_mode);
             serde_json::json!({
                 "carries": h.carries,
                 "resolved": h.resolved,
                 "modes": h.modes,
                 "roles": h.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
                 "is_a_question": h.is_a_question(),
+                // What the stage below actually reads, which is the clip
+                // itself unless the connector takes a frame out of it. The
+                // validator admits on this, so the connector says it.
+                "reads": c.reads,
             })
         });
         out.push(serde_json::json!({
@@ -200,7 +215,6 @@ pub(super) fn draft_stages_json(
             "produces": contract.produces,
             "handoff": handoff,
         }));
-        above.push(contract.produces);
     }
     out
 }
@@ -251,12 +265,12 @@ type RunTaskRow = (String, Option<i32>, String, String, Option<String>);
 /// second copy to disagree with.
 fn stage_json(
     stage: &StageRow,
-    upstream: Option<MediaType>,
+    upstream: Option<line::Carried>,
     takes_video: bool,
 ) -> serde_json::Value {
-    let handoff = upstream.map(|carries| {
+    let handoff = upstream.map(|c| {
         let h = crate::comfyui::editor::handoff(
-            carries,
+            c.produced,
             &stage.contract,
             takes_video,
             stage.source_mode.as_deref(),
@@ -267,6 +281,10 @@ fn stage_json(
             "modes": h.modes,
             "roles": h.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
             "is_a_question": h.is_a_question(),
+            // What the stage below actually reads, which is the clip itself
+            // unless the connector takes a frame out of it. The validator
+            // admits on this, so the connector says it.
+            "reads": c.reads,
         })
     });
     serde_json::json!({
@@ -293,20 +311,14 @@ fn stage_json(
 /// The join is what the *media flow* carries into that stage, not simply what
 /// the stage above produced: a stage that makes no file is transparent to it,
 /// so the connector under a describe stage still says `image`. That rule is
-/// [`crate::comfyui::editor::carried_into`], and it is the only place it is
-/// asked here.
+/// [`line::carried_into`] — the one the validator admits on and the dispatcher
+/// sends on — and it is asked here and nowhere else.
 pub(super) fn stages_json(stages: &[StageRow]) -> Vec<serde_json::Value> {
+    let typings: Vec<StageTyping> = stages.iter().map(StageRow::typing).collect();
     stages
         .iter()
         .enumerate()
-        .map(|(i, s)| {
-            let above: Vec<MediaType> = stages[..i].iter().map(|p| p.contract.produces).collect();
-            stage_json(
-                s,
-                crate::comfyui::editor::carried_into(&above),
-                s.takes_video,
-            )
-        })
+        .map(|(i, s)| stage_json(s, line::carried_into(&typings, i), s.takes_video))
         .collect()
 }
 
@@ -524,6 +536,8 @@ pub(super) fn check_payload(
             name,
             accepts: contract.accepts,
             produces: contract.produces,
+            source_mode: stage.source_mode.clone(),
+            takes_video: graph_takes_video(&workflow_json),
         });
     }
 
@@ -1397,16 +1411,17 @@ mod tests {
         let (_dir, mut conn) = library(&format!(
             "{}{}{}",
             stated("wf-i2v", "Image to Video", Accepts::Image, MediaType::Video),
-            stated("wf-interp", "Interpolate", Accepts::Video, MediaType::Video),
-            // A still-image upscaler dropped in after the clip.
-            stated("wf-4k", "Upscale 4K", Accepts::Image, MediaType::Image),
+            // A still restorer, which happily reads a frame of the clip above
+            // it — and then leaves the clip upscaler below it nothing to eat.
+            stated("wf-restore", "Restore", Accepts::Image, MediaType::Image),
+            stated("wf-4k", "Upscale 4K", Accepts::Video, MediaType::Video),
         ));
-        let payload = line(vec![stage("wf-i2v"), stage("wf-interp"), stage("wf-4k")]);
+        let payload = line(vec![stage("wf-i2v"), stage("wf-restore"), stage("wf-4k")]);
         let ApiError(status, message) = check_payload(&mut conn, &payload).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             message.unwrap(),
-            "Stage 3 (Upscale 4K) takes image, but stage 2 (Interpolate) produces video.",
+            "Stage 3 (Upscale 4K) takes video, but stage 2 (Restore) produces image.",
             "the refusal names the stage, in the words the person used"
         );
         // And nothing was stored: validation happens before the write.
@@ -1510,22 +1525,28 @@ mod tests {
         let swapped = line(vec![stage("wf-i2v"), stage("wf-4k"), stage("wf-interp")]);
         assert!(check_payload(&mut conn, &swapped).is_ok());
 
-        // Dragging the still-maker into the middle is not, and the refusal
-        // names the stage it broke rather than the one that was moved.
+        // Dragging the still-maker into the middle is not — and the refusal
+        // names the stage it broke rather than the one that was moved. Not the
+        // still-maker itself: it reads a frame of the clip above it quite
+        // happily. It is the upscaler *below* it that is left with a still.
         let broken = line(vec![stage("wf-i2v"), stage("wf-restore"), stage("wf-4k")]);
         let ApiError(status, message) = check_payload(&mut conn, &broken).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             message.unwrap(),
-            "Stage 2 (Restore) takes image, but stage 1 (Image to Video) produces video."
+            "Stage 3 (Upscale 4K) takes video, but stage 2 (Restore) produces image."
         );
 
-        // And dragging the clip-maker to the bottom breaks the join above it.
-        let upended = line(vec![stage("wf-interp"), stage("wf-4k"), stage("wf-i2v")]);
+        // And dragging it to the top strands both clip stages under it.
+        let upended = line(vec![
+            stage("wf-restore"),
+            stage("wf-interp"),
+            stage("wf-4k"),
+        ]);
         let ApiError(_, message) = check_payload(&mut conn, &upended).unwrap_err();
         assert_eq!(
             message.unwrap(),
-            "Stage 3 (Image to Video) takes image, but stage 2 (Upscale 4K) produces video."
+            "Stage 2 (Interpolate) takes video, but stage 1 (Restore) produces image."
         );
     }
 

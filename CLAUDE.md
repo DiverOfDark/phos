@@ -132,11 +132,19 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   node declares, which is how a graph written against another release of a node pack is caught
   before a run rather than by one. A catalogue that could not be read is `unchecked`, never
   `missing`, and never a refusal
-- **A line is rejected when it is drawn.** Every join is checked with `Accepts::admits` — the same
-  function FR5b's stage picker will call, so the editor and the validator cannot disagree — on
-  `POST`/`PUT`, again on every read, again when a run starts (with the shot's own type), and once
-  more at dispatch against the file that actually turned up. A workflow can be re-imported or its
-  contract corrected long after a line was built
+- **What crosses a join is one function, asked by four callers.** `line::carried_into` answers
+  "what media type arrives at this stage", and the picker, the validator, the line reader that
+  draws the connector and the dispatcher all ask *it* rather than agreeing with it. Two rules live
+  inside it, both of which had been written more than once: a stage that produces **text** is
+  transparent to the media flow (a describe stage makes no file, so the photograph it read is the
+  photograph the stage after it reads), and a connector set to a **frame** of a clip —
+  `first_frame` / `last_frame` / `at_time` / `keyframe` — hands on a still, which is what makes
+  `photo → clip → restore` a line that can be built at all. `Accepts::admits` stays a pure
+  media-type match: it is the primitive underneath, not the rule
+- **A line is rejected when it is drawn.** Every join is `carried_into` and then `Accepts::admits`,
+  on `POST`/`PUT`, again on every read, again when a run starts (with the shot's own type), and
+  once more at dispatch against the file that actually turned up. A workflow can be re-imported or
+  its contract corrected long after a line was built
 - **A line travels as one file, and that file is also the template format.** `comfyui/portable/`
   defines a `LineBundle`: the line and its ordered stages, **every stage's workflow graph** (a line
   exported as ids alone is a bundle of broken pointers), the derived contracts, and a requirements
@@ -152,9 +160,10 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   whitespace), so a re-import reuses what is there and one changed seed does not
 - **The stage picker asks the validator, it does not agree with it.** `comfyui/editor.rs` builds the
   line each candidate *would* make and hands it to `validate_chain`; offered means accepted, and the
-  greyed row shows the validator's own sentence. Not a second rule to keep in step — which is what
-  lets a change to what validation permits (a text-producing stage being transparent to the media
-  flow, say) reach the editor without the editor changing. The browser holds no copy of any of it:
+  greyed row shows the validator's own sentence. Not a second rule to keep in step — which is why
+  the two rules above reached the picker without a line of it moving. What is left in `editor.rs`
+  is what there is to *decide* about a join rather than what it carries: which source mode, and
+  which of a multi-input graph's slots. The browser holds no copy of any of it:
   `POST /api/comfyui/lines/stage-options` takes the draft and answers
 - **A stage says one of three things about each setting.** *Pinned* (`parameters`), *varied*
   (`vary`, FR4's sweep) or *exposed* (`line_stages.exposed`) — asked for when the line is sent, and

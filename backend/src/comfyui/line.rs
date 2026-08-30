@@ -12,10 +12,15 @@
 //! can only exercise through a ComfyUI and a GPU is a state machine nobody
 //! tests.
 //!
+//! * **What crosses this join?** [`carried_into`], and it is the only place
+//!   that question is answered. A stage that makes no file is transparent to
+//!   the media flow, and a connector that extracts a frame turns a clip into a
+//!   still — two rules that were written three times over on three branches
+//!   and are written once here.
 //! * **Does this chain hold together?** [`validate_chain`] asks
-//!   [`Accepts::admits`] of every join. Not a second compatibility rule — the
-//!   same function FR5b's stage picker will call, so a line the editor offers
-//!   and a line the validator accepts can never disagree.
+//!   [`Accepts::admits`] of every [`carried_into`]. Not a second compatibility
+//!   rule — the same function FR5b's stage picker calls, so a line the editor
+//!   offers and a line the validator accepts can never disagree.
 //! * **What happens after a stage finishes?** [`advance_after`]. One step, and
 //!   deliberately dull: v1 lines are linear, fan-out propagates by each
 //!   completed task spawning its own continuation, and fan-*in* waits for FR5c.
@@ -35,10 +40,12 @@
 //! something this module can do, because there is no code here that could.
 
 use super::contract::{Accepts, MediaType};
+use super::source::SourceMode;
 
 // ===== Design time: does this chain hold together? ==========================
 
-/// A stage, reduced to what deciding needs: what it eats and what it hands on.
+/// A stage, reduced to what deciding needs: what it eats, what it hands on,
+/// and how it reads what the stage above it made.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StageTyping {
     pub stage_idx: i32,
@@ -47,6 +54,30 @@ pub struct StageTyping {
     pub name: String,
     pub accepts: Accepts,
     pub produces: MediaType,
+    /// What this stage stored about *which part* of its input it reads —
+    /// `line_stages.source_mode`, the connector above it. `None` is "whatever
+    /// the graph implies", which is what [`SourceMode::resolve`] answers.
+    pub source_mode: Option<String>,
+    /// Whether this stage's graph has a loader that can read a clip, taken off
+    /// the graph the way the dispatcher takes it. A contract corrected by hand
+    /// can disagree with the graph, and the graph is what runs.
+    pub takes_video: bool,
+}
+
+impl StageTyping {
+    /// A stage with no connector settings — the picker's view of a candidate,
+    /// and what a test writes when the mode is not what it is about.
+    #[cfg(test)]
+    pub fn bare(stage_idx: i32, name: &str, accepts: Accepts, produces: MediaType) -> Self {
+        StageTyping {
+            stage_idx,
+            name: name.to_string(),
+            accepts,
+            produces,
+            source_mode: None,
+            takes_video: false,
+        }
+    }
 }
 
 /// Why a line was refused, and where.
@@ -69,13 +100,33 @@ fn human(stage_idx: i32) -> i32 {
     stage_idx + 1
 }
 
-/// Can every stage eat what the one before it produces?
+// ----- The one rule about what crosses a join -------------------------------
+
+/// What the connector above one stage carries into it.
 ///
-/// Rejected at design time, so a four-hour chain is refused when it is drawn
-/// rather than after its third stage has run. The rule is
-/// [`Accepts::admits`] and nothing else — including the case where a stage
-/// consumes nothing at all, which `admits` answers `false` to, and which reads
-/// as "that can only be the first stage of a line".
+/// The single answer to "what media type crosses this join", asked by the
+/// picker ([`super::editor::stage_options`]), by the validator
+/// ([`validate_chain`]), by the line reader that draws the connector, and by
+/// the dispatcher the moment before it uploads. Three copies of this idea were
+/// written independently and each was right about a different half; there is
+/// one now, and "offered", "accepted" and "sent" cannot come apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Carried {
+    /// The stage whose output travels down this join.
+    pub from: i32,
+    /// What that stage made — what the connector says on the screen.
+    pub produced: MediaType,
+    /// What the stage below actually reads. The same thing, unless it asked
+    /// for a frame of a clip, because a frame of a clip is a still.
+    pub reads: MediaType,
+}
+
+/// What flows into the stage at `position`, or `None` when nothing does.
+///
+/// `None` means that stage reads the **run's own source**: it is the first, or
+/// everything above it produced text. That is not a hole in the check — it is
+/// the one question design time cannot answer, because a line is drawn once and
+/// run against many shots, and [`admits_source`] asks it when a run starts.
 ///
 /// # A text stage is transparent
 ///
@@ -83,20 +134,78 @@ fn human(stage_idx: i32) -> i32 {
 /// row, and there is nothing for the stage after it to load. What flows down
 /// the line is therefore *unchanged* by it — the photograph the describe stage
 /// read is the photograph the generation stage after it reads — and its
-/// sentence binds into that stage's prompt slot instead.
+/// sentence binds into that stage's prompt slot instead. So the join is taken
+/// from the last stage that actually made a file.
 ///
-/// Which is why the line the whole feature exists for validates at all:
+/// # A frame of a clip is a still
+///
+/// The other half, and the one that was missing. [`Accepts::admits`] is a pure
+/// media-type match and stays one; whether a clip arrives as a clip is not a
+/// question about media types but about the connector, and FR2 built
+/// `first_frame` / `last_frame` / `at_time` / `keyframe` precisely so a video
+/// can feed a still stage. [`reads_as`] applies that here, once.
+pub fn carried_into(stages: &[StageTyping], position: usize) -> Option<Carried> {
+    let down = stages.get(position)?;
+    let up = upstream_of(stages, position)?;
+    Some(Carried {
+        from: up.stage_idx,
+        produced: up.produces,
+        reads: reads_as(up.produces, down),
+    })
+}
+
+/// The last stage before `position` that actually made a file.
+fn upstream_of(stages: &[StageTyping], position: usize) -> Option<&StageTyping> {
+    stages
+        .get(..position)?
+        .iter()
+        .rev()
+        .find(|s| s.produces != MediaType::Text)
+}
+
+/// What `down` will actually be handed, given what came out of the stage above
+/// it and what `down` said about reading it.
+///
+/// The dispatcher's own rule, borrowed rather than restated: [`SourceMode`] is
+/// what decides, and this asks it. A clip going into a stage that takes clips
+/// stays a clip, and which of that graph's loaders the file lands in is the
+/// stage's own business. A clip going into a stage that does *not* take clips
+/// is whatever the source mode makes of it — by default frame zero, which is
+/// what the dispatcher would send anyway.
+pub fn reads_as(produced: MediaType, down: &StageTyping) -> MediaType {
+    if produced != MediaType::Video || down.accepts.admits(MediaType::Video) {
+        return produced;
+    }
+    match SourceMode::resolve(down.source_mode.as_deref(), down.takes_video, true) {
+        SourceMode::WholeVideo => MediaType::Video,
+        _ => MediaType::Image,
+    }
+}
+
+/// Can every stage eat what the one before it produces?
+///
+/// Rejected at design time, so a four-hour chain is refused when it is drawn
+/// rather than after its third stage has run. Every join is [`carried_into`]
+/// and then [`Accepts::admits`], and nothing else — including the case where a
+/// stage consumes nothing at all, which `admits` answers `false` to, and which
+/// reads as "that can only be the first stage of a line".
+///
+/// Which is why both of the lines the last two features exist for validate:
 ///
 /// ```text
 ///   [1]  DESCRIBE (QWEN-VL)     image → text
 ///    │   text → positive
 ///   [2]  PHOTO → 5S CLIP        image + text → video
+///
+///   [1]  PHOTO → 5S CLIP        image → video
+///    │   last frame
+///   [2]  RESTORE PORTRAIT       image → image
 /// ```
 ///
-/// Stage 2 accepts `image`, and asking it to admit stage 1's `text` would
-/// refuse a line that is obviously correct. So each join is checked against the
-/// last stage that actually made a file, and a line of nothing but text stages
-/// leaves every join reading the run's own source.
+/// Stage 2 of the first accepts `image` and stage 1 produced `text`; stage 2 of
+/// the second accepts `image` and stage 1 produced `video`. Both are obviously
+/// correct lines, and both are correct for a reason that lives in
+/// [`carried_into`] rather than in a second compatibility rule here.
 pub fn validate_chain(stages: &[StageTyping]) -> Result<(), LineError> {
     if stages.is_empty() {
         return Err(LineError {
@@ -105,16 +214,22 @@ pub fn validate_chain(stages: &[StageTyping]) -> Result<(), LineError> {
         });
     }
 
-    // The last stage that made a file, and what it made. `None` until one has:
-    // every stage until then reads the run's source, which is checked when the
-    // run starts and the shot is known.
-    let mut carried: Option<&StageTyping> = None;
-
     for (position, down) in stages.iter().enumerate() {
-        match carried {
-            _ if position == 0 => {}
-            Some(up) if down.accepts.admits(up.produces) => {}
-            Some(up) => {
+        match carried_into(stages, position) {
+            // Nothing above has made a file, so this stage reads the run's own
+            // source like the first one does. Nothing to check here — except
+            // that a stage consuming nothing at all still cannot follow one.
+            None => {
+                if position > 0 && down.accepts.starts_a_line() {
+                    return Err(LineError {
+                        stage_idx: down.stage_idx,
+                        message: starts_a_line_message(down),
+                    });
+                }
+            }
+            Some(carried) if down.accepts.admits(carried.reads) => {}
+            Some(carried) => {
+                let up = upstream_of(stages, position).expect("carried_into found one");
                 return Err(LineError {
                     stage_idx: down.stage_idx,
                     message: if down.accepts.starts_a_line() {
@@ -125,27 +240,13 @@ pub fn validate_chain(stages: &[StageTyping]) -> Result<(), LineError> {
                             human(down.stage_idx),
                             down.name,
                             down.accepts.as_str(),
-                            human(up.stage_idx),
+                            human(carried.from),
                             up.name,
-                            up.produces.as_str()
+                            carried.produced.as_str()
                         )
                     },
                 });
             }
-            // Only describe stages so far, so this one reads the run's source
-            // like the first stage does. Nothing to check here — except that a
-            // stage consuming nothing at all still cannot follow anything.
-            None if down.accepts.starts_a_line() => {
-                return Err(LineError {
-                    stage_idx: down.stage_idx,
-                    message: starts_a_line_message(down),
-                });
-            }
-            None => {}
-        }
-
-        if down.produces != MediaType::Text {
-            carried = Some(down);
         }
     }
 
@@ -164,18 +265,16 @@ fn starts_a_line_message(stage: &StageTyping) -> String {
 ///
 /// Normally just the first. A line that opens with one or more describe stages
 /// has several, because none of them made a file for the next one to read, and
-/// every one of them has to fit the shot the run is against.
+/// every one of them has to fit the shot the run is against. Which stages those
+/// are is [`carried_into`]'s answer, not a second walk of the same list.
 pub fn source_readers(stages: &[StageTyping]) -> Vec<&StageTyping> {
-    let mut readers = Vec::new();
-    for stage in stages {
-        if reads_source(stage.accepts) {
-            readers.push(stage);
-        }
-        if stage.produces != MediaType::Text {
-            break;
-        }
-    }
-    readers
+    stages
+        .iter()
+        .enumerate()
+        .take_while(|(position, _)| carried_into(stages, *position).is_none())
+        .map(|(_, stage)| stage)
+        .filter(|stage| reads_source(stage.accepts))
+        .collect()
 }
 
 /// Does this stage read the run's source at all?
@@ -216,8 +315,12 @@ pub fn admits_source(first: &StageTyping, source: MediaType) -> Result<(), LineE
 /// next stage is queued — a workflow can be re-imported, or its contract
 /// corrected, long after a line was drawn, and a run should not discover that
 /// by uploading a video into an image loader.
+///
+/// Through [`reads_as`], so the dispatcher answers with the same rule the
+/// picker offered on and the validator accepted on. A clip whose connector says
+/// `last_frame` is a still by the time this stage sees it, here as everywhere.
 pub fn admits_upstream_output(next: &StageTyping, produced: MediaType) -> Result<(), LineError> {
-    if next.accepts.admits(produced) {
+    if next.accepts.admits(reads_as(produced, next)) {
         return Ok(());
     }
     Err(LineError {
@@ -442,11 +545,21 @@ mod tests {
     use super::*;
 
     fn stage(idx: i32, name: &str, accepts: Accepts, produces: MediaType) -> StageTyping {
+        StageTyping::bare(idx, name, accepts, produces)
+    }
+
+    /// The same, with the connector set: what this stage reads out of whatever
+    /// the stage above it made.
+    fn stage_reading(
+        idx: i32,
+        name: &str,
+        accepts: Accepts,
+        produces: MediaType,
+        mode: &str,
+    ) -> StageTyping {
         StageTyping {
-            stage_idx: idx,
-            name: name.to_string(),
-            accepts,
-            produces,
+            source_mode: Some(mode.to_string()),
+            ..StageTyping::bare(idx, name, accepts, produces)
         }
     }
 
@@ -467,13 +580,15 @@ mod tests {
     #[test]
     fn a_stage_that_cannot_eat_what_the_one_before_it_makes_is_refused() {
         let mut line = restore_4k();
-        // Somebody dropped a still-image upscaler in after the clip.
-        line[2] = stage(2, "Upscale 4K", Accepts::Image, MediaType::Image);
+        // Somebody dropped a still-image restorer in at the top, so the clip
+        // maker below it is handed a still it cannot animate into a clip —
+        // and there is no frame of a still to fall back on.
+        line[1] = stage(1, "Restore Portrait", Accepts::Image, MediaType::Image);
         let err = validate_chain(&line).unwrap_err();
         assert_eq!(err.stage_idx, 2);
         assert_eq!(
             err.message,
-            "Stage 3 (Upscale 4K) takes image, but stage 2 (Interpolate) produces video."
+            "Stage 3 (Upscale 4K) takes video, but stage 2 (Restore Portrait) produces image."
         );
     }
 
@@ -523,16 +638,16 @@ mod tests {
     #[test]
     fn a_join_is_checked_against_the_last_stage_that_made_a_file() {
         let line = vec![
-            stage(0, "Image to Video", Accepts::Image, MediaType::Video),
-            stage(1, "Describe", Accepts::Video, MediaType::Text),
-            stage(2, "Upscale", Accepts::Image, MediaType::Image),
+            stage(0, "Restore Portrait", Accepts::Image, MediaType::Image),
+            stage(1, "Describe", Accepts::Image, MediaType::Text),
+            stage(2, "Upscale 4K", Accepts::Video, MediaType::Video),
         ];
         let err = validate_chain(&line).unwrap_err();
         assert_eq!(err.stage_idx, 2);
         // Stage 2 made nothing, so stage 1 is what stage 3 is refused against.
         assert_eq!(
             err.message,
-            "Stage 3 (Upscale) takes image, but stage 1 (Image to Video) produces video."
+            "Stage 3 (Upscale 4K) takes video, but stage 1 (Restore Portrait) produces image."
         );
     }
 
@@ -576,6 +691,171 @@ mod tests {
         );
     }
 
+    // === What one join carries, which is one rule and not three ===========
+
+    #[test]
+    fn a_stage_that_makes_no_file_does_not_interrupt_the_media_flow() {
+        // The picker used to ask this of its own copy of the rule. There is
+        // one copy now, and this is it: a describe stage reads the photograph
+        // and hands on a sentence, so the stage after it is still reading the
+        // photograph, and the join says `image` rather than `text`.
+        let line = vec![
+            stage(0, "Restore Portrait", Accepts::Image, MediaType::Image),
+            stage(1, "Describe", Accepts::Image, MediaType::Text),
+            stage(2, "Describe Again", Accepts::Image, MediaType::Text),
+            stage(3, "Restore Again", Accepts::Image, MediaType::Image),
+        ];
+        assert_eq!(carried_into(&line, 0), None, "the first reads the shot");
+        assert_eq!(carried_into(&line, 1).unwrap().produced, MediaType::Image);
+        assert_eq!(carried_into(&line, 2).unwrap().from, 0, "past one describe");
+        let last = carried_into(&line, 3).unwrap();
+        assert_eq!(last.from, 0, "past two of them");
+        assert_eq!(last.produced, MediaType::Image);
+        // A line that has so far only described things is still reading the
+        // shot, so there is no join above the next stage at all.
+        let only_text = vec![
+            stage(0, "Describe", Accepts::Image, MediaType::Text),
+            stage(1, "Photo to clip", Accepts::Image, MediaType::Video),
+        ];
+        assert_eq!(carried_into(&only_text, 1), None);
+        assert_eq!(carried_into(&only_text, 9), None, "past the end");
+    }
+
+    /// The gap FR5b found: `Accepts::admits` refuses `video → image`, so the
+    /// editor offered `last_frame` on a connector the validator then refused.
+    #[test]
+    fn a_still_stage_may_follow_a_clip_stage_because_a_frame_of_a_clip_is_a_still() {
+        // No source mode at all. A graph with no video loader gets frame zero
+        // — the dispatcher's own default — so this line is buildable, and was
+        // not before.
+        let line = vec![
+            stage(0, "Photo to 5s Clip", Accepts::Image, MediaType::Video),
+            stage(1, "Restore Portrait", Accepts::Image, MediaType::Image),
+        ];
+        assert_eq!(validate_chain(&line), Ok(()));
+        let carried = carried_into(&line, 1).unwrap();
+        assert_eq!(
+            carried.produced,
+            MediaType::Video,
+            "the connector says clip"
+        );
+        assert_eq!(carried.reads, MediaType::Image, "the stage reads a still");
+
+        // And the mode FR2 built this for, said out loud.
+        let asked = vec![
+            stage(0, "Photo to 5s Clip", Accepts::Image, MediaType::Video),
+            stage_reading(
+                1,
+                "Restore Portrait",
+                Accepts::Image,
+                MediaType::Image,
+                "last_frame",
+            ),
+        ];
+        assert_eq!(validate_chain(&asked), Ok(()));
+        assert_eq!(carried_into(&asked, 1).unwrap().reads, MediaType::Image);
+    }
+
+    #[test]
+    fn asking_a_still_stage_for_the_whole_clip_is_still_refused() {
+        // `whole_video` is not a frame, and a stage with no video loader
+        // cannot read one. Saying so here beats a ComfyUI validation error.
+        let line = vec![
+            stage(0, "Photo to 5s Clip", Accepts::Image, MediaType::Video),
+            stage_reading(
+                1,
+                "Restore Portrait",
+                Accepts::Image,
+                MediaType::Image,
+                "whole_video",
+            ),
+        ];
+        let err = validate_chain(&line).unwrap_err();
+        assert_eq!(err.stage_idx, 1);
+        assert_eq!(
+            err.message,
+            "Stage 2 (Restore Portrait) takes image, but stage 1 (Photo to 5s Clip) produces video."
+        );
+    }
+
+    #[test]
+    fn a_clip_stage_asked_for_a_frame_still_carries_a_clip() {
+        // The extend-clip shape: a graph with a video loader *and* an image
+        // loader, told to take the last frame. Which of its own loaders the
+        // file lands in is the stage's business — the line still carries video,
+        // and refusing it would be the reverse of the bug above.
+        let line = vec![
+            stage(0, "Photo to 5s Clip", Accepts::Image, MediaType::Video),
+            StageTyping {
+                takes_video: true,
+                ..stage_reading(
+                    1,
+                    "Extend Clip",
+                    Accepts::Video,
+                    MediaType::Video,
+                    "last_frame",
+                )
+            },
+        ];
+        assert_eq!(validate_chain(&line), Ok(()));
+        assert_eq!(carried_into(&line, 1).unwrap().reads, MediaType::Video);
+    }
+
+    #[test]
+    fn the_validator_and_the_dispatcher_admit_the_same_joins() {
+        // `admits_upstream_output` is the dispatcher's second look, taken
+        // against the file that actually turned up. It must agree with the
+        // design-time check on every pair, or a line that draws will fail at
+        // upload — which is the failure this whole subsystem is arranged to
+        // avoid.
+        let library = [
+            stage(0, "Photo to Clip", Accepts::Image, MediaType::Video),
+            stage(0, "Upscale 4K", Accepts::Video, MediaType::Video),
+            stage(0, "Restore Portrait", Accepts::Image, MediaType::Image),
+            stage(0, "Describe", Accepts::Image, MediaType::Text),
+            stage_reading(
+                0,
+                "Last Frame",
+                Accepts::Image,
+                MediaType::Image,
+                "last_frame",
+            ),
+            stage_reading(
+                0,
+                "Whole Clip",
+                Accepts::Image,
+                MediaType::Image,
+                "whole_video",
+            ),
+        ];
+        for up in &library {
+            for down in &library {
+                if up.produces == MediaType::Text {
+                    // A describe stage hands on no file, so there is nothing
+                    // for the dispatcher to check against.
+                    continue;
+                }
+                let chain = vec![
+                    StageTyping {
+                        stage_idx: 0,
+                        ..up.clone()
+                    },
+                    StageTyping {
+                        stage_idx: 1,
+                        ..down.clone()
+                    },
+                ];
+                assert_eq!(
+                    validate_chain(&chain).is_ok(),
+                    admits_upstream_output(&chain[1], up.produces).is_ok(),
+                    "{} after {}: the validator and the dispatcher disagree",
+                    down.name,
+                    up.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn an_empty_line_is_not_a_line() {
         assert_eq!(validate_chain(&[]).unwrap_err().stage_idx, -1);
@@ -598,16 +878,31 @@ mod tests {
     #[test]
     fn a_contract_corrected_after_the_line_was_built_is_caught_before_dispatch() {
         // The design-time check passed when the line was drawn. Since then
-        // somebody corrected stage 3's contract to say it takes stills.
-        let next = stage(2, "Upscale 4K", Accepts::Image, MediaType::Image);
-        let err = admits_upstream_output(&next, MediaType::Video).unwrap_err();
-        assert!(err.message.contains("handed it video"), "{}", err.message);
+        // somebody corrected stage 3's contract to say it takes clips, and the
+        // stage above it makes stills.
+        let next = stage(2, "Upscale 4K", Accepts::Video, MediaType::Video);
+        let err = admits_upstream_output(&next, MediaType::Image).unwrap_err();
+        assert!(err.message.contains("handed it image"), "{}", err.message);
         assert!(
             err.message.contains("contract has changed"),
             "{}",
             err.message
         );
-        assert_eq!(admits_upstream_output(&next, MediaType::Image), Ok(()));
+        assert_eq!(admits_upstream_output(&next, MediaType::Video), Ok(()));
+
+        // The other way round is not a mismatch any more: a still stage handed
+        // a clip reads a frame of it, here exactly as in the editor.
+        let still = stage(2, "Restore Portrait", Accepts::Image, MediaType::Image);
+        assert_eq!(admits_upstream_output(&still, MediaType::Video), Ok(()));
+        // Unless it asked for the whole thing, which it cannot read.
+        let whole = stage_reading(
+            2,
+            "Restore Portrait",
+            Accepts::Image,
+            MediaType::Image,
+            "whole_video",
+        );
+        assert!(admits_upstream_output(&whole, MediaType::Video).is_err());
     }
 
     #[test]

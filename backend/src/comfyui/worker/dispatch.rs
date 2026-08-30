@@ -196,11 +196,18 @@ fn check_stage_admits(task: &PendingTask, source_mime: &str) -> Result<(), StepF
     };
     let contract =
         crate::comfyui::runs::contract_of(task.contract_json.as_deref(), &task.workflow_json);
+    let graph: serde_json::Value =
+        serde_json::from_str(&task.workflow_json).unwrap_or(serde_json::Value::Null);
     let typing = StageTyping {
         stage_idx,
         name: task.workflow_name.clone(),
         accepts: contract.accepts,
         produces: contract.produces,
+        // What this task was queued with, and what its graph can load: the two
+        // things `reads_as` needs to give the answer the picker offered on and
+        // the validator accepted.
+        source_mode: task.source_mode.clone(),
+        takes_video: takes_video(&graph),
     };
     // Not a second rule: the same function the line editor's validation calls,
     // asked of the file that actually turned up.

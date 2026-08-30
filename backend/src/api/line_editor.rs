@@ -84,6 +84,10 @@ fn candidates(conn: &mut SqliteConnection) -> Result<Vec<Candidate>, ApiError> {
                 name,
                 accepts: contract.accepts,
                 produces: contract.produces,
+                // Off the graph, not off the contract: that is where the
+                // dispatcher reads it, and a contract stored before loaders
+                // were recorded carries none.
+                takes_video: super::lines::graph_takes_video(&workflow_json),
             }
         })
         .collect())
@@ -105,6 +109,11 @@ fn draft_typings(conn: &mut SqliteConnection, workflow_ids: &[String]) -> Vec<St
             name: c.name.clone(),
             accepts: c.accepts,
             produces: c.produces,
+            // The draft is a list of workflow ids and nothing else, so every
+            // join is whatever each graph implies — which is what a line saved
+            // as it stands would resolve to.
+            source_mode: None,
+            takes_video: c.takes_video,
         })
         .collect()
 }
@@ -600,14 +609,19 @@ mod tests {
         let (_dir, mut conn) = shop();
         assert_eq!(candidates(&mut conn).unwrap().len(), 4);
 
-        // After a stage that makes a clip, only the video-eating ones.
+        // After a stage that makes a clip: the video-eating ones take the
+        // clip, and the still-eating one takes a frame of it.
         let after_clip = ask(&mut conn, &["wf-i2v"], 1, "insert");
-        assert_eq!(names(&after_clip), ["Interpolate 60fps", "Upscale 4K"]);
-        assert_eq!(after_clip["refused"], serde_json::json!(2));
         assert_eq!(
-            after_clip["filter"],
-            serde_json::json!("only video-accepting stages fit here")
+            names(&after_clip),
+            [
+                "Interpolate 60fps",
+                "Photo to 5s Clip",
+                "Restore Portrait",
+                "Upscale 4K"
+            ]
         );
+        assert_eq!(after_clip["refused"], serde_json::json!(0));
 
         // At the top of a line, everything: a first stage is checked against
         // the shot it is run on, which no editor can know in advance.
@@ -619,19 +633,28 @@ mod tests {
         let swap = ask(&mut conn, &["wf-restore", "wf-i2v", "wf-4k"], 1, "replace");
         assert_eq!(names(&swap), ["Photo to 5s Clip"]);
 
+        // After a stage that makes a still, only the still-eating ones: there
+        // is no frame of a JPEG to hand a clip stage.
+        let after_still = ask(&mut conn, &["wf-restore"], 1, "insert");
+        assert_eq!(
+            names(&after_still),
+            ["Photo to 5s Clip", "Restore Portrait"]
+        );
+        assert_eq!(after_still["refused"], serde_json::json!(2));
+
         // The refusal against a greyed row is the validator's own sentence.
-        let refused = after_clip["items"]
+        let refused = after_still["items"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|i| i["name"] == serde_json::json!("Restore Portrait"))
+            .find(|i| i["name"] == serde_json::json!("Upscale 4K"))
             .unwrap()["reason"]
             .as_str()
             .unwrap()
             .to_string();
         assert_eq!(
             refused,
-            "Stage 2 (Restore Portrait) takes image, but stage 1 (Photo to 5s Clip) produces video."
+            "Stage 2 (Upscale 4K) takes video, but stage 1 (Restore Portrait) produces image."
         );
     }
 
@@ -641,7 +664,15 @@ mod tests {
         // A draft holding a workflow somebody deleted in another tab. The slot
         // still answers, about the line that can actually be built.
         let answer = ask(&mut conn, &["wf-i2v", "wf-vanished"], 2, "insert");
-        assert_eq!(names(&answer), ["Interpolate 60fps", "Upscale 4K"]);
+        assert_eq!(
+            names(&answer),
+            [
+                "Interpolate 60fps",
+                "Photo to 5s Clip",
+                "Restore Portrait",
+                "Upscale 4K"
+            ]
+        );
     }
 
     #[test]

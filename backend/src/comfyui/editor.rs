@@ -18,13 +18,17 @@
 //!   the stage after it still reads the shot), the picker learns it in the same
 //!   commit, without a line changing here.
 //! * **What travels along a join, and is there anything to decide about it?**
-//!   [`handoff`]. Usually nothing: an image is an image, and a clip going into
-//!   a graph with a video loader goes in whole. It becomes a question when the
-//!   next stage can read the handoff in more than one way — a graph with both a
-//!   video loader and an image loader can take the clip *or* a frame of it —
-//!   or when it has more than one slot to put it in, which is FR2's
-//!   `SourceRole` and is answered with FR2's own `role` directive rather than
-//!   with a second mechanism.
+//!   *What* it carries is [`super::line::carried_into`] and is not this
+//!   module's to answer — a stage that makes no file is transparent to the
+//!   media flow, and a connector that extracts a frame turns a clip into a
+//!   still, and both of those are the validator's rules. What is left here is
+//!   [`handoff`]: what there is to *decide* about the join. Usually nothing —
+//!   an image is an image, and a clip going into a graph with a video loader
+//!   goes in whole. It becomes a question when the next stage can read the
+//!   handoff in more than one way — a graph with both a video loader and an
+//!   image loader can take the clip *or* a frame of it — or when it has more
+//!   than one slot to put it in, which is FR2's `SourceRole` and is answered
+//!   with FR2's own `role` directive rather than with a second mechanism.
 //!
 //! Nothing here touches the database or the network, for the same reason
 //! [`super::line`] does not: the interesting behaviour is a set of rules, and
@@ -45,6 +49,10 @@ pub struct Candidate {
     pub name: String,
     pub accepts: Accepts,
     pub produces: MediaType,
+    /// Whether its graph has a loader that can read a clip, read off the graph
+    /// the way the dispatcher reads it. Part of what decides a join: a stage
+    /// that cannot take a clip is offered one as a frame of one.
+    pub takes_video: bool,
 }
 
 /// One row of the picker: a workflow, and whether it may go in this slot.
@@ -85,6 +93,12 @@ fn hypothetical(
         name: candidate.name.clone(),
         accepts: candidate.accepts,
         produces: candidate.produces,
+        // A workflow that has just been picked has stored no source mode yet,
+        // so the join is whatever the graph implies — which is the same
+        // default the dispatcher would resolve to if the line were saved and
+        // run as it stands.
+        source_mode: None,
+        takes_video: candidate.takes_video,
     };
     match placement {
         Placement::Insert => chain.insert(at, stage),
@@ -134,28 +148,6 @@ pub fn stage_options(
             refused: fits(existing, at, placement, c).err(),
         })
         .collect()
-}
-
-/// What is flowing into the slot at `at` — what the connector above it carries.
-///
-/// A stage that produces no file is **transparent** to the media flow: a
-/// describe stage reads the photograph and hands on a sentence, so the stage
-/// after it is still reading the photograph. Skipping those is the difference
-/// between a connector that says `image` and one that says `text` and then
-/// cannot explain why the next stage eats a picture.
-///
-/// **Integration note.** FR9 (`feat/comfyui-prompt-compiler`, PR #117) owns
-/// this rule — it is the same one that makes `validate_chain` accept
-/// `describe → photo-to-clip` — and expresses it in [`super::line`]. This
-/// function exists so that this branch stands on its own, and is the one place
-/// to delete when the two are merged: every caller here goes through it, and
-/// nothing else in this module reasons about the media flow at all.
-pub fn carried_into(above: &[MediaType]) -> Option<MediaType> {
-    above
-        .iter()
-        .rev()
-        .find(|&&produces| produces != MediaType::Text)
-        .copied()
 }
 
 // ===== What travels along a join? ===========================================
@@ -312,6 +304,9 @@ mod tests {
             name: name.to_string(),
             accepts,
             produces,
+            // Derived the way a real one is: only a graph with a video loader
+            // takes a clip, and only such a graph declares it accepts one.
+            takes_video: accepts == Accepts::Video,
         }
     }
 
@@ -341,6 +336,8 @@ mod tests {
             name: c.name.clone(),
             accepts: c.accepts,
             produces: c.produces,
+            source_mode: None,
+            takes_video: c.takes_video,
         }
     }
 
@@ -362,20 +359,34 @@ mod tests {
     }
 
     #[test]
-    fn after_a_stage_that_makes_a_clip_only_video_stages_are_offered() {
+    fn after_a_stage_that_makes_a_clip_a_still_stage_is_offered_a_frame_of_it() {
+        // Everything but the stage that reads nothing. The video-eating ones
+        // take the clip; the still-eating ones take a frame of it, which is
+        // what FR2 built `first_frame` and `last_frame` for and what the
+        // connector under this slot will offer.
         let line = drawn(&["Photo to 5s Clip"]);
         let options = stage_options(&library(), &line, 1, Placement::Insert);
-        assert_eq!(offered(&options), ["Interpolate 60fps", "Upscale 4K"]);
-        // And the ones that are not offered say why — in the validator's own
+        assert_eq!(
+            offered(&options),
+            [
+                "Photo to 5s Clip",
+                "Interpolate 60fps",
+                "Upscale 4K",
+                "Restore Portrait",
+                "Describe"
+            ]
+        );
+        // And the one that is not offered says why — in the validator's own
         // words, because it is the validator that was asked.
-        let restore = options
+        let t2i = options
             .iter()
-            .find(|o| o.candidate.name == "Restore Portrait")
+            .find(|o| o.candidate.name == "Text to Image")
             .unwrap();
         assert_eq!(
-            restore.refused.as_deref(),
+            t2i.refused.as_deref(),
             Some(
-                "Stage 2 (Restore Portrait) takes image, but stage 1 (Photo to 5s Clip) produces video."
+                "Stage 2 (Text to Image) consumes nothing, so it can only be the first \
+                 stage of a line."
             )
         );
     }
@@ -458,15 +469,17 @@ mod tests {
         let line = drawn(&["Restore Portrait", "Restore Portrait", "Photo to 5s Clip"]);
         assert_eq!(
             offered(&stage_options(&library(), &line, 1, Placement::Insert)),
-            ["Restore Portrait", "Describe"]
+            ["Photo to 5s Clip", "Restore Portrait", "Describe"],
+            "a clip maker fits too: the still stage below reads a frame of it"
         );
         // …and on a shorter line they come apart, which is the whole reason
         // the two are different questions. image → image, at index 1:
         let two = drawn(&["Restore Portrait", "Restore Portrait"]);
         assert_eq!(
             offered(&stage_options(&library(), &two, 1, Placement::Insert)),
-            ["Restore Portrait", "Describe"],
-            "inserted above a still stage, it has to hand on a still — or nothing"
+            ["Photo to 5s Clip", "Restore Portrait", "Describe"],
+            "inserted above a still stage, it has to hand on something a still \
+             stage can read — a still, a frame of a clip, or nothing at all"
         );
         assert_eq!(
             offered(&stage_options(&library(), &two, 1, Placement::Replace)),
@@ -538,20 +551,67 @@ mod tests {
         }
     }
 
+    /// The whole point of the reconciliation: one rule, three readers.
+    ///
+    /// The picker offers a stage by building the line it would make and asking
+    /// [`validate_chain`]; the validator admits a join by asking
+    /// [`super::line::carried_into`]; the dispatcher, minutes or hours later
+    /// and with the file in its hand, asks
+    /// [`super::line::admits_upstream_output`], which asks
+    /// [`super::line::reads_as`] — the same function `carried_into` asks. This
+    /// says so out loud, over every pair, because "they call the same
+    /// function" is only worth saying if it is checked.
+    ///
+    /// The video → still pairs are the ones that used to come apart: the
+    /// connector offered `last_frame`, and the validator refused the line.
     #[test]
-    fn a_stage_that_makes_no_file_does_not_interrupt_the_media_flow() {
-        // What the connector above a slot carries. A describe stage reads the
-        // photograph and hands on a sentence, so the stage after it is still
-        // reading the photograph — and the join says `image`, not `text`.
-        use MediaType::{Image, Text, Video};
-        assert_eq!(carried_into(&[]), None, "nothing above: the shot decides");
-        assert_eq!(carried_into(&[Image]), Some(Image));
-        assert_eq!(carried_into(&[Image, Text]), Some(Image));
-        assert_eq!(carried_into(&[Image, Text, Text]), Some(Image));
-        assert_eq!(carried_into(&[Image, Video, Text]), Some(Video));
-        // A line that has so far only described things is still reading the
-        // shot, so there is no join above the next stage to draw at all.
-        assert_eq!(carried_into(&[Text]), None);
+    fn the_picker_the_validator_and_the_dispatcher_answer_with_one_rule() {
+        for above in library() {
+            let line = vec![typing(0, &above)];
+            for option in stage_options(&library(), &line, 1, Placement::Insert) {
+                let chain = hypothetical(&line, 1, Placement::Insert, &option.candidate);
+                let accepted = validate_chain(&chain).is_ok();
+
+                // 1. What the picker offered.
+                assert_eq!(
+                    option.offered(),
+                    accepted,
+                    "{} after {}: the picker and the validator disagree",
+                    option.candidate.name,
+                    above.name
+                );
+
+                // 2. What the join says it carries, and what the stage reads.
+                let carried = crate::comfyui::line::carried_into(&chain, 1);
+                match carried {
+                    // A describe stage above makes no file, so this stage
+                    // reads the run's own source and there is no join to check
+                    // — which is the one case the dispatcher never reaches.
+                    None => assert_eq!(above.produces, MediaType::Text),
+                    Some(c) => {
+                        assert_eq!(c.produced, above.produces);
+                        assert_eq!(
+                            accepted,
+                            chain[1].accepts.admits(c.reads),
+                            "{} after {}: the join and the validator disagree",
+                            option.candidate.name,
+                            above.name
+                        );
+
+                        // 3. What the dispatcher will do with the file that
+                        //    actually turned up.
+                        assert_eq!(
+                            accepted,
+                            crate::comfyui::line::admits_upstream_output(&chain[1], c.produced)
+                                .is_ok(),
+                            "{} after {}: the dispatcher and the validator disagree",
+                            option.candidate.name,
+                            above.name
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ----- Handoffs ---------------------------------------------------------

@@ -483,6 +483,8 @@ pub fn typings(bundle: &LineBundle, catalog: Option<&NodeCatalog>) -> Vec<StageT
                 name: wf.name.clone(),
                 accepts: contract.accepts,
                 produces: contract.produces,
+                source_mode: stage.source_mode.clone(),
+                takes_video: crate::comfyui::loaders::takes_video(&wf.graph),
             })
         })
         .collect()

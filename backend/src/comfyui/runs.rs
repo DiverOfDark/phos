@@ -77,6 +77,8 @@ impl StageRow {
             name: self.workflow_name.clone(),
             accepts: self.contract.accepts,
             produces: self.contract.produces,
+            source_mode: self.source_mode.clone(),
+            takes_video: self.takes_video,
         }
     }
 
