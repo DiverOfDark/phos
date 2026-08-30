@@ -68,7 +68,7 @@ mod worker;
 mod workflow;
 
 pub use client::ComfyUiClient;
-pub use loaders::{detect_loaders, importable, LoaderKind};
+pub use loaders::{default_binding_warnings, detect_loaders, importable, LoaderKind};
 pub use source::SourceMode;
 pub use worker::spawn_enhancement_worker;
 pub use workflow::{detect_inputs, detect_outputs};
