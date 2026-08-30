@@ -74,6 +74,65 @@ async fn node_catalog(url: &str) -> Option<std::sync::Arc<crate::comfyui::NodeCa
     })
 }
 
+/// GET /api/comfyui/nodes?classes=A,B — what ComfyUI says its nodes take
+#[derive(Deserialize, utoipa::IntoParams)]
+pub(super) struct NodesQuery {
+    /// Comma-separated class names to return. Omit for the whole catalogue,
+    /// which on a loaded install is several megabytes.
+    classes: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/comfyui/nodes",
+    tag = "comfyui",
+    summary = "Get ComfyUI node definitions",
+    description = "What ComfyUI says its installed node classes take: every input's name, \
+                   type, default and range, and for an enum its contents — the checkpoints, \
+                   samplers, schedulers and LoRAs installed on that server. Cached in memory \
+                   and re-read when ComfyUI comes back after being down. Always 200: a server \
+                   that is unreachable or too old to have /object_info answers \
+                   `available: false`, and the console falls back to plain text boxes.",
+    params(NodesQuery),
+    responses(
+        (status = 200, description = "Node definitions, or available=false"),
+        (status = 503, description = "ComfyUI not configured"),
+    )
+)]
+pub(super) async fn comfyui_nodes(
+    UState(state): UState,
+    Query(query): Query<NodesQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let url = require_comfyui(&state)?;
+    let Some(catalog) = node_catalog(&url).await else {
+        return Ok(Json(serde_json::json!({
+            "available": false,
+            "nodes": {},
+        })));
+    };
+
+    let nodes = match query.classes.as_deref() {
+        Some(list) => {
+            let mut picked = serde_json::Map::new();
+            for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(class) = catalog.get(name) {
+                    if let Ok(v) = serde_json::to_value(class) {
+                        picked.insert(name.to_string(), v);
+                    }
+                }
+            }
+            serde_json::Value::Object(picked)
+        }
+        None => serde_json::to_value(&catalog.classes).unwrap_or_else(|_| serde_json::json!({})),
+    };
+
+    Ok(Json(serde_json::json!({
+        "available": true,
+        "node_count": catalog.classes.len(),
+        "nodes": nodes,
+    })))
+}
+
 /// GET /api/comfyui/workflows
 #[utoipa::path(
     get,

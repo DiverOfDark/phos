@@ -331,6 +331,38 @@
         }
       }
     },
+    "/api/comfyui/nodes": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Get ComfyUI node definitions",
+        "description": "What ComfyUI says its installed node classes take: every input's name, type, default and range, and for an enum its contents — the checkpoints, samplers, schedulers and LoRAs installed on that server. Cached in memory and re-read when ComfyUI comes back after being down. Always 200: a server that is unreachable or too old to have /object_info answers `available: false`, and the console falls back to plain text boxes.",
+        "operationId": "comfyui_nodes",
+        "parameters": [
+          {
+            "name": "classes",
+            "in": "query",
+            "description": "Comma-separated class names to return. Omit for the whole catalogue,\nwhich on a loaded install is several megabytes.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Node definitions, or available=false"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
     "/api/comfyui/tasks": {
       "get": {
         "tags": [
