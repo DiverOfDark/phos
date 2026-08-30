@@ -36,6 +36,7 @@ diesel::table! {
         run_id -> Nullable<Text>,
         stage_idx -> Nullable<Integer>,
         parent_task_id -> Nullable<Text>,
+        text_output -> Nullable<Text>,
     }
 }
 
@@ -154,6 +155,7 @@ diesel::table! {
         description -> Nullable<Text>,
         created_at -> Nullable<Timestamp>,
         updated_at -> Nullable<Timestamp>,
+        analysis_json -> Nullable<Text>,
     }
 }
 

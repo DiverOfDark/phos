@@ -68,6 +68,15 @@
 //!   frame of the clip (the first, the last, one at a timestamp, one of the
 //!   indexed keyframes) or the file itself, which is the default whenever the
 //!   graph has a video loader to read it.
+//! * **A prompt is compiled, not retyped.** A *describe* stage is a workflow
+//!   like any other — a vision model running inside ComfyUI — whose product is
+//!   a sentence rather than a file. [`prompt`] writes the instruction it is
+//!   given (the person names clustering found, the EXIF date and place, the
+//!   library caption, the user's intent and the stage's constraints), reads
+//!   what comes back, and compiles it into the two strings the stage after it
+//!   takes. Binding it there is one `text_overrides` entry, because FR5a keys
+//!   prompt slots by exactly the key [`workflow::prepare_workflow`] substitutes
+//!   on.
 //! * **Everything this module creates is marked synthetic.** A generated file
 //!   is flagged on its row and carries a [`manifest::ProvenanceManifest`]. The
 //!   flag keeps machine-made faces out of the person model; the manifest is how
@@ -84,6 +93,7 @@ mod outputs;
 mod overrides;
 pub mod params;
 mod policy;
+pub mod prompt;
 pub mod runs;
 mod source;
 mod timestamp;
@@ -100,6 +110,7 @@ pub use manifest::ProvenanceManifest;
 pub use nodes::NodeCatalog;
 pub use overrides::detect_inputs;
 pub use params::{expand, ParameterMap, VaryMap, VaryMode, VarySpec};
+pub use prompt::{Analysis, CompiledPrompt, Intent, ShotFacts};
 pub use source::SourceMode;
 pub(crate) use worker::advance::{cancel_run, retry_run};
 pub use worker::spawn_enhancement_worker;
