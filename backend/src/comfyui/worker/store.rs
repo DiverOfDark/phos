@@ -375,6 +375,7 @@ mod tests {
             output_prefix: Some("phos/task-1234".to_string()),
             settle_until: None,
             retry_count: 0,
+            produces_text: false,
         }
     }
 
