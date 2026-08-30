@@ -209,3 +209,29 @@ export function runCount(vary) {
 
 /** The most tasks one queue request may expand into — the backend's own cap. */
 export const MAX_FANOUT = 64;
+
+/**
+ * A run's clock, in the schedule register: `00:03:12`.
+ *
+ * The seconds come from the server, because the board is reading a machine's
+ * clock and the browser's may not agree with it.
+ */
+export function formatDuration(seconds) {
+  if (seconds == null || Number.isNaN(Number(seconds))) return "--:--:--";
+  const s = Math.max(0, Math.floor(Number(seconds)));
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(Math.floor(s / 3600))}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`;
+}
+
+/**
+ * How far along its line a run is, as `2/4`.
+ *
+ * `current_stage` is 0-based and, on a run that finished, is the count itself.
+ * A reader counts from one and expects the last stage of a four-stage line to
+ * read `4/4` rather than `5/4`, which is the whole of why this is a function.
+ */
+export function stageOf(run) {
+  const count = Math.max(1, run?.stage_count ?? 1);
+  const at = run?.status === "completed" ? count : (run?.current_stage ?? 0) + 1;
+  return `${Math.min(at, count)}/${count}`;
+}
