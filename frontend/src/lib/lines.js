@@ -220,3 +220,45 @@ export function heldLabel(run) {
   if (!takes) return "held";
   return `held · ${takes} take${takes === 1 ? "" : "s"}`;
 }
+
+/**
+ * The field names the backend's contract calls a seed, lowercased.
+ *
+ * The same list as `ParamName::Seed`'s aliases in
+ * `backend/src/comfyui/contract/mod.rs`. Duplicated rather than fetched because
+ * it is three words that have not changed since FR3, and a round trip to learn
+ * them would be a request per card.
+ */
+const SEED_FIELDS = ["seed", "noise_seed", "rand_seed"];
+
+/**
+ * The seed a take was made with, or `null` if the stage does not carry one.
+ *
+ * A take's parameters are keyed `"<node_id>.<field>"`, and the node id is
+ * whatever the workflow's author numbered their sampler — `3` in ComfyUI's own
+ * example graph and almost nothing else. Reading one hard-coded key would make
+ * every card of every real workflow fall back to a task id, which is exactly
+ * the four-identical-cards problem the seed is shown to solve. So the *field*
+ * is what is matched, and the node id is left to be whatever it is.
+ *
+ * The lowest node id wins when a graph has several samplers, so the same take
+ * shows the same number every time the board is drawn — and by node id as a
+ * number, or `10` would sort before `3` and the card would flip between two
+ * samplers depending on which workflow it came from.
+ */
+export function takeSeed(take) {
+  const params = take?.parameters;
+  if (!params || typeof params !== "object") return null;
+  const seeds = Object.keys(params)
+    .filter((key) => key.includes("."))
+    .filter((key) => SEED_FIELDS.includes(key.slice(key.indexOf(".") + 1).toLowerCase()))
+    .filter((key) => typeof params[key] === "number")
+    .sort((a, b) => {
+      const node = (k) => k.slice(0, k.indexOf("."));
+      const na = Number(node(a));
+      const nb = Number(node(b));
+      if (Number.isFinite(na) && Number.isFinite(nb) && na !== nb) return na - nb;
+      return node(a).localeCompare(node(b));
+    });
+  return seeds.length ? params[seeds[0]] : null;
+}

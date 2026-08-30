@@ -6,7 +6,7 @@ import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
 import WorkflowContract from '@/components/WorkflowContract.vue'
 import LineEditor from '@/components/LineEditor.vue'
 import { controlKind, isParameterInput, isTextInput, inputKey, parameterValue, formatDuration, stageOf, readinessColor, installedLabel } from '@/lib/utils'
-import { typeTrack, continuationCost, heldLabel } from '@/lib/lines'
+import { typeTrack, continuationCost, heldLabel, takeSeed } from '@/lib/lines'
 
 // --- Connection health ---
 const comfyuiHealthy = ref(false)
@@ -1642,7 +1642,8 @@ defineExpose({ loadData: fetchWorkflows })
                 </span>
                 <span class="flex items-center justify-between gap-1 px-2 py-1 border-t border-line">
                   <span class="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-tertiary truncate">
-                    seed {{ take.parameters?.['3.seed'] ?? shortId(take.task_id) }}
+                    <template v-if="takeSeed(take) !== null">seed {{ takeSeed(take) }}</template>
+                    <template v-else>{{ shortId(take.task_id) }}</template>
                   </span>
                   <span
                     class="signal-dot flex-none"

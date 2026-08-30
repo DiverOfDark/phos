@@ -21,6 +21,7 @@ import {
   askedCount,
   continuationCost,
   heldLabel,
+  takeSeed,
 } from "./lines.js";
 
 /** One stage, as `GET /api/comfyui/lines/{id}` serves it. */
@@ -234,4 +235,22 @@ test("a line reads as what goes in one end and what comes out the other", () => 
     askedCount({ stages: [stage("A", "image", "image", { exposed: ["6.text", "3.seed"] }), stage("B", "image", "image")] }),
     2,
   );
+});
+
+test("a take is told apart by its seed, whatever the sampler is numbered", () => {
+  // ComfyUI's own example graph numbers the sampler 3; almost no real workflow
+  // does. Matching the field rather than the whole key is the difference
+  // between four cards that say 1000–1003 and four that say nothing useful.
+  assert.equal(takeSeed({ parameters: { "3.seed": 1002, "3.steps": 20 } }), 1002);
+  assert.equal(takeSeed({ parameters: { "31.noise_seed": 77 } }), 77);
+  assert.equal(takeSeed({ parameters: { "12.rand_seed": 5 } }), 5);
+  // Two samplers: the lowest node id, and by number — "10" is not before "3".
+  assert.equal(takeSeed({ parameters: { "10.seed": 1, "3.seed": 2 } }), 2);
+  // A stage that carries no seed says so, so the card can fall back to an id
+  // rather than printing "seed undefined".
+  assert.equal(takeSeed({ parameters: { "6.text": "a jetty" } }), null);
+  assert.equal(takeSeed({ parameters: {} }), null);
+  assert.equal(takeSeed({}), null);
+  // A wired socket is an array, not a number, and is not a seed anybody set.
+  assert.equal(takeSeed({ parameters: { "3.seed": ["1", 0] } }), null);
 });
