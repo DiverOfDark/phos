@@ -85,7 +85,7 @@ mod worker;
 mod workflow;
 
 pub use client::ComfyUiClient;
-pub use loaders::{detect_loaders, importable, LoaderKind};
+pub use loaders::{default_binding_warnings, detect_loaders, importable, LoaderKind};
 pub use manifest::ProvenanceManifest;
 pub use nodes::NodeCatalog;
 pub use overrides::detect_inputs;

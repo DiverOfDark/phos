@@ -12,7 +12,7 @@
 use super::status::{handle_failure, live_task};
 use crate::comfyui::client::ComfyUiClient;
 use crate::comfyui::loaders::{
-    role_directives, takes_video, LoaderKind, SourceBinding, SourceRole,
+    bind_targets, role_directives, takes_video, LoaderKind, SourceBinding, SourceRole,
 };
 use crate::comfyui::policy::FailureSite;
 use crate::comfyui::source::{read_source, resolve_source_file, SourceMode};
@@ -23,7 +23,7 @@ use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use serde_json::Value;
 use std::path::Path;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// A task waiting to be sent to ComfyUI.
 struct PendingTask {
@@ -199,6 +199,13 @@ fn dispatch_one(
         role: target_role.unwrap_or(SourceRole::Start),
         role_overrides: &role_overrides,
     };
+    let plan = bind_targets(&workflow, &binding);
+    // An ambiguity is not a failure — the run still goes ahead with the first
+    // candidate — but it is the difference between a clip that moves and one
+    // that does not, so it is said out loud rather than swallowed.
+    for warning in &plan.warnings {
+        warn!("Task {}: {}", task.id, warning);
+    }
 
     // Pin the output names before the run starts, and record the prefix so a
     // later poll can find the files even if history never mentions them. The
@@ -206,7 +213,7 @@ fn dispatch_one(
     // advances the counter for the next one, so a reused prefix would let the
     // by-name probe import the stale first result.
     let output_prefix = output_prefix_for_task(&task.id, &fresh_attempt_id());
-    let prepared = prepare_workflow(&workflow, &binding, &text_overrides, Some(&output_prefix));
+    let prepared = prepare_workflow(&workflow, &plan, &text_overrides, Some(&output_prefix));
 
     // 5. Queue prompt
     let prompt_id = client

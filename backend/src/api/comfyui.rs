@@ -221,12 +221,21 @@ pub(super) async fn comfyui_list_workflows(
             // imported before this existed have no record of theirs, and the
             // graph is already in memory here — the list only omits it from the
             // *response*, which is tens of kilobytes per row.
-            let loaders = serde_json::from_str::<serde_json::Value>(&wf.workflow_json)
-                .map(|graph| crate::comfyui::detect_loaders(&graph))
+            let graph = serde_json::from_str::<serde_json::Value>(&wf.workflow_json).ok();
+            let loaders = graph
+                .as_ref()
+                .map(crate::comfyui::detect_loaders)
                 .unwrap_or_default();
             let takes_video = loaders
                 .iter()
                 .any(|l| l.kind == crate::comfyui::LoaderKind::Video);
+            // Slots more than one loader claims with nothing to tell them
+            // apart. Answered here, before a run, because after the run the
+            // evidence is a clip that does not move.
+            let warnings = graph
+                .as_ref()
+                .map(crate::comfyui::default_binding_warnings)
+                .unwrap_or_default();
             let inputs: serde_json::Value = wf
                 .inputs_json
                 .and_then(|s| serde_json::from_str(&s).ok())
@@ -243,6 +252,7 @@ pub(super) async fn comfyui_list_workflows(
                 "outputs": outputs,
                 "loaders": loaders,
                 "takes_video": takes_video,
+                "warnings": warnings,
                 "created_at": wf.created_at,
             })
         })

@@ -130,6 +130,11 @@ function presetHasGeneration(preset) {
   })
 }
 
+// Slots this workflow gives Phos no way to choose between — two untitled
+// LoadImage nodes, say. The backend binds the first and leaves the rest alone;
+// without this the user's only clue would be a clip that does not move.
+const bindingWarnings = computed(() => selectedWorkflow.value?.warnings || [])
+
 // Check if current text overrides match any existing generation
 const currentMatchesGeneration = computed(() => {
   if (!selectedWorkflowId.value) return false
@@ -418,6 +423,19 @@ async function enhance() {
                 @input="selectedPresetId = null"
               ></textarea>
             </div>
+          </div>
+
+          <!-- Slots more than one loader claims, with nothing in the graph to
+               tell them apart. The run still goes ahead with the first, so this
+               is the only place a person finds out there was a choice. -->
+          <div
+            v-for="(warning, i) in bindingWarnings"
+            :key="i"
+            class="flex items-start gap-2 px-3 py-2 border rounded font-mono text-xs"
+            style="border-color: var(--status-degraded); color: var(--status-degraded)"
+          >
+            <span class="signal-dot mt-1 flex-none" style="width:6px;height:6px;background:var(--status-degraded)"></span>
+            <span>{{ warning }}</span>
           </div>
 
           <div
