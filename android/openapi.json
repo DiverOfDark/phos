@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "integrate/wave-b"
+    "version": "feat/comfyui-production-lines"
   },
   "paths": {
     "/api/auth/callback": {
@@ -334,6 +334,165 @@
         }
       }
     },
+    "/api/comfyui/lines": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "List production lines",
+        "description": "Every line in this library, with its stages and whether the chain still type-checks against the workflows' current contracts.",
+        "operationId": "list_lines",
+        "responses": {
+          "200": {
+            "description": "List of lines"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Create a production line",
+        "description": "Store a chain of workflows. Rejected with a message naming the stage if any stage cannot consume what the one before it produces.",
+        "operationId": "create_line",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Line created"
+          },
+          "400": {
+            "description": "The chain does not fit together, or a stage is unusable"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/{id}": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Get a production line",
+        "operationId": "get_line",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Line ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The line and its stages"
+          },
+          "404": {
+            "description": "Line not found"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Replace a production line",
+        "description": "Replace a line's name, description and whole stage list. Refused while a run of this line is still in flight.",
+        "operationId": "update_line",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Line ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Line replaced"
+          },
+          "400": {
+            "description": "The chain does not fit together"
+          },
+          "404": {
+            "description": "Line not found"
+          },
+          "409": {
+            "description": "A run of this line is still in flight"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Delete a production line",
+        "operationId": "delete_line",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Line ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Line deleted"
+          },
+          "404": {
+            "description": "Line not found"
+          },
+          "409": {
+            "description": "A run of this line is still in flight"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
     "/api/comfyui/nodes": {
       "get": {
         "tags": [
@@ -359,6 +518,196 @@
         "responses": {
           "200": {
             "description": "Node definitions, or available=false"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/runs": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "List runs",
+        "description": "The queue board: one row per run, newest first, with the stage it is on and how far along its line that is. The tasks underneath are reachable through GET /api/comfyui/runs/{id}.",
+        "operationId": "list_runs",
+        "parameters": [
+          {
+            "name": "shot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max items to return (default 50)",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Cursor: `created_at` of the last run from the previous page",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of runs"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Start a production line against a shot",
+        "description": "Open a run and queue its first stage. Each stage's output becomes the next stage's input as it completes. Refused if the line does not fit together, or if its first stage cannot read this shot.",
+        "operationId": "start_run",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartRunPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Run started"
+          },
+          "400": {
+            "description": "The line does not fit, or does not fit this shot"
+          },
+          "404": {
+            "description": "Line or shot not found"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/runs/{id}": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Get a run and its tasks",
+        "description": "One run with every task under it, in stage order — the drill-down behind a board row.",
+        "operationId": "get_run",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Run ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The run and its tasks"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/runs/{id}/cancel": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Cancel a run",
+        "description": "Stop every task of a run that has not landed yet, interrupting on ComfyUI the one that is actually executing and dropping the rest from its queue.",
+        "operationId": "cancel_run",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Run ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run cancelled"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/runs/{id}/retry": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Resume a run from the stage that failed",
+        "description": "Re-queue every failed or cancelled task of a run, from the source file it was already given. Stages that already succeeded are not re-run.",
+        "operationId": "retry_run",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Run ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run resumed"
+          },
+          "400": {
+            "description": "Nothing in this run is waiting to be retried"
+          },
+          "404": {
+            "description": "Run not found"
           },
           "503": {
             "description": "ComfyUI not configured"
@@ -2989,6 +3338,71 @@
           }
         }
       },
+      "LinePayload": {
+        "type": "object",
+        "required": [
+          "name",
+          "stages"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LineStagePayload"
+            }
+          }
+        }
+      },
+      "LineStagePayload": {
+        "type": "object",
+        "description": "One step of a line, as a client sends it.\n\nEvery field but `workflow_id` mirrors something a single-workflow enhance\nalready sends, and is stored and dispatched through exactly the same code —\nwhich is why a stage of a line and an ad-hoc run cannot drift apart.",
+        "required": [
+          "workflow_id"
+        ],
+        "properties": {
+          "keep_output": {
+            "type": "boolean",
+            "description": "Keep this stage's output once the run completes. The last stage's output\nis the product and is kept regardless."
+          },
+          "parameters": {
+            "type": "object",
+            "description": "Typed values for this stage's non-text inputs, keyed\n`\"<node_id>.<field_name>\"`."
+          },
+          "source_mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which part of an upstream video this stage consumes: `first_frame`,\n`last_frame`, `at_time:<ms>`, `keyframe:<n>` or `whole_video`. Omit it\nto let the graph decide."
+          },
+          "text_overrides": {
+            "type": "object",
+            "description": "Prompt bindings, plus the `role:<node_id>` directives the loader binder\nreads.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "vary": {
+            "type": "object",
+            "description": "Parameters to sweep rather than pin. Expanded once per continuation, so\na count of 4 here means four takes and four independent runners through\nevery stage after this one."
+          },
+          "workflow_id": {
+            "type": "string"
+          }
+        }
+      },
       "MediaType": {
         "type": "string",
         "description": "What flows from one stage to the next.\n\nThree, and `text` is one of them: a text-producing stage writes no file at\nall, so it is not a degenerate image.",
@@ -3713,6 +4127,22 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "StartRunPayload": {
+        "type": "object",
+        "description": "What starts a run.\n\nFR7 adds a query in place of `shot_id` and a cursor beside it; the handler\nis already written around \"which shots does this ask for\", so that is a new\nfield rather than a new endpoint.",
+        "required": [
+          "line_id",
+          "shot_id"
+        ],
+        "properties": {
+          "line_id": {
+            "type": "string"
+          },
+          "shot_id": {
+            "type": "string"
           }
         }
       },
