@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/comfyui-prompt-compiler"
+    "version": "integrate/wave-d"
   },
   "paths": {
     "/api/auth/callback": {
@@ -498,6 +498,60 @@
         }
       }
     },
+    "/api/comfyui/lines/import": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Import a production line",
+        "description": "Read a line out of an exported bundle — the same format bundled templates ship in. Its workflows are created, or reused where an identical graph is already here, and its requirements are checked against what this ComfyUI has installed. A line whose nodes or models are missing is still imported; the response says what is missing. A name already in use is suffixed, never overwritten. Pass `dry_run=true` for the report alone.",
+        "operationId": "import_line",
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "description": "Check the bundle and report what it needs, writing nothing. Defaults to\n`false`.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Name the imported line this rather than what the file calls it. A name\nalready in use is still suffixed rather than overwritten.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LineBundle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The imported line, and what it needs"
+          },
+          "400": {
+            "description": "The file is not a readable line export, or its chain does not fit together here"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
     "/api/comfyui/lines/{id}": {
       "get": {
         "tags": [
@@ -600,6 +654,45 @@
           },
           "409": {
             "description": "A run of this line is still in flight"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/{id}/export": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Export a production line",
+        "description": "The line, its stages, the workflow graph behind every stage, and a manifest of the node classes and model files it needs — as one JSON document that can be imported into another library or another Phos install. This is the same format bundled templates ship in.",
+        "operationId": "export_line",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Line ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The line as a portable bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LineBundle"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Line not found"
           },
           "503": {
             "description": "ComfyUI not configured"
@@ -1025,6 +1118,62 @@
           },
           "404": {
             "description": "Task not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/templates": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "List bundled templates",
+        "description": "The templates this build ships, what this library already has of each, and whether this ComfyUI has the nodes and models to run it. Readiness is `unknown` — never `missing` — when the node catalogue cannot be read.",
+        "operationId": "list_templates",
+        "responses": {
+          "200": {
+            "description": "Bundled templates with readiness"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/templates/{key}/install": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Install a bundled template",
+        "description": "Write this template's workflows and its line into the library. Installing one that is already installed gives a fresh copy and leaves the existing rows alone — they may have been edited, and they are the user's.",
+        "operationId": "install_template",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Template key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Installed"
+          },
+          "404": {
+            "description": "No such template"
           },
           "500": {
             "description": "Internal server error"
@@ -3050,6 +3199,96 @@
           }
         }
       },
+      "BundleLine": {
+        "type": "object",
+        "description": "The line itself. Stage order is array order — there is no `stage_idx`,\nbecause two sources of truth for one ordering is one too many.",
+        "required": [
+          "name",
+          "stages"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BundleStage"
+            }
+          }
+        }
+      },
+      "BundleStage": {
+        "type": "object",
+        "description": "One step of a line, as it travels.\n\nField for field this is what line CRUD already takes, with one difference:\n`workflow` is a key into this bundle's own `workflows` map rather than a\nlibrary id, because a library id is meaningless in the library it is being\ncarried to.",
+        "required": [
+          "workflow"
+        ],
+        "properties": {
+          "keep_output": {
+            "type": "boolean"
+          },
+          "parameters": {
+            "type": "object"
+          },
+          "source_mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text_overrides": {
+            "type": "object",
+            "description": "Prompt bindings, plus the `role:<node_id>` directives the loader binder\nreads.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "vary": {
+            "type": "object"
+          },
+          "workflow": {
+            "type": "string",
+            "description": "Which entry of `workflows` this stage runs. Any string: an export uses\nthe source library's workflow id, a hand-written template can use a\nreadable name."
+          }
+        }
+      },
+      "BundleWorkflow": {
+        "type": "object",
+        "description": "A workflow, carried whole.",
+        "required": [
+          "name",
+          "graph"
+        ],
+        "properties": {
+          "contract": {
+            "type": "object",
+            "description": "The contract this workflow carried where it came from.\n\nOptional, and re-derived on import against the *target* box's node\ncatalogue — only the `corrections` inside it survive verbatim, because a\ncorrection is the one part of a contract that cannot be worked out\nagain. A hand-written template can leave it out entirely."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "graph": {
+            "type": "object",
+            "description": "The ComfyUI API-format graph, exactly as the library stores it."
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "ClientVersionResponse": {
         "type": "object",
         "description": "`GET /api/client/version` response — the bundled Android build.\n\nEvery field is non-nullable, so a generated client needs no null-handling at\nall: \"no APK bundled\" is expressed by `available: false` with\n`version_code: 0`, not by absent fields and not by an error status.",
@@ -3105,6 +3344,14 @@
             "type": "string"
           }
         }
+      },
+      "Confidence": {
+        "type": "string",
+        "description": "How much Phos claims to know about whether this template runs.\n\nStated because the shipped graphs were built from published node definitions\nrather than exported from a running ComfyUI, and saying so is better than\nimplying otherwise. The readiness check is the machine-readable half of the\nsame honesty.",
+        "enum": [
+          "high",
+          "unverified"
+        ]
       },
       "ContractCorrections": {
         "type": "object",
@@ -3636,6 +3883,116 @@
           }
         }
       },
+      "InputMismatch": {
+        "type": "object",
+        "description": "A field a graph sets that its node does not take, or one the node requires\nand the graph does not set.",
+        "required": [
+          "workflow_key",
+          "node_id",
+          "node_class",
+          "field",
+          "kind",
+          "message"
+        ],
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`unexpected` — the graph sets it and the node has no such input.\n`absent` — the node requires it and the graph does not set it."
+          },
+          "message": {
+            "type": "string",
+            "description": "The same thing in a sentence, so a UI never has to compose one."
+          },
+          "node_class": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "workflow_key": {
+            "type": "string"
+          }
+        }
+      },
+      "InstalledState": {
+        "type": "object",
+        "description": "What a library has of one template.",
+        "required": [
+          "version",
+          "line_exists",
+          "workflows",
+          "customised"
+        ],
+        "properties": {
+          "customised": {
+            "type": "boolean",
+            "description": "At least one workflow is present and no longer managed: somebody edited\nit, so this template will not be updated over their work."
+          },
+          "line_exists": {
+            "type": "boolean",
+            "description": "The line row is still there. `false` once the user deletes it."
+          },
+          "line_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The version last seeded.",
+            "minimum": 0
+          },
+          "workflows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstalledWorkflow"
+            }
+          }
+        }
+      },
+      "InstalledWorkflow": {
+        "type": "object",
+        "description": "What one seeded workflow looks like right now.",
+        "required": [
+          "key",
+          "workflow_id",
+          "managed"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "The bundle-local key, so a reader can line it up with the template."
+          },
+          "managed": {
+            "type": "boolean",
+            "description": "Still carries this template's marker, so an upgrade may still update it."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`None` when the row has been deleted."
+          },
+          "version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The template version the marker records.",
+            "minimum": 0
+          },
+          "workflow_id": {
+            "type": "string"
+          }
+        }
+      },
       "Intent": {
         "type": "object",
         "description": "What the person asked for, as opposed to what is in the photograph.",
@@ -3660,6 +4017,48 @@
               "null"
             ],
             "description": "A style preset: \"35mm film, muted palette\"."
+          }
+        }
+      },
+      "LineBundle": {
+        "type": "object",
+        "description": "A line, its stages, its workflows and what it needs installed.",
+        "required": [
+          "line"
+        ],
+        "properties": {
+          "exported_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it left, for a human reading the file. Never read by the importer."
+          },
+          "format": {
+            "type": "string",
+            "description": "Always [`BUNDLE_FORMAT`]."
+          },
+          "format_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "line": {
+            "$ref": "#/components/schemas/BundleLine"
+          },
+          "requirements": {
+            "$ref": "#/components/schemas/Requirements",
+            "description": "What this line needs installed, as computed where it was exported.\n\nDocumentation, not input: the importer recomputes it from the graphs in\nthis same file, so a stale or hand-edited manifest cannot make an import\nreport something untrue."
+          },
+          "workflows": {
+            "type": "object",
+            "description": "Every workflow the stages name, keyed by whatever they name it.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/BundleWorkflow"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           }
         }
       },
@@ -3771,6 +4170,26 @@
             "type": "string"
           },
           "target_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ModelRef": {
+        "type": "object",
+        "description": "One weights file a graph names, and where it names it.\n\nThe node class and field are carried because \"sd_xl.safetensors is missing\"\nis not actionable and \"CheckpointLoaderSimple wants sd_xl.safetensors in\nckpt_name\" is: it says which of ComfyUI's model directories to put it in.",
+        "required": [
+          "class_type",
+          "field",
+          "name"
+        ],
+        "properties": {
+          "class_type": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "name": {
             "type": "string"
           }
         }
@@ -4063,6 +4482,50 @@
           "description": "Anything a newer Phos wrote that this one has no field for. Kept so a\nround trip through an older binary does not quietly drop provenance.\n\nFlattened, so it has no name of its own in the JSON and nothing to\npublish in the schema — a client generated from an older spec simply\ndoes not see the newer keys, which is the point."
         }
       },
+      "Readiness": {
+        "type": "object",
+        "description": "What a template's readiness comes to.",
+        "required": [
+          "state",
+          "label",
+          "detail",
+          "requirements",
+          "input_mismatches"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "The whole story, for the panel under the label."
+          },
+          "input_mismatches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InputMismatch"
+            }
+          },
+          "label": {
+            "type": "string",
+            "description": "The one-line verdict, in the status vocabulary the rest of the console\nuses: `READY`, `MISSING NODE RIFE VFI`, `MISSING 2 MODELS`, `UNKNOWN`."
+          },
+          "requirements": {
+            "$ref": "#/components/schemas/RequirementsReport",
+            "description": "FR5d's report, verbatim, so a client can render either."
+          },
+          "state": {
+            "$ref": "#/components/schemas/ReadinessState"
+          }
+        }
+      },
+      "ReadinessState": {
+        "type": "string",
+        "description": "How ready, in one word. FR5d's three, plus one.",
+        "enum": [
+          "ready",
+          "missing",
+          "degraded",
+          "unchecked"
+        ]
+      },
       "ReassignFacePayload": {
         "type": "object",
         "description": "Reassign a face to a different person",
@@ -4084,6 +4547,61 @@
         "properties": {
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "Requirements": {
+        "type": "object",
+        "description": "What a line needs installed on the ComfyUI that will run it.",
+        "properties": {
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelRef"
+            },
+            "description": "Every weights file the graphs name, sorted."
+          },
+          "node_classes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Every distinct `class_type` in the line's graphs, sorted."
+          }
+        }
+      },
+      "RequirementsReport": {
+        "type": "object",
+        "description": "What the catalogue said, and what is missing.\n\nStand-in for `portable::RequirementsReport`, field for field.",
+        "required": [
+          "checked",
+          "missing_nodes",
+          "missing_models",
+          "unverified_models"
+        ],
+        "properties": {
+          "checked": {
+            "type": "boolean",
+            "description": "False when there was no catalogue to check against."
+          },
+          "missing_models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelRef"
+            }
+          },
+          "missing_nodes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "unverified_models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelRef"
+            },
+            "description": "Weights files that could be neither confirmed nor denied."
           }
         }
       },
@@ -4539,6 +5057,42 @@
           "total_shots": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "Template": {
+        "type": "object",
+        "description": "What makes this line export a *bundled template* rather than somebody's\nexport: an identity that is stable across releases, and a version.\n\nFR6's, and the only field in the document FR5d does not define. Absent on an\nordinary export, which is exactly right — a line somebody sent you is not\nsomething Phos should later overwrite.",
+        "required": [
+          "key",
+          "version"
+        ],
+        "properties": {
+          "confidence": {
+            "$ref": "#/components/schemas/Confidence"
+          },
+          "key": {
+            "type": "string",
+            "description": "Stable across releases; the identity an upgrade matches on."
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What a person should know before running it: which custom node packs,\nwhich weights, what the frame rates mean."
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Bumped whenever the shipped content changes.",
+            "minimum": 0
           }
         }
       },
