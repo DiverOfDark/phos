@@ -40,6 +40,8 @@
 //!   what kind of control does each one want?
 //! * [`params`] — what did they set them to, and when they asked for a sweep
 //!   rather than a value, which runs does that come to?
+//! * [`portable`] — a line as a file: what leaves this library, what a line
+//!   needs installed, and whether the box it arrives on has it.
 //!
 //! Those all take `serde_json::Value` in and give an answer out, so the whole
 //! completion path is tested against recorded `/history` payloads with no
@@ -84,6 +86,7 @@ mod outputs;
 mod overrides;
 pub mod params;
 mod policy;
+pub mod portable;
 pub mod runs;
 mod source;
 mod timestamp;
@@ -100,6 +103,9 @@ pub use manifest::ProvenanceManifest;
 pub use nodes::NodeCatalog;
 pub use overrides::detect_inputs;
 pub use params::{expand, ParameterMap, VaryMap, VaryMode, VarySpec};
+pub use portable::{
+    BundleLine, BundleStage, BundleWorkflow, LineBundle, ModelRef, Requirements, RequirementsReport,
+};
 pub use source::SourceMode;
 pub(crate) use worker::advance::{cancel_run, retry_run};
 pub use worker::spawn_enhancement_worker;
