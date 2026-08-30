@@ -60,9 +60,14 @@
 //! * **Failures are split by site.** A refused graph or a node exception fails
 //!   at once with the real message; a dropped connection backs off and tries
 //!   again.
+//! * **Everything this module creates is marked synthetic.** A generated file
+//!   is flagged on its row and carries a [`manifest::ProvenanceManifest`]. The
+//!   flag keeps machine-made faces out of the person model; the manifest is how
+//!   anyone, years from now, can still tell which memories were real.
 
 mod client;
 mod history;
+mod manifest;
 pub mod nodes;
 mod outputs;
 mod overrides;
@@ -73,6 +78,7 @@ mod worker;
 mod workflow;
 
 pub use client::ComfyUiClient;
+pub use manifest::ProvenanceManifest;
 pub use nodes::NodeCatalog;
 pub use overrides::detect_inputs;
 // The contract test reads it through the library crate; the binary compiles
