@@ -23,6 +23,7 @@
 //! because a branch is just a task with a parent.
 
 use super::contract::{MediaType, StageContract};
+use super::editor;
 use super::line::{self, LineError, StageTyping};
 use super::params::{ParameterMap, VaryMap};
 use super::prompt;
@@ -33,7 +34,8 @@ use diesel::sqlite::SqliteConnection;
 use std::collections::HashMap;
 
 /// A `line_stages` row joined to its workflow: position, workflow id and name,
-/// the three override maps, source mode, keep flag, stored contract and graph.
+/// the three override maps, source mode, keep flag, exposed keys, stored
+/// contract and graph.
 type StageTuple = (
     i32,
     String,
@@ -43,6 +45,7 @@ type StageTuple = (
     String,
     Option<String>,
     bool,
+    String,
     Option<String>,
     String,
 );
@@ -57,6 +60,13 @@ pub(crate) struct StageRow {
     pub vary: String,
     pub source_mode: Option<String>,
     pub keep_output: bool,
+    /// Keys this stage leaves to whoever sends it — the *exposed* disposition.
+    /// Everything else the stage carries is a decision it made.
+    pub exposed: Vec<String>,
+    /// Whether the graph has a loader that can read a clip, taken off the graph
+    /// the way the dispatcher takes it. The contract's roles usually say the
+    /// same thing, but one stored before loaders were recorded says nothing.
+    pub takes_video: bool,
     pub contract: StageContract,
 }
 
@@ -70,17 +80,35 @@ impl StageRow {
         }
     }
 
-    /// The stage as something queueable, with everything only Phos can supply
-    /// already written into its override map.
+    /// The stage as something queueable, with the sender's answers folded in
+    /// and everything only Phos can supply written into its override map.
     ///
-    /// Today that is one thing: a **describe** stage is handed the instruction
-    /// compiled from what the library knows about this shot — the person names
-    /// clustering found, the EXIF date and place, the caption — which is the
-    /// whole point of FR9 and is a single `text_overrides` entry.
-    pub fn plan_for(&self, conn: &mut SqliteConnection, shot_id: &str) -> StagePlan<'_> {
+    /// The order is the point, and it is why this is one function rather than
+    /// two calls at each site:
+    ///
+    /// 1. the line's own values ([`Self::plan`]);
+    /// 2. what the sender answered for the keys this stage left **exposed**
+    ///    ([`StagePlan::accept`]) — refused by name if they answered one it
+    ///    pinned;
+    /// 3. what only Phos can supply. Today that is one thing: a **describe**
+    ///    stage is handed the instruction compiled from what the library knows
+    ///    about this shot — the person names clustering found, the EXIF date
+    ///    and place, the caption — as a single `text_overrides` entry.
+    ///
+    /// Third rather than second because a describe stage may leave
+    /// `phos:intent` exposed, and the instruction has to be compiled out of the
+    /// intent that ended up on the stage rather than the one the line was drawn
+    /// with.
+    pub fn plan_for(
+        &self,
+        conn: &mut SqliteConnection,
+        shot_id: &str,
+        supplied: &SuppliedValues,
+    ) -> Result<StagePlan<'_>, LineError> {
         let mut plan = self.plan();
+        plan.accept(&self.exposed, supplied)?;
         compile_describe_instruction(conn, shot_id, &self.contract, &mut plan.text_overrides);
-        plan
+        Ok(plan)
     }
 
     /// The stage as something queueable: its stored JSON parsed, and the
@@ -112,6 +140,64 @@ pub(crate) struct StagePlan<'a> {
     pub source_mode: Option<&'a str>,
 }
 
+impl StagePlan<'_> {
+    /// Fold in what the sender answered for this stage.
+    ///
+    /// Only for keys the stage marked *exposed*. Anything else is a decision
+    /// the line made, and a caller setting one is not steering the line but
+    /// rewriting it — which is a refusal, by name, rather than a silent drop.
+    pub fn accept(
+        &mut self,
+        exposed: &[String],
+        supplied: &SuppliedValues,
+    ) -> Result<(), LineError> {
+        let unasked = editor::unasked_keys(
+            exposed,
+            supplied
+                .parameters
+                .keys()
+                .chain(supplied.text_overrides.keys()),
+        );
+        if let Some(key) = unasked.first() {
+            return Err(LineError {
+                stage_idx: self.stage_idx,
+                message: format!("Stage {} does not ask for {}.", self.stage_idx + 1, key),
+            });
+        }
+        for (key, value) in &supplied.parameters {
+            self.parameters.insert(key.clone(), value.clone());
+            // An answer is a value, so it stops being a sweep. Sweeping a key
+            // the line left open would be two people deciding it at once.
+            self.vary.remove(key);
+        }
+        for (key, value) in &supplied.text_overrides {
+            self.text_overrides.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+}
+
+/// What the sender answered for one stage of a line.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SuppliedValues {
+    #[serde(default)]
+    pub text_overrides: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub parameters: ParameterMap,
+}
+
+/// Those answers, keyed by stage index — the shape stored in
+/// `runs.stage_values`. JSON has no integer keys, so the index is a string.
+pub(crate) type SuppliedByStage = std::collections::BTreeMap<String, SuppliedValues>;
+
+/// The answers for one stage, out of what the run snapshotted.
+pub(crate) fn supplied_for(stored: Option<&str>, stage_idx: i32) -> SuppliedValues {
+    stored
+        .and_then(|s| serde_json::from_str::<SuppliedByStage>(s).ok())
+        .and_then(|mut m| m.remove(&stage_idx.to_string()))
+        .unwrap_or_default()
+}
+
 /// Every stage of a line, in order, with the contract each workflow carries.
 ///
 /// A workflow imported before contracts existed has `contract_json` NULL; one
@@ -137,6 +223,7 @@ pub(crate) fn stages_of_line(
             diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(line_stages.vary, '{}')"),
             line_stages::source_mode,
             line_stages::keep_output,
+            diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(line_stages.exposed, '[]')"),
             comfyui_workflows::contract_json,
             comfyui_workflows::workflow_json,
         ))
@@ -153,7 +240,11 @@ pub(crate) fn stages_of_line(
             vary: r.5,
             source_mode: r.6,
             keep_output: r.7,
-            contract: contract_of(r.8.as_deref(), &r.9),
+            exposed: serde_json::from_str(&r.8).unwrap_or_default(),
+            takes_video: serde_json::from_str::<serde_json::Value>(&r.10)
+                .map(|g| super::loaders::takes_video(&g))
+                .unwrap_or(false),
+            contract: contract_of(r.9.as_deref(), &r.10),
         })
         .collect())
 }
@@ -272,6 +363,7 @@ pub(crate) fn open_run(
     shot_id: &str,
     label: &str,
     stage_count: i32,
+    stage_values: Option<&str>,
 ) -> QueryResult<String> {
     let run_id = uuid::Uuid::new_v4().to_string();
     diesel::insert_into(runs::table)
@@ -281,6 +373,7 @@ pub(crate) fn open_run(
             shot_id,
             label,
             stage_count,
+            stage_values,
         })
         .execute(conn)?;
     Ok(run_id)
@@ -324,6 +417,7 @@ pub(crate) fn start_line_run(
     conn: &mut SqliteConnection,
     line_id: &str,
     shot_id: &str,
+    answers: &SuppliedByStage,
 ) -> Result<RunStart, StartError> {
     let label: String = crate::schema::production_lines::table
         .filter(crate::schema::production_lines::id.eq(line_id))
@@ -370,10 +464,47 @@ pub(crate) fn start_line_run(
         None => {}
     }
 
+    // Every answer is checked against the stage that would read it, here,
+    // before anything is written — a value sent to a stage that pins it is a
+    // misunderstanding of the line, and finding that out at stage 4 is finding
+    // out four hours late.
+    for (key, supplied) in answers {
+        let Ok(idx) = key.parse::<i32>() else {
+            return Err(StartError::Rejected(LineError {
+                stage_idx: -1,
+                message: format!("{:?} is not a stage number.", key),
+            }));
+        };
+        let Some(stage) = stages.iter().find(|s| s.stage_idx == idx) else {
+            return Err(StartError::Rejected(LineError {
+                stage_idx: idx,
+                message: format!("This line has no stage {}.", idx + 1),
+            }));
+        };
+        let mut plan = stage.plan();
+        plan.accept(&stage.exposed, supplied)
+            .map_err(StartError::Rejected)?;
+    }
+    let stage_values = (!answers.is_empty())
+        .then(|| serde_json::to_string(answers).ok())
+        .flatten();
+
     let stage_count = stages.len() as i32;
     conn.transaction::<_, diesel::result::Error, _>(|conn| {
-        let run_id = open_run(conn, Some(line_id), shot_id, &label, stage_count)?;
-        let plan = stages[0].plan_for(conn, shot_id);
+        let run_id = open_run(
+            conn,
+            Some(line_id),
+            shot_id,
+            &label,
+            stage_count,
+            stage_values.as_deref(),
+        )?;
+        // Already checked above, so the `accept` inside this cannot refuse;
+        // applied again because the plan is rebuilt inside the transaction.
+        let first = answers.get("0").cloned().unwrap_or_default();
+        let plan = stages[0]
+            .plan_for(conn, shot_id, &first)
+            .map_err(|e| diesel::result::Error::QueryBuilderError(e.message.into()))?;
         let task_ids = queue_stage(conn, &run_id, shot_id, &plan, None, None)
             .map_err(|e| diesel::result::Error::QueryBuilderError(e.into()))?;
         Ok(RunStart {
@@ -460,7 +591,8 @@ mod tests {
         ))
         .unwrap();
 
-        let err = start_line_run(&mut conn, "line-1", "shot-1").unwrap_err();
+        let err =
+            start_line_run(&mut conn, "line-1", "shot-1", &SuppliedByStage::new()).unwrap_err();
         assert!(
             matches!(&err, StartError::Rejected(e) if e.message.contains("this shot is video")),
             "{}",
@@ -487,7 +619,8 @@ mod tests {
         ))
         .unwrap();
 
-        let started = start_line_run(&mut conn, "line-1", "shot-1").unwrap();
+        let started =
+            start_line_run(&mut conn, "line-1", "shot-1", &SuppliedByStage::new()).unwrap();
         assert_eq!(started.stage_count, 2);
         assert_eq!(started.task_ids.len(), 1, "stage 2 waits for stage 1");
 
@@ -516,6 +649,124 @@ mod tests {
     }
 
     #[test]
+    fn a_stage_gets_the_answers_it_asked_for_and_refuses_the_ones_it_did_not() {
+        let (_dir, mut conn) = library();
+        conn.batch_execute(&format!(
+            "INSERT INTO comfyui_workflows (id, name, workflow_json) \
+             VALUES ('wf-1', 'Portrait', '{g}'), ('wf-2', 'Upscale', '{g}');
+             INSERT INTO production_lines (id, name) VALUES ('line-1', 'Portrait Line');
+             INSERT INTO line_stages (id, line_id, stage_idx, workflow_id, parameters, exposed) \
+             VALUES ('st-1', 'line-1', 0, 'wf-1', '{{\"3.seed\":1000,\"3.steps\":20}}', \
+                     '[\"3.seed\"]'),
+                    ('st-2', 'line-1', 1, 'wf-2', '{{}}', '[\"3.cfg\"]');
+             INSERT INTO shots (id) VALUES ('shot-1');
+             INSERT INTO files (id, shot_id, path, hash, mime_type, is_original) \
+             VALUES ('file-1', 'shot-1', 'a.jpg', 'h1', 'image/jpeg', 1);",
+            g = IMAGE_GRAPH.replace('\'', "''")
+        ))
+        .unwrap();
+
+        // What the line pins is not askable, and saying so is the answer.
+        let mut refused = SuppliedByStage::new();
+        refused.insert(
+            "0".to_string(),
+            serde_json::from_value(serde_json::json!({ "parameters": { "3.steps": 40 } })).unwrap(),
+        );
+        let err = start_line_run(&mut conn, "line-1", "shot-1", &refused).unwrap_err();
+        assert!(
+            matches!(&err, StartError::Rejected(e) if e.message == "Stage 1 does not ask for 3.steps."),
+            "{}",
+            err
+        );
+        let opened: i64 = runs::table.count().get_result(&mut conn).unwrap();
+        assert_eq!(opened, 0, "nothing is written before the answers check out");
+
+        // What it does ask for lands on the task the run queues now…
+        let mut answers = SuppliedByStage::new();
+        answers.insert(
+            "0".to_string(),
+            serde_json::from_value(serde_json::json!({ "parameters": { "3.seed": 42 } })).unwrap(),
+        );
+        answers.insert(
+            "1".to_string(),
+            serde_json::from_value(serde_json::json!({ "parameters": { "3.cfg": 6.5 } })).unwrap(),
+        );
+        let started = start_line_run(&mut conn, "line-1", "shot-1", &answers).unwrap();
+        let parameters: Option<String> = enhancement_tasks::table
+            .filter(enhancement_tasks::id.eq(&started.task_ids[0]))
+            .select(enhancement_tasks::parameters)
+            .first(&mut conn)
+            .unwrap();
+        let queued: serde_json::Value = serde_json::from_str(&parameters.unwrap()).unwrap();
+        assert_eq!(queued["3.seed"], serde_json::json!(42), "the answer wins");
+        assert_eq!(queued["3.steps"], serde_json::json!(20), "the line's own");
+
+        // …and the answer for stage 2 waits on the run until the worker gets
+        // there, hours later, out of `line_stages` and this column.
+        let stored: Option<String> = runs::table
+            .filter(runs::id.eq(&started.run_id))
+            .select(runs::stage_values)
+            .first(&mut conn)
+            .unwrap();
+        let for_stage_two = supplied_for(stored.as_deref(), 1);
+        assert_eq!(
+            for_stage_two.parameters.get("3.cfg"),
+            Some(&serde_json::json!(6.5))
+        );
+        assert!(supplied_for(stored.as_deref(), 5).parameters.is_empty());
+        assert!(supplied_for(None, 0).parameters.is_empty());
+    }
+
+    #[test]
+    fn an_answer_for_a_stage_that_is_not_there_is_refused() {
+        let (_dir, mut conn) = library();
+        conn.batch_execute(&format!(
+            "INSERT INTO comfyui_workflows (id, name, workflow_json) \
+             VALUES ('wf-1', 'Portrait', '{}');
+             INSERT INTO production_lines (id, name) VALUES ('line-1', 'One Stage');
+             INSERT INTO line_stages (id, line_id, stage_idx, workflow_id) \
+             VALUES ('st-1', 'line-1', 0, 'wf-1');
+             INSERT INTO shots (id) VALUES ('shot-1');
+             INSERT INTO files (id, shot_id, path, hash, mime_type, is_original) \
+             VALUES ('file-1', 'shot-1', 'a.jpg', 'h1', 'image/jpeg', 1);",
+            IMAGE_GRAPH.replace('\'', "''")
+        ))
+        .unwrap();
+
+        let mut answers = SuppliedByStage::new();
+        answers.insert(
+            "3".to_string(),
+            serde_json::from_value(serde_json::json!({ "parameters": { "3.seed": 1 } })).unwrap(),
+        );
+        let err = start_line_run(&mut conn, "line-1", "shot-1", &answers).unwrap_err();
+        assert!(
+            matches!(&err, StartError::Rejected(e) if e.message == "This line has no stage 4."),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn an_answered_key_stops_being_a_sweep() {
+        // A key cannot be both, and `check_payload` refuses a line that says
+        // otherwise — but a line saved before that check, or one edited by
+        // hand, must not queue two decisions about one value.
+        let mut plan = StagePlan {
+            stage_idx: 0,
+            workflow_id: "wf-1",
+            text_overrides: HashMap::new(),
+            parameters: ParameterMap::from([("3.seed".to_string(), serde_json::json!(1))]),
+            vary: serde_json::from_value(serde_json::json!({ "3.seed": { "count": 4 } })).unwrap(),
+            source_mode: None,
+        };
+        let supplied: SuppliedValues =
+            serde_json::from_value(serde_json::json!({ "parameters": { "3.seed": 42 } })).unwrap();
+        plan.accept(&["3.seed".to_string()], &supplied).unwrap();
+        assert_eq!(plan.parameters["3.seed"], serde_json::json!(42));
+        assert!(plan.vary.is_empty(), "an answer is a value, not an axis");
+    }
+
+    #[test]
     fn a_stages_sweep_becomes_that_many_independent_tasks() {
         let (_dir, mut conn) = library();
         conn.batch_execute(&format!(
@@ -532,7 +783,8 @@ mod tests {
         ))
         .unwrap();
 
-        let started = start_line_run(&mut conn, "line-1", "shot-1").unwrap();
+        let started =
+            start_line_run(&mut conn, "line-1", "shot-1", &SuppliedByStage::new()).unwrap();
         assert_eq!(started.task_ids.len(), 4);
         let mut seeds: Vec<i64> = enhancement_tasks::table
             .filter(enhancement_tasks::run_id.eq(&started.run_id))

@@ -1,0 +1,36 @@
+-- What a stage decides for itself, and what it leaves to whoever sends it.
+--
+-- A stage already stores two ways a run can be steered: `parameters` (pinned —
+-- this value, every time) and `vary` (swept — this many takes, one per value).
+-- Those cover "the line decides" and "the line decides several times". They do
+-- not cover the third thing a person actually wants, which is "the line leaves
+-- this one to me".
+--
+-- `exposed` is that: a JSON array of keys — `"<node_id>.<field>"`, the same
+-- spelling `parameters`, `vary` and `text_overrides` all use — that the line
+-- deliberately does not pin. Starting a run may supply values for exactly
+-- those keys and no others, so a line can be shared with its craft baked in
+-- and its subject left open, without a caller being able to rewrite a stage
+-- somebody fixed on purpose.
+--
+-- NULL and '[]' mean the same thing, and NULL is what every existing row gets:
+-- a line that exposes nothing behaves exactly as it did before.
+--
+-- FR9's fourth disposition — *compiled*, a slot a describe stage writes into —
+-- is deliberately not here. It is a binding between two stages rather than a
+-- question for the sender, so it belongs with the describe stage that fills it.
+ALTER TABLE line_stages ADD COLUMN exposed TEXT;
+
+-- And the answers, snapshotted onto the run that asked for them.
+--
+-- A run walks its line over hours: stage 1 is queued when the run opens, stage
+-- 4 by the worker long afterwards, out of `line_stages`. So an answer given at
+-- send time has to survive somewhere the worker will look, and the run row is
+-- already where a run keeps what it was asked for — `label` and `stage_count`
+-- are snapshotted there for exactly the same reason.
+--
+--   {"1": {"parameters": {"3.seed": 42}, "text_overrides": {"6.text": "..."}}}
+--
+-- keyed by stage index as a string, because JSON has no integer keys. NULL is
+-- "nothing was asked", which is every run that exists today.
+ALTER TABLE runs ADD COLUMN stage_values TEXT;

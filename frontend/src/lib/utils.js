@@ -253,6 +253,9 @@ export function installedLabel(template) {
   if (installed.customised) return "EDITED · NOT UPDATED";
   if (!installed.line_exists) return "LINE DELETED";
   return `INSTALLED v${installed.version}`;
+}
+
+/**
  * Does this workflow hand on a sentence rather than a file?
  *
  * A *describe* stage: it reads a photograph and its whole product is text, so

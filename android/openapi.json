@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "integrate/wave-d"
+    "version": "integ/wave-d-reconcile"
   },
   "paths": {
     "/api/auth/callback": {
@@ -552,6 +552,80 @@
         }
       }
     },
+    "/api/comfyui/lines/stage-options": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Which workflows may go in one slot of a line",
+        "description": "Send the line as it stands and the position being filled; every workflow comes back marked offered or refused. The verdict is `validate_chain` run over the line that each candidate would make, so a stage this offers can never be one that saving then refuses — and the refused ones come back too, each with the reason, so the editor can say what it is not offering and why.",
+        "operationId": "list_stage_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StageOptionsPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The workflows, offered or refused"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/suggestions": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Lines somebody has already been running by hand",
+        "description": "Sequences of workflows a person ran one at a time, over and over, on enough different shots to be a habit rather than an afternoon. Each comes back as a line ready to POST, with the settings that never changed pinned and the ones that did marked as asked-for.",
+        "operationId": "list_suggestions",
+        "responses": {
+          "200": {
+            "description": "The sequences worth offering"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/validate": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Check a line without saving it",
+        "description": "The same check POST and PUT make, with nothing written. What the editor asks after a reorder, so a chain that no longer fits says so where it was dragged rather than after Save.",
+        "operationId": "validate_line",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Whether it holds together, and why not"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
     "/api/comfyui/lines/{id}": {
       "get": {
         "tags": [
@@ -654,6 +728,38 @@
           },
           "409": {
             "description": "A run of this line is still in flight"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/{id}/duplicate": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Fork a production line",
+        "description": "Copy a line and everything its stages carry — workflows, prompts, parameters, sweeps, source modes, keep flags and exposed keys — under a new name. The default way to get a line, and the way to change one that a run is currently walking.",
+        "operationId": "duplicate_line",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Line ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The fork"
+          },
+          "404": {
+            "description": "Line not found"
           },
           "503": {
             "description": "ComfyUI not configured"
@@ -3231,6 +3337,13 @@
           "workflow"
         ],
         "properties": {
+          "exposed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The keys this stage deliberately left open — FR5b's *exposed*\ndisposition. Travels with the stage for the same reason `parameters`\ndoes: a line that asks the sender for a seed is not the same line once\nit has been carried somewhere that pins one."
+          },
           "keep_output": {
             "type": "boolean"
           },
@@ -4093,6 +4206,13 @@
           "workflow_id"
         ],
         "properties": {
+          "exposed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Keys this stage deliberately leaves open — the *exposed* disposition.\nStarting a run may supply values for exactly these, and only these."
+          },
           "keep_output": {
             "type": "boolean",
             "description": "Keep this stage's output once the run completes. The last stage's output\nis the product and is kept regardless."
@@ -5021,6 +5141,31 @@
           }
         }
       },
+      "StageOptionsPayload": {
+        "type": "object",
+        "description": "The draft being edited, and where in it a stage is going.\n\nThe whole draft rather than the two types either side of the slot, because\nwhether a stage fits is a question about the *line*: a stage that makes no\nfile is transparent to what flows past it, so the join above position 3 is\nnot necessarily what stage 2 produced. Sending the line and letting\n`validate_chain` answer is the only shape that cannot fall behind that rule.",
+        "properties": {
+          "at": {
+            "type": "integer",
+            "description": "The position being filled, 0-based.",
+            "minimum": 0
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`insert` (the default) pushes whatever is at `at` down; `replace` puts\nthe candidate in its place."
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The workflow ids of the line as it stands, in order. Empty for a line\nwith no stages yet."
+          }
+        }
+      },
       "StartRunPayload": {
         "type": "object",
         "description": "What starts a run.\n\nFR7 adds a query in place of `shot_id` and a cursor beside it; the handler\nis already written around \"which shots does this ask for\", so that is a new\nfield rather than a new endpoint.",
@@ -5034,6 +5179,10 @@
           },
           "shot_id": {
             "type": "string"
+          },
+          "stage_values": {
+            "type": "object",
+            "description": "Values for the keys each stage left open, keyed by stage index as a\nstring. A key a stage did not expose is refused by name rather than\nignored."
           }
         }
       },

@@ -223,6 +223,7 @@ pub fn install(
                     vary: Some(&vary),
                     source_mode: stage.source_mode.as_deref(),
                     keep_output: stage.keep_output,
+                    exposed: None,
                 })
                 .execute(conn)?;
         }

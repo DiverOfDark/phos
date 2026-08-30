@@ -192,6 +192,8 @@ test("a template says whether it is installed, and whether it is still ours to u
     installedLabel({ version: 1, installed: { version: 1, line_exists: false, customised: false } }),
     "LINE DELETED",
   );
+});
+
 // --- FR9: the prompt is compiled, and putting it in must match the backend ---
 
 /** A generation workflow the way the list endpoint serves one. */

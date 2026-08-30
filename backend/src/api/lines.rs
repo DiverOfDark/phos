@@ -30,8 +30,8 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 
 use crate::comfyui::line::{self, RunState};
-use crate::comfyui::runs::{contract_of, StageRow};
-use crate::comfyui::{ParameterMap, StageTyping, VaryMap};
+use crate::comfyui::runs::{contract_of, StageRow, SuppliedByStage};
+use crate::comfyui::{MediaType, ParameterMap, StageTyping, VaryMap};
 use crate::models::{NewLineStage, NewProductionLine};
 use crate::schema::{
     comfyui_workflows, enhancement_tasks, files, line_stages, people, production_lines, runs, shots,
@@ -73,6 +73,10 @@ pub(super) struct LineStagePayload {
     /// is the product and is kept regardless.
     #[serde(default)]
     pub(super) keep_output: bool,
+    /// Keys this stage deliberately leaves open — the *exposed* disposition.
+    /// Starting a run may supply values for exactly these, and only these.
+    #[serde(default)]
+    pub(super) exposed: Vec<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -80,6 +84,125 @@ pub(super) struct LinePayload {
     pub(super) name: String,
     pub(super) description: Option<String>,
     pub(super) stages: Vec<LineStagePayload>,
+}
+
+impl LineStagePayload {
+    /// One stage of an existing line, copied — what Duplicate and the
+    /// promote-from-history flow both build a payload out of.
+    pub(super) fn from_row(row: &StageRow) -> Self {
+        LineStagePayload {
+            workflow_id: row.workflow_id.clone(),
+            text_overrides: serde_json::from_str(&row.text_overrides).unwrap_or_default(),
+            parameters: serde_json::from_str(&row.parameters).unwrap_or_default(),
+            vary: serde_json::from_str(&row.vary).unwrap_or_default(),
+            source_mode: row.source_mode.clone(),
+            keep_output: row.keep_output,
+            exposed: row.exposed.clone(),
+        }
+    }
+
+    pub(super) fn new(
+        workflow_id: String,
+        text_overrides: HashMap<String, String>,
+        parameters: ParameterMap,
+        source_mode: Option<String>,
+        exposed: Vec<String>,
+    ) -> Self {
+        LineStagePayload {
+            workflow_id,
+            text_overrides,
+            parameters,
+            vary: VaryMap::new(),
+            source_mode,
+            keep_output: false,
+            exposed,
+        }
+    }
+}
+
+impl LinePayload {
+    pub(super) fn new(
+        name: String,
+        description: Option<String>,
+        stages: Vec<LineStagePayload>,
+    ) -> Self {
+        LinePayload {
+            name,
+            description,
+            stages,
+        }
+    }
+
+    pub(super) fn name(&self) -> &str {
+        self.name.trim()
+    }
+
+    pub(super) fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Each stage's workflow and the part of an upstream video it consumes —
+    /// the two things working out a draft's joins needs, without exposing the
+    /// payload's fields to the rest of the API.
+    pub(super) fn stage_specs(&self) -> Vec<(&str, Option<&str>)> {
+        self.stages
+            .iter()
+            .map(|s| (s.workflow_id.as_str(), s.source_mode.as_deref()))
+            .collect()
+    }
+}
+
+/// One join of a *draft* line, worked out the same way a stored one's is.
+///
+/// A stage the editor has just added has no join yet — it has never been read
+/// back from the database — so the validate endpoint answers with them, and the
+/// editor draws its connectors from the same function that drew them before the
+/// edit. There is no second derivation for "not saved yet".
+pub(super) fn draft_stages_json(
+    conn: &mut SqliteConnection,
+    specs: &[(&str, Option<&str>)],
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::with_capacity(specs.len());
+    let mut above: Vec<MediaType> = Vec::with_capacity(specs.len());
+    for (idx, (workflow_id, source_mode)) in specs.iter().enumerate() {
+        let row: Option<(Option<String>, String)> = comfyui_workflows::table
+            .filter(comfyui_workflows::id.eq(workflow_id))
+            .select((
+                comfyui_workflows::contract_json,
+                comfyui_workflows::workflow_json,
+            ))
+            .first(conn)
+            .optional()
+            .unwrap_or(None);
+        let Some((contract_json, workflow_json)) = row else {
+            // A stage naming a workflow this library does not have. The
+            // refusal says so; there is nothing to draw for it, and nothing is
+            // known about what it would have handed on.
+            out.push(serde_json::json!({ "stage_idx": idx }));
+            above.clear();
+            continue;
+        };
+        let contract = contract_of(contract_json.as_deref(), &workflow_json);
+        let takes_video = graph_takes_video(&workflow_json);
+        let handoff = crate::comfyui::editor::carried_into(&above).map(|carries| {
+            let h = crate::comfyui::editor::handoff(carries, &contract, takes_video, *source_mode);
+            serde_json::json!({
+                "carries": h.carries,
+                "resolved": h.resolved,
+                "modes": h.modes,
+                "roles": h.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                "is_a_question": h.is_a_question(),
+            })
+        });
+        out.push(serde_json::json!({
+            "stage_idx": idx,
+            "accepts": contract.accepts,
+            "produces": contract.produces,
+            "handoff": handoff,
+        }));
+        above.push(contract.produces);
+    }
+    out
 }
 
 /// What starts a run.
@@ -91,6 +214,12 @@ pub(super) struct LinePayload {
 pub(super) struct StartRunPayload {
     line_id: String,
     shot_id: String,
+    /// Values for the keys each stage left open, keyed by stage index as a
+    /// string. A key a stage did not expose is refused by name rather than
+    /// ignored.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    stage_values: SuppliedByStage,
 }
 
 /// A `production_lines` row: name, description, and the two timestamps.
@@ -113,7 +242,33 @@ type RunTaskRow = (String, Option<i32>, String, String, Option<String>);
 
 /// A line's stages, with each workflow's contract folded in — what the editor
 /// draws and what validation reads.
-pub(super) fn stage_json(stage: &StageRow) -> serde_json::Value {
+///
+/// `upstream` is what the stage before it produces, which is what turns a
+/// stage into a *join*: the connector the editor draws between two rows states
+/// what travels along it and whether there is anything to decide. Worked out
+/// here rather than in the browser for the same reason validity is — the
+/// dispatcher's rule lives on this side, and a second copy of it would be a
+/// second copy to disagree with.
+fn stage_json(
+    stage: &StageRow,
+    upstream: Option<MediaType>,
+    takes_video: bool,
+) -> serde_json::Value {
+    let handoff = upstream.map(|carries| {
+        let h = crate::comfyui::editor::handoff(
+            carries,
+            &stage.contract,
+            takes_video,
+            stage.source_mode.as_deref(),
+        );
+        serde_json::json!({
+            "carries": h.carries,
+            "resolved": h.resolved,
+            "modes": h.modes,
+            "roles": h.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+            "is_a_question": h.is_a_question(),
+        })
+    });
     serde_json::json!({
         "stage_idx": stage.stage_idx,
         "workflow_id": stage.workflow_id,
@@ -122,6 +277,8 @@ pub(super) fn stage_json(stage: &StageRow) -> serde_json::Value {
         "produces": stage.contract.produces,
         "keep_output": stage.keep_output,
         "source_mode": stage.source_mode,
+        "exposed": stage.exposed,
+        "handoff": handoff,
         "text_overrides": serde_json::from_str::<serde_json::Value>(&stage.text_overrides)
             .unwrap_or_else(|_| serde_json::json!({})),
         "parameters": serde_json::from_str::<serde_json::Value>(&stage.parameters)
@@ -131,6 +288,43 @@ pub(super) fn stage_json(stage: &StageRow) -> serde_json::Value {
     })
 }
 
+/// Every stage, each with the join above it.
+///
+/// The join is what the *media flow* carries into that stage, not simply what
+/// the stage above produced: a stage that makes no file is transparent to it,
+/// so the connector under a describe stage still says `image`. That rule is
+/// [`crate::comfyui::editor::carried_into`], and it is the only place it is
+/// asked here.
+pub(super) fn stages_json(stages: &[StageRow]) -> Vec<serde_json::Value> {
+    stages
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let above: Vec<MediaType> = stages[..i].iter().map(|p| p.contract.produces).collect();
+            stage_json(
+                s,
+                crate::comfyui::editor::carried_into(&above),
+                s.takes_video,
+            )
+        })
+        .collect()
+}
+
+/// Does this graph have a loader that can read a clip?
+///
+/// Read off the graph rather than off the contract, because that is where the
+/// dispatcher reads it — see [`crate::comfyui::editor::handoff`].
+pub(super) fn graph_takes_video(workflow_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(workflow_json)
+        .ok()
+        .map(|graph| {
+            crate::comfyui::detect_loaders(&graph)
+                .iter()
+                .any(|l| l.kind == crate::comfyui::LoaderKind::Video)
+        })
+        .unwrap_or(false)
+}
+
 pub(super) fn line_json(
     id: &str,
     name: &str,
@@ -138,6 +332,7 @@ pub(super) fn line_json(
     created_at: Option<&str>,
     updated_at: Option<&str>,
     stages: &[StageRow],
+    live_runs: i64,
 ) -> serde_json::Value {
     let typings: Vec<StageTyping> = stages.iter().map(StageRow::typing).collect();
     // Asked on every read, not just on save: a workflow can be re-imported or
@@ -151,10 +346,16 @@ pub(super) fn line_json(
         "created_at": created_at,
         "updated_at": updated_at,
         "stage_count": stages.len(),
-        "stages": stages.iter().map(stage_json).collect::<Vec<_>>(),
+        "stages": stages_json(stages),
         "valid": error.is_none(),
         "error": error.as_ref().map(|e| e.message.clone()),
         "error_stage_idx": error.as_ref().map(|e| e.stage_idx),
+        // Editing is refused while a run of this line is walking it. Said on
+        // every read rather than only in the 409, so the editor can lock
+        // itself and offer Duplicate instead of letting somebody type for ten
+        // minutes and then be told no.
+        "live_runs": live_runs,
+        "editable": live_runs == 0,
     })
 }
 
@@ -191,6 +392,7 @@ pub(super) async fn list_lines(UState(state): UState) -> Result<Json<serde_json:
     for (id, name, description, created_at, updated_at) in rows {
         let stages = crate::comfyui::runs::stages_of_line(&mut conn, &id)
             .map_err(|_| ApiError::internal())?;
+        let live = live_run_count(&mut conn, &id);
         items.push(line_json(
             &id,
             &name,
@@ -198,6 +400,7 @@ pub(super) async fn list_lines(UState(state): UState) -> Result<Json<serde_json:
             created_at.as_deref(),
             updated_at.as_deref(),
             &stages,
+            live,
         ));
     }
     Ok(Json(serde_json::json!({ "items": items })))
@@ -239,6 +442,7 @@ pub(super) async fn get_line(
 
     let stages =
         crate::comfyui::runs::stages_of_line(&mut conn, &id).map_err(|_| ApiError::internal())?;
+    let live = live_run_count(&mut conn, &id);
     Ok(Json(line_json(
         &id,
         &name,
@@ -246,6 +450,7 @@ pub(super) async fn get_line(
         created_at.as_deref(),
         updated_at.as_deref(),
         &stages,
+        live,
     )))
 }
 
@@ -302,6 +507,17 @@ pub(super) fn check_payload(
         crate::comfyui::expand(&stage.parameters, &stage.vary)
             .map_err(|e| ApiError::bad_request(format!("Stage {}: {}", idx + 1, e)))?;
 
+        // A key is pinned, swept or asked for — one of the three, never two.
+        // Sweeping a value the line also asks for is two people deciding it.
+        if let Some(key) = stage.exposed.iter().find(|k| stage.vary.contains_key(*k)) {
+            return Err(ApiError::bad_request(format!(
+                "Stage {}: {} is both swept and asked for. A setting is pinned, \
+                 varied or exposed — one of the three.",
+                idx + 1,
+                key
+            )));
+        }
+
         let contract = contract_of(contract_json.as_deref(), &workflow_json);
         typings.push(StageTyping {
             stage_idx: idx as i32,
@@ -325,6 +541,7 @@ pub(super) fn insert_stages(
         let text_overrides = serde_json::to_string(&stage.text_overrides).unwrap_or_default();
         let parameters = serde_json::to_string(&stage.parameters).unwrap_or_default();
         let vary = serde_json::to_string(&stage.vary).unwrap_or_default();
+        let exposed = serde_json::to_string(&stage.exposed).unwrap_or_default();
         diesel::insert_into(line_stages::table)
             .values(NewLineStage {
                 id: &uuid::Uuid::new_v4().to_string(),
@@ -336,6 +553,7 @@ pub(super) fn insert_stages(
                 vary: Some(&vary),
                 source_mode: stage.source_mode.as_deref(),
                 keep_output: stage.keep_output,
+                exposed: Some(&exposed),
             })
             .execute(conn)?;
     }
@@ -389,6 +607,7 @@ pub(super) async fn create_line(
         None,
         None,
         &stages,
+        0,
     )))
 }
 
@@ -399,7 +618,7 @@ pub(super) async fn create_line(
 /// no longer exists. Refused rather than versioned: v1 lines are small and
 /// remaking one is cheap, and FR5b can do better once there is an editor to do
 /// it in.
-fn has_live_runs(conn: &mut SqliteConnection, line_id: &str) -> bool {
+pub(super) fn live_run_count(conn: &mut SqliteConnection, line_id: &str) -> i64 {
     runs::table
         .filter(
             runs::line_id
@@ -409,7 +628,10 @@ fn has_live_runs(conn: &mut SqliteConnection, line_id: &str) -> bool {
         .count()
         .get_result::<i64>(conn)
         .unwrap_or(0)
-        > 0
+}
+
+fn has_live_runs(conn: &mut SqliteConnection, line_id: &str) -> bool {
+    live_run_count(conn, line_id) > 0
 }
 
 #[utoipa::path(
@@ -481,6 +703,7 @@ pub(super) async fn update_line(
         None,
         Some(&now),
         &stages,
+        0,
     )))
 }
 
@@ -560,7 +783,12 @@ pub(super) async fn start_run(
 
     let mut started = Vec::with_capacity(shot_ids.len());
     for shot_id in &shot_ids {
-        match crate::comfyui::runs::start_line_run(&mut conn, &payload.line_id, shot_id) {
+        match crate::comfyui::runs::start_line_run(
+            &mut conn,
+            &payload.line_id,
+            shot_id,
+            &payload.stage_values,
+        ) {
             Ok(run) => started.push(serde_json::json!({
                 "run_id": run.run_id,
                 "shot_id": shot_id,
@@ -1140,6 +1368,7 @@ mod tests {
             vary: VaryMap::new(),
             source_mode: None,
             keep_output: false,
+            exposed: Vec::new(),
         }
     }
 
@@ -1254,5 +1483,213 @@ mod tests {
         // Still going: measured against now, which is after any fixed past.
         assert!(elapsed_seconds(Some("2020-01-01 00:00:00"), None).unwrap() > 0);
         assert_eq!(elapsed_seconds(None, None), None);
+    }
+
+    // ----- The editor -------------------------------------------------------
+
+    /// The library the worked example is built out of.
+    fn shop() -> (tempfile::TempDir, SqliteConnection) {
+        library(&format!(
+            "{}{}{}{}",
+            stated("wf-i2v", "Image to Video", Accepts::Image, MediaType::Video),
+            stated("wf-interp", "Interpolate", Accepts::Video, MediaType::Video),
+            stated("wf-4k", "Upscale 4K", Accepts::Video, MediaType::Video),
+            stated("wf-restore", "Restore", Accepts::Image, MediaType::Image),
+        ))
+    }
+
+    #[test]
+    fn reordering_a_line_is_accepted_or_refused_by_name() {
+        let (_dir, mut conn) = shop();
+        // The order that works. A PUT replaces the whole list, so this is what
+        // a reorder actually sends.
+        let ok = line(vec![stage("wf-i2v"), stage("wf-interp"), stage("wf-4k")]);
+        assert!(check_payload(&mut conn, &ok).is_ok());
+
+        // Swapping the last two is still valid — both eat and make video.
+        let swapped = line(vec![stage("wf-i2v"), stage("wf-4k"), stage("wf-interp")]);
+        assert!(check_payload(&mut conn, &swapped).is_ok());
+
+        // Dragging the still-maker into the middle is not, and the refusal
+        // names the stage it broke rather than the one that was moved.
+        let broken = line(vec![stage("wf-i2v"), stage("wf-restore"), stage("wf-4k")]);
+        let ApiError(status, message) = check_payload(&mut conn, &broken).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            message.unwrap(),
+            "Stage 2 (Restore) takes image, but stage 1 (Image to Video) produces video."
+        );
+
+        // And dragging the clip-maker to the bottom breaks the join above it.
+        let upended = line(vec![stage("wf-interp"), stage("wf-4k"), stage("wf-i2v")]);
+        let ApiError(_, message) = check_payload(&mut conn, &upended).unwrap_err();
+        assert_eq!(
+            message.unwrap(),
+            "Stage 3 (Image to Video) takes image, but stage 2 (Upscale 4K) produces video."
+        );
+    }
+
+    #[test]
+    fn a_setting_is_pinned_varied_or_exposed_but_never_two_of_them() {
+        let (_dir, mut conn) = shop();
+        let mut s = stage("wf-restore");
+        s.vary = serde_json::from_value(serde_json::json!({ "3.seed": { "count": 4 } })).unwrap();
+        s.exposed = vec!["3.seed".to_string()];
+        let ApiError(status, message) = check_payload(&mut conn, &line(vec![s])).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            message.unwrap().contains("both swept and asked for"),
+            "two people deciding one value is a refusal, not a merge"
+        );
+
+        // Exposing something that is merely pinned is fine: the answer wins.
+        let mut s = stage("wf-restore");
+        s.parameters = serde_json::from_value(serde_json::json!({ "3.seed": 7 })).unwrap();
+        s.exposed = vec!["3.seed".to_string()];
+        assert!(check_payload(&mut conn, &line(vec![s])).is_ok());
+    }
+
+    #[test]
+    fn duplicating_a_line_copies_everything_its_stages_carry() {
+        let (_dir, mut conn) = shop();
+
+        let mut first = stage("wf-i2v");
+        first.text_overrides =
+            HashMap::from([("6.text".to_string(), "a winter street".to_string())]);
+        first.parameters = serde_json::from_value(serde_json::json!({ "3.steps": 28 })).unwrap();
+        first.vary =
+            serde_json::from_value(serde_json::json!({ "3.seed": { "count": 3 } })).unwrap();
+        first.exposed = vec!["6.text".to_string()];
+        let mut second = stage("wf-interp");
+        second.source_mode = Some("whole_video".to_string());
+        second.keep_output = true;
+
+        let original = line(vec![first, second]);
+        check_payload(&mut conn, &original).unwrap();
+        diesel::insert_into(production_lines::table)
+            .values(NewProductionLine {
+                id: "line-1",
+                name: "4K Restore",
+                description: Some("the original"),
+            })
+            .execute(&mut conn)
+            .unwrap();
+        insert_stages(&mut conn, "line-1", &original).unwrap();
+
+        // The fork: read the stages back, turn them into a payload, write them
+        // under a new id. Exactly what the endpoint does, without the router.
+        let read = crate::comfyui::runs::stages_of_line(&mut conn, "line-1").unwrap();
+        let fork = LinePayload::new(
+            "4K Restore (2)".to_string(),
+            Some("the original".to_string()),
+            read.iter().map(LineStagePayload::from_row).collect(),
+        );
+        diesel::insert_into(production_lines::table)
+            .values(NewProductionLine {
+                id: "line-2",
+                name: fork.name(),
+                description: fork.description(),
+            })
+            .execute(&mut conn)
+            .unwrap();
+        insert_stages(&mut conn, "line-2", &fork).unwrap();
+
+        let copied = crate::comfyui::runs::stages_of_line(&mut conn, "line-2").unwrap();
+        assert_eq!(copied.len(), 2);
+        for (a, b) in read.iter().zip(&copied) {
+            assert_eq!(a.workflow_id, b.workflow_id);
+            assert_eq!(a.text_overrides, b.text_overrides);
+            assert_eq!(a.parameters, b.parameters);
+            assert_eq!(a.vary, b.vary);
+            assert_eq!(a.source_mode, b.source_mode);
+            assert_eq!(a.keep_output, b.keep_output);
+            assert_eq!(a.exposed, b.exposed);
+        }
+        assert_eq!(copied[0].exposed, ["6.text"]);
+        assert_eq!(copied[1].source_mode.as_deref(), Some("whole_video"));
+        assert!(copied[1].keep_output);
+
+        // And the fork stands on its own: editing it leaves the original be.
+        let json = line_json("line-2", fork.name(), None, None, None, &copied, 0);
+        assert_eq!(json["valid"], serde_json::json!(true));
+        assert_eq!(json["editable"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn a_line_says_on_every_read_whether_it_can_be_edited() {
+        let (_dir, mut conn) = shop();
+        let payload = line(vec![stage("wf-i2v"), stage("wf-interp")]);
+        diesel::insert_into(production_lines::table)
+            .values(NewProductionLine {
+                id: "line-1",
+                name: "4K Restore",
+                description: None,
+            })
+            .execute(&mut conn)
+            .unwrap();
+        insert_stages(&mut conn, "line-1", &payload).unwrap();
+        conn.batch_execute(
+            "INSERT INTO shots (id) VALUES ('shot-1');
+             INSERT INTO runs (id, line_id, shot_id, label, status, stage_count) \
+             VALUES ('run-1', 'line-1', 'shot-1', '4K Restore', 'running', 2);",
+        )
+        .unwrap();
+
+        assert_eq!(live_run_count(&mut conn, "line-1"), 1);
+        let stages = crate::comfyui::runs::stages_of_line(&mut conn, "line-1").unwrap();
+        let json = line_json("line-1", "4K Restore", None, None, None, &stages, 1);
+        assert_eq!(json["editable"], serde_json::json!(false));
+        assert_eq!(json["live_runs"], serde_json::json!(1));
+        // The guard the editor is reflecting is the one PUT enforces.
+        assert!(has_live_runs(&mut conn, "line-1"));
+
+        // Once it lands, the line is its own again.
+        diesel::update(runs::table.filter(runs::id.eq("run-1")))
+            .set(runs::status.eq("completed"))
+            .execute(&mut conn)
+            .unwrap();
+        assert_eq!(live_run_count(&mut conn, "line-1"), 0);
+    }
+
+    #[test]
+    fn a_join_that_can_be_read_two_ways_comes_back_as_a_question() {
+        // A graph with a video loader *and* an image loader: the clip itself,
+        // or a frame of it. Derived, not stated, because the loaders are what
+        // decide it.
+        let graph = r#"{
+            "4": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}},
+            "7": {"class_type": "VHS_LoadVideo", "inputs": {"video": "clip.mp4"}},
+            "9": {"class_type": "VHS_VideoCombine", "inputs": {"filename_prefix": "out"}}
+        }"#;
+        let (_dir, mut conn) = library(&format!(
+            "{}INSERT INTO comfyui_workflows (id, name, workflow_json) \
+             VALUES ('wf-extend', 'Extend Clip', '{}');",
+            stated("wf-i2v", "Image to Video", Accepts::Image, MediaType::Video),
+            graph.replace('\'', "''")
+        ));
+        let payload = line(vec![stage("wf-i2v"), stage("wf-extend")]);
+        check_payload(&mut conn, &payload).unwrap();
+        diesel::insert_into(production_lines::table)
+            .values(NewProductionLine {
+                id: "line-1",
+                name: "Extend",
+                description: None,
+            })
+            .execute(&mut conn)
+            .unwrap();
+        insert_stages(&mut conn, "line-1", &payload).unwrap();
+
+        let stages = crate::comfyui::runs::stages_of_line(&mut conn, "line-1").unwrap();
+        let drawn = stages_json(&stages);
+        // Nothing above the first stage, so no join above it.
+        assert_eq!(drawn[0]["handoff"], serde_json::Value::Null);
+        let join = &drawn[1]["handoff"];
+        assert_eq!(join["carries"], serde_json::json!("video"));
+        assert_eq!(join["resolved"], serde_json::json!("whole_video"));
+        assert_eq!(join["is_a_question"], serde_json::json!(true));
+        assert_eq!(
+            join["modes"],
+            serde_json::json!(["whole_video", "first_frame", "last_frame", "at_time"])
+        );
     }
 }

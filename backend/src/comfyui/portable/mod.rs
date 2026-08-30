@@ -78,6 +78,12 @@ pub struct BundleStage {
     pub source_mode: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_output: bool,
+    /// The keys this stage deliberately left open — FR5b's *exposed*
+    /// disposition. Travels with the stage for the same reason `parameters`
+    /// does: a line that asks the sender for a seed is not the same line once
+    /// it has been carried somewhere that pins one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exposed: Vec<String>,
 }
 
 /// The line itself. Stage order is array order — there is no `stage_idx`,
@@ -428,6 +434,7 @@ mod tests {
                     vary: VaryMap::new(),
                     source_mode: None,
                     keep_output: false,
+                    exposed: Vec::new(),
                 }],
             },
             workflows,
