@@ -2,7 +2,7 @@ pub mod client;
 mod comfyui;
 mod describe;
 mod faces;
-mod files;
+pub(crate) mod files;
 mod holds;
 mod line_editor;
 mod line_io;
@@ -11,6 +11,7 @@ mod people;
 pub mod settings;
 mod shots;
 mod stats;
+mod takes;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -120,6 +121,8 @@ use utoipa::OpenApi;
         lines::cancel_run,
         holds::get_hold,
         holds::post_verdict,
+        takes::list_takes,
+        takes::put_rating,
         line_io::export_line,
         line_io::import_line,
         describe::describe_shot,
@@ -177,6 +180,7 @@ use utoipa::OpenApi;
             faces::AddManualFacePayload,
             // Files
             files::FileManifestResponse,
+            takes::RatingPayload,
             crate::comfyui::ProvenanceManifest,
             // Import
             crate::ingest::IngestStatus,
@@ -530,6 +534,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/files/{id}/thumbnail", get(files::get_file_thumbnail))
         .route("/api/files/{id}/manifest", get(files::get_file_manifest))
         .route("/api/files/{id}/set-original", put(files::set_file_original))
+        // The Takes lane's 1-5 keys. Any file may carry one.
+        .route("/api/files/{id}/rating", put(takes::put_rating))
         .route("/api/files/{id}/faces", post(faces::add_manual_face))
         // Stats + organize
         .route("/api/stats", get(stats::get_stats))
@@ -638,6 +644,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/comfyui/runs/{id}/hold",
             get(holds::get_hold).post(holds::post_verdict),
         )
+        // And every held run at once: the curation lane's contact sheet.
+        .route("/api/comfyui/takes", get(takes::list_takes))
         // The prompt a shot's own contents compile to.
         .route("/api/comfyui/describe", post(describe::describe_shot))
         .route(

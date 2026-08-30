@@ -117,6 +117,7 @@ pub mod promote;
 pub mod prompt;
 pub mod runs;
 mod source;
+pub mod takes;
 mod timestamp;
 mod worker;
 mod workflow;
@@ -141,7 +142,7 @@ pub use portable::{
 };
 pub use prompt::{Analysis, CompiledPrompt, Intent, ShotFacts};
 pub use source::SourceMode;
-pub(crate) use worker::advance::{cancel_run, retry_run};
+pub(crate) use worker::advance::{cancel_run, discard_outputs, retry_run};
 pub use worker::spawn_enhancement_worker;
 pub use workflow::detect_outputs;
 

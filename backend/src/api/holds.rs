@@ -18,6 +18,8 @@ use utoipa::ToSchema;
 
 use crate::comfyui::holds::{self, Hold, HoldError};
 use crate::comfyui::line::{self, Verdict};
+use crate::comfyui::takes::bulk::Scope;
+use crate::comfyui::takes::verdicts;
 
 use super::comfyui::{require_comfyui, ApiError};
 use super::UState;
@@ -31,9 +33,29 @@ pub(super) struct VerdictPayload {
     /// the other two, which are about the hold rather than about a selection.
     #[serde(default)]
     pub(super) keep: Vec<String>,
+    /// The takes whose **bytes go**, by task id — the curation lane's `X`.
+    ///
+    /// Deleting, not passing over: a take nobody named is disposed of by its
+    /// stage's `keep_output` policy, which is the line author's decision, while
+    /// a rejected one goes regardless, which is the reviewer's. Generated video
+    /// is enormous and a farm fills a disk in days, so this is the key that
+    /// keeps the library habitable.
+    ///
+    /// Never carried to another run by `scope`, whatever it says. Deleting
+    /// bytes is something you do to pictures you have looked at.
+    #[serde(default)]
+    pub(super) reject: Vec<String>,
     /// Why, in the reviewer's own words. Kept with the verdict.
     #[serde(default)]
     pub(super) note: Option<String>,
+    /// How far this verdict reaches: `run` (the default) or `batch`.
+    ///
+    /// `batch` applies the same verdict to every other run of the same FR7
+    /// batch held at the same stage of the same line. `continue` resolves there
+    /// to *all* of that run's waiting takes, because task ids are per run and
+    /// the selection made here does not exist there.
+    #[serde(default)]
+    pub(super) scope: Option<String>,
 }
 
 /// The hold as the board draws it.
@@ -79,7 +101,7 @@ fn hold_json(hold: &Hold) -> serde_json::Value {
     })
 }
 
-fn to_api_error(e: HoldError) -> ApiError {
+pub(super) fn to_api_error(e: HoldError) -> ApiError {
     match e {
         HoldError::NotFound => axum::http::StatusCode::NOT_FOUND.into(),
         HoldError::NotHeld => ApiError::conflict(e.to_string()),
@@ -127,12 +149,15 @@ pub(super) async fn get_hold(
                    walks the rest of the line for itself. `regenerate` runs the held stage again \
                    with fresh seeds and nothing else changed, and the run holds again on the new \
                    takes. `cancel` abandons the run and removes its intermediates except where a \
-                   stage says keep.",
+                   stage says keep. Takes named in `reject` have their files removed from the \
+                   library outright — that is the curation lane's `X`, and it is how a farm's \
+                   disk stays habitable. `scope: batch` applies the same verdict to the rest of \
+                   the batch; a rejection never travels with it.",
     params(("id" = String, Path, description = "Run ID")),
     request_body = VerdictPayload,
     responses(
         (status = 200, description = "Verdict recorded"),
-        (status = 400, description = "The verdict names no takes, or a take this hold is not offering"),
+        (status = 400, description = "The verdict names no takes, names a take this hold is not offering, or is not a verdict"),
         (status = 404, description = "Run not found"),
         (status = 409, description = "This run is not holding anything for review"),
         (status = 503, description = "ComfyUI not configured"),
@@ -152,17 +177,28 @@ pub(super) async fn post_verdict(
             payload.verdict
         )));
     };
+    let scope = match payload.scope.as_deref().map(str::trim) {
+        None | Some("") => Scope::Run,
+        Some(s) => Scope::parse(s).ok_or_else(|| {
+            ApiError::bad_request(format!("{:?} is not a scope. It is run or batch.", s))
+        })?,
+    };
 
-    let outcome = holds::give_verdict(
+    let applied = verdicts::apply(
         &mut conn,
         &state.library_root,
         &id,
-        verdict,
-        &payload.keep,
-        payload.note.as_deref(),
+        verdicts::Ask {
+            verdict,
+            keep: &payload.keep,
+            reject: &payload.reject,
+            note: payload.note.as_deref(),
+            scope,
+        },
     )
     .map_err(to_api_error)?;
 
+    let outcome = &applied.outcome;
     Ok(Json(serde_json::json!({
         "verdict": outcome.verdict.as_str(),
         "status": outcome.status.as_str(),
@@ -172,6 +208,20 @@ pub(super) async fn post_verdict(
         // leaves that to the advance pass, which is the one place a stage is
         // queued from.
         "queued": outcome.queued,
+        // The takes whose bytes are gone, and how much disk that was. Reported
+        // because it is the one thing in this response nobody can go and check
+        // afterwards.
+        "rejected": applied.rejected,
+        "freed_bytes": applied.freed_bytes,
+        "scope": applied.scope.as_str(),
+        // Sibling runs the same verdict reached, and the ones it could not. A
+        // sibling that stopped holding in between is skipped with its reason,
+        // not rolled back over the nine hundred that worked.
+        "also_applied": applied.also_applied,
+        "failed": applied.failed
+            .iter()
+            .map(|(run_id, error)| serde_json::json!({ "run_id": run_id, "error": error }))
+            .collect::<Vec<_>>(),
     })))
 }
 

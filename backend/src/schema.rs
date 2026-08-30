@@ -71,6 +71,7 @@ diesel::table! {
         updated_at -> Nullable<Timestamp>,
         synthetic -> Bool,
         manifest_json -> Nullable<Text>,
+        rating -> Nullable<Integer>,
     }
 }
 
