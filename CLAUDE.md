@@ -58,11 +58,14 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
-- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting) and `contract/` (what a workflow accepts and produces) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `worker/` holds the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine
+- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces) and `line.rs` (whether a chain of them holds together, what happens after a stage lands, and whether a run is over) take values in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
 
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
 - **`components/ReviewDesk.vue`** — One screen, three lanes (`?lane=` → shots / duplicates / faces); `/variations` redirects into it
+- **`components/WorkflowsPage.vue`** — Three tabs: workflows, lines, and a queue that is a schedule
+  board of **runs** — one row per run saying `STAGE 2/4 · UPSCALE · 00:03:12`, with the tasks
+  underneath one click away. A four-stage run as four unrelated rows is what it replaced
 - **`components/SettingsPage.vue`** — Settings as a route (library path, WebDAV, S3, dedupe maintenance, APK)
 - **`style.css`** — The AppBahn design system: raw tokens on `:root`, then a `@theme` block remapping Tailwind's palette, radii, shadows and fonts onto them, so utility classes render in the system. Semantic aliases (`bg-base`, `text-ink`, `border-line`, `text-signal`, `text-ready`…) are what components should use
 - **`components/ui/`** — shadcn-vue primitives, no longer used by any screen (only the unreferenced `PhotoLightbox.vue`)
@@ -82,6 +85,35 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   does not get a vote
 
 ### Key Design Decisions
+- **A run is the unit, not a task.** `production_lines` + `line_stages` are a chain of workflows;
+  `runs` is one chain applied to one shot; `enhancement_tasks.run_id` / `stage_idx` /
+  `parent_task_id` make a task a step of one. A single-workflow enhance is a **one-stage run**, so
+  the queue board has one kind of row and FR7's batch extends one endpoint rather than two.
+  `runs.label` and `runs.stage_count` are snapshotted at creation, so a run still reads correctly
+  after its line is renamed, edited or deleted
+- **A stage advances by its output becoming the next stage's `source_file_id`.** The whole runtime
+  is `comfyui/worker/advance.rs`: a completed task that is not at the last stage queues the one
+  after it, and `parent_task_id` is the marker that says it already did — no "advanced" flag that
+  could disagree with the thing it marks. Fan-out needs no special case: four completed takes each
+  queue their own continuation, so four takes at stage 2 are four independent runners through 3
+  and 4. **Order matters inside a tick** — continue, *then* settle. Settling first would call a run
+  finished in the window before its next stage was written, and the sweep would delete the
+  intermediate that stage was about to read
+- **A failed stage fails the run, and a retry resumes from it.** The failed task queues no
+  continuation, so the stages after it are never reached; nothing is cancelled and nothing is
+  swept, so completed intermediates stay for inspection and sibling branches of a fan-out run on.
+  Retrying re-queues only the failed tasks, each still holding the `source_file_id` it was given —
+  re-running an hour of upscaling because stage 4 hiccupped is not something the code *can* do
+- **Intermediates live exactly as long as they are useful.** Kept while the run is live (the next
+  stage reads them, a failure wants them), swept when it *completes* — never when it fails.
+  `line_stages.keep_output` overrides that per stage, and the last stage's output is the product and
+  is always kept. `keeps_output` is a function of a `StageDisposition` rather than a column read,
+  because FR5c adds a third case (a stage feeding a hold point always keeps)
+- **A line is rejected when it is drawn.** Every join is checked with `Accepts::admits` — the same
+  function FR5b's stage picker will call, so the editor and the validator cannot disagree — on
+  `POST`/`PUT`, again on every read, again when a run starts (with the shot's own type), and once
+  more at dispatch against the file that actually turned up. A workflow can be re-imported or its
+  contract corrected long after a line was built
 - **A workflow knows what it takes and what it gives.** `comfyui_workflows.contract_json` holds a
   `comfyui::StageContract`: `accepts` (image / video / text / **none**, because a text-to-image graph
   begins a line rather than continuing one), `produces` (image / video / text), which loader fills
@@ -130,6 +162,10 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `POST /api/faces/dedupe?dry_run=` — Collapse overlapping boxes drawn on one face (never merges two boxes assigned to different people; skips reviewed shots). Also runs at startup and after each upload batch is analyzed
 - `PUT /api/comfyui/workflows/{id}/contract` — Replace the corrections applied to a workflow's derived stage contract, and get back the contract that results. Sending `{}` discards every correction and takes the derivation as it stands
 - `GET /api/files/{id}/manifest` — Whether a file was generated, and the provenance manifest recording how. Answers for any file; a photograph comes back `synthetic: false` with no manifest
+- `POST /api/comfyui/runs` — Start a line against a shot: `{ line_id, shot_id }`. Queues stage 1; the worker queues each stage after it as the one before lands. FR7 replaces `shot_id` with a query and adds a cursor, which is why the handler already resolves a *set* of shots and answers with a list of runs
+- `GET /api/comfyui/runs` — The queue board: one row per run, with the stage it is on, of how many, what that stage is running, and its clock. `GET /api/comfyui/runs/{id}` is the drill-down to the tasks underneath
+- `POST /api/comfyui/runs/{id}/retry` — Resume from the stage that failed. What already succeeded is not re-run
+- `GET|POST /api/comfyui/lines`, `GET|PUT|DELETE /api/comfyui/lines/{id}` — Line CRUD. A chain whose stages do not fit together is refused with a message naming the stage; editing or deleting a line is refused with `409` while a run of it is in flight
 - `GET /api/client/version` — Bundled Android APK metadata for the in-app updater (no auth)
 
 ## AI Models
