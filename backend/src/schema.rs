@@ -31,6 +31,7 @@ diesel::table! {
         settle_until -> Nullable<Timestamp>,
         next_attempt_at -> Nullable<Timestamp>,
         source_mode -> Nullable<Text>,
+        parameters -> Nullable<Text>,
     }
 }
 
@@ -130,6 +131,7 @@ diesel::table! {
         text_overrides -> Text,
         sort_order -> Nullable<Integer>,
         created_at -> Nullable<Timestamp>,
+        parameters -> Nullable<Text>,
     }
 }
 
