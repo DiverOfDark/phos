@@ -33,6 +33,8 @@
 //!   rewrite it for one run?
 //! * [`loaders`] — which node reads the file we uploaded, and which slot of a
 //!   multi-input graph does it fill?
+//! * [`contract`] — put those together: what does this workflow *accept* and
+//!   what does it *produce*, so it can be a stage in a line?
 //! * [`nodes`] — what does ComfyUI say its installed node classes take?
 //! * [`overrides`] — so which of this graph's fields can a person change, and
 //!   what kind of control does each one want?
@@ -74,6 +76,7 @@
 //!   graph has a video loader to read it.
 
 mod client;
+pub mod contract;
 mod history;
 mod loaders;
 mod manifest;
@@ -88,9 +91,10 @@ mod worker;
 mod workflow;
 
 pub use client::ComfyUiClient;
+pub use contract::{Accepts, ContractCorrections, MediaType, ParamName, StageContract};
 pub use loaders::{
     check_source_kind, default_binding_warnings, detect_loaders, importable, takes_video,
-    LoaderKind,
+    LoaderKind, SourceRole,
 };
 pub use manifest::ProvenanceManifest;
 pub use nodes::NodeCatalog;

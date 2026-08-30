@@ -32,7 +32,7 @@ pub enum LoaderKind {
 /// Three is enough for every graph worth running: the frame a clip starts on,
 /// the frame it ends on, and a picture that is neither (a style or pose
 /// reference).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceRole {
     Start,
@@ -75,6 +75,16 @@ impl SourceRole {
             "end" => Some(SourceRole::End),
             "reference" | "ref" => Some(SourceRole::Reference),
             _ => None,
+        }
+    }
+
+    /// The spelling [`Self::parse`] reads back, and the one a `role:<node_id>`
+    /// directive is written with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceRole::Start => "start",
+            SourceRole::End => "end",
+            SourceRole::Reference => "reference",
         }
     }
 }
