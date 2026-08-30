@@ -95,6 +95,12 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `files.manifest_json` holds a `comfyui::ProvenanceManifest` — a **versioned object with optional
   fields**, so later stages of the pipeline (line id, stage index, seed, compiled prompt) add to it
   without a migration. Unknown keys round-trip through `extra` rather than being dropped
+- **The generated file's row is written before its bytes.** `files.path` is `UNIQUE`, so
+  `comfyui/worker/store.rs` claims a name by inserting and treats the constraint failure as an
+  answer, not an error. Checking for a free name and inserting later leaves a window that the write
+  itself opens — once bytes are on disk a scan or the watcher can index the path first, and the
+  task then fails with `UNIQUE constraint failed: files.path`. Reserving first also means the row
+  already says `synthetic` by the time anything can find the file
 - No global database — each root directory gets its own `.phos.db`
 - AI models (ONNX) are auto-downloaded from Hugging Face (`public-data/insightface`) on first run and cached locally by `hf-hub`; startup fails hard if download fails (unless `PHOS_DUMMY_AI=1`)
 - Backend serves the built frontend as static files via `fallback_service`

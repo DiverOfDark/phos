@@ -2,9 +2,13 @@
 //!
 //! Downloads what ComfyUI named and saves it beside the shot's original as a
 //! non-original variant. Re-running the same task is safe: an identical file
-//! already on disk is recognised by hash and reused, and a *different* file at
-//! the expected path gets its own suffixed name rather than overwriting
-//! something the user may already have looked at.
+//! already in the library is recognised by hash and reused, and a *different*
+//! file under the expected name gets its own suffixed one rather than
+//! overwriting something the user may already have looked at.
+//!
+//! The row is written *before* the bytes. `files.path` is `UNIQUE`, so the
+//! insert is how a name is claimed, and a collision is an answer rather than a
+//! failed task — see [`store_output_file`].
 //!
 //! Every row this module writes is marked `synthetic` and carries a
 //! [`ProvenanceManifest`]. That is the one place in Phos where a machine-made
@@ -47,8 +51,26 @@ pub(super) fn download_and_save_output(
     Ok(())
 }
 
+/// How many names to try before giving up on finding a free one.
+const MAX_NAMING_ATTEMPTS: usize = 8;
+
 /// Write the bytes next to the shot's original and register them as a file row.
 /// Returns the id of the file the task should point at.
+///
+/// # The row is reserved before the bytes are written
+///
+/// `files.path` is `UNIQUE`, and the obvious order — look for a free name,
+/// write the file, insert the row — has a window between the look and the
+/// insert that the write itself opens: once the bytes are on disk, a scan or
+/// the file watcher can walk past them and index the path first. The insert
+/// then fails with `UNIQUE constraint failed: files.path` and the task is
+/// reported as failed for a reason that has nothing to do with the workflow.
+///
+/// So the insert goes first and *is* the check: a name is claimed by taking it,
+/// and a collision is an answer rather than an error. That also closes the
+/// larger hole, because the reserved row already says `synthetic` — by the time
+/// the bytes exist for anything to find, the library already knows a machine
+/// made them, and no scanner can index the path as a photograph.
 fn store_output_file(
     conn: &mut SqliteConnection,
     task: &ActiveTask,
@@ -90,69 +112,111 @@ fn store_output_file(
         .map_err(|e| anyhow::anyhow!("Failed to serialize provenance manifest: {e}"))?;
 
     let task_short = &task.id[..8.min(task.id.len())];
-    let base_output_path = parent.join(format!("{}_enhanced_{}.{}", stem, task_short, ext));
-    let base_path_str = db::make_relative(library_root, &base_output_path);
+    let mut target = parent.join(format!("{}_enhanced_{}.{}", stem, task_short, ext));
 
-    // Check if a file with the expected path already exists in the DB (from a previous attempt)
-    let existing: Option<(String, String)> = files::table
-        .filter(files::path.eq(&base_path_str))
-        .select((files::id, files::hash))
-        .first::<(String, String)>(conn)
-        .ok();
+    for _ in 0..MAX_NAMING_ATTEMPTS {
+        let path_str = db::make_relative(library_root, &target);
+        let file_id = Uuid::new_v4().to_string();
 
-    if let Some((existing_id, existing_hash)) = &existing {
-        if *existing_hash == hash {
-            // Same content already saved — nothing to write. The row may be an
-            // earlier attempt at this task, or one the file watcher indexed in
-            // the moment between the bytes landing and this insert; either way
-            // it is this run's output and has to say so.
-            info!(
-                "Task {} output already exists with same hash, skipping write",
-                task.id
-            );
-            mark_synthetic(conn, existing_id, task, &manifest_json)?;
-            return Ok(existing_id.clone());
+        let reserved = diesel::insert_into(files::table)
+            .values(NewFile {
+                id: &file_id,
+                shot_id,
+                path: &path_str,
+                hash: &hash,
+                mime_type: Some(mime_for(ext)),
+                file_size: Some(data.len() as i32),
+                is_original: Some(false),
+                visual_embedding: None,
+                source_workflow_id: Some(&task.workflow_id),
+                source_text_overrides: Some(&task.text_overrides),
+                synthetic: Some(true),
+                manifest_json: Some(&manifest_json),
+            })
+            .execute(conn);
+
+        match reserved {
+            Ok(_) => {
+                // The name is ours, and the row already says a machine made it.
+                // Only now do the bytes appear.
+                if let Err(e) = std::fs::write(&target, data) {
+                    // A row pointing at a file that does not exist is worse than
+                    // no row: it shows up in the library as a broken variant and
+                    // holds the name against the retry. Give the name back.
+                    let _ =
+                        diesel::delete(files::table.filter(files::id.eq(&file_id))).execute(conn);
+                    return Err(anyhow::anyhow!("Failed to write {:?}: {}", target, e));
+                }
+                info!("Saved enhanced output to {:?}", target);
+                return Ok(file_id);
+            }
+            Err(e) if is_unique_violation(&e) => {
+                // Someone holds this name: an earlier attempt at this same task,
+                // or a scan that walked past the bytes before the row landed.
+                let (holder_id, holder_hash): (String, String) = files::table
+                    .filter(files::path.eq(&path_str))
+                    .select((files::id, files::hash))
+                    .first(conn)?;
+
+                if holder_hash == hash {
+                    // The same bytes, so it is this run's output whoever put it
+                    // there. Claim it rather than making a second copy.
+                    info!(
+                        "Task {} output is already in the library as {}",
+                        task.id, holder_id
+                    );
+                    mark_synthetic(conn, &holder_id, task, &manifest_json)?;
+                    // A reservation whose write never happened is finished here.
+                    ensure_bytes_on_disk(&target, data)?;
+                    return Ok(holder_id);
+                }
+
+                // Different content under that name — take another one rather
+                // than overwrite something the user may already have looked at.
+                let unique = &Uuid::new_v4().to_string()[..8];
+                target = parent.join(format!(
+                    "{}_enhanced_{}_{}.{}",
+                    stem, task_short, unique, ext
+                ));
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 
-    let path_taken = existing.is_some();
-    let target = if path_taken {
-        // Path is taken but content differs — save as a new variant with a unique suffix
-        let unique = &Uuid::new_v4().to_string()[..8];
-        parent.join(format!(
-            "{}_enhanced_{}_{}.{}",
-            stem, task_short, unique, ext
-        ))
-    } else {
-        base_output_path
-    };
+    Err(anyhow::anyhow!(
+        "Could not find a free name for task {} output after {} attempts",
+        task.id,
+        MAX_NAMING_ATTEMPTS
+    ))
+}
 
-    std::fs::write(&target, data)?;
-    if path_taken {
-        info!("Saved enhanced output (new variant) to {:?}", target);
-    } else {
-        info!("Saved enhanced output to {:?}", target);
+/// Whether a database error is the `files.path` uniqueness constraint saying
+/// somebody else got there first.
+fn is_unique_violation(e: &diesel::result::Error) -> bool {
+    matches!(
+        e,
+        diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::UniqueViolation, _)
+    )
+}
+
+/// Put the bytes where the row says they are, if they are not there already.
+///
+/// This is the other half of reserving the row first: a crash between the
+/// insert and the write leaves a row pointing at nothing. The next attempt at
+/// the same task recognises its own reservation by hash and finishes it, so the
+/// two orderings converge instead of one of them stranding a file.
+fn ensure_bytes_on_disk(target: &Path, data: &[u8]) -> anyhow::Result<()> {
+    if let Ok(meta) = std::fs::metadata(target) {
+        if meta.len() == data.len() as u64 {
+            return Ok(());
+        }
     }
-
-    let path_str = db::make_relative(library_root, &target);
-    let file_id = Uuid::new_v4().to_string();
-    diesel::insert_into(files::table)
-        .values(NewFile {
-            id: &file_id,
-            shot_id,
-            path: &path_str,
-            hash: &hash,
-            mime_type: Some(mime_for(ext)),
-            file_size: Some(data.len() as i32),
-            is_original: Some(false),
-            visual_embedding: None,
-            source_workflow_id: Some(&task.workflow_id),
-            source_text_overrides: Some(&task.text_overrides),
-            synthetic: Some(true),
-            manifest_json: Some(&manifest_json),
-        })
-        .execute(conn)?;
-    Ok(file_id)
+    std::fs::write(target, data)?;
+    info!(
+        "Wrote the bytes a reserved row was still missing: {:?}",
+        target
+    );
+    Ok(())
 }
 
 /// The record that travels with the file: what ran, what it was given, and what
@@ -422,6 +486,238 @@ mod tests {
                 .get_result::<i64>(&mut conn)
                 .unwrap(),
             "and takes back the face that should never have been detected",
+        );
+    }
+
+    /// The partial-write race: the watcher indexed the path this task is about
+    /// to claim, but with *different* bytes — a half-flushed file caught
+    /// mid-write. The run still has to land.
+    #[test]
+    fn a_path_taken_by_different_bytes_does_not_sink_the_task() {
+        let (_dir, root, mut conn) = library_with_a_finished_task();
+
+        // What the watcher caught: a truncated file, indexed as a photograph.
+        let partial = b"gener";
+        let mut hasher = Sha256::new();
+        hasher.update(partial);
+        let partial_hash = hex::encode(hasher.finalize());
+        std::fs::write(root.join("holiday_enhanced_task-123.png"), partial).unwrap();
+        diesel::insert_into(files::table)
+            .values(NewFile {
+                id: "file-partial",
+                shot_id: "shot-1",
+                path: "holiday_enhanced_task-123.png",
+                hash: &partial_hash,
+                mime_type: Some("image/png"),
+                file_size: Some(partial.len() as i32),
+                is_original: Some(false),
+                visual_embedding: None,
+                source_workflow_id: None,
+                source_text_overrides: None,
+                synthetic: None,
+                manifest_json: None,
+            })
+            .execute(&mut conn)
+            .unwrap();
+
+        let result = store_output_file(&mut conn, &a_task(), &an_output(), b"generated", &root);
+
+        let file_id = result.expect("a taken path must not fail the run");
+        assert_ne!(
+            "file-partial", file_id,
+            "the truncated file is not the output"
+        );
+        let (path, synthetic): (String, bool) = files::table
+            .filter(files::id.eq(&file_id))
+            .select((files::path, files::synthetic))
+            .first(&mut conn)
+            .unwrap();
+        assert!(synthetic);
+        assert_eq!(
+            b"generated".to_vec(),
+            std::fs::read(root.join(&path)).unwrap(),
+            "the bytes on disk are the ones the run produced",
+        );
+    }
+
+    /// The race the reservation exists for: between deciding a name was free
+    /// and inserting the row, the bytes are on disk and a scan can index the
+    /// path first. Taking the name by inserting makes that a collision to
+    /// resolve rather than `UNIQUE constraint failed: files.path` reported as a
+    /// failed workflow.
+    #[test]
+    fn a_scan_that_indexes_the_output_first_does_not_fail_the_task() {
+        let (_dir, root, mut conn) = library_with_a_finished_task();
+        let data = b"generated";
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash = hex::encode(hasher.finalize());
+
+        // What a concurrent scan leaves behind: the same bytes, at the name
+        // this task is about to take, indexed as an ordinary photograph.
+        std::fs::write(root.join("holiday_enhanced_task-123.png"), data).unwrap();
+        diesel::insert_into(files::table)
+            .values(NewFile {
+                id: "file-from-scan",
+                shot_id: "shot-1",
+                path: "holiday_enhanced_task-123.png",
+                hash: &hash,
+                mime_type: Some("image/png"),
+                file_size: Some(data.len() as i32),
+                is_original: Some(false),
+                visual_embedding: None,
+                source_workflow_id: None,
+                source_text_overrides: None,
+                synthetic: None,
+                manifest_json: None,
+            })
+            .execute(&mut conn)
+            .unwrap();
+
+        let file_id = store_output_file(&mut conn, &a_task(), &an_output(), data, &root)
+            .expect("a name taken by a scan must not fail the run");
+
+        assert_eq!("file-from-scan", file_id, "the same bytes, so the same row");
+        let synthetic: bool = files::table
+            .filter(files::id.eq("file-from-scan"))
+            .select(files::synthetic)
+            .first(&mut conn)
+            .unwrap();
+        assert!(synthetic, "and the row the scan made is corrected");
+        assert_eq!(
+            2i64,
+            files::table.count().get_result::<i64>(&mut conn).unwrap(),
+            "no second copy",
+        );
+    }
+
+    /// The window itself, which only real concurrency can show: a row landing
+    /// at the chosen name *between* deciding it was free and inserting it.
+    ///
+    /// Two writers, one name. Checking first and inserting later leaves a gap
+    /// wide enough for the loser to be handed `UNIQUE constraint failed:
+    /// files.path`, which the caller reports as a failed workflow. Taking the
+    /// name by inserting has no gap: whichever loses discovers it lost from the
+    /// constraint and resolves it. No interleaving may produce an error.
+    #[test]
+    fn two_writers_racing_for_the_same_name_both_land() {
+        let (_dir, root, _conn) = library_with_a_finished_task();
+        let db_path = root.join(".phos.db");
+        let barrier = std::sync::Barrier::new(2);
+
+        let results: Vec<anyhow::Result<String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let db_path = db_path.clone();
+                    let root = root.clone();
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let mut conn = crate::db::open_diesel_connection(&db_path).unwrap();
+                        barrier.wait();
+                        store_output_file(&mut conn, &a_task(), &an_output(), b"generated", &root)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for r in &results {
+            assert!(
+                r.is_ok(),
+                "a lost race is a name to resolve, not a failed run: {:?}",
+                r.as_ref().err()
+            );
+        }
+        assert_eq!(
+            results[0].as_ref().unwrap(),
+            results[1].as_ref().unwrap(),
+            "the same bytes must converge on one row",
+        );
+
+        let mut conn = crate::db::open_diesel_connection(&db_path).unwrap();
+        assert_eq!(
+            2i64,
+            files::table.count().get_result::<i64>(&mut conn).unwrap(),
+            "the original and exactly one output",
+        );
+    }
+
+    /// The reservation is a promise about a name, so a write that never lands
+    /// has to give the name back — a row pointing at a file that does not exist
+    /// would show as a broken variant and block the retry.
+    #[test]
+    fn a_write_that_fails_leaves_no_row_behind() {
+        let (_dir, root, mut conn) = library_with_a_finished_task();
+
+        // A directory where the output file wants to be: the write fails, the
+        // insert before it does not.
+        std::fs::create_dir(root.join("holiday_enhanced_task-123.png")).unwrap();
+
+        let result = store_output_file(&mut conn, &a_task(), &an_output(), b"generated", &root);
+
+        assert!(result.is_err(), "the failure is reported, not swallowed");
+        assert_eq!(
+            1i64,
+            files::table.count().get_result::<i64>(&mut conn).unwrap(),
+            "only the original — the reservation was given back",
+        );
+    }
+
+    /// A reservation whose write never happened is finished by the next
+    /// attempt, rather than leaving a row pointing at nothing forever.
+    #[test]
+    fn a_retry_finishes_a_reservation_whose_bytes_never_landed() {
+        let (_dir, root, mut conn) = library_with_a_finished_task();
+        let data = b"generated";
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash = hex::encode(hasher.finalize());
+
+        // The row a crash between the insert and the write would leave.
+        diesel::insert_into(files::table)
+            .values(NewFile {
+                id: "file-reserved",
+                shot_id: "shot-1",
+                path: "holiday_enhanced_task-123.png",
+                hash: &hash,
+                mime_type: Some("image/png"),
+                file_size: Some(data.len() as i32),
+                is_original: Some(false),
+                visual_embedding: None,
+                source_workflow_id: Some("wf-portrait"),
+                source_text_overrides: Some("{}"),
+                synthetic: Some(true),
+                manifest_json: Some("{}"),
+            })
+            .execute(&mut conn)
+            .unwrap();
+        assert!(!root.join("holiday_enhanced_task-123.png").exists());
+
+        let file_id = store_output_file(&mut conn, &a_task(), &an_output(), data, &root).unwrap();
+
+        assert_eq!("file-reserved", file_id);
+        assert_eq!(
+            data.to_vec(),
+            std::fs::read(root.join("holiday_enhanced_task-123.png")).unwrap(),
+            "the bytes the row was already promising are there now",
+        );
+    }
+
+    /// A second attempt at the same task converges on one file and one row.
+    #[test]
+    fn a_second_attempt_at_the_same_task_converges() {
+        let (_dir, root, mut conn) = library_with_a_finished_task();
+
+        let first =
+            store_output_file(&mut conn, &a_task(), &an_output(), b"generated", &root).unwrap();
+        let second =
+            store_output_file(&mut conn, &a_task(), &an_output(), b"generated", &root).unwrap();
+
+        assert_eq!(first, second, "the same run must not make a second file");
+        assert_eq!(
+            2i64,
+            files::table.count().get_result::<i64>(&mut conn).unwrap(),
+            "the original and one output",
         );
     }
 }
