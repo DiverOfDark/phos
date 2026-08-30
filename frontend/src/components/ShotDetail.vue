@@ -93,6 +93,40 @@ const facesForSelectedFile = computed(() => {
   return shot.value.faces.filter(f => f.file_id === selectedFile.value.id)
 })
 
+// --- Provenance ---
+// A generated picture looks exactly like a photograph. The badge says which it
+// is; this says how it was made, for the day nobody remembers.
+const provenance = ref(null)
+
+watch(selectedFile, async (file) => {
+  provenance.value = null
+  if (!file?.synthetic) return
+  const id = file.id
+  try {
+    const res = await fetch(`/api/files/${id}/manifest`)
+    if (!res.ok) return
+    const body = await res.json()
+    // The selection may have moved on while this was in flight.
+    if (selectedFile.value?.id === id) provenance.value = body.manifest || null
+  } catch {
+    provenance.value = null
+  }
+}, { immediate: true })
+
+/** The manifest, as rows in the same register as the metadata block. */
+const provenanceRows = computed(() => {
+  const m = provenance.value
+  if (!m) return []
+  const rows = [['made', m.generated_at || '—'], ['workflow', m.workflow_id]]
+  if (m.seed != null) rows.push(['seed', String(m.seed)])
+  if (m.output_filename) rows.push(['output', m.output_filename])
+  rows.push(['task', String(m.task_id || '').slice(0, 8)])
+  for (const [node, text] of Object.entries(m.text_overrides || {})) {
+    rows.push([`prompt/${node}`, text])
+  }
+  return rows
+})
+
 const peopleMap = computed(() => {
   const map = {}
   for (const p of people.value) {
@@ -789,6 +823,7 @@ watch(() => route.params.id, () => {
           <img :src="`/api/files/${file.id}/thumbnail`" class="w-full h-full object-cover" loading="lazy" />
           <span v-if="file.is_original" class="absolute top-1 left-1 w-1.5 h-1.5 rounded-full bg-signal"></span>
           <span v-if="file.mime_type?.startsWith('video/')" class="absolute bottom-0.5 right-1 font-mono text-[9px] text-building">VID</span>
+          <span v-if="file.synthetic" class="absolute bottom-0.5 left-1 font-mono text-[9px] tracking-[0.08em] text-ink-tertiary">GEN</span>
           <span v-if="splitMode && splitSelection.has(file.id)" class="absolute top-1 right-1 font-mono text-[11px] text-signal">✓</span>
         </button>
       </div>
@@ -853,6 +888,12 @@ watch(() => route.params.id, () => {
                 class="font-mono text-[10px] tracking-[0.08em] text-signal border rounded-sm px-1"
                 style="border-color: var(--accent-muted)"
               >MASTER</span>
+              <!-- An attribute of the file, not a status: the label register, no colour. -->
+              <span
+                v-if="selectedFile?.synthetic"
+                class="font-mono text-[10px] tracking-[0.08em] text-ink-tertiary border border-line rounded-sm px-1"
+                title="Made by a workflow, not a camera. Kept out of face recognition."
+              >GENERATED</span>
               <span class="flex-1"></span>
               <template v-if="selectedFile && !selectedFile.is_original">
                 <button
@@ -952,6 +993,20 @@ watch(() => route.params.id, () => {
                 </template>
               </div>
               <div v-if="shot.description" class="text-xs font-light text-ink-secondary">"{{ shot.description }}"</div>
+            </div>
+
+            <!-- Provenance: what made this picture, for the day nobody remembers. -->
+            <div v-if="selectedFile?.synthetic" class="flex flex-col gap-2">
+              <div class="label">Provenance</div>
+              <div class="grid font-mono text-xs" style="grid-template-columns: auto 1fr; gap: 4px 16px">
+                <template v-for="row in provenanceRows" :key="row[0]">
+                  <span class="text-ink-tertiary">{{ row[0] }}</span>
+                  <span class="text-ink-secondary break-all">{{ row[1] }}</span>
+                </template>
+              </div>
+              <div v-if="!provenanceRows.length" class="font-mono text-[11px] text-ink-tertiary">
+                generated before provenance was recorded
+              </div>
             </div>
 
             <!-- AI enhancements -->
