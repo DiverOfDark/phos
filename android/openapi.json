@@ -5039,6 +5039,14 @@
             ],
             "description": "The prompt as submitted, after every override was applied."
           },
+          "duration_seconds": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "How long the run took, in seconds, from dispatch to the output landing.\n\nThe task row that timed it is swept five minutes after its run settles,\nso this is the only durable record of what a workflow costs — and it is\nwhat FR7's confirm sheet calibrates its GPU estimate from. Absent on\nfiles generated before this field existed, and on any run whose clock\ndid not tick."
+          },
           "generated_at": {
             "type": "string",
             "description": "When Phos brought the file into the library, UTC, `YYYY-MM-DD HH:MM:SS`."

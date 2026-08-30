@@ -194,7 +194,10 @@ fn a_query_selected_batch_materialises_across_ticks_and_never_all_at_once() {
     assert_eq!(second.opened, 5);
     let so_far = opened_shot_ids(&mut conn, &id);
     assert_eq!(so_far.len(), 10);
-    assert_eq!(&so_far[5..], &["shot-005", "shot-006", "shot-007", "shot-008", "shot-009"]);
+    assert_eq!(
+        &so_far[5..],
+        &["shot-005", "shot-006", "shot-007", "shot-008", "shot-009"]
+    );
 
     let mut unique = so_far.clone();
     unique.sort();
@@ -206,16 +209,20 @@ fn a_query_selected_batch_materialises_across_ticks_and_never_all_at_once() {
 fn the_cursor_is_written_to_the_row_and_resumes_from_there() {
     let (dir, mut conn) = library();
     seed(&mut conn, 10);
-    let id = make_batch(
-        &mut conn,
-        Caps::default(),
-        false,
-    );
+    let id = make_batch(&mut conn, Caps::default(), false);
 
-    assert!(store::load(&mut conn, &id).unwrap().unwrap().cursor.is_none());
+    assert!(store::load(&mut conn, &id)
+        .unwrap()
+        .unwrap()
+        .cursor
+        .is_none());
     tick_lead(&mut conn, dir.path(), &id, Some(3));
 
-    let cursor = store::load(&mut conn, &id).unwrap().unwrap().cursor.unwrap();
+    let cursor = store::load(&mut conn, &id)
+        .unwrap()
+        .unwrap()
+        .cursor
+        .unwrap();
     assert_eq!(cursor.shot_id, "shot-002");
     assert_eq!(cursor.key, "1902-01-01 00:00:00");
 
@@ -264,11 +271,7 @@ fn a_batch_that_runs_out_of_shots_completes_once_nothing_is_live() {
 fn a_shot_imported_mid_batch_is_picked_up_if_it_sorts_after_the_cursor() {
     let (dir, mut conn) = library();
     seed(&mut conn, 3);
-    let id = make_batch(
-        &mut conn,
-        Caps::default(),
-        false,
-    );
+    let id = make_batch(&mut conn, Caps::default(), false);
     tick_lead(&mut conn, dir.path(), &id, Some(2));
     assert_eq!(opened_shot_ids(&mut conn, &id).len(), 2);
 
@@ -575,10 +578,7 @@ fn a_held_run_with_a_null_stage_still_counts_against_the_cap() {
         .execute(&mut conn)
         .unwrap();
     diesel::update(runs::table.filter(runs::id.eq(&opened[1])))
-        .set((
-            runs::status.eq("held"),
-            runs::held_at_stage.eq(None::<i32>),
-        ))
+        .set((runs::status.eq("held"), runs::held_at_stage.eq(None::<i32>)))
         .execute(&mut conn)
         .unwrap();
 
@@ -625,11 +625,7 @@ fn held_runs_count_as_live_so_a_batch_is_not_done_while_one_waits() {
 fn stop_halts_mid_batch_and_leaves_no_half_queued_run() {
     let (dir, mut conn) = library();
     seed(&mut conn, 50);
-    let id = make_batch(
-        &mut conn,
-        Caps::default(),
-        false,
-    );
+    let id = make_batch(&mut conn, Caps::default(), false);
     tick_lead(&mut conn, dir.path(), &id, Some(6));
     assert_eq!(opened_shot_ids(&mut conn, &id).len(), 6);
 
@@ -742,10 +738,7 @@ fn stop_survives_a_held_run_with_no_stage_to_hold() {
     tick(&mut conn, dir.path(), &id);
 
     diesel::update(runs::table.filter(runs::batch_id.eq(&id)))
-        .set((
-            runs::status.eq("held"),
-            runs::held_at_stage.eq(None::<i32>),
-        ))
+        .set((runs::status.eq("held"), runs::held_at_stage.eq(None::<i32>)))
         .execute(&mut conn)
         .unwrap();
 
@@ -768,13 +761,8 @@ fn a_batchs_runs_carry_its_id_and_a_hand_started_run_carries_none() {
     let id = make_batch(&mut conn, Caps::default(), false);
     tick(&mut conn, dir.path(), &id);
 
-    crate::comfyui::runs::start_line_run(
-        &mut conn,
-        "line-1",
-        "shot-000",
-        &Default::default(),
-    )
-    .unwrap();
+    crate::comfyui::runs::start_line_run(&mut conn, "line-1", "shot-000", &Default::default())
+        .unwrap();
 
     let unattributed: i64 = runs::table
         .filter(runs::batch_id.is_null())
@@ -825,6 +813,69 @@ fn a_stage_this_library_has_run_is_costed_from_what_it_actually_took() {
         costs[0].seconds
     );
     assert_eq!(costs[0].bytes, 3000);
+}
+
+#[test]
+fn a_workflow_is_still_measured_after_its_task_rows_are_swept() {
+    // `cleanup_completed_tasks` deletes a completed task five minutes after its
+    // run settles. If that were the only source of a duration, "measured" would
+    // be a label that is almost never true — so the completion path also writes
+    // the duration into the file's manifest, which is durable.
+    let (_dir, mut conn) = library();
+    seed(&mut conn, 1);
+    conn.batch_execute(
+        "INSERT INTO files (id, shot_id, path, hash, source_workflow_id, file_size, \
+         synthetic, manifest_json) VALUES
+           ('m1','shot-000','m1.png','hm1','wf-1',4000,1,
+            '{\"version\":1,\"generator\":\"comfyui\",\"generated_at\":\"2026-01-01 00:00:00\",\
+              \"task_id\":\"t1\",\"workflow_id\":\"wf-1\",\"duration_seconds\":40.0}'),
+           ('m2','shot-000','m2.png','hm2','wf-1',4000,1,
+            '{\"version\":1,\"generator\":\"comfyui\",\"generated_at\":\"2026-01-01 00:00:00\",\
+              \"task_id\":\"t2\",\"workflow_id\":\"wf-1\",\"duration_seconds\":60.0}'),
+           ('m3','shot-000','m3.png','hm3','wf-1',4000,1,
+            '{\"version\":1,\"generator\":\"comfyui\",\"generated_at\":\"2026-01-01 00:00:00\",\
+              \"task_id\":\"t3\",\"workflow_id\":\"wf-1\",\"duration_seconds\":50.0}');",
+    )
+    .unwrap();
+
+    // Not one task row exists, and the stage is measured anyway.
+    let tasks: i64 = enhancement_tasks::table
+        .count()
+        .get_result(&mut conn)
+        .unwrap();
+    assert_eq!(tasks, 0);
+
+    let costs = store::stage_costs(&mut conn, "line-1").unwrap();
+    assert!(costs[0].seconds_measured);
+    assert!(
+        (costs[0].seconds - 50.0).abs() < 0.5,
+        "got {}",
+        costs[0].seconds
+    );
+}
+
+#[test]
+fn a_file_with_no_duration_in_its_manifest_is_simply_not_counted() {
+    // Every file generated before the field existed. It must not read as a
+    // zero-second run and drag the median towards free.
+    let (_dir, mut conn) = library();
+    seed(&mut conn, 1);
+    conn.batch_execute(
+        "INSERT INTO files (id, shot_id, path, hash, source_workflow_id, file_size, \
+         synthetic, manifest_json) VALUES
+           ('old','shot-000','old.png','hold','wf-1',4000,1,
+            '{\"version\":1,\"generator\":\"comfyui\",\"generated_at\":\"2026-01-01 00:00:00\",\
+              \"task_id\":\"t0\",\"workflow_id\":\"wf-1\"}');",
+    )
+    .unwrap();
+
+    let costs = store::stage_costs(&mut conn, "line-1").unwrap();
+    assert!(!costs[0].seconds_measured);
+    assert_eq!(costs[0].seconds, super::plan::GUESS_IMAGE_SECONDS);
+    // The size on that row *is* known, so bytes are measured even when the
+    // clock is not — the two are answered separately for exactly this reason.
+    assert!(costs[0].bytes_measured);
+    assert_eq!(costs[0].bytes, 4000);
 }
 
 #[test]
@@ -965,11 +1016,7 @@ fn an_explicit_id_list_walks_the_same_cursor_as_a_query() {
     seed(&mut conn, 10);
     let (estimate, _) = store::estimate_for(&mut conn, "line-1", 0, 0).unwrap();
     let selection = Selection::Ids {
-        ids: vec![
-            "shot-007".into(),
-            "shot-002".into(),
-            "shot-005".into(),
-        ],
+        ids: vec!["shot-007".into(), "shot-002".into(), "shot-005".into()],
     };
     let id = store::create(
         &mut conn,
@@ -1041,7 +1088,11 @@ fn the_cursor_is_written_as_a_pair_or_not_at_all() {
         .set(crate::schema::batches::cursor_key.eq("1975"))
         .execute(&mut conn)
         .unwrap();
-    assert!(store::load(&mut conn, &id).unwrap().unwrap().cursor.is_none());
+    assert!(store::load(&mut conn, &id)
+        .unwrap()
+        .unwrap()
+        .cursor
+        .is_none());
 
     diesel::update(crate::schema::batches::table.filter(crate::schema::batches::id.eq(&id)))
         .set(crate::schema::batches::cursor_shot_id.eq("shot-001"))

@@ -338,11 +338,7 @@ pub fn run_counts(conn: &mut SqliteConnection, batch_id: &str) -> QueryResult<Ru
 /// Counted from the tasks themselves rather than from a per-day column, so a
 /// restart, a crash or a hand-edited row cannot make the daily cap believe a
 /// day is fresh when it is not.
-pub fn tasks_since(
-    conn: &mut SqliteConnection,
-    batch_id: &str,
-    since: &str,
-) -> QueryResult<i64> {
+pub fn tasks_since(conn: &mut SqliteConnection, batch_id: &str, since: &str) -> QueryResult<i64> {
     #[derive(QueryableByName)]
     struct N {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -448,8 +444,7 @@ pub fn list_selections(conn: &mut SqliteConnection) -> QueryResult<Vec<SavedSele
             id: r.0,
             name: r.1,
             line_id: r.2,
-            selection: serde_json::from_str(&r.3)
-                .unwrap_or(Selection::Ids { ids: Vec::new() }),
+            selection: serde_json::from_str(&r.3).unwrap_or(Selection::Ids { ids: Vec::new() }),
             caps_json: r.4,
             skip_if_generated: r.5,
             created_at: r.6,
@@ -530,6 +525,29 @@ struct MedianRow {
     bytes: Option<f64>,
 }
 
+/// Every duration this library can still remember for a workflow.
+///
+/// **Two sources, one measurement.** The obvious one is the task row's own
+/// clock — but `cleanup_completed_tasks` deletes a completed task five minutes
+/// after its run settles, so on its own that source is empty for every workflow
+/// run longer ago than lunch, and "measured" would have been a label that was
+/// almost never true. The durable one is `files.manifest_json`, which the
+/// completion path writes at the same moment from the same two timestamps.
+///
+/// They cannot disagree, because they are the same number recorded twice with
+/// different lifetimes: the union of the two is exactly "every run of this
+/// workflow this library still has any record of".
+const DURATION_SOURCES: &str = "\
+    SELECT (julianday(t.completed_at) - julianday(t.started_at)) * 86400.0 AS d \
+      FROM enhancement_tasks t \
+     WHERE t.workflow_id = ? AND t.status = 'completed' \
+       AND t.started_at IS NOT NULL AND t.completed_at IS NOT NULL \
+    UNION ALL \
+    SELECT CAST(json_extract(f.manifest_json, '$.duration_seconds') AS REAL) AS d \
+      FROM files f \
+     WHERE f.source_workflow_id = ? AND f.manifest_json IS NOT NULL \
+       AND json_extract(f.manifest_json, '$.duration_seconds') IS NOT NULL";
+
 /// The median duration and output size this library has seen for a workflow.
 ///
 /// `NULL` for either means "never measured here". SQLite has no median, so this
@@ -543,34 +561,34 @@ fn measured_cost(
     // takes one row when the count is odd and the middle two when it is even,
     // which is what a median is; a plain `LIMIT 2` would average the middle
     // with the one above it and report a number that is in neither half.
-    let row: MedianRow = diesel::sql_query(
+    //
+    // The duration source is spelled out three times because SQLite needs the
+    // rows, the count and the offset separately, and a subquery cannot be named
+    // once and reused here.
+    let sql = format!(
         "SELECT \
-           (SELECT AVG(d) FROM (\
-              SELECT (julianday(t.completed_at) - julianday(t.started_at)) * 86400.0 AS d \
-              FROM enhancement_tasks t \
-              WHERE t.workflow_id = ?1 AND t.status = 'completed' \
-                AND t.started_at IS NOT NULL AND t.completed_at IS NOT NULL \
-              ORDER BY d \
-              LIMIT (SELECT 2 - (COUNT(*) % 2) FROM enhancement_tasks t3 \
-                     WHERE t3.workflow_id = ?1 AND t3.status = 'completed' \
-                       AND t3.started_at IS NOT NULL AND t3.completed_at IS NOT NULL) \
-              OFFSET (\
-                SELECT (COUNT(*) - 1) / 2 FROM enhancement_tasks t2 \
-                WHERE t2.workflow_id = ?1 AND t2.status = 'completed' \
-                  AND t2.started_at IS NOT NULL AND t2.completed_at IS NOT NULL))) AS seconds, \
+           (SELECT AVG(d) FROM ({src} ORDER BY d \
+              LIMIT (SELECT 2 - (COUNT(*) % 2) FROM ({src})) \
+              OFFSET (SELECT (COUNT(*) - 1) / 2 FROM ({src})))) AS seconds, \
            (SELECT AVG(b) FROM (\
               SELECT f.file_size AS b FROM files f \
-              WHERE f.source_workflow_id = ?2 AND f.file_size IS NOT NULL \
+              WHERE f.source_workflow_id = ? AND f.file_size IS NOT NULL \
               ORDER BY b \
               LIMIT (SELECT 2 - (COUNT(*) % 2) FROM files f3 \
-                     WHERE f3.source_workflow_id = ?2 AND f3.file_size IS NOT NULL) \
+                     WHERE f3.source_workflow_id = ? AND f3.file_size IS NOT NULL) \
               OFFSET (\
                 SELECT (COUNT(*) - 1) / 2 FROM files f2 \
-                WHERE f2.source_workflow_id = ?2 AND f2.file_size IS NOT NULL))) AS bytes",
-    )
-    .bind::<diesel::sql_types::Text, _>(workflow_id)
-    .bind::<diesel::sql_types::Text, _>(workflow_id)
-    .get_result(conn)?;
+                WHERE f2.source_workflow_id = ? AND f2.file_size IS NOT NULL))) AS bytes",
+        src = DURATION_SOURCES
+    );
+
+    // Six binds for the duration sources (two each, three times) and three for
+    // the sizes, all the same id, in the order the `?` appear.
+    let mut query = diesel::sql_query(sql).into_boxed();
+    for _ in 0..9 {
+        query = query.bind::<diesel::sql_types::Text, _>(workflow_id.to_string());
+    }
+    let row: MedianRow = query.get_result(conn)?;
 
     // A duration of zero is a clock that did not tick, not a free workflow.
     let seconds = row.seconds.filter(|s| *s > 0.0);

@@ -92,14 +92,7 @@ pub fn feed_one(
         Feed::Open(n) => n,
         Feed::Idle => return settle(conn, batch, BatchState::Running, None, 0, 0),
         Feed::Pause(reason) => {
-            return settle(
-                conn,
-                batch,
-                BatchState::Paused,
-                Some(reason.as_str()),
-                0,
-                0,
-            )
+            return settle(conn, batch, BatchState::Paused, Some(reason.as_str()), 0, 0)
         }
         // Unreachable with `exhausted = false`, but a `Done` here would be a
         // batch declared over while its query still had shots.
@@ -244,11 +237,7 @@ fn settle(
     })
 }
 
-fn finish(
-    conn: &mut SqliteConnection,
-    batch: &BatchRow,
-    state: BatchState,
-) -> QueryResult<()> {
+fn finish(conn: &mut SqliteConnection, batch: &BatchRow, state: BatchState) -> QueryResult<()> {
     let finished_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     store::apply(
         conn,
@@ -330,7 +319,12 @@ pub fn stop(
         // that must always work, so this falls through rather than refusing.
         match crate::comfyui::cancel_run(conn, run_id) {
             Ok(_) => cancelled += 1,
-            Err(e) => tracing::warn!("Could not cancel run {} of batch {}: {}", run_id, batch_id, e),
+            Err(e) => tracing::warn!(
+                "Could not cancel run {} of batch {}: {}",
+                run_id,
+                batch_id,
+                e
+            ),
         }
     }
 

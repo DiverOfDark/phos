@@ -240,10 +240,8 @@ mod tests {
 
     #[test]
     fn an_empty_id_list_matches_nothing_rather_than_failing_to_parse() {
-        let (conditions, binds) = conditions_for(
-            &Selection::Ids { ids: vec![] },
-            &Narrowing::default(),
-        );
+        let (conditions, binds) =
+            conditions_for(&Selection::Ids { ids: vec![] }, &Narrowing::default());
         assert_eq!(conditions, vec!["0 = 1".to_string()]);
         assert!(binds.is_empty());
     }
@@ -359,10 +357,7 @@ mod tests {
             to: Some("1990-01-01".into()),
             ..Default::default()
         };
-        assert_eq!(
-            Selection::Query { query }.shorthand(),
-            "person · –1990"
-        );
+        assert_eq!(Selection::Query { query }.shorthand(), "person · –1990");
         assert_eq!(
             Selection::Query {
                 query: ShotsQuery::default()
@@ -382,10 +377,7 @@ mod tests {
         };
         let json = serde_json::to_string(&selection).unwrap();
         assert!(json.contains("\"kind\":\"query\""));
-        assert_eq!(
-            serde_json::from_str::<Selection>(&json).unwrap(),
-            selection
-        );
+        assert_eq!(serde_json::from_str::<Selection>(&json).unwrap(), selection);
 
         let ids = Selection::Ids {
             ids: vec!["a".into()],

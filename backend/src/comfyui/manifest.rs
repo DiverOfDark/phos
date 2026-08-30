@@ -68,6 +68,15 @@ pub struct ProvenanceManifest {
     pub output_filename: Option<String>,
 
     // ── Filled in by later stages of the pipeline (FR4 / FR5 / FR9). ──
+    /// How long the run took, in seconds, from dispatch to the output landing.
+    ///
+    /// The task row that timed it is swept five minutes after its run settles,
+    /// so this is the only durable record of what a workflow costs — and it is
+    /// what FR7's confirm sheet calibrates its GPU estimate from. Absent on
+    /// files generated before this field existed, and on any run whose clock
+    /// did not tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<f64>,
     /// The generation line this file belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_id: Option<String>,
@@ -116,6 +125,9 @@ impl ProvenanceManifest {
             comfyui_prompt_id: run.comfyui_prompt_id.map(str::to_string),
             source_file_id: run.source_file_id.map(str::to_string),
             output_filename: run.output_filename.map(str::to_string),
+            // A run that took no measurable time did not run; recording a zero
+            // would drag every estimate calibrated on it towards free.
+            duration_seconds: run.duration_seconds.filter(|s| *s > 0.0),
             line_id: None,
             stage_index: None,
             compiled_prompt: None,
@@ -142,6 +154,9 @@ pub struct ComfyuiRun<'a> {
     pub output_filename: Option<&'a str>,
     /// UTC, `YYYY-MM-DD HH:MM:SS`.
     pub generated_at: &'a str,
+    /// Seconds from dispatch to the output landing, when the task row had both
+    /// ends of the clock on it.
+    pub duration_seconds: Option<f64>,
 }
 
 /// The seed a parameter map names, if it names one.
@@ -181,6 +196,7 @@ mod tests {
             source_file_id: Some("file-source"),
             output_filename: Some("task-1234_00001.png"),
             generated_at: "2026-08-30 12:00:00",
+            duration_seconds: Some(31.5),
         })
     }
 
@@ -197,6 +213,7 @@ mod tests {
                 source_file_id: Some("file-source"),
                 output_filename: Some("task-1234_00001.png"),
                 generated_at: "2026-08-30 12:00:00",
+                duration_seconds: Some(31.5),
             }
         })
     }
@@ -364,6 +381,7 @@ mod tests {
             source_file_id: None,
             output_filename: None,
             generated_at: "2026-08-30 12:00:00",
+            duration_seconds: None,
         });
         assert!(m.text_overrides.is_empty());
         assert_eq!("t", m.task_id);

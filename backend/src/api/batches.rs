@@ -405,10 +405,11 @@ pub(super) async fn stop_batch(
         return Err(StatusCode::NOT_FOUND.into());
     }
 
-    let stopped = crate::comfyui::batch::stop(&mut conn, &state.library_root, &id).map_err(|e| {
-        tracing::error!("Could not stop batch {}: {}", id, e);
-        ApiError::internal()
-    })?;
+    let stopped =
+        crate::comfyui::batch::stop(&mut conn, &state.library_root, &id).map_err(|e| {
+            tracing::error!("Could not stop batch {}: {}", id, e);
+            ApiError::internal()
+        })?;
 
     let purged = stopped.prompt_ids.len();
     if let (Some(url), false) = (state.comfyui_url.clone(), stopped.prompt_ids.is_empty()) {
@@ -594,10 +595,7 @@ fn line_of(conn: &mut SqliteConnection, line_id: &str) -> Result<(String, Vec<St
 /// single `COUNT` cannot give them. They are taken back to back, so a very busy
 /// import could in principle make `skipped` exceed `matched` between them —
 /// which is why the estimate clamps rather than trusting the subtraction.
-fn counts_for(
-    conn: &mut SqliteConnection,
-    payload: &BatchPayload,
-) -> Result<(i64, i64), ApiError> {
+fn counts_for(conn: &mut SqliteConnection, payload: &BatchPayload) -> Result<(i64, i64), ApiError> {
     use crate::comfyui::batch::selection::{count, Narrowing};
     use crate::schema::line_stages;
 
@@ -721,19 +719,16 @@ mod tests {
         // The point of reusing `ShotsQuery`: what the person saw in the gallery
         // is what the batch runs.
         let (_dir, mut conn) = library();
-        let (all, _) =
-            counts_for(&mut conn, &payload(whole_library(), false)).unwrap();
+        let (all, _) = counts_for(&mut conn, &payload(whole_library(), false)).unwrap();
         assert_eq!(all, 8);
 
         // Grandma has five of the eight.
-        let grandma = |to: Option<&str>| {
-            Selection::Query {
-                query: ShotsQuery {
-                    person_id: Some("p-gran".into()),
-                    to: to.map(str::to_string),
-                    ..Default::default()
-                },
-            }
+        let grandma = |to: Option<&str>| Selection::Query {
+            query: ShotsQuery {
+                person_id: Some("p-gran".into()),
+                to: to.map(str::to_string),
+                ..Default::default()
+            },
         };
         let (matched, _) = counts_for(&mut conn, &payload(grandma(None), false)).unwrap();
         assert_eq!(matched, 5);

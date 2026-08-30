@@ -614,7 +614,10 @@ mod tests {
 
     #[test]
     fn an_exhausted_query_with_nothing_live_is_done() {
-        assert_eq!(decide(&Caps::default(), &Pulse::default(), true, 1), Feed::Done);
+        assert_eq!(
+            decide(&Caps::default(), &Pulse::default(), true, 1),
+            Feed::Done
+        );
     }
 
     #[test]
