@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -304,6 +304,11 @@ impl Scanner {
         // After all files are processed, run face clustering
         let mut conn = self.open_db()?;
 
+        // Generated files hold no faces. Anything the library picked up before
+        // that was a rule — or before the row said what the file was — goes
+        // now, while there is still only one library to re-cluster.
+        self.purge_synthetic_faces(&mut conn)?;
+
         // Remove overlapping duplicate detections (e.g. the same face across many
         // video keyframes) from not-yet-reviewed shots before clustering, so
         // duplicates don't spawn phantom people or skew person centroids.
@@ -416,11 +421,19 @@ impl Scanner {
     /// centroid is updated as a running average. Otherwise a new person is created.
     /// This is O(n x k) where k = number of people, instead of the previous O(n^2) pairwise approach.
     pub fn cluster_faces(&self, conn: &mut SqliteConnection) -> anyhow::Result<()> {
-        // Load unassigned faces with embeddings
+        // Load unassigned faces with embeddings.
+        //
+        // Never a face on a generated file. [`Self::purge_synthetic_faces`] has
+        // normally already deleted those, but this filter is the rule and that
+        // is the sweep: a generated face admitted here is averaged into an
+        // ArcFace centroid, and taking it back out again means re-clustering
+        // the whole library.
         let unassigned_rows: Vec<(String, Vec<u8>)> = faces::table
+            .inner_join(files::table.on(faces::file_id.eq(files::id)))
             .select((faces::id, faces::embedding.assume_not_null()))
             .filter(faces::embedding.is_not_null())
             .filter(faces::person_id.is_null())
+            .filter(files::synthetic.eq(false))
             .load::<(String, Vec<u8>)>(conn)?;
 
         let unassigned: Vec<(String, Vec<f32>)> = unassigned_rows
@@ -690,7 +703,8 @@ impl Scanner {
         conn: &mut SqliteConnection,
         dry_run: bool,
     ) -> anyhow::Result<usize> {
-        // Files belonging to not-yet-reviewed shots.
+        // Files belonging to not-yet-reviewed shots. Generated files are not
+        // among them: they hold no faces to sweep, by rule.
         let file_ids: Vec<String> = files::table
             .inner_join(shots::table.on(files::shot_id.eq(shots::id)))
             .filter(
@@ -698,6 +712,7 @@ impl Scanner {
                     .ne("confirmed")
                     .or(shots::review_status.is_null()),
             )
+            .filter(files::synthetic.eq(false))
             .select(files::id)
             .load::<String>(conn)?;
 
@@ -800,6 +815,23 @@ impl Scanner {
         Ok(total_removed)
     }
 
+    /// Delete every face box drawn on a generated file, and repair whatever
+    /// those boxes had already influenced.
+    ///
+    /// A generated face should never have been detected in the first place —
+    /// [`Self::process_file`] refuses to look at a file the database says is
+    /// synthetic. But "should never" is not the same as "cannot": a file can be
+    /// indexed by the watcher in the moment between the bytes landing on disk
+    /// and the generator claiming the row, and libraries carry rows written
+    /// before any of this existed. So the sweep runs anyway, and puts back what
+    /// a wrong box had already moved: the person's centroid, the shot's owner,
+    /// and any person who turns out to have been made of nothing else.
+    ///
+    /// Returns the number of face rows removed.
+    pub fn purge_synthetic_faces(&self, conn: &mut SqliteConnection) -> anyhow::Result<usize> {
+        purge_faces_on_synthetic_files(conn)
+    }
+
     /// Returns `true` if the file was newly indexed, `false` if it was
     /// already known (same path or duplicate content).
     pub fn process_file(
@@ -815,12 +847,28 @@ impl Scanner {
         // Quick path duplicate check — catches concurrent processing of the
         // same file (e.g. upload handler + watcher race).
         {
-            let existing: Option<String> = files::table
-                .select(files::id)
+            // `.optional()?`, never `.ok()`: a query error here (say, a schema
+            // this build doesn't match) must abort, because "not found" is what
+            // licenses the duplicate branch below to delete files from disk.
+            let existing: Option<(String, bool)> = files::table
+                .select((files::id, files::synthetic))
                 .filter(files::path.eq(&relative_path))
-                .first::<String>(conn)
-                .ok();
-            if existing.is_some() {
+                .first::<(String, bool)>(conn)
+                .optional()?;
+            if let Some((existing_id, synthetic)) = existing {
+                if synthetic {
+                    // Nothing a machine drew goes near the person model. This
+                    // is the rule the rest of the pipeline leans on, so state
+                    // it here rather than let the early return imply it — and
+                    // clear any boxes that got in before the row said so.
+                    let removed = purge_faces_on_file(conn, &existing_id)?;
+                    if removed > 0 {
+                        warn!(
+                            "Dropped {} face box(es) found on generated file {:?}",
+                            removed, path
+                        );
+                    }
+                }
                 debug!("File already indexed at path {:?}, skipping", path);
                 return Ok(false);
             }
@@ -835,7 +883,7 @@ impl Scanner {
                 .select((files::id, files::path))
                 .filter(files::hash.eq(&hash))
                 .first::<(String, String)>(conn)
-                .ok();
+                .optional()?;
             if let Some((existing_id, existing_path)) = existing {
                 std::fs::remove_file(path)?;
 
@@ -992,6 +1040,10 @@ impl Scanner {
                     visual_embedding: None,
                     source_workflow_id: None,
                     source_text_overrides: None,
+                    // A file found on disk is a photograph until a generator
+                    // says otherwise; only the generators set this.
+                    synthetic: None,
+                    manifest_json: None,
                 })
                 .execute(conn)?;
 
@@ -1163,6 +1215,147 @@ impl Scanner {
     }
 }
 
+// ── The synthetic-media rule ─────────────────────────────────────────────────
+//
+// Generated faces never enter the person model. A file whose `synthetic` flag
+// is set is skipped by detection, excluded from clustering, excluded from the
+// overlap sweep, and cannot decide a shot's primary person. What follows is the
+// repair path for boxes that got in anyway.
+
+/// Delete the face boxes on one file, leaving nothing pointing at them.
+///
+/// Returns the number of rows removed.
+pub fn purge_faces_on_file(conn: &mut SqliteConnection, file_id: &str) -> anyhow::Result<usize> {
+    let doomed: Vec<String> = faces::table
+        .filter(faces::file_id.eq(file_id))
+        .select(faces::id)
+        .load::<String>(conn)?;
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+
+    // A person whose portrait is one of these boxes needs a different one.
+    // Picked here, not left for clustering: cluster_faces returns before its
+    // thumbnail-refresh loop when every remaining face is already assigned, so
+    // in a settled library "cleared" would mean "blank forever".
+    let widowed: Vec<String> = people::table
+        .filter(people::thumbnail_face_id.eq_any(&doomed))
+        .select(people::id)
+        .load::<String>(conn)?;
+
+    let removed = diesel::delete(faces::table.filter(faces::id.eq_any(&doomed))).execute(conn)?;
+
+    for person_id in &widowed {
+        let replacement: Option<String> = faces::table
+            .inner_join(files::table.on(faces::file_id.eq(files::id)))
+            .filter(faces::person_id.eq(person_id))
+            .filter(files::synthetic.eq(false))
+            .select(faces::id)
+            .order(faces::score.desc())
+            .first::<String>(conn)
+            .optional()?;
+        diesel::update(people::table.filter(people::id.eq(person_id)))
+            .set(people::thumbnail_face_id.eq(replacement))
+            .execute(conn)?;
+    }
+
+    Ok(removed)
+}
+
+/// Sweep every face box drawn on a generated file out of the library, and undo
+/// what those boxes had already influenced.
+///
+/// See [`Scanner::purge_synthetic_faces`] for why this exists at all.
+pub fn purge_faces_on_synthetic_files(conn: &mut SqliteConnection) -> anyhow::Result<usize> {
+    let offending_files: Vec<String> = files::table
+        .filter(files::synthetic.eq(true))
+        .filter(diesel::dsl::exists(
+            faces::table.filter(faces::file_id.eq(files::id)),
+        ))
+        .select(files::id)
+        .load::<String>(conn)?;
+    if offending_files.is_empty() {
+        return Ok(0);
+    }
+
+    // Whose average these boxes were pulling on, before they go.
+    let contaminated: Vec<String> = faces::table
+        .filter(faces::file_id.eq_any(&offending_files))
+        .filter(faces::person_id.is_not_null())
+        .select(faces::person_id.assume_not_null())
+        .distinct()
+        .load::<String>(conn)?;
+
+    let mut removed = 0usize;
+    for file_id in &offending_files {
+        removed += purge_faces_on_file(conn, file_id)?;
+    }
+    if removed == 0 {
+        return Ok(0);
+    }
+
+    // Deleting the box is not enough: the embedding is already averaged into
+    // the person's centroid, and the next face compared against it would be
+    // compared against a person partly made of something that never existed.
+    for pid in &contaminated {
+        recompute_representative_embedding(conn, pid)?;
+    }
+
+    // A generated face may have been the largest one in its shot, and so the
+    // reason the shot belongs to whoever it belongs to.
+    assign_primary_persons(conn)?;
+    // And a person who was only ever that face is now nobody.
+    crate::db::cleanup_orphaned_people(conn)?;
+
+    warn!(
+        "Removed {} face box(es) detected on {} generated file(s); recomputed {} person centroid(s)",
+        removed,
+        offending_files.len(),
+        contaminated.len()
+    );
+    Ok(removed)
+}
+
+/// Recompute a person's representative embedding from the faces they still
+/// have. A person left with none keeps whatever they had — the orphan cleanup
+/// decides whether they still exist at all.
+fn recompute_representative_embedding(
+    conn: &mut SqliteConnection,
+    person_id: &str,
+) -> anyhow::Result<()> {
+    let blobs: Vec<Vec<u8>> = faces::table
+        .select(faces::embedding.assume_not_null())
+        .filter(faces::person_id.eq(person_id))
+        .filter(faces::embedding.is_not_null())
+        .load::<Vec<u8>>(conn)?;
+
+    let embeddings: Vec<Vec<f32>> = blobs
+        .into_iter()
+        .filter_map(|b| crate::embedding::decode_embedding(&b).filter(|e| !e.is_empty()))
+        .collect();
+    if embeddings.is_empty() {
+        return Ok(());
+    }
+
+    let dim = embeddings[0].len();
+    let mut sum = vec![0.0f32; dim];
+    for emb in &embeddings {
+        for (i, v) in emb.iter().enumerate() {
+            sum[i] += v;
+        }
+    }
+    let mean: Vec<f32> = sum.iter().map(|v| v / embeddings.len() as f32).collect();
+    let norm: f32 = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        let normalized: Vec<f32> = mean.iter().map(|v| v / norm).collect();
+        let blob = crate::embedding::encode_embedding(&normalized);
+        diesel::update(people::table.filter(people::id.eq(person_id)))
+            .set(people::representative_embedding.eq(&blob))
+            .execute(conn)?;
+    }
+    Ok(())
+}
+
 /// Assign `primary_person_id` for each shot based on the largest face with a person_id.
 ///
 /// For each shot where `review_status != 'confirmed'`, finds the face with the
@@ -1193,6 +1386,8 @@ pub fn assign_primary_persons(conn: &mut SqliteConnection) -> anyhow::Result<()>
             .select(faces::person_id.assume_not_null())
             .filter(files::shot_id.eq(shot_id))
             .filter(faces::person_id.is_not_null())
+            // A generated variant does not get to decide whose shot this is.
+            .filter(files::synthetic.eq(false))
             .order(
                 diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::Float>>(
                     "(faces.box_x2 - faces.box_x1) * (faces.box_y2 - faces.box_y1)",
@@ -2246,5 +2441,397 @@ mod tests {
             DynamicImage::ImageRgb8(RgbImage::from_fn(100, 100, |_, _| image::Rgb([42, 42, 42])));
         let hash = compute_dhash(&img);
         assert_eq!(hash, [0u8; 8]);
+    }
+
+    // ── The synthetic-media rule ────────────────────────────────────────────
+
+    /// A library with one photograph, scanned: one file, one face, one person.
+    /// The pipeline runs in dummy mode, which finds exactly one face per image —
+    /// so every file in these tests has a detectable face, including the ones
+    /// that must not be allowed to keep it.
+    fn scanned_library_with_one_photograph() -> (tempfile::TempDir, PathBuf, Scanner) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let db_path = root.join(".phos.db");
+        crate::db::init_and_migrate(&db_path).unwrap();
+
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(200, 200, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        }));
+        img.save(root.join("orig.png")).unwrap();
+
+        let scanner = Scanner::new(db_path.clone(), Some(AiPipeline::dummy()));
+        scanner.scan(&root).unwrap();
+        (dir, root, scanner)
+    }
+
+    /// Write a picture a machine made, and register it the way the ComfyUI
+    /// worker does.
+    fn register_generated_file(
+        conn: &mut SqliteConnection,
+        root: &Path,
+        name: &str,
+        file_id: &str,
+        tint: u8,
+    ) -> PathBuf {
+        let gen = DynamicImage::ImageRgb8(RgbImage::from_fn(200, 200, |x, y| {
+            image::Rgb([255 - (x % 256) as u8, (y % 256) as u8, tint])
+        }));
+        let path = root.join(name);
+        gen.save(&path).unwrap();
+
+        let shot_id: String = shots::table.select(shots::id).first(conn).unwrap();
+        let rel = db::make_relative(root, &path);
+        diesel::insert_into(files::table)
+            .values(NewFile {
+                id: file_id,
+                shot_id: &shot_id,
+                path: &rel,
+                hash: file_id,
+                mime_type: Some("image/png"),
+                file_size: Some(1),
+                is_original: Some(false),
+                visual_embedding: None,
+                source_workflow_id: Some("wf-1"),
+                source_text_overrides: Some("{}"),
+                synthetic: Some(true),
+                manifest_json: Some(r#"{"version":1,"generator":"comfyui"}"#),
+            })
+            .execute(conn)
+            .unwrap();
+        path
+    }
+
+    fn centroid_of_the_only_person(conn: &mut SqliteConnection) -> Vec<u8> {
+        people::table
+            .select(people::representative_embedding.assume_not_null())
+            .first::<Vec<u8>>(conn)
+            .unwrap()
+    }
+
+    fn add_face(
+        conn: &mut SqliteConnection,
+        id: &str,
+        file_id: &str,
+        person_id: Option<&str>,
+        box_to: f32,
+        embedding: &[u8],
+    ) {
+        diesel::insert_into(faces::table)
+            .values(NewFace {
+                id,
+                file_id,
+                person_id,
+                box_x1: Some(0.0),
+                box_y1: Some(0.0),
+                box_x2: Some(box_to),
+                box_y2: Some(box_to),
+                embedding: Some(embedding),
+                score: Some(0.99),
+            })
+            .execute(conn)
+            .unwrap();
+    }
+
+    /// The rule, end to end: a generated file with a perfectly detectable face
+    /// comes out of a rescan with no face rows and leaves the person model
+    /// exactly as it found it.
+    #[test]
+    fn a_rescan_never_takes_a_face_off_a_generated_file() {
+        let (_dir, root, scanner) = scanned_library_with_one_photograph();
+        let mut conn = scanner.open_db().unwrap();
+
+        assert_eq!(
+            1i64,
+            faces::table.count().get_result::<i64>(&mut conn).unwrap(),
+            "the photograph's own face"
+        );
+        let centroid_before = centroid_of_the_only_person(&mut conn);
+
+        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
+        scanner.scan(&root).unwrap();
+
+        let on_generated: i64 = faces::table
+            .filter(faces::file_id.eq("gen-file"))
+            .count()
+            .get_result(&mut conn)
+            .unwrap();
+        assert_eq!(0, on_generated, "a generated file carries no faces");
+        assert_eq!(
+            2i64,
+            files::table.count().get_result::<i64>(&mut conn).unwrap(),
+            "the generated file is still in the library, just not in the face index"
+        );
+        assert_eq!(
+            1i64,
+            people::table.count().get_result::<i64>(&mut conn).unwrap(),
+            "no person invented from a face nobody has"
+        );
+        assert_eq!(
+            centroid_before,
+            centroid_of_the_only_person(&mut conn),
+            "the person model must be bit-for-bit what it was"
+        );
+    }
+
+    /// The same file arriving before its row does — the watcher race, and every
+    /// library that generated a variant before this rule existed. The boxes are
+    /// swept out, and what they had already moved is put back.
+    #[test]
+    fn faces_that_got_onto_a_generated_file_are_swept_back_out() {
+        let (_dir, root, scanner) = scanned_library_with_one_photograph();
+        let mut conn = scanner.open_db().unwrap();
+        let centroid_before = centroid_of_the_only_person(&mut conn);
+        let shot_id: String = shots::table.select(shots::id).first(&mut conn).unwrap();
+
+        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
+
+        // A face nobody should have detected, clustered into a person who has
+        // never existed, holding the shot.
+        let invented = crate::embedding::encode_embedding(&vec![0.9f32; 512]);
+        diesel::insert_into(people::table)
+            .values(NewPerson {
+                id: "phantom",
+                name: None,
+                thumbnail_face_id: Some("face-generated"),
+                representative_embedding: Some(&invented),
+                folder_name: None,
+            })
+            .execute(&mut conn)
+            .unwrap();
+        add_face(
+            &mut conn,
+            "face-generated",
+            "gen-file",
+            Some("phantom"),
+            190.0,
+            &invented,
+        );
+        diesel::update(shots::table.filter(shots::id.eq(&shot_id)))
+            .set(shots::primary_person_id.eq("phantom"))
+            .execute(&mut conn)
+            .unwrap();
+
+        let removed = scanner.purge_synthetic_faces(&mut conn).unwrap();
+
+        assert_eq!(1, removed);
+        assert_eq!(
+            0i64,
+            faces::table
+                .filter(faces::id.eq("face-generated"))
+                .count()
+                .get_result::<i64>(&mut conn)
+                .unwrap(),
+        );
+        assert_eq!(
+            0i64,
+            people::table
+                .filter(people::id.eq("phantom"))
+                .count()
+                .get_result::<i64>(&mut conn)
+                .unwrap(),
+            "a person made only of a generated face is nobody",
+        );
+        let owner: Option<String> = shots::table
+            .select(shots::primary_person_id)
+            .filter(shots::id.eq(&shot_id))
+            .first(&mut conn)
+            .unwrap();
+        assert_ne!(
+            Some("phantom".to_string()),
+            owner,
+            "the shot goes back to whoever its real face says it belongs to",
+        );
+        assert_eq!(
+            centroid_before,
+            centroid_of_the_only_person(&mut conn),
+            "the surviving person's centroid is untouched",
+        );
+    }
+
+    /// The centroid repair, on its own: a real person whose average was pulled
+    /// by a generated face gets that face's contribution taken back out.
+    #[test]
+    fn a_centroid_a_generated_face_pulled_on_is_recomputed_without_it() {
+        let (_dir, root, scanner) = scanned_library_with_one_photograph();
+        let mut conn = scanner.open_db().unwrap();
+        let person_id: String = people::table.select(people::id).first(&mut conn).unwrap();
+        let centroid_before = centroid_of_the_only_person(&mut conn);
+
+        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
+
+        // A generated face assigned to a person who really exists, and a
+        // centroid already averaged with it.
+        let drifted = crate::embedding::encode_embedding(&vec![0.5f32; 512]);
+        add_face(
+            &mut conn,
+            "face-generated",
+            "gen-file",
+            Some(&person_id),
+            50.0,
+            &drifted,
+        );
+        diesel::update(people::table.filter(people::id.eq(&person_id)))
+            .set(people::representative_embedding.eq(&drifted))
+            .execute(&mut conn)
+            .unwrap();
+        assert_ne!(centroid_before, centroid_of_the_only_person(&mut conn));
+
+        scanner.purge_synthetic_faces(&mut conn).unwrap();
+
+        assert_eq!(
+            centroid_before,
+            centroid_of_the_only_person(&mut conn),
+            "the centroid is rebuilt from the faces that are really theirs",
+        );
+    }
+
+    /// Belt and braces: even handed a generated face directly, clustering will
+    /// not take it. This is the filter that holds when the sweep has not run.
+    #[test]
+    fn clustering_will_not_take_a_generated_face_even_when_offered_one() {
+        let (_dir, root, scanner) = scanned_library_with_one_photograph();
+        let mut conn = scanner.open_db().unwrap();
+        let people_before: i64 = people::table.count().get_result(&mut conn).unwrap();
+
+        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
+        let invented = crate::embedding::encode_embedding(&vec![0.9f32; 512]);
+        add_face(
+            &mut conn,
+            "face-generated",
+            "gen-file",
+            None,
+            100.0,
+            &invented,
+        );
+
+        scanner.cluster_faces(&mut conn).unwrap();
+
+        let assigned: Option<String> = faces::table
+            .select(faces::person_id)
+            .filter(faces::id.eq("face-generated"))
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(None, assigned, "it belongs to nobody, because it is nobody");
+        assert_eq!(
+            people_before,
+            people::table.count().get_result::<i64>(&mut conn).unwrap(),
+            "and it invents nobody",
+        );
+    }
+
+    /// A generated variant can be the biggest face in the shot and still not
+    /// get to say whose shot it is.
+    #[test]
+    fn a_generated_variant_does_not_decide_whose_shot_it_is() {
+        let (_dir, root, scanner) = scanned_library_with_one_photograph();
+        let mut conn = scanner.open_db().unwrap();
+        let real_person: String = people::table.select(people::id).first(&mut conn).unwrap();
+        let shot_id: String = shots::table.select(shots::id).first(&mut conn).unwrap();
+
+        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
+        let invented = crate::embedding::encode_embedding(&vec![0.9f32; 512]);
+        diesel::insert_into(people::table)
+            .values(NewPerson {
+                id: "someone-else",
+                name: Some("Someone Else"),
+                thumbnail_face_id: None,
+                representative_embedding: Some(&invented),
+                folder_name: None,
+            })
+            .execute(&mut conn)
+            .unwrap();
+        // Bigger than the photograph's own 100x100 box, so on area alone it wins.
+        add_face(
+            &mut conn,
+            "face-generated",
+            "gen-file",
+            Some("someone-else"),
+            199.0,
+            &invented,
+        );
+
+        assign_primary_persons(&mut conn).unwrap();
+
+        let owner: Option<String> = shots::table
+            .select(shots::primary_person_id)
+            .filter(shots::id.eq(&shot_id))
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(Some(real_person), owner);
+    }
+
+    /// The gate in `process_file` itself: walking past a file the database
+    /// already knows is generated drops any box hanging off it, rather than
+    /// leaving the skip to imply the rule.
+    #[test]
+    fn walking_past_a_generated_file_drops_any_box_hanging_off_it() {
+        let (_dir, root, scanner) = scanned_library_with_one_photograph();
+        let mut conn = scanner.open_db().unwrap();
+
+        let gen_path =
+            register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
+        let invented = crate::embedding::encode_embedding(&vec![0.9f32; 512]);
+        add_face(
+            &mut conn,
+            "face-generated",
+            "gen-file",
+            None,
+            100.0,
+            &invented,
+        );
+
+        let cache = std::sync::Mutex::new(Vec::<DHashCacheEntry>::new());
+        let indexed = scanner.process_file(&mut conn, &gen_path, &cache).unwrap();
+
+        assert!(!indexed, "already known, so nothing new is indexed");
+        assert_eq!(
+            0i64,
+            faces::table
+                .filter(faces::file_id.eq("gen-file"))
+                .count()
+                .get_result::<i64>(&mut conn)
+                .unwrap(),
+        );
+    }
+
+    /// A surviving person whose portrait happened to be a generated face gets
+    /// a replacement from their real faces during the purge itself — not
+    /// "eventually", because clustering returns early in a settled library
+    /// and would leave the blank forever.
+    #[test]
+    fn purging_a_persons_thumbnail_face_picks_a_real_replacement() {
+        let (_dir, root, scanner) = scanned_library_with_one_photograph();
+        let mut conn = scanner.open_db().unwrap();
+        let person_id: String = people::table.select(people::id).first(&mut conn).unwrap();
+        let real_face: String = faces::table.select(faces::id).first(&mut conn).unwrap();
+
+        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
+        let invented = crate::embedding::encode_embedding(&vec![0.9f32; 512]);
+        add_face(
+            &mut conn,
+            "face-generated",
+            "gen-file",
+            Some(&person_id),
+            100.0,
+            &invented,
+        );
+        diesel::update(people::table.filter(people::id.eq(&person_id)))
+            .set(people::thumbnail_face_id.eq("face-generated"))
+            .execute(&mut conn)
+            .unwrap();
+
+        scanner.purge_synthetic_faces(&mut conn).unwrap();
+
+        let thumbnail: Option<String> = people::table
+            .select(people::thumbnail_face_id)
+            .filter(people::id.eq(&person_id))
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(
+            Some(real_face),
+            thumbnail,
+            "the portrait falls back to a face that really is theirs",
+        );
     }
 }

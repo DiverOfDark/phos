@@ -209,6 +209,21 @@ pub(super) async fn get_person_shots(
         std::collections::HashMap::new()
     };
 
+    // Which of those main files a machine made, so the card can say so.
+    let main_file_ids: Vec<&str> = shot_rows.iter().filter_map(|r| r.5.as_deref()).collect();
+    let synthetic_main_files: std::collections::HashSet<String> = if !main_file_ids.is_empty() {
+        files::table
+            .filter(files::id.eq_any(&main_file_ids))
+            .filter(files::synthetic.eq(true))
+            .select(files::id)
+            .load::<String>(&mut conn)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let shots: Vec<ShotBrief> = shot_rows
         .into_iter()
         .map(|(sid, timestamp, ppid, review_status, folder_number, main_file_id, description)| ShotBrief {
@@ -218,6 +233,9 @@ pub(super) async fn get_person_shots(
             primary_person_id: ppid,
             review_status,
             folder_number: folder_number.map(|n| n as i64),
+            synthetic: main_file_id
+                .as_deref()
+                .is_some_and(|fid| synthetic_main_files.contains(fid)),
             thumbnail_url: main_file_id
                 .map(|fid| format!("/api/files/{}/thumbnail", fid))
                 .unwrap_or_default(),
@@ -395,6 +413,8 @@ pub(super) struct BrowseFileDetail {
     is_original: bool,
     file_size: Option<i64>,
     thumbnail_url: String,
+    /// A workflow made this file, not a camera. The client says so.
+    synthetic: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -473,6 +493,7 @@ pub(super) fn browse_graph(
         .select((
             shots::id, shots::timestamp, shots::review_status,
             files::id, files::mime_type, files::is_original, files::file_size,
+            files::synthetic,
         ))
         .into_boxed();
 
@@ -495,7 +516,7 @@ pub(super) fn browse_graph(
         query.filter(shots::primary_person_id.eq(id.to_string()))
     };
 
-    let rows: Vec<(String, Option<String>, Option<String>, String, Option<String>, Option<bool>, Option<i32>)> = query
+    let rows: Vec<(String, Option<String>, Option<String>, String, Option<String>, Option<bool>, Option<i32>, bool)> = query
         .order((shots::id.asc(), files::is_original.desc(), files::path.asc()))
         .load(conn)
         .map_err(|e| {
@@ -507,13 +528,14 @@ pub(super) fn browse_graph(
     let mut shots_vec: Vec<BrowseShotDetail> = Vec::new();
     let mut current_shot_id: Option<String> = None;
 
-    for (shot_id, timestamp, review_status, file_id, mime_type, is_original, file_size) in rows {
+    for (shot_id, timestamp, review_status, file_id, mime_type, is_original, file_size, synthetic) in rows {
         let file = BrowseFileDetail {
             thumbnail_url: format!("/api/files/{}/thumbnail", file_id),
             id: file_id,
             mime_type,
             is_original: is_original.unwrap_or(false),
             file_size: file_size.map(|s| s as i64),
+            synthetic,
         };
 
         if current_shot_id.as_deref() == Some(&shot_id) {

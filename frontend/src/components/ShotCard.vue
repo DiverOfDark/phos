@@ -5,7 +5,7 @@ const props = defineProps({
   shot: {
     type: Object,
     required: true,
-    // Expected shape: { id, thumbnail_url, file_count, primary_person_name, review_status }
+    // Expected shape: { id, thumbnail_url, file_count, primary_person_name, review_status, synthetic }
   },
 })
 
@@ -38,6 +38,13 @@ const statusColor = computed(() => {
       v-if="shot.file_count > 1"
       class="absolute top-1.5 right-2 font-mono text-[10px] text-ink-secondary bg-base border border-line rounded-sm px-1"
     >×{{ shot.file_count }}</span>
+
+    <!-- The card's picture was made by a workflow. An attribute, so no colour. -->
+    <span
+      v-if="shot.synthetic"
+      class="absolute bottom-7 right-2 font-mono text-[10px] tracking-[0.08em] text-ink-tertiary bg-base border border-line rounded-sm px-1"
+      title="Made by a workflow, not a camera"
+    >GEN</span>
 
     <span
       class="absolute inset-x-0 bottom-0 px-2 py-1 font-mono text-[10px] truncate bg-base border-t border-line"

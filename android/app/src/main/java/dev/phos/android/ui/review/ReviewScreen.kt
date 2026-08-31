@@ -432,6 +432,19 @@ private fun ReviewBody(
                         .padding(8.dp),
                 )
             }
+
+            // An attribute of the file, not a status: the label register, no
+            // colour — same disclosure the web client gives.
+            if (file?.synthetic == true) {
+                PhosTag(
+                    text = "GENERATED",
+                    color = c.textTertiary,
+                    background = c.base,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(8.dp),
+                )
+            }
         }
 
         Column(horizontalAlignment = Alignment.CenterHorizontally) {

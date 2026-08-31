@@ -153,6 +153,7 @@ pub(super) struct ReassignFacePayload {
     responses(
         (status = 200, description = "Face reassigned successfully"),
         (status = 404, description = "Face or target person not found"),
+        (status = 409, description = "Face is on a machine-generated file and cannot join the person model"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -175,6 +176,19 @@ pub(super) async fn reassign_face(
 
     if person_exists == 0 {
         return Err(StatusCode::NOT_FOUND);
+    }
+
+    // A box on a generated file should not exist at all (the scanner purges
+    // them), but if one is mid-flight, assigning it a person would let
+    // machine-made imagery steer suggestions and shot ownership.
+    let on_synthetic: bool = faces::table
+        .inner_join(files::table.on(faces::file_id.eq(files::id)))
+        .filter(faces::id.eq(&id))
+        .select(files::synthetic)
+        .first::<bool>(&mut conn)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    if on_synthetic {
+        return Err(StatusCode::CONFLICT);
     }
 
     // Find the shot_id and old person_id for this face before updating
@@ -501,6 +515,7 @@ pub(super) struct AddManualFacePayload {
         (status = 200, description = "Face added successfully"),
         (status = 400, description = "Invalid bounding box coordinates"),
         (status = 404, description = "File not found"),
+        (status = 409, description = "File is machine-generated; faces on it are not accepted"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -515,7 +530,7 @@ pub(super) async fn add_manual_face(
     }
 
     // Look up the file path and shot_id
-    let (file_path, shot_id) = {
+    let (file_path, shot_id, synthetic) = {
         let mut conn = state
             .pool
             .get()
@@ -523,10 +538,17 @@ pub(super) async fn add_manual_face(
 
         files::table
             .filter(files::id.eq(&file_id))
-            .select((files::path, files::shot_id))
-            .first::<(String, String)>(&mut conn)
+            .select((files::path, files::shot_id, files::synthetic))
+            .first::<(String, String, bool)>(&mut conn)
             .map_err(|_| StatusCode::NOT_FOUND)?
     };
+
+    // Generated faces never enter the person model — refusing the box here is
+    // the same rule the scanner enforces, stated at the door instead of by a
+    // later purge.
+    if synthetic {
+        return Err(StatusCode::CONFLICT);
+    }
 
     let bbox = (
         payload.box_x1,

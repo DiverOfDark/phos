@@ -70,6 +70,21 @@ pub struct NewFile<'a> {
     pub visual_embedding: Option<&'a [u8]>,
     pub source_workflow_id: Option<&'a str>,
     pub source_text_overrides: Option<&'a str>,
+    /// Made by a machine, not a camera. `None` leaves the column's `false`
+    /// default in place — only the generators say `Some(true)`.
+    pub synthetic: Option<bool>,
+    /// [`crate::comfyui::ProvenanceManifest`], serialized.
+    pub manifest_json: Option<&'a str>,
+}
+
+/// What a generator writes onto a file once it knows what it made.
+#[derive(AsChangeset)]
+#[diesel(table_name = files)]
+pub struct SyntheticProvenance<'a> {
+    pub synthetic: bool,
+    pub manifest_json: Option<&'a str>,
+    pub source_workflow_id: Option<&'a str>,
+    pub source_text_overrides: Option<&'a str>,
 }
 
 // ── Faces ──

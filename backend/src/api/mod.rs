@@ -71,6 +71,7 @@ use utoipa::OpenApi;
         files::get_file,
         files::delete_file,
         files::get_file_thumbnail,
+        files::get_file_manifest,
         files::set_file_original,
         files::upload_file_raw,
         files::finalize_import,
@@ -147,6 +148,9 @@ use utoipa::OpenApi;
             faces::DedupeFacesResponse,
             faces::ReassignFacePayload,
             faces::AddManualFacePayload,
+            // Files
+            files::FileManifestResponse,
+            crate::comfyui::ProvenanceManifest,
             // Import
             crate::ingest::IngestStatus,
             // Stats
@@ -340,6 +344,9 @@ pub(crate) fn recalculate_primary_person(conn: &mut diesel::SqliteConnection, sh
         .select(faces::person_id.assume_not_null())
         .filter(files::shot_id.eq(shot_id))
         .filter(faces::person_id.is_not_null())
+        // A generated variant does not get to decide whose shot this is —
+        // same rule as the scanner's assign_primary_persons.
+        .filter(files::synthetic.eq(false))
         .order(
             diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::Float>>(
                 "(faces.box_x2 - faces.box_x1) * (faces.box_y2 - faces.box_y1)",
@@ -466,6 +473,7 @@ pub fn create_router(state: AppState) -> Router {
             get(files::get_file).delete(files::delete_file),
         )
         .route("/api/files/{id}/thumbnail", get(files::get_file_thumbnail))
+        .route("/api/files/{id}/manifest", get(files::get_file_manifest))
         .route("/api/files/{id}/set-original", put(files::set_file_original))
         .route("/api/files/{id}/faces", post(faces::add_manual_face))
         // Stats + organize

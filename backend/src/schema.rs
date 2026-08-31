@@ -62,6 +62,8 @@ diesel::table! {
         source_text_overrides -> Nullable<Text>,
         created_at -> Nullable<Timestamp>,
         updated_at -> Nullable<Timestamp>,
+        synthetic -> Bool,
+        manifest_json -> Nullable<Text>,
     }
 }
 

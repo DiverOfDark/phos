@@ -7,4 +7,6 @@ data class MediaFile(
     val isOriginal: Boolean,
     val fileSize: Long?,
     val thumbnailUrl: String?,
+    /** A workflow made this file, not a camera. The screens say so. */
+    val synthetic: Boolean = false,
 )
