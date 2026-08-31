@@ -75,6 +75,10 @@ mod workflow;
 pub use client::ComfyUiClient;
 pub use nodes::NodeCatalog;
 pub use overrides::detect_inputs;
+// The contract test reads it through the library crate; the binary compiles
+// this module directly and has no use for it, which is what the allow is for.
+#[allow(unused_imports)]
+pub use overrides::WorkflowInput;
 pub use worker::spawn_enhancement_worker;
 pub use workflow::detect_outputs;
 

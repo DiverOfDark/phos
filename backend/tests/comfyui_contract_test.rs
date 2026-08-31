@@ -29,7 +29,8 @@
 //! ```
 
 use diesel::prelude::*;
-use phos_backend::comfyui::spawn_enhancement_worker;
+use phos_backend::comfyui::nodes::{parse_object_info, WideInt, WidgetSpec};
+use phos_backend::comfyui::{detect_inputs, spawn_enhancement_worker, ComfyUiClient, NodeCatalog};
 use phos_backend::models::{NewComfyuiWorkflow, NewEnhancementTask, NewFile, NewShot};
 use phos_backend::schema::{comfyui_workflows, enhancement_tasks, files, shots};
 use serde_json::{json, Value};
@@ -264,13 +265,19 @@ impl Library {
 
     /// Queue a task exactly as `POST /api/comfyui/tasks` does.
     fn queue_task(&self, workflow_id: &str) -> String {
+        self.queue_task_with(workflow_id, &json!({}))
+    }
+
+    /// Queue a task with overrides keyed `node_id.field`, as the console sends them.
+    fn queue_task_with(&self, workflow_id: &str, overrides: &Value) -> String {
         let id = uuid::Uuid::new_v4().to_string();
+        let overrides = serde_json::to_string(overrides).unwrap();
         diesel::insert_into(enhancement_tasks::table)
             .values(NewEnhancementTask {
                 id: &id,
                 shot_id: &self.shot_id,
                 workflow_id,
-                text_overrides: Some("{}"),
+                text_overrides: Some(&overrides),
                 source_file_id: None,
             })
             .execute(&mut self.conn())
@@ -447,6 +454,50 @@ fn dangling_link_workflow() -> Value {
 /// Does `/view` serve this file? This is how the by-name fallback finds a
 /// file when history is silent, so the names it guesses have to be the names
 /// ComfyUI writes.
+/// LoadImage → ImageScale → SaveImage, with a text encoder hanging off a model
+/// that is never loaded. The scale node carries an enum (`upscale_method`) the
+/// console can override, and the encoder a titled prompt box; nothing in it
+/// needs a model file, and the encoder never runs because nothing downstream
+/// asks for it.
+fn scale_and_prompt_workflow() -> Value {
+    json!({
+        "1": { "class_type": "LoadImage",   "inputs": { "image": "replaced-by-phos.png" } },
+        "4": { "class_type": "ImageScale",  "inputs": { "image": ["1", 0], "upscale_method": "nearest-exact",
+                                                        "width": 32, "height": 32, "crop": "disabled" },
+               "_meta": { "title": "Resize" } },
+        "6": { "class_type": "CLIPTextEncode", "inputs": { "text": "a cat", "clip": ["9", 0] },
+               "_meta": { "title": "Positive Prompt" } },
+        "3": { "class_type": "SaveImage",   "inputs": { "images": ["4", 0], "filename_prefix": "ComfyUI" } }
+    })
+}
+
+/// The raw `/object_info` document, read the plain way so a test can compare
+/// what the server said against what the catalogue made of it.
+fn object_info(comfyui_url: &str) -> Value {
+    ureq::get(&format!("{}/object_info", comfyui_url))
+        .call()
+        .expect("/object_info answers")
+        .body_mut()
+        .read_json()
+        .expect("/object_info is JSON")
+}
+
+/// The catalogue as the import path sees it, read from the server now.
+fn live_catalog(comfyui_url: &str) -> Arc<NodeCatalog> {
+    phos_backend::comfyui::refresh_node_catalog(&ComfyUiClient::new(comfyui_url))
+        .expect("a current ComfyUI serves /object_info and it parses to classes")
+}
+
+fn widget(catalog: &NodeCatalog, class: &str, field: &str) -> WidgetSpec {
+    catalog
+        .get(class)
+        .unwrap_or_else(|| panic!("{} is a core node and must be in the catalogue", class))
+        .input(field)
+        .unwrap_or_else(|| panic!("{}.{} is declared by ComfyUI", class, field))
+        .widget
+        .clone()
+}
+
 fn view_exists(comfyui_url: &str, subfolder: &str, filename: &str) -> bool {
     let url = format!(
         "{}/view?filename={}&subfolder={}&type=output",
@@ -658,6 +709,273 @@ fn a_lost_video_prompt_is_recovered_by_name(url: &str) {
     lost_prompt_is_recovered_by_name(url, one_frame_video_workflow(), "one-frame-video");
 }
 
+// ===== What ComfyUI says about its nodes =====================================
+
+/// The parser skips what it cannot read rather than failing, which is right
+/// for a custom pack nobody has seen — and wrong if it is quietly skipping
+/// inputs on the server everyone has. So: every input the live document
+/// declares, on every class, must come out the other side.
+fn nothing_in_the_live_object_info_is_skipped_silently(url: &str) {
+    let doc = object_info(url);
+    let catalog = parse_object_info(&doc);
+    let classes = doc.as_object().expect("/object_info is an object");
+    assert!(
+        classes.len() > 100,
+        "a bare ComfyUI has a few hundred core classes, this one has {}",
+        classes.len()
+    );
+
+    let mut skipped = Vec::new();
+    for (name, entry) in classes {
+        let declared: usize = ["required", "optional"]
+            .iter()
+            .map(|section| {
+                entry["input"][section]
+                    .as_object()
+                    .map_or(0, |fields| fields.len())
+            })
+            .sum();
+        let read = catalog.get(name).map_or(0, |class| class.inputs.len());
+        if read != declared {
+            let unread: Vec<&str> = ["required", "optional"]
+                .iter()
+                .flat_map(|section| {
+                    entry["input"][section]
+                        .as_object()
+                        .into_iter()
+                        .flat_map(|fields| fields.keys())
+                })
+                .filter(|field| catalog.get(name).and_then(|c| c.input(field)).is_none())
+                .map(String::as_str)
+                .collect();
+            skipped.push(format!(
+                "{}: declares {} inputs, {} read; unread: {:?}",
+                name, declared, read, unread
+            ));
+        }
+    }
+    assert!(
+        skipped.is_empty(),
+        "{} classes have inputs the parser silently dropped — a spec shape it \
+         does not know:\n{}",
+        skipped.len(),
+        skipped.join("\n")
+    );
+}
+
+/// The shapes the unit fixtures were transcribed from, checked against the
+/// document a real server actually sends.
+fn core_nodes_are_read_the_way_the_fixtures_assume(url: &str) {
+    let doc = object_info(url);
+    let catalog = live_catalog(url);
+
+    // The seed marker is where the fixture puts it, and the range is the full
+    // unsigned one — not clamped on the way through.
+    assert_eq!(
+        doc["KSampler"]["input"]["required"]["seed"][1]["control_after_generate"],
+        json!(true),
+        "the seed marker has moved: {}",
+        doc["KSampler"]["input"]["required"]["seed"]
+    );
+    match widget(&catalog, "KSampler", "seed") {
+        WidgetSpec::Seed { min, max, .. } => {
+            assert_eq!(min, Some(WideInt(0)));
+            assert_eq!(max, Some(WideInt(u64::MAX as i128)));
+        }
+        other => panic!("KSampler.seed should be a seed, got {:?}", other),
+    }
+    match widget(&catalog, "KSampler", "steps") {
+        WidgetSpec::Int {
+            min: Some(1),
+            max: Some(10000),
+            ..
+        } => {}
+        other => panic!("KSampler.steps range: {:?}", other),
+    }
+    assert!(matches!(
+        widget(&catalog, "KSampler", "cfg"),
+        WidgetSpec::Float { .. }
+    ));
+    match widget(&catalog, "KSampler", "sampler_name") {
+        WidgetSpec::Combo { choices, .. } => {
+            assert!(choices.contains(&json!("euler")), "{:?}", choices)
+        }
+        other => panic!("sampler_name should be an enum, got {:?}", other),
+    }
+    match widget(&catalog, "KSampler", "scheduler") {
+        WidgetSpec::Combo { choices, .. } => {
+            assert!(choices.contains(&json!("karras")), "{:?}", choices)
+        }
+        other => panic!("scheduler should be an enum, got {:?}", other),
+    }
+    assert_eq!(
+        widget(&catalog, "KSampler", "model"),
+        WidgetSpec::Link {
+            data_type: "MODEL".into()
+        }
+    );
+
+    // A prompt box is multiline by ComfyUI's say-so, not by a length guess.
+    assert!(matches!(
+        widget(&catalog, "CLIPTextEncode", "text"),
+        WidgetSpec::Text {
+            multiline: true,
+            ..
+        }
+    ));
+
+    // A saver is an output node, and its prefix is the text Phos pins.
+    let save = catalog.get("SaveImage").unwrap();
+    assert!(save.output_node);
+    assert!(matches!(
+        widget(&catalog, "SaveImage", "filename_prefix"),
+        WidgetSpec::Text { .. }
+    ));
+
+    // An enum of model files is an enum even when no model is installed —
+    // which on the test image is the case. An empty list must not turn into
+    // a socket, and it has no default to invent.
+    match widget(&catalog, "CheckpointLoaderSimple", "ckpt_name") {
+        WidgetSpec::Combo {
+            choices, default, ..
+        } => assert_eq!(
+            default.is_none(),
+            choices.is_empty(),
+            "an empty enum has no default; a non-empty one does: {:?} / {:?}",
+            choices,
+            default
+        ),
+        other => panic!("ckpt_name should be an enum, got {:?}", other),
+    }
+    assert!(matches!(
+        widget(&catalog, "LoadImage", "image"),
+        WidgetSpec::Combo { .. }
+    ));
+
+    // A resolution: bounded, and stepping by 8 as latents require.
+    match widget(&catalog, "EmptyLatentImage", "width") {
+        WidgetSpec::Int {
+            min: Some(16),
+            step: Some(8),
+            max: Some(max),
+            ..
+        } => assert!(max >= 8192, "max {}", max),
+        other => panic!("EmptyLatentImage.width: {:?}", other),
+    }
+    assert!(matches!(
+        widget(&catalog, "EmptyLatentImage", "batch_size"),
+        WidgetSpec::Int { .. }
+    ));
+}
+
+/// What an import stores, computed against the live catalogue: real kinds
+/// for what the server knows, the shot's own input left alone, the pinned
+/// prefix and every link kept out.
+fn an_import_against_the_live_catalogue_gets_typed_inputs(url: &str) {
+    let catalog = live_catalog(url);
+    let inputs = detect_inputs(&scale_and_prompt_workflow(), Some(&catalog));
+    let find = |key: &str| {
+        inputs
+            .iter()
+            .find(|i| format!("{}.{}", i.node_id, i.field_name) == key)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} missing from {:?}",
+                    key,
+                    inputs
+                        .iter()
+                        .map(|i| format!("{}.{}", i.node_id, i.field_name))
+                        .collect::<Vec<_>>()
+                )
+            })
+    };
+    let absent = |key: &str| {
+        assert!(
+            !inputs
+                .iter()
+                .any(|i| format!("{}.{}", i.node_id, i.field_name) == key),
+            "{} must not be offered as a control",
+            key
+        )
+    };
+
+    let method = find("4.upscale_method");
+    assert_eq!(method.current_value, json!("nearest-exact"));
+    assert_eq!(method.node_title.as_deref(), Some("Resize"));
+    match &method.widget {
+        Some(WidgetSpec::Combo { choices, .. }) => {
+            assert!(choices.contains(&json!("nearest-exact")), "{:?}", choices);
+            assert!(choices.contains(&json!("lanczos")), "{:?}", choices);
+        }
+        other => panic!("upscale_method should be an enum, got {:?}", other),
+    }
+    assert!(matches!(
+        find("4.width").widget,
+        Some(WidgetSpec::Int { .. })
+    ));
+    assert!(matches!(
+        find("4.crop").widget,
+        Some(WidgetSpec::Combo { .. })
+    ));
+
+    let text = find("6.text");
+    assert_eq!(text.node_title.as_deref(), Some("Positive Prompt"));
+    assert!(matches!(
+        text.widget,
+        Some(WidgetSpec::Text {
+            multiline: true,
+            ..
+        })
+    ));
+
+    // The shot is the image; the console never asks for one, so it stays the
+    // untyped field it has always been.
+    assert_eq!(find("1.image").widget, None);
+    absent("3.filename_prefix");
+    absent("4.image");
+    absent("3.images");
+    absent("6.clip");
+
+    // The record goes into SQLite as JSON and comes back for every workflow
+    // list; it must survive the trip whole.
+    let stored = serde_json::to_string(&inputs).unwrap();
+    let back: Vec<phos_backend::comfyui::WorkflowInput> = serde_json::from_str(&stored).unwrap();
+    assert_eq!(back, inputs);
+}
+
+/// A picked enum value travels the same road as a typed prompt: through the
+/// stored overrides, `prepare_workflow`, and ComfyUI's own validation. The
+/// proof that it *arrived* is that ComfyUI rejects one it does not list.
+fn a_combo_override_reaches_comfyui(url: &str) {
+    let lib = Library::new();
+    let wf = lib.add_workflow("scale", &scale_and_prompt_workflow());
+
+    // A value ComfyUI lists: the run completes, at the size the graph asked for.
+    let task_id = lib.queue_task_with(&wf, &json!({ "4.upscale_method": "lanczos" }));
+    let task = lib.run_until_done(url, &task_id, STEP_BUDGET);
+    assert_eq!(task.status, "completed", "{:?}", task);
+    let (path, _) = lib.output_file(&task);
+    assert_eq!(image::open(&path).unwrap().to_rgb8().dimensions(), (32, 32));
+
+    // A value it does not: rejected at validation, naming the field, and not
+    // retried — so the override demonstrably reached the server.
+    let task_id = lib.queue_task_with(&wf, &json!({ "4.upscale_method": "no-such-method" }));
+    let task = lib.run_until_done(url, &task_id, STEP_BUDGET);
+    assert_eq!(task.status, "failed", "{:?}", task);
+    let message = task.error_message.clone().unwrap_or_default();
+    assert!(
+        message.contains("ComfyUI rejected the prompt"),
+        "an enum value ComfyUI does not list is a validation failure, got: {}",
+        message
+    );
+    assert!(
+        message.contains("upscale_method"),
+        "the message should name the field, got: {}",
+        message
+    );
+    assert_eq!(task.retry_count, 0);
+}
+
 // ===== The test ==============================================================
 
 /// One scenario, given the server's URL. Panics to fail.
@@ -704,6 +1022,22 @@ fn comfyui_contract() {
         (
             "a lost video prompt is recovered by name",
             a_lost_video_prompt_is_recovered_by_name,
+        ),
+        (
+            "nothing in the live /object_info is skipped silently",
+            nothing_in_the_live_object_info_is_skipped_silently,
+        ),
+        (
+            "core nodes are read the way the fixtures assume",
+            core_nodes_are_read_the_way_the_fixtures_assume,
+        ),
+        (
+            "an import against the live catalogue gets typed inputs",
+            an_import_against_the_live_catalogue_gets_typed_inputs,
+        ),
+        (
+            "a combo override reaches ComfyUI",
+            a_combo_override_reaches_comfyui,
         ),
     ];
 
