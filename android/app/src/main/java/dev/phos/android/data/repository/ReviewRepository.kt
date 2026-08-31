@@ -43,6 +43,7 @@ class ReviewRepository @Inject constructor(
                 personName = brief.primaryPersonName,
                 fileCount = brief.fileCount?.toInt() ?: 0,
                 timestamp = brief.timestamp,
+                synthetic = brief.synthetic == true,
             )
         }
 
@@ -65,6 +66,7 @@ class ReviewRepository @Inject constructor(
                     isOriginal = file.isOriginal ?: false,
                     fileSize = file.fileSize,
                     thumbnailUrl = file.thumbnailUrl,
+                    synthetic = file.synthetic == true,
                 )
             },
             faces = response.faces.orEmpty().map { face ->

@@ -109,7 +109,9 @@ watch(selectedFile, async (file) => {
     // The selection may have moved on while this was in flight.
     if (selectedFile.value?.id === id) provenance.value = body.manifest || null
   } catch {
-    provenance.value = null
+    // Same guard on failure: a stale request rejecting must not wipe out
+    // what a newer request already loaded.
+    if (selectedFile.value?.id === id) provenance.value = null
   }
 }, { immediate: true })
 

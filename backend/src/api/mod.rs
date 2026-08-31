@@ -344,6 +344,9 @@ pub(crate) fn recalculate_primary_person(conn: &mut diesel::SqliteConnection, sh
         .select(faces::person_id.assume_not_null())
         .filter(files::shot_id.eq(shot_id))
         .filter(faces::person_id.is_not_null())
+        // A generated variant does not get to decide whose shot this is —
+        // same rule as the scanner's assign_primary_persons.
+        .filter(files::synthetic.eq(false))
         .order(
             diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::Float>>(
                 "(faces.box_x2 - faces.box_x1) * (faces.box_y2 - faces.box_y1)",

@@ -229,6 +229,8 @@ impl Library {
                 visual_embedding: None,
                 source_workflow_id: None,
                 source_text_overrides: None,
+                synthetic: None,
+                manifest_json: None,
             })
             .execute(&mut conn)
             .unwrap();

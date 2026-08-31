@@ -8,6 +8,8 @@ data class PendingShot(
     val personName: String?,
     val fileCount: Int,
     val timestamp: String?,
+    /** The shot's main file was made by a workflow, not a camera. */
+    val synthetic: Boolean = false,
 )
 
 /**

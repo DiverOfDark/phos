@@ -257,6 +257,22 @@ async fn run_server() {
                     tracing::error!("DB init failed for user {}: {}", user_name, e);
                     continue;
                 }
+                // Diesel schema migrations too, before anything queries this
+                // database: a scanner selecting a column this build added to a
+                // database an older build made would otherwise error on every
+                // row it looks at.
+                match db::establish_pool(&user_db_path) {
+                    Ok(user_pool) => {
+                        if let Err(e) = db::run_migrations(&user_pool) {
+                            tracing::error!("Migrations failed for user {}: {}", user_name, e);
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Pool creation failed for user {}: {}", user_name, e);
+                        continue;
+                    }
+                }
 
                 let user_scanner = Arc::new(scanner_ref.with_db_path(user_db_path.clone()));
 

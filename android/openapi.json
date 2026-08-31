@@ -976,6 +976,9 @@
           "404": {
             "description": "Face or target person not found"
           },
+          "409": {
+            "description": "Face is on a machine-generated file and cannot join the person model"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -1165,6 +1168,9 @@
           },
           "404": {
             "description": "File not found"
+          },
+          "409": {
+            "description": "File is machine-generated; faces on it are not accepted"
           },
           "500": {
             "description": "Internal server error"
@@ -2453,7 +2459,8 @@
         "required": [
           "id",
           "is_original",
-          "thumbnail_url"
+          "thumbnail_url",
+          "synthetic"
         ],
         "properties": {
           "file_size": {
@@ -2474,6 +2481,10 @@
               "string",
               "null"
             ]
+          },
+          "synthetic": {
+            "type": "boolean",
+            "description": "A workflow made this file, not a camera. The client says so."
           },
           "thumbnail_url": {
             "type": "string"

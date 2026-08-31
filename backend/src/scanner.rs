@@ -847,11 +847,14 @@ impl Scanner {
         // Quick path duplicate check — catches concurrent processing of the
         // same file (e.g. upload handler + watcher race).
         {
+            // `.optional()?`, never `.ok()`: a query error here (say, a schema
+            // this build doesn't match) must abort, because "not found" is what
+            // licenses the duplicate branch below to delete files from disk.
             let existing: Option<(String, bool)> = files::table
                 .select((files::id, files::synthetic))
                 .filter(files::path.eq(&relative_path))
                 .first::<(String, bool)>(conn)
-                .ok();
+                .optional()?;
             if let Some((existing_id, synthetic)) = existing {
                 if synthetic {
                     // Nothing a machine drew goes near the person model. This
@@ -880,7 +883,7 @@ impl Scanner {
                 .select((files::id, files::path))
                 .filter(files::hash.eq(&hash))
                 .first::<(String, String)>(conn)
-                .ok();
+                .optional()?;
             if let Some((existing_id, existing_path)) = existing {
                 std::fs::remove_file(path)?;
 
@@ -1231,13 +1234,32 @@ pub fn purge_faces_on_file(conn: &mut SqliteConnection, file_id: &str) -> anyhow
         return Ok(0);
     }
 
-    // A person whose portrait is one of these boxes needs a different one;
-    // clustering picks a replacement from the faces that remain.
-    diesel::update(people::table.filter(people::thumbnail_face_id.eq_any(&doomed)))
-        .set(people::thumbnail_face_id.eq(None::<String>))
-        .execute(conn)?;
+    // A person whose portrait is one of these boxes needs a different one.
+    // Picked here, not left for clustering: cluster_faces returns before its
+    // thumbnail-refresh loop when every remaining face is already assigned, so
+    // in a settled library "cleared" would mean "blank forever".
+    let widowed: Vec<String> = people::table
+        .filter(people::thumbnail_face_id.eq_any(&doomed))
+        .select(people::id)
+        .load::<String>(conn)?;
 
-    Ok(diesel::delete(faces::table.filter(faces::id.eq_any(&doomed))).execute(conn)?)
+    let removed = diesel::delete(faces::table.filter(faces::id.eq_any(&doomed))).execute(conn)?;
+
+    for person_id in &widowed {
+        let replacement: Option<String> = faces::table
+            .inner_join(files::table.on(faces::file_id.eq(files::id)))
+            .filter(faces::person_id.eq(person_id))
+            .filter(files::synthetic.eq(false))
+            .select(faces::id)
+            .order(faces::score.desc())
+            .first::<String>(conn)
+            .optional()?;
+        diesel::update(people::table.filter(people::id.eq(person_id)))
+            .set(people::thumbnail_face_id.eq(replacement))
+            .execute(conn)?;
+    }
+
+    Ok(removed)
 }
 
 /// Sweep every face box drawn on a generated file out of the library, and undo
@@ -2770,6 +2792,46 @@ mod tests {
                 .count()
                 .get_result::<i64>(&mut conn)
                 .unwrap(),
+        );
+    }
+
+    /// A surviving person whose portrait happened to be a generated face gets
+    /// a replacement from their real faces during the purge itself — not
+    /// "eventually", because clustering returns early in a settled library
+    /// and would leave the blank forever.
+    #[test]
+    fn purging_a_persons_thumbnail_face_picks_a_real_replacement() {
+        let (_dir, root, scanner) = scanned_library_with_one_photograph();
+        let mut conn = scanner.open_db().unwrap();
+        let person_id: String = people::table.select(people::id).first(&mut conn).unwrap();
+        let real_face: String = faces::table.select(faces::id).first(&mut conn).unwrap();
+
+        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
+        let invented = crate::embedding::encode_embedding(&vec![0.9f32; 512]);
+        add_face(
+            &mut conn,
+            "face-generated",
+            "gen-file",
+            Some(&person_id),
+            100.0,
+            &invented,
+        );
+        diesel::update(people::table.filter(people::id.eq(&person_id)))
+            .set(people::thumbnail_face_id.eq("face-generated"))
+            .execute(&mut conn)
+            .unwrap();
+
+        scanner.purge_synthetic_faces(&mut conn).unwrap();
+
+        let thumbnail: Option<String> = people::table
+            .select(people::thumbnail_face_id)
+            .filter(people::id.eq(&person_id))
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(
+            Some(real_face),
+            thumbnail,
+            "the portrait falls back to a face that really is theirs",
         );
     }
 }
