@@ -24,7 +24,13 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 uuid = { version = "1.22", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
-ffmpeg-next = { version = "8", features = ["build"] }
+ffmpeg-next = { version = "9", features = ["build"] }
+# `build` compiles ffmpeg from source; on its own it passes `-march=native`,
+# so a binary (or a CI cache, or a Docker image) built on one CPU can SIGILL
+# on another. `build-portable` omits -march/-mtune so the C half is as
+# generic as RUSTFLAGS makes the Rust half. Not re-exported by ffmpeg-next, so
+# it is set on the sys crate directly; cargo unifies the feature set.
+ffmpeg-sys-next = { version = "9", features = ["build-portable"] }
 ndarray = "0.17"
 hf-hub = "0.5"
 kamadak-exif = "0.6"
