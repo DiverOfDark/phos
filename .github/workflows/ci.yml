@@ -156,6 +156,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # The bundled ffmpeg (ffmpeg-sys-next's `build` feature) is configured
+      # with `-march=native -mtune=native`, and nothing in its build.rs lets a
+      # native build say otherwise. A `backend/target` compiled on one runner
+      # therefore carries that CPU's instruction set — AVX-512 on an EPYC, say —
+      # and dies with SIGILL when the cache restores it on a Xeon. RUSTFLAGS
+      # only governs the Rust half. Keying the cache on the CPU model keeps a
+      # restored build on the kind of machine that produced it.
+      - name: Identify the runner CPU
+        id: cpu
+        run: |
+          model="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | tr -cd '[:alnum:]')"
+          echo "model=${model:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "runner cpu: ${model:-unknown}"
+
       - name: Cache Cargo registry and build
         uses: actions/cache@v5
         with:
@@ -163,9 +177,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             backend/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('backend/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ steps.cpu.outputs.model }}-${{ hashFiles('backend/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-
+            cargo-${{ runner.os }}-${{ steps.cpu.outputs.model }}-
 
       - name: Backend Tests
         run: |
