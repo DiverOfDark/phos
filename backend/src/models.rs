@@ -1,5 +1,5 @@
-use diesel::prelude::*;
 use crate::schema::*;
+use diesel::prelude::*;
 
 // ── People ──
 
@@ -147,6 +147,13 @@ pub struct EnhancementTaskChangeset<'a> {
     pub retry_count: Option<i32>,
     pub started_at: Option<&'a str>,
     pub completed_at: Option<&'a str>,
+    /// `filename_prefix` the task's save nodes were pinned to, so a finished run
+    /// can be found by name when history says nothing.
+    pub output_prefix: Option<&'a str>,
+    /// Deadline for `awaiting_output`.
+    pub settle_until: Option<&'a str>,
+    /// Earliest time the worker may pick this row up again.
+    pub next_attempt_at: Option<&'a str>,
 }
 
 // ── Workflow Presets ──

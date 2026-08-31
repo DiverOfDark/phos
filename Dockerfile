@@ -39,6 +39,8 @@ WORKDIR /app/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
 COPY backend/build.rs ./
 # Keep codegen conservative so the runtime works on older x86-64 CPUs too.
+# This covers the Rust half; the bundled ffmpeg is kept generic by the
+# `build-portable` feature on ffmpeg-sys-next in backend/Cargo.toml.
 ENV RUSTFLAGS="-C target-cpu=x86-64"
 
 # Stage 2b: Generate dependency recipe
@@ -48,8 +50,11 @@ COPY backend/migrations ./migrations
 COPY backend/src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
-# Stage 2c: Build deps + run tests
-FROM chef AS backend-test
+# Stage 2c: Build deps + release binary. Tests are not run here: CI runs them
+# (unit, integration and the ComfyUI contract test) in its own job and only
+# builds this image once they pass, so a test stage in the image would run the
+# same tests a second time on every build.
+FROM chef AS backend-builder
 COPY --from=planner /app/backend/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
@@ -58,10 +63,6 @@ ENV PHOS_VERSION=${PHOS_VERSION}
 COPY backend/Cargo.toml backend/Cargo.lock backend/build.rs ./
 COPY backend/migrations ./migrations
 COPY backend/src ./src
-RUN cargo test --release --lib
-
-# Stage 2d: Build release binary (reuses compilation from test stage)
-FROM backend-test AS backend-builder
 RUN cargo build --release && \
     cp target/release/phos-backend /usr/local/bin/phos-backend
 

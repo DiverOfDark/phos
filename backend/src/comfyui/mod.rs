@@ -1,0 +1,140 @@
+//! ComfyUI integration: running a user's workflow against a shot and bringing
+//! the result back into the library.
+//!
+//! # The pipeline
+//!
+//! A row in `enhancement_tasks` walks one path, driven by a per-library
+//! background thread ([`worker`]) that wakes every three seconds:
+//!
+//! ```text
+//!   pending ──> uploading ──> queued ──> processing ──> downloading ──> completed
+//!      ^                                     │                │
+//!      │                                     v                │
+//!      │                            awaiting_output ──────────┘
+//!      │                                     │
+//!      └────── retry (transient) ────────────┴──> failed / cancelled
+//! ```
+//!
+//! [`worker::dispatch`] owns the left half: read the shot's source image, push
+//! it to ComfyUI, rewrite the graph for this run, queue the prompt.
+//! [`worker::complete`] owns the right half: read `/history` until the prompt
+//! resolves, then download what it named.
+//!
+//! # Why it is split this way
+//!
+//! The bug this module was reorganised around was a *reading* bug — a finished
+//! run reported as a failure — so the code that reads and decides is kept
+//! separate from the code that does IO, and is pure:
+//!
+//! * [`history`] — what did ComfyUI say? Outputs, still running, or an error.
+//! * [`policy`] — what do we do about it? How long to wait for a file that has
+//!   not appeared, and whether a failure is worth another attempt.
+//! * [`workflow`] — what does this graph take and produce, and how do we
+//!   rewrite it for one run?
+//!
+//! Those three take `serde_json::Value` in and give an answer out, so the whole
+//! completion path is tested against recorded `/history` payloads with no
+//! server involved. [`client`] holds the HTTP calls and decides nothing;
+//! [`worker`] holds the database writes.
+//!
+//! # Three things worth knowing
+//!
+//! * **Output filenames are pinned before the run starts.** Every saver's
+//!   `filename_prefix` is rewritten to `phos/<task_id>-<attempt>`, so when
+//!   history is empty, unhelpful, or lost to a ComfyUI restart, the file can
+//!   still be fetched from `/view` by a name we already know. The attempt token
+//!   is fresh per dispatch, because ComfyUI keeps an earlier run's file and
+//!   advances the counter — a shared prefix would find the stale one.
+//! * **"Finished but no file yet" is a state, not a verdict.** It is
+//!   `awaiting_output`, budgeted at a minute for images and a quarter of an
+//!   hour for video, because `VHS_VideoCombine` shells out to ffmpeg and lands
+//!   in history well before the mp4 is closed. A file history names but `/view`
+//!   still 404s is the same state and gets the same budget.
+//! * **A cancelled row is never written again by the worker.** Cancel claims
+//!   the row with one conditional update before talking to ComfyUI; every
+//!   worker write filters `status != cancelled`, so a worker mid-flight cannot
+//!   move the task back.
+//! * **Failures are split by site.** A refused graph or a node exception fails
+//!   at once with the real message; a dropped connection backs off and tries
+//!   again.
+
+mod client;
+mod history;
+mod outputs;
+mod policy;
+mod source;
+mod timestamp;
+mod worker;
+mod workflow;
+
+pub use client::ComfyUiClient;
+pub use worker::spawn_enhancement_worker;
+pub use workflow::{detect_inputs, detect_outputs};
+
+/// Statuses the worker owns, and that the API and queue UI switch on.
+///
+/// The rest of the vocabulary — `pending`, `uploading`, `queued`, `processing`,
+/// `downloading`, `completed`, `failed` — is written inline where it is set.
+/// These two are named because they are read outside this module.
+pub const STATUS_AWAITING_OUTPUT: &str = "awaiting_output";
+pub const STATUS_CANCELLED: &str = "cancelled";
+
+#[cfg(test)]
+mod tests {
+    use super::history::{fixtures::history, interpret_history, HistoryVerdict};
+    use super::outputs::OutputRef;
+    use super::policy::{decide_settle, settle_budget, SettleDecision, SETTLE_BUDGET_VIDEO};
+    use super::timestamp::parse_ts;
+    use serde_json::json;
+
+    /// The reported symptom, walked end to end across the modules that fix it.
+    #[test]
+    fn the_reported_symptom_no_longer_reads_as_a_failure() {
+        // "the workflow is done but the result file is not in the response":
+        // a completed VHS_VideoCombine run whose file has not been published yet.
+        let wf = json!({
+            "12": { "class_type": "VHS_VideoCombine",
+                    "inputs": { "filename_prefix": "AnimateDiff" } }
+        });
+        let entry = history(json!({}), true);
+
+        // Step 1: reading history says "nothing yet", not "failed".
+        assert_eq!(interpret_history(&entry), HistoryVerdict::NoOutputs);
+
+        // Step 2: the task settles, with fifteen minutes rather than ten seconds.
+        let now = parse_ts("2026-08-30 12:00:00").unwrap();
+        let budget = settle_budget(&wf);
+        assert_eq!(budget, SETTLE_BUDGET_VIDEO);
+        let SettleDecision::Start { deadline, .. } = decide_settle(now, None, budget) else {
+            panic!("should have started settling");
+        };
+        assert_eq!(deadline, parse_ts("2026-08-30 12:15:00").unwrap());
+
+        // Step 3: meanwhile the file is findable by the name we pinned, even
+        // though history never mentioned it.
+        let prefix = super::workflow::output_prefix_for_task("task-1234", "a1b2c3d4");
+        assert_eq!(prefix, "phos/task-1234-a1b2c3d4");
+        let suffixes = super::workflow::expected_output_suffixes(&wf);
+        assert!(
+            super::outputs::fallback_output_candidates(&prefix, &suffixes)
+                .iter()
+                .any(|c| c.filename == "task-1234-a1b2c3d4_00001.mp4" && c.subfolder == "phos")
+        );
+
+        // Step 4: when it does show up under a key nobody enumerated, it counts.
+        let late = history(
+            json!({ "12": { "gifs": [
+                { "filename": "task-1234_00001.mp4", "subfolder": "phos", "type": "output" }
+            ] } }),
+            true,
+        );
+        assert_eq!(
+            interpret_history(&late),
+            HistoryVerdict::Outputs(vec![OutputRef {
+                filename: "task-1234_00001.mp4".to_string(),
+                subfolder: "phos".to_string(),
+                output_type: "output".to_string(),
+            }])
+        );
+    }
+}

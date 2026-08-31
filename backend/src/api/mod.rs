@@ -92,6 +92,7 @@ use utoipa::OpenApi;
         comfyui::comfyui_list_tasks,
         comfyui::comfyui_get_task,
         comfyui::comfyui_retry_task,
+        comfyui::comfyui_cancel_task,
         comfyui::comfyui_delete_task,
         comfyui::comfyui_shot_generations,
         comfyui::comfyui_list_presets,
@@ -513,6 +514,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/comfyui/tasks/{id}/retry",
             post(comfyui::comfyui_retry_task),
+        )
+        .route(
+            "/api/comfyui/tasks/{id}/cancel",
+            post(comfyui::comfyui_cancel_task),
         )
         .route("/api/version", get(stats::get_version))
         // Settings
