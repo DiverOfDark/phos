@@ -12,7 +12,7 @@
 use super::status::{handle_failure, live_task};
 use crate::comfyui::client::ComfyUiClient;
 use crate::comfyui::loaders::{
-    bind_targets, role_directives, takes_video, LoaderKind, SourceBinding, SourceRole,
+    bind_targets, check_source_kind, role_directives, takes_video, SourceBinding, SourceRole,
 };
 use crate::comfyui::policy::FailureSite;
 use crate::comfyui::source::{read_source, resolve_source_file, SourceMode};
@@ -173,6 +173,16 @@ fn dispatch_one(
         takes_video(&workflow),
         source.is_video(),
     );
+    // A mode the graph has no loader for fails here, before anything is
+    // extracted or uploaded — falling back to a loader of the wrong kind would
+    // only move the failure into ComfyUI, with a worse message.
+    check_source_kind(&workflow, mode.loader_kind()).map_err(|e| {
+        StepFailure::new(
+            FailureSite::SourceImage,
+            &format!("Source mode {} does not fit this workflow", mode),
+            e,
+        )
+    })?;
     let upload = read_source(conn, &source, mode).map_err(|e| {
         StepFailure::new(
             FailureSite::SourceImage,
@@ -181,25 +191,36 @@ fn dispatch_one(
         )
     })?;
 
-    // 3. Upload to ComfyUI
+    // 3. Upload to ComfyUI, streaming — a whole video is not read into memory.
+    let (mut body, body_len) = upload
+        .open()
+        .map_err(|e| StepFailure::new(FailureSite::SourceImage, "Source open failed", e))?;
     let uploaded_name = client
-        .upload_file(&upload.filename, &upload.content_type, &upload.bytes)
+        .upload_file(
+            &upload.filename,
+            &upload.content_type,
+            body.as_mut(),
+            body_len,
+        )
         .map_err(|e| StepFailure::new(FailureSite::Upload, "Upload failed", e))?;
+    drop(body);
 
     // 4. Bind the upload to the loader nodes it belongs in. Writing it into
     // every loader is what made a start-frame/end-frame workflow impossible.
     let (target_role, role_overrides) = role_directives(&text_overrides);
     let binding = SourceBinding {
         uploaded_filename: &uploaded_name,
-        kind: if mode == SourceMode::WholeVideo {
-            LoaderKind::Video
-        } else {
-            LoaderKind::Image
-        },
+        kind: mode.loader_kind(),
         role: target_role.unwrap_or(SourceRole::Start),
         role_overrides: &role_overrides,
     };
-    let plan = bind_targets(&workflow, &binding);
+    let plan = bind_targets(&workflow, &binding).map_err(|e| {
+        StepFailure::new(
+            FailureSite::SourceImage,
+            "Source does not fit this workflow",
+            e,
+        )
+    })?;
     // An ambiguity is not a failure — the run still goes ahead with the first
     // candidate — but it is the difference between a clip that moves and one
     // that does not, so it is said out loud rather than swallowed.

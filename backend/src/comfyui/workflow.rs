@@ -236,6 +236,7 @@ mod tests {
                 role_overrides: &std::collections::HashMap::new(),
             },
         )
+        .unwrap_or_default()
     }
 
     #[test]

@@ -468,7 +468,7 @@ pub(super) struct EnhancePayload {
     request_body = EnhancePayload,
     responses(
         (status = 200, description = "Enhancement task queued"),
-        (status = 400, description = "Unrecognised source_mode"),
+        (status = 400, description = "Unrecognised source_mode, or one this workflow cannot take"),
         (status = 404, description = "Shot or workflow not found"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "ComfyUI not configured"),
@@ -477,21 +477,19 @@ pub(super) struct EnhancePayload {
 pub(super) async fn comfyui_enhance(
     UState(state): UState,
     Json(payload): Json<EnhancePayload>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let _ = require_comfyui(&state)?;
 
     // Reject an unreadable source mode here rather than storing it and letting
     // the worker fall back to a default the caller did not ask for.
-    if let Some(mode) = payload.source_mode.as_deref() {
-        if mode.parse::<crate::comfyui::SourceMode>().is_err() {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    }
+    let explicit_mode = payload
+        .source_mode
+        .as_deref()
+        .map(|m| m.parse::<crate::comfyui::SourceMode>())
+        .transpose()
+        .map_err(ApiError::bad_request)?;
 
-    let mut conn = state
-        .pool
-        .get()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut conn = state.pool.get().map_err(|_| ApiError::internal())?;
 
     // Verify shot exists
     let shot_exists: bool = shots::table
@@ -502,21 +500,80 @@ pub(super) async fn comfyui_enhance(
         .unwrap_or(false);
 
     if !shot_exists {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     }
 
-    // Verify workflow exists
-    let wf_exists: bool = comfyui_workflows::table
+    // Verify workflow exists, and that it can take the mode the caller picked —
+    // a `whole_video` against a graph with only image loaders (or a frame
+    // against a video-only graph) would otherwise queue a task guaranteed to
+    // fail. Same check the worker enforces; here it is a 400 instead of a
+    // failed task discovered later.
+    let workflow_json: Option<String> = comfyui_workflows::table
         .filter(comfyui_workflows::id.eq(&payload.workflow_id))
-        .count()
-        .get_result::<i64>(&mut conn)
-        .map(|c| c > 0)
-        .unwrap_or(false);
-
-    if !wf_exists {
-        return Err(StatusCode::NOT_FOUND);
+        .select(comfyui_workflows::workflow_json)
+        .first::<String>(&mut conn)
+        .optional()
+        .map_err(|_| ApiError::internal())?;
+    let Some(workflow_json) = workflow_json else {
+        return Err(StatusCode::NOT_FOUND.into());
+    };
+    if explicit_mode.is_some() {
+        if let Ok(workflow) = serde_json::from_str::<serde_json::Value>(&workflow_json) {
+            // A still resolves every mode to a frame, so `whole_video` is only
+            // checked when the source really is a video; frame modes always
+            // produce an image and are checkable regardless.
+            let source_is_video = source_mime(&mut conn, &payload)
+                .map(|m| m.starts_with("video/"))
+                .unwrap_or(false);
+            let resolved = crate::comfyui::SourceMode::resolve(
+                payload.source_mode.as_deref(),
+                crate::comfyui::takes_video(&workflow),
+                source_is_video,
+            );
+            crate::comfyui::check_source_kind(&workflow, resolved.loader_kind())
+                .map_err(ApiError::bad_request)?;
+        }
     }
 
+    queue_enhancement(&mut conn, &payload)
+}
+
+/// The mime type of the file a task would read: the one the payload names, or
+/// the shot's original. `None` when there is nothing to say — the worker will
+/// name the real problem if the file is missing.
+fn source_mime(
+    conn: &mut diesel::sqlite::SqliteConnection,
+    payload: &EnhancePayload,
+) -> Option<String> {
+    let mime_sql = diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(mime_type, '')");
+    if let Some(file_id) = &payload.source_file_id {
+        files::table
+            .filter(
+                files::id
+                    .eq(file_id)
+                    .and(files::shot_id.eq(&payload.shot_id)),
+            )
+            .select(mime_sql)
+            .first::<String>(conn)
+            .ok()
+    } else {
+        files::table
+            .filter(
+                files::shot_id
+                    .eq(&payload.shot_id)
+                    .and(files::is_original.eq(true)),
+            )
+            .order(files::created_at.asc())
+            .select(mime_sql)
+            .first::<String>(conn)
+            .ok()
+    }
+}
+
+fn queue_enhancement(
+    conn: &mut diesel::sqlite::SqliteConnection,
+    payload: &EnhancePayload,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let task_id = uuid::Uuid::new_v4().to_string();
     let text_overrides_json =
         serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
@@ -530,7 +587,7 @@ pub(super) async fn comfyui_enhance(
             source_file_id: payload.source_file_id.as_deref(),
             source_mode: payload.source_mode.as_deref(),
         })
-        .execute(&mut conn)
+        .execute(conn)
         .map_err(|e| {
             tracing::error!("Failed to insert enhancement task: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -576,7 +633,12 @@ pub(super) async fn comfyui_list_tasks(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let limit = query.limit.unwrap_or(50).min(200);
-    let result = query_tasks(&mut conn, query.shot_id.as_ref(), query.cursor.as_ref(), limit)?;
+    let result = query_tasks(
+        &mut conn,
+        query.shot_id.as_ref(),
+        query.cursor.as_ref(),
+        limit,
+    )?;
 
     Ok(Json(result))
 }
@@ -602,9 +664,17 @@ struct TaskRow {
 }
 
 type TaskTuple = (
-    String, String, String, String, String,
-    Option<String>, Option<i32>, Option<String>,
-    Option<String>, Option<String>, Option<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
     Option<String>,
 );
 
@@ -695,12 +765,10 @@ fn query_tasks(
         query = query.filter(enhancement_tasks::created_at.lt(c));
     }
 
-    let mut tuples: Vec<TaskTuple> = query
-        .load(conn)
-        .map_err(|e| {
-            tracing::error!("Failed to query tasks: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let mut tuples: Vec<TaskTuple> = query.load(conn).map_err(|e| {
+        tracing::error!("Failed to query tasks: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let has_more = tuples.len() as i64 > limit;
     if has_more {
@@ -731,8 +799,12 @@ fn query_tasks(
         .map(|(id, _, pid)| (id.clone(), pid.clone()))
         .collect();
 
-    let person_ids: Vec<String> = shot_rows.iter().filter_map(|(_, _, pid)| pid.clone()).collect();
-    let person_names: std::collections::HashMap<String, Option<String>> = if !person_ids.is_empty() {
+    let person_ids: Vec<String> = shot_rows
+        .iter()
+        .filter_map(|(_, _, pid)| pid.clone())
+        .collect();
+    let person_names: std::collections::HashMap<String, Option<String>> = if !person_ids.is_empty()
+    {
         people::table
             .filter(people::id.eq_any(&person_ids))
             .select((people::id, people::name))
@@ -774,12 +846,11 @@ fn query_tasks(
                 .cloned()
                 .flatten()
                 .and_then(|pid| person_names.get(&pid).cloned().flatten());
-            let source_name = t
-                .11
-                .clone()
-                .or_else(|| main_fid.clone())
-                .and_then(|fid| file_paths.get(&fid).cloned())
-                .and_then(|path| path.rsplit('/').next().map(|s| s.to_string()));
+            let source_name =
+                t.11.clone()
+                    .or_else(|| main_fid.clone())
+                    .and_then(|fid| file_paths.get(&fid).cloned())
+                    .and_then(|path| path.rsplit('/').next().map(|s| s.to_string()));
             task_tuple_to_row(t, main_fid, person_name, source_name)
         })
         .collect();
@@ -983,12 +1054,13 @@ pub(super) async fn comfyui_cancel_task(
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         let claimed = diesel::update(
-            enhancement_tasks::table.filter(
-                enhancement_tasks::id.eq(&id).and(
-                    enhancement_tasks::status
-                        .ne_all(&["completed", "failed", crate::comfyui::STATUS_CANCELLED]),
-                ),
-            ),
+            enhancement_tasks::table.filter(enhancement_tasks::id.eq(&id).and(
+                enhancement_tasks::status.ne_all(&[
+                    "completed",
+                    "failed",
+                    crate::comfyui::STATUS_CANCELLED,
+                ]),
+            )),
         )
         .set((
             enhancement_tasks::status.eq(crate::comfyui::STATUS_CANCELLED),

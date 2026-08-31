@@ -99,6 +99,15 @@ impl SourceMode {
         }
     }
 
+    /// What kind of loader the upload this mode produces needs: `whole_video`
+    /// yields the clip itself, every other mode yields a PNG frame.
+    pub fn loader_kind(self) -> super::loaders::LoaderKind {
+        match self {
+            SourceMode::WholeVideo => super::loaders::LoaderKind::Video,
+            _ => super::loaders::LoaderKind::Image,
+        }
+    }
+
     /// A short tag for the upload filename, so two runs over one file with
     /// different modes never collide in ComfyUI's input directory.
     fn slug(&self) -> String {
@@ -128,13 +137,37 @@ impl SourceFile {
 
 /// What gets pushed to ComfyUI for one run.
 pub(crate) struct SourceUpload {
-    pub bytes: Vec<u8>,
+    pub body: UploadBody,
     /// The name to store it under in ComfyUI's input directory.
     pub filename: String,
     /// The `Content-Type` of the multipart part. `/upload/image` takes video
     /// files happily — the VHS loaders read them out of the same directory —
     /// but only if it is not told they are PNGs.
     pub content_type: String,
+}
+
+/// The payload itself: a frame is small and already in memory, but a whole
+/// video is *streamed from disk* — reading a multi-gigabyte clip into a `Vec`
+/// (and then copying it again into a multipart buffer) is how the backend runs
+/// out of memory on an ordinary 4K video.
+pub(crate) enum UploadBody {
+    Bytes(Vec<u8>),
+    File(PathBuf),
+}
+
+impl SourceUpload {
+    /// Open the payload for streaming: the reader, and its exact length so the
+    /// upload can declare a `Content-Length` instead of buffering.
+    pub fn open(&self) -> anyhow::Result<(Box<dyn std::io::Read + '_>, u64)> {
+        match &self.body {
+            UploadBody::Bytes(b) => Ok((Box::new(b.as_slice()), b.len() as u64)),
+            UploadBody::File(path) => {
+                let file = std::fs::File::open(path)?;
+                let len = file.metadata()?.len();
+                Ok((Box::new(file), len))
+            }
+        }
+    }
 }
 
 /// Find the file a task reads from: the one it named, or the shot's original.
@@ -183,12 +216,11 @@ pub(crate) fn read_source(
     mode: SourceMode,
 ) -> anyhow::Result<SourceUpload> {
     if mode == SourceMode::WholeVideo && source.is_video() {
-        let bytes = std::fs::read(&source.path)?;
         let ext = extension_for(&source.mime_type, &source.path);
         return Ok(SourceUpload {
             filename: upload_name(source, mode, &ext),
             content_type: content_type_for(&source.mime_type, &ext),
-            bytes,
+            body: UploadBody::File(source.path.clone()),
         });
     }
 
@@ -204,7 +236,7 @@ pub(crate) fn read_source(
     Ok(SourceUpload {
         filename: upload_name(source, mode, "png"),
         content_type: "image/png".to_string(),
-        bytes,
+        body: UploadBody::Bytes(bytes),
     })
 }
 

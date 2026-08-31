@@ -203,6 +203,31 @@ pub fn importable(workflow: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Can this graph take a source of `kind` at all?
+///
+/// A known mismatch used to fall back to loaders of the other kind, which
+/// wrote an mp4 into a `LoadImage` field: the queued prompt then failed inside
+/// ComfyUI with a message about the wrong node. The mismatch is knowable
+/// before anything is extracted or uploaded, so it is refused here with the
+/// fix named. A graph with no recognised loaders at all passes — there is
+/// nothing to mis-bind, and the run proceeds with the author's saved values,
+/// as it always did.
+pub fn check_source_kind(workflow: &Value, kind: LoaderKind) -> Result<(), String> {
+    let loaders = detect_loaders(workflow);
+    if loaders.is_empty() || loaders.iter().any(|l| l.kind == kind) {
+        return Ok(());
+    }
+    Err(match kind {
+        LoaderKind::Video => "This workflow has no video loader (VHS_LoadVideo, LoadVideo or \
+                              similar), so it cannot take the whole clip. Pick a frame source \
+                              mode instead."
+            .to_string(),
+        LoaderKind::Image => "This workflow only loads video, so a single frame has nowhere to \
+                              go. If the source is a video, send it whole."
+            .to_string(),
+    })
+}
+
 /// What the run uploaded, and where it should land.
 #[derive(Debug, Clone)]
 pub(crate) struct SourceBinding<'a> {
@@ -260,23 +285,25 @@ pub(crate) struct BindingPlan {
 /// interpolator whose author typed no titles would get the same frame as its
 /// start *and* its end, and produce a clip that goes nowhere, silently.
 ///
-/// Throughout, a loader that takes a name beats one that takes a path: an
+/// Within a rung, a loader that takes a name beats one that takes a path: an
 /// upload yields a name, and the path a `VHS_LoadVideoPath` wants can only be
-/// guessed at.
-pub(crate) fn bind_targets(workflow: &Value, binding: &SourceBinding) -> BindingPlan {
+/// guessed at. It is a *tie-breaker among candidates for the slot*, not a
+/// pre-filter — filtering path-style nodes out before the ladder runs made an
+/// explicitly assigned path loader unreachable, and let its slot's source fall
+/// through to whichever node the last rung happened to grab.
+///
+/// A source the graph has no loader for is refused, not mis-bound — see
+/// [`check_source_kind`], which this enforces.
+pub(crate) fn bind_targets(
+    workflow: &Value,
+    binding: &SourceBinding,
+) -> Result<BindingPlan, String> {
+    check_source_kind(workflow, binding.kind)?;
     let loaders = detect_loaders(workflow);
     let assigned = |l: &LoaderNode| binding.role_overrides.get(&l.node_id).copied();
 
-    // The upload has to land in a node that can read it. Failing that, take
-    // anything — a graph we could not classify is no worse off than before.
-    let mut pool: Vec<&LoaderNode> = loaders.iter().filter(|l| l.kind == binding.kind).collect();
-    if pool.is_empty() {
-        pool = loaders.iter().collect();
-    }
-    let by_name: Vec<&LoaderNode> = pool.iter().copied().filter(|l| !l.path_style).collect();
-    if !by_name.is_empty() {
-        pool = by_name;
-    }
+    // The upload lands in a node that can read it, or nowhere.
+    let pool: Vec<&LoaderNode> = loaders.iter().filter(|l| l.kind == binding.kind).collect();
 
     // Rung 1 — the user pointed at these nodes. Take them all, say nothing.
     let explicit: Vec<&LoaderNode> = pool
@@ -285,7 +312,7 @@ pub(crate) fn bind_targets(workflow: &Value, binding: &SourceBinding) -> Binding
         .filter(|l| assigned(l) == Some(binding.role))
         .collect();
     if !explicit.is_empty() {
-        return plan(explicit, binding, Vec::new());
+        return Ok(plan(explicit, binding, Vec::new()));
     }
 
     // A node the user moved elsewhere is not a candidate for this slot.
@@ -298,7 +325,7 @@ pub(crate) fn bind_targets(workflow: &Value, binding: &SourceBinding) -> Binding
         .filter(|l| l.role_from_title && l.role == binding.role)
         .collect();
     if !titled.is_empty() {
-        return first_only(titled, binding);
+        return Ok(first_only(titled, binding));
     }
 
     // Rung 3 — untitled nodes, which is what `start` means by default.
@@ -309,16 +336,30 @@ pub(crate) fn bind_targets(workflow: &Value, binding: &SourceBinding) -> Binding
             .filter(|l| !l.role_from_title)
             .collect();
         if !untitled.is_empty() {
-            return first_only(untitled, binding);
+            return Ok(first_only(untitled, binding));
         }
     }
 
     // Rung 4 — nothing fits the slot, so run with what there is.
-    first_only(pool, binding)
+    Ok(first_only(pool, binding))
 }
 
 /// Bind the first candidate, and say so when there were others.
+///
+/// The name-beats-path preference lives here, inside the rung: a name-style
+/// rival eliminates the path-style ones on principle (an upload yields a name),
+/// which is a decision, not an ambiguity — so it is not warned about.
 fn first_only(candidates: Vec<&LoaderNode>, binding: &SourceBinding) -> BindingPlan {
+    let by_name: Vec<&LoaderNode> = candidates
+        .iter()
+        .copied()
+        .filter(|l| !l.path_style)
+        .collect();
+    let candidates = if by_name.is_empty() {
+        candidates
+    } else {
+        by_name
+    };
     let Some((first, rest)) = candidates.split_first() else {
         return BindingPlan::default();
     };
@@ -410,7 +451,10 @@ pub fn default_binding_warnings(workflow: &Value) -> Vec<String> {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides,
             },
-        );
+        )
+        // Unreachable: the kind check only fails for a kind the graph lacks,
+        // and this loop asks only about kinds it has.
+        .unwrap_or_default();
         for warning in plan.warnings {
             if !out.contains(&warning) {
                 out.push(warning);
@@ -546,7 +590,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&targets), [("4", "image", "new.png")]);
     }
 
@@ -566,7 +611,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&start), [("4", "image", "new.png")]);
 
         let end = bind_targets(
@@ -577,7 +623,8 @@ mod tests {
                 role: SourceRole::End,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&end), [("5", "image", "new.png")]);
     }
 
@@ -605,7 +652,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &overrides,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&targets), [("5", "image", "new.png")]);
     }
 
@@ -631,7 +679,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &overrides,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&plan), [("5", "image", "new.png")]);
         assert!(plan.warnings.is_empty(), "the user was explicit");
     }
@@ -658,7 +707,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &overrides,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             bound(&plan),
             [("4", "image", "new.png"), ("5", "image", "new.png")]
@@ -681,7 +731,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&targets), [("4", "image", "new.png")]);
     }
 
@@ -700,7 +751,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&targets), [("1", "video", "new.mp4")]);
     }
 
@@ -769,7 +821,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             bound(&plan),
             [("4", "image", "new.png")],
@@ -802,7 +855,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&plan), [("4", "image", "new.png")]);
         assert!(plan.warnings.is_empty());
     }
@@ -824,7 +878,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&plan), [("4", "image", "new.png")]);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         assert_eq!(
@@ -852,7 +907,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&plan), [("4", "image", "new.png")]);
         assert_eq!(plan.warnings.len(), 1);
         assert!(
@@ -876,7 +932,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&plan), [("1", "video", "new.mp4")]);
         assert_eq!(plan.warnings.len(), 1);
     }
@@ -902,7 +959,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(warnings, plan.warnings);
 
         // The ordinary workflows have nothing to say.
@@ -951,7 +1009,8 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&targets), [("2", "video", "new.mp4")]);
     }
 
@@ -968,8 +1027,148 @@ mod tests {
                 role: SourceRole::Start,
                 role_overrides: &no_overrides(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(bound(&targets), [("1", "video", "input/new.mp4")]);
+    }
+
+    // === Kind mismatches are refused, not mis-bound =========================
+
+    #[test]
+    fn a_whole_video_against_an_image_only_graph_is_refused_not_shoved_into_load_image() {
+        // The old fallback wrote the mp4 into the LoadImage field and let the
+        // prompt fail inside ComfyUI with a message about the wrong node.
+        let wf = json!({
+            "4": { "class_type": "LoadImage", "inputs": { "image": "a.png" } },
+        });
+        let err = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.mp4",
+                kind: LoaderKind::Video,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("no video loader"), "{}", err);
+        assert!(err.contains("frame"), "the fix should be named: {}", err);
+        assert!(check_source_kind(&wf, LoaderKind::Video).is_err());
+        assert!(check_source_kind(&wf, LoaderKind::Image).is_ok());
+    }
+
+    #[test]
+    fn a_frame_against_a_video_only_graph_is_refused_too() {
+        let wf = json!({
+            "1": { "class_type": "VHS_LoadVideo", "inputs": { "video": "a.mp4" } },
+        });
+        let err = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.png",
+                kind: LoaderKind::Image,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("only loads video"), "{}", err);
+    }
+
+    #[test]
+    fn a_graph_with_no_recognised_loader_still_binds_nothing_rather_than_failing() {
+        // Nothing to mis-bind: the run proceeds with the author's saved values,
+        // which is what it always did.
+        let wf = json!({
+            "6": { "class_type": "CLIPTextEncode", "inputs": { "text": "a cat" } },
+        });
+        let plan = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.png",
+                kind: LoaderKind::Image,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides(),
+            },
+        )
+        .unwrap();
+        assert!(plan.targets.is_empty());
+        assert!(plan.warnings.is_empty());
+    }
+
+    // === Name-beats-path is a tie-breaker, not a pre-filter =================
+
+    #[test]
+    fn an_explicit_role_reaches_a_path_style_loader() {
+        // Pre-filtering path-style nodes out threw away the node the user
+        // explicitly assigned, leaving the start slot with no target at all.
+        let wf = json!({
+            "1": { "class_type": "VHS_LoadVideoPath", "inputs": { "video": "/data/a.mp4" } },
+            "2": { "class_type": "VHS_LoadVideo", "inputs": { "video": "b.mp4" } },
+        });
+        let overrides: HashMap<String, SourceRole> = [
+            ("1".to_string(), SourceRole::Start),
+            ("2".to_string(), SourceRole::End),
+        ]
+        .into_iter()
+        .collect();
+        let plan = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.mp4",
+                kind: LoaderKind::Video,
+                role: SourceRole::Start,
+                role_overrides: &overrides,
+            },
+        )
+        .unwrap();
+        assert_eq!(bound(&plan), [("1", "video", "input/new.mp4")]);
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_title_reaches_a_path_style_loader_before_the_last_rung_grabs_the_wrong_node() {
+        // Titled Start (path-style) + titled End (name-style): the start source
+        // used to fall through every rung and land in the End node.
+        let wf = json!({
+            "1": { "class_type": "VHS_LoadVideoPath", "inputs": { "video": "/data/a.mp4" },
+                   "_meta": { "title": "Start clip" } },
+            "2": { "class_type": "VHS_LoadVideo", "inputs": { "video": "b.mp4" },
+                   "_meta": { "title": "End clip" } },
+        });
+        let plan = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.mp4",
+                kind: LoaderKind::Video,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides(),
+            },
+        )
+        .unwrap();
+        assert_eq!(bound(&plan), [("1", "video", "input/new.mp4")]);
+    }
+
+    #[test]
+    fn within_a_rung_a_name_style_rival_still_beats_a_path_style_one_silently() {
+        // Both untitled, same rung: preferring the name-style node is a
+        // decision (an upload yields a name), not an ambiguity — no warning.
+        let wf = json!({
+            "1": { "class_type": "VHS_LoadVideoPath", "inputs": { "video": "/data/a.mp4" } },
+            "2": { "class_type": "VHS_LoadVideo", "inputs": { "video": "b.mp4" } },
+        });
+        let plan = bind_targets(
+            &wf,
+            &SourceBinding {
+                uploaded_filename: "new.mp4",
+                kind: LoaderKind::Video,
+                role: SourceRole::Start,
+                role_overrides: &no_overrides(),
+            },
+        )
+        .unwrap();
+        assert_eq!(bound(&plan), [("2", "video", "new.mp4")]);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]

@@ -56,6 +56,28 @@ const sourceAtMs = ref(0)
 const sourceKeyframe = ref(0)
 const sourceModeTouched = ref(false)
 
+// Only the modes the selected workflow can actually consume: whole_video needs
+// a video loader, a frame needs an image loader. Offering an impossible mode
+// and warning about it afterwards queued tasks guaranteed to fail.
+const availableSourceModes = computed(() => {
+  const wf = selectedWorkflow.value
+  if (!wf) return SOURCE_MODES
+  const kinds = (wf.loaders || []).map(l => l.kind)
+  const hasVideo = kinds.includes('video')
+  const hasImage = kinds.includes('image')
+  if (!hasVideo && !hasImage) return SOURCE_MODES
+  return SOURCE_MODES.filter(m => (m.key === 'whole_video' ? hasVideo : hasImage))
+})
+
+// A workflow switch can strand the selection on a mode the new workflow
+// cannot take; fall back to that workflow's own default.
+watch(availableSourceModes, (modes) => {
+  if (!modes.some(m => m.key === sourceModeKey.value)) {
+    sourceModeKey.value = defaultSourceModeKey()
+    sourceModeTouched.value = false
+  }
+})
+
 /** What goes on the wire, or null to let the backend decide. */
 const sourceMode = computed(() => {
   if (!sourceIsVideo.value) return null
@@ -331,7 +353,7 @@ async function enhance() {
             <div class="label">Source</div>
             <div class="flex flex-wrap gap-2">
               <button
-                v-for="mode in SOURCE_MODES"
+                v-for="mode in availableSourceModes"
                 :key="mode.key"
                 :title="mode.note"
                 class="whitespace-nowrap border rounded px-3 py-1.5 font-mono text-xs transition-colors"
