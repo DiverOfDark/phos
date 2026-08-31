@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import WorkflowGraph from '@/components/WorkflowGraph.vue'
+import { isEditableInput, isComboInput, comboChoices } from '@/lib/utils'
 
 // --- Connection health ---
 const comfyuiHealthy = ref(false)
@@ -153,8 +154,8 @@ async function createPreset() {
   const overrides = {}
   const inputs = selectedWorkflow.value?.inputs || []
   for (const input of inputs) {
-    if (input.node_type !== 'LoadImage') {
-      overrides[`${input.node_id}.${input.field_name}`] = typeof input.current_value === 'string' ? input.current_value : ''
+    if (isEditableInput(input)) {
+      overrides[`${input.node_id}.${input.field_name}`] = String(input.current_value ?? '')
     }
   }
   try {
@@ -373,16 +374,16 @@ function shortId(id) {
   return String(id || '').slice(0, 7)
 }
 
-/** Text inputs of a workflow — LoadImage is fed by the shot, never by hand. */
-function textInputsOf(wf) {
-  return (wf?.inputs || []).filter(i => i.node_type !== 'LoadImage')
+/** Editable inputs of a workflow — LoadImage is fed by the shot, never by hand. */
+function editableInputsOf(wf) {
+  return (wf?.inputs || []).filter(isEditableInput)
 }
 
 const importReady = computed(() => importName.value.trim() && importJson.value.trim())
 
 /** Node ids the Enhance dialog can override — the graph marks them as editable. */
 const editableNodeIds = computed(() =>
-  textInputsOf(selectedWorkflow.value).map((i) => String(i.node_id))
+  editableInputsOf(selectedWorkflow.value).map((i) => String(i.node_id))
 )
 
 function formatRelativeTime(dateStr) {
@@ -488,7 +489,7 @@ defineExpose({ loadData: fetchWorkflows })
           <span class="font-mono text-[13px] font-medium text-ink">{{ wf.name }}</span>
           <span v-if="wf.description" class="text-xs font-light text-ink-secondary">{{ wf.description }}</span>
           <span class="font-mono text-[11px] text-ink-tertiary">
-            {{ textInputsOf(wf).length }} input(s) · {{ (wf.outputs || []).length }} output(s)
+            {{ editableInputsOf(wf).length }} input(s) · {{ (wf.outputs || []).length }} output(s)
           </span>
         </button>
 
@@ -574,23 +575,28 @@ defineExpose({ loadData: fetchWorkflows })
           <div class="label">Detected inputs</div>
           <div class="border border-line rounded overflow-hidden overflow-x-auto">
             <div
-              class="grid gap-4 px-3 py-2 border-b min-w-[420px]"
-              style="grid-template-columns: 64px 1fr 1fr 1fr; border-color: var(--border-strong)"
+              class="grid gap-4 px-3 py-2 border-b min-w-[520px]"
+              style="grid-template-columns: 64px 1fr 1fr 72px 1fr; border-color: var(--border-strong)"
             >
               <span class="label">Node</span>
               <span class="label">Type</span>
               <span class="label">Field</span>
+              <span class="label">Kind</span>
               <span class="label">Default</span>
             </div>
             <div
               v-for="input in (selectedWorkflow.inputs || [])"
               :key="`${input.node_id}.${input.field_name}`"
-              class="grid gap-4 px-3 py-2 border-b border-line font-mono text-xs min-w-[420px]"
-              style="grid-template-columns: 64px 1fr 1fr 1fr"
+              class="grid gap-4 px-3 py-2 border-b border-line font-mono text-xs min-w-[520px]"
+              style="grid-template-columns: 64px 1fr 1fr 72px 1fr"
             >
               <span class="text-ink-tertiary">{{ input.node_id }}</span>
-              <span class="text-ink-secondary truncate">{{ input.node_type }}</span>
+              <span class="text-ink-secondary truncate">
+                {{ input.node_type }}
+                <span v-if="input.node_title" class="text-ink-tertiary">· {{ input.node_title }}</span>
+              </span>
               <span class="text-ink truncate">{{ input.field_name }}</span>
+              <span class="text-ink-tertiary uppercase">{{ input.widget?.kind || '—' }}</span>
               <span class="text-ink-secondary truncate">
                 {{ input.node_type === 'LoadImage' ? '(source file)' : (input.current_value ?? '') }}
               </span>
@@ -633,16 +639,29 @@ defineExpose({ loadData: fetchWorkflows })
                 >remove</button>
               </div>
 
-              <template v-if="textInputsOf(selectedWorkflow).length">
+              <template v-if="editableInputsOf(selectedWorkflow).length">
                 <div
-                  v-for="input in textInputsOf(selectedWorkflow)"
+                  v-for="input in editableInputsOf(selectedWorkflow)"
                   :key="`${preset.id}-${input.node_id}.${input.field_name}`"
                   class="flex flex-col gap-1"
                 >
                   <span class="font-mono text-[11px] text-ink-tertiary">
                     {{ input.node_id }} · {{ input.field_name }}
                   </span>
+                  <select
+                    v-if="isComboInput(input)"
+                    class="w-full bg-surface border border-line rounded-sm px-3 py-2 font-mono text-xs text-ink"
+                    :value="preset.text_overrides?.[`${input.node_id}.${input.field_name}`] || ''"
+                    @change="updatePresetOverrides(preset, `${input.node_id}.${input.field_name}`, $event.target.value)"
+                  >
+                    <option
+                      v-for="choice in comboChoices(input, preset.text_overrides?.[`${input.node_id}.${input.field_name}`] || '')"
+                      :key="choice"
+                      :value="choice"
+                    >{{ choice }}</option>
+                  </select>
                   <textarea
+                    v-else
                     rows="2"
                     spellcheck="false"
                     class="w-full bg-surface border border-line rounded-sm px-3 py-2 font-mono text-xs text-ink"
@@ -652,7 +671,7 @@ defineExpose({ loadData: fetchWorkflows })
                 </div>
               </template>
               <span v-else class="text-xs font-light text-ink-secondary">
-                No text inputs in this workflow — the preset runs node defaults.
+                No editable inputs in this workflow — the preset runs node defaults.
               </span>
             </div>
           </div>

@@ -1,10 +1,12 @@
 //! Reading and rewriting the workflow graph.
 //!
-//! Two jobs: work out what a graph takes and produces (so the UI can offer the
-//! overridable inputs, and so the poller knows whether to expect a video), and
-//! rewrite a copy of it for one run — the uploaded image, the user's text
-//! overrides, and the pinned `filename_prefix` that makes the output findable
-//! by name afterwards.
+//! Two jobs: work out what a graph produces (so the poller knows whether to
+//! expect a video, and which filenames are worth probing), and rewrite a copy
+//! of it for one run — the uploaded image, the user's text overrides, and the
+//! pinned `filename_prefix` that makes the output findable by name afterwards.
+//!
+//! What a graph *takes* is [`super::overrides`]' question, because answering it
+//! well needs what ComfyUI says about its own node classes.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,82 +33,9 @@ pub(crate) fn fresh_attempt_id() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowInput {
-    pub node_id: String,
-    pub node_type: String,
-    pub field_name: String,
-    pub current_value: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowOutput {
     pub node_id: String,
     pub node_type: String,
-}
-
-/// Detect input nodes that the user can override.
-pub fn detect_inputs(workflow: &Value) -> Vec<WorkflowInput> {
-    let mut inputs = Vec::new();
-    if let Some(nodes) = workflow.as_object() {
-        for (node_id, node) in nodes {
-            let class_type = node
-                .get("class_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let node_inputs = node.get("inputs");
-
-            match class_type {
-                "LoadImage" => {
-                    if let Some(inp) = node_inputs {
-                        if let Some(val) = inp.get("image") {
-                            inputs.push(WorkflowInput {
-                                node_id: node_id.clone(),
-                                node_type: class_type.to_string(),
-                                field_name: "image".to_string(),
-                                current_value: val.clone(),
-                            });
-                        }
-                    }
-                }
-                "CLIPTextEncode" => {
-                    if let Some(inp) = node_inputs {
-                        if let Some(val) = inp.get("text") {
-                            // Only include if text is a string (not a link to another node)
-                            if val.is_string() {
-                                inputs.push(WorkflowInput {
-                                    node_id: node_id.clone(),
-                                    node_type: class_type.to_string(),
-                                    field_name: "text".to_string(),
-                                    current_value: val.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    // Check for String (Multiline) widget pattern
-                    if let Some(inp) = node_inputs {
-                        if let Some(obj) = inp.as_object() {
-                            for (field, val) in obj {
-                                if val.is_string()
-                                    && (class_type.contains("String")
-                                        || class_type.contains("Text"))
-                                {
-                                    inputs.push(WorkflowInput {
-                                        node_id: node_id.clone(),
-                                        node_type: class_type.to_string(),
-                                        field_name: field.clone(),
-                                        current_value: val.clone(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    inputs
 }
 
 /// Detect output nodes (SaveImage, SaveVideo, VHS_VideoCombine, etc.).

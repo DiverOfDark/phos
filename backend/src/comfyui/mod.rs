@@ -29,10 +29,13 @@
 //! * [`history`] — what did ComfyUI say? Outputs, still running, or an error.
 //! * [`policy`] — what do we do about it? How long to wait for a file that has
 //!   not appeared, and whether a failure is worth another attempt.
-//! * [`workflow`] — what does this graph take and produce, and how do we
-//!   rewrite it for one run?
+//! * [`workflow`] — what does this graph produce, and how do we rewrite it for
+//!   one run?
+//! * [`nodes`] — what does ComfyUI say its installed node classes take?
+//! * [`overrides`] — so which of this graph's fields can a person change, and
+//!   what kind of control does each one want?
 //!
-//! Those three take `serde_json::Value` in and give an answer out, so the whole
+//! Those all take `serde_json::Value` in and give an answer out, so the whole
 //! completion path is tested against recorded `/history` payloads with no
 //! server involved. [`client`] holds the HTTP calls and decides nothing;
 //! [`worker`] holds the database writes.
@@ -60,7 +63,9 @@
 
 mod client;
 mod history;
+pub mod nodes;
 mod outputs;
+mod overrides;
 mod policy;
 mod source;
 mod timestamp;
@@ -68,8 +73,35 @@ mod worker;
 mod workflow;
 
 pub use client::ComfyUiClient;
+pub use nodes::NodeCatalog;
+pub use overrides::detect_inputs;
+// The contract test reads it through the library crate; the binary compiles
+// this module directly and has no use for it, which is what the allow is for.
+#[allow(unused_imports)]
+pub use overrides::WorkflowInput;
 pub use worker::spawn_enhancement_worker;
-pub use workflow::{detect_inputs, detect_outputs};
+pub use workflow::detect_outputs;
+
+/// The node catalogue for this server, read from `/object_info` and cached
+/// for a few minutes, or until the health check sees ComfyUI come back from
+/// being down.
+///
+/// `None` whenever nothing could be learned — unreachable, too old to have the
+/// endpoint, or an answer nothing parsed out of. Every caller treats that as
+/// ordinary and falls back.
+///
+/// Blocking: call it from `spawn_blocking`, not from an async handler.
+pub fn node_catalog(client: &ComfyUiClient) -> Option<std::sync::Arc<NodeCatalog>> {
+    nodes::catalog_for(client)
+}
+
+/// [`node_catalog`], but read from ComfyUI now regardless of what is cached —
+/// for a client that knows the installed models just changed.
+///
+/// Blocking, like [`node_catalog`].
+pub fn refresh_node_catalog(client: &ComfyUiClient) -> Option<std::sync::Arc<NodeCatalog>> {
+    nodes::refresh_for(client)
+}
 
 /// Statuses the worker owns, and that the API and queue UI switch on.
 ///

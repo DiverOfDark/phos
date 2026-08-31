@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
+import { isEditableInput, isComboInput, comboChoices } from '@/lib/utils'
 
 const props = defineProps({
   open: Boolean,
@@ -122,8 +123,8 @@ watch(selectedWorkflow, (wf) => {
   const overrides = {}
   const inputs = wf.inputs || []
   for (const input of inputs) {
-    if (input.node_type !== 'LoadImage') {
-      overrides[`${input.node_id}.${input.field_name}`] = typeof input.current_value === 'string' ? input.current_value : ''
+    if (isEditableInput(input)) {
+      overrides[`${input.node_id}.${input.field_name}`] = String(input.current_value ?? '')
     }
   }
   textOverrides.value = overrides
@@ -154,8 +155,8 @@ function selectPreset(preset) {
     const overrides = {}
     const inputs = selectedWorkflow.value?.inputs || []
     for (const input of inputs) {
-      if (input.node_type !== 'LoadImage') {
-        overrides[`${input.node_id}.${input.field_name}`] = typeof input.current_value === 'string' ? input.current_value : ''
+      if (isEditableInput(input)) {
+        overrides[`${input.node_id}.${input.field_name}`] = String(input.current_value ?? '')
       }
     }
     textOverrides.value = overrides
@@ -171,9 +172,7 @@ function selectPreset(preset) {
 
 const textInputs = computed(() => {
   if (!selectedWorkflow.value) return []
-  return (selectedWorkflow.value.inputs || []).filter(
-    i => i.node_type !== 'LoadImage'
-  )
+  return (selectedWorkflow.value.inputs || []).filter(isEditableInput)
 })
 
 const outputType = computed(() => {
@@ -299,8 +298,22 @@ async function enhance() {
             <div v-for="input in textInputs" :key="`${input.node_id}.${input.field_name}`" class="flex flex-col gap-1">
               <span class="font-mono text-[11px] text-ink-tertiary">
                 {{ input.node_id }} · {{ input.node_type }} · {{ input.field_name }}
+                <span v-if="input.node_title">· {{ input.node_title }}</span>
               </span>
+              <select
+                v-if="isComboInput(input)"
+                v-model="textOverrides[`${input.node_id}.${input.field_name}`]"
+                class="w-full bg-base border border-line rounded-sm px-3 py-2 font-mono text-xs text-ink"
+                @change="selectedPresetId = null"
+              >
+                <option
+                  v-for="choice in comboChoices(input, textOverrides[`${input.node_id}.${input.field_name}`])"
+                  :key="choice"
+                  :value="choice"
+                >{{ choice }}</option>
+              </select>
               <textarea
+                v-else
                 v-model="textOverrides[`${input.node_id}.${input.field_name}`]"
                 rows="2"
                 spellcheck="false"
