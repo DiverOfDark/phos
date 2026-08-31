@@ -83,6 +83,13 @@ const isVideo = computed(() => {
   return mime.startsWith('video/')
 })
 
+// The file an enhancement run reads: the original, since the dialog does not
+// pin a source file. Its type is what decides whether the source picker appears.
+const originalFile = computed(() => {
+  const files = shot.value?.files || []
+  return files.find(f => f.is_original) || files[0] || null
+})
+
 const selectedFilename = computed(() => {
   if (!selectedFile.value) return ''
   return selectedFile.value.path.split('/').pop()
@@ -1118,6 +1125,7 @@ watch(() => route.params.id, () => {
       v-model:open="showEnhanceDialog"
       :shot-id="shotId"
       :shot-label="shotIdLabel"
+      :source-mime="originalFile?.mime_type || ''"
       @task-created="onTaskCreated"
     />
   </div>

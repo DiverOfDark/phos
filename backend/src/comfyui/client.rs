@@ -144,40 +144,50 @@ impl ComfyUiClient {
         Ok(resp.body_mut().read_json()?)
     }
 
-    /// Upload an image to ComfyUI's /upload/image endpoint using manual multipart.
-    pub(crate) fn upload_image(&self, filename: &str, image_data: &[u8]) -> anyhow::Result<String> {
-        let boundary = format!("----PhosUpload{}", Uuid::new_v4().simple());
+    /// Upload a source file to ComfyUI's `/upload/image` endpoint using manual
+    /// multipart.
+    ///
+    /// The endpoint is named for images but is not limited to them: it drops
+    /// whatever it is given into ComfyUI's input directory, which is exactly
+    /// where the VHS video loaders read from. What it must not be told is that
+    /// an mp4 is a PNG, which is what this used to hard-code.
+    ///
+    /// The payload is *streamed*, not buffered: a whole-video source can be
+    /// gigabytes, and building the multipart body in a `Vec` would hold the
+    /// entire clip in memory a second time. The multipart framing around the
+    /// reader is fixed, so the exact `Content-Length` is still known up front.
+    pub(crate) fn upload_file(
+        &self,
+        filename: &str,
+        content_type: &str,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+    ) -> anyhow::Result<String> {
+        use std::io::Read;
 
-        let mut body = Vec::new();
-        // image field
-        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-        body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"image\"; filename=\"{}\"\r\n",
-                filename
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(b"Content-Type: image/png\r\n\r\n");
-        body.extend_from_slice(image_data);
-        body.extend_from_slice(b"\r\n");
-        // overwrite field (always true so repeated uploads of same name work)
-        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-        body.extend_from_slice(b"Content-Disposition: form-data; name=\"overwrite\"\r\n\r\n");
-        body.extend_from_slice(b"true\r\n");
-        // closing boundary
-        body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+        let boundary = format!("----PhosUpload{}", Uuid::new_v4().simple());
+        let preamble = multipart_preamble(&boundary, filename, content_type);
+        let epilogue = multipart_epilogue(&boundary);
+        let total_len = preamble.len() as u64 + data_len + epilogue.len() as u64;
+        // `take` keeps the declared length truthful if the file grows mid-read;
+        // a file that shrinks ends the sized body early, which ureq reports as
+        // an error and the worker retries.
+        let mut body = preamble
+            .as_slice()
+            .chain(data.take(data_len))
+            .chain(epilogue.as_slice());
 
         let url = format!("{}/upload/image", self.base_url);
         let content_type = format!("multipart/form-data; boundary={}", boundary);
 
         let mut resp = ureq::post(&url)
             .header("Content-Type", &content_type)
+            .header("Content-Length", total_len.to_string())
             .config()
             .timeout_global(Some(self.timeouts.transfer))
             .timeout_recv_response(Some(self.timeouts.response))
             .build()
-            .send(body.as_slice())
+            .send(ureq::SendBody::from_reader(&mut body))
             .map_err(|e| anyhow::anyhow!("Upload failed: {}", e))?;
 
         let json: Value = resp.body_mut().read_json()?;
@@ -361,6 +371,45 @@ impl ComfyUiClient {
     }
 }
 
+/// Everything before the file bytes in one `/upload/image` multipart body.
+///
+/// Split out so the part headers can be checked without a server: the
+/// `Content-Type` of the file part is what decides whether ComfyUI's input
+/// directory ends up holding a video or something it thinks is a PNG.
+fn multipart_preamble(boundary: &str, filename: &str, content_type: &str) -> Vec<u8> {
+    // file field — named `image` because that is what the endpoint expects,
+    // whatever the file actually is
+    format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"image\"; filename=\"{filename}\"\r\n\
+         Content-Type: {content_type}\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// Everything after the file bytes: the overwrite field (always true so
+/// repeated uploads of the same name work) and the closing boundary.
+fn multipart_epilogue(boundary: &str) -> Vec<u8> {
+    format!(
+        "\r\n--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"overwrite\"\r\n\r\n\
+         true\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes()
+}
+
+/// The whole body in one buffer — only the tests want that.
+#[cfg(test)]
+fn upload_body(boundary: &str, filename: &str, content_type: &str, data: &[u8]) -> Vec<u8> {
+    [
+        multipart_preamble(boundary, filename, content_type),
+        data.to_vec(),
+        multipart_epilogue(boundary),
+    ]
+    .concat()
+}
+
 /// `queue_running`/`queue_pending` are arrays of `[number, prompt_id, ...]`.
 pub(crate) fn queue_contains(queue: &Value, key: &str, prompt_id: &str) -> bool {
     queue
@@ -473,8 +522,9 @@ mod tests {
         });
         must_not_hang("interrupt", &url, |c| c.interrupt().is_err());
         must_not_hang("delete_queued", &url, |c| c.delete_queued("abc").is_err());
-        must_not_hang("upload_image", &url, |c| {
-            c.upload_image("x.png", &[0u8; 512]).is_err()
+        must_not_hang("upload_file", &url, |c| {
+            let mut data = std::io::Cursor::new([0u8; 512]);
+            c.upload_file("x.png", "image/png", &mut data, 512).is_err()
         });
         must_not_hang("download_output", &url, |c| {
             c.download_output(&OutputRef {
@@ -512,5 +562,29 @@ mod tests {
             t.transfer <= Duration::from_secs(30 * 60),
             "a budget this large is unbounded in all but name"
         );
+    }
+
+    // FR2 — a video has to go up as a video.
+    #[test]
+    fn an_upload_carries_the_content_type_it_was_given() {
+        let body = upload_body("BOUND", "phos_a_b_video.mp4", "video/mp4", b"\x00\x00moov");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("Content-Type: video/mp4\r\n"),
+            "an mp4 was announced as something else:\n{}",
+            text
+        );
+        assert!(text.contains("filename=\"phos_a_b_video.mp4\""), "{}", text);
+        // The bytes go through untouched, and the overwrite flag still rides along.
+        assert!(body.windows(4).any(|w| w == b"moov"));
+        assert!(text.contains("name=\"overwrite\"\r\n\r\ntrue"), "{}", text);
+        assert!(text.ends_with("--BOUND--\r\n"), "{}", text);
+    }
+
+    #[test]
+    fn an_image_upload_is_unchanged() {
+        let body = upload_body("BOUND", "phos_a_b_first.png", "image/png", b"\x89PNG");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Content-Type: image/png\r\n"), "{}", text);
     }
 }

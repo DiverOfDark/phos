@@ -20,6 +20,40 @@ fn require_comfyui(state: &AppState) -> Result<String, StatusCode> {
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
+/// A status plus, where it helps, something the user can act on.
+///
+/// Import is the one endpoint here where a bare 400 is actively unhelpful: the
+/// user pasted a graph and needs to know which part of it Phos could not use.
+/// The UI already reads `error` out of a JSON body.
+pub(super) struct ApiError(StatusCode, Option<String>);
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self(StatusCode::BAD_REQUEST, Some(message.into()))
+    }
+
+    fn internal() -> Self {
+        Self(StatusCode::INTERNAL_SERVER_ERROR, None)
+    }
+}
+
+impl From<StatusCode> for ApiError {
+    fn from(status: StatusCode) -> Self {
+        Self(status, None)
+    }
+}
+
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        match self.1 {
+            Some(message) => {
+                (self.0, Json(serde_json::json!({ "error": message }))).into_response()
+            }
+            None => self.0.into_response(),
+        }
+    }
+}
+
 /// GET /api/comfyui/health
 #[utoipa::path(
     get,
@@ -183,6 +217,25 @@ pub(super) async fn comfyui_list_workflows(
     let workflows: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|wf| {
+            // Loaders are derived on read rather than stored: workflows
+            // imported before this existed have no record of theirs, and the
+            // graph is already in memory here — the list only omits it from the
+            // *response*, which is tens of kilobytes per row.
+            let graph = serde_json::from_str::<serde_json::Value>(&wf.workflow_json).ok();
+            let loaders = graph
+                .as_ref()
+                .map(crate::comfyui::detect_loaders)
+                .unwrap_or_default();
+            let takes_video = loaders
+                .iter()
+                .any(|l| l.kind == crate::comfyui::LoaderKind::Video);
+            // Slots more than one loader claims with nothing to tell them
+            // apart. Answered here, before a run, because after the run the
+            // evidence is a clip that does not move.
+            let warnings = graph
+                .as_ref()
+                .map(crate::comfyui::default_binding_warnings)
+                .unwrap_or_default();
             let inputs: serde_json::Value = wf
                 .inputs_json
                 .and_then(|s| serde_json::from_str(&s).ok())
@@ -197,6 +250,9 @@ pub(super) async fn comfyui_list_workflows(
                 "description": wf.description,
                 "inputs": inputs,
                 "outputs": outputs,
+                "loaders": loaders,
+                "takes_video": takes_video,
+                "warnings": warnings,
                 "created_at": wf.created_at,
             })
         })
@@ -230,44 +286,41 @@ pub(super) struct ImportWorkflowPayload {
 pub(super) async fn comfyui_import_workflow(
     UState(state): UState,
     Json(payload): Json<ImportWorkflowPayload>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let url = require_comfyui(&state)?;
 
     if payload.name.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::bad_request("A workflow needs a name."));
     }
 
     // Validate: must be a JSON object
     if !payload.workflow.is_object() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::bad_request(
+            "The workflow must be a ComfyUI API-format graph: a JSON object of nodes \
+             keyed by node id. Export it with 'Save (API Format)', not 'Save'.",
+        ));
     }
+
+    // Must have somewhere to put the source: an image loader, or a video one.
+    // Requiring `LoadImage` specifically 400'd every video workflow, which made
+    // video→video unreachable however good the rest of the pipeline was.
+    crate::comfyui::importable(&payload.workflow).map_err(ApiError::bad_request)?;
 
     // Ask ComfyUI what its nodes take, so the stored inputs carry real types
     // and ranges. A server that cannot say falls the import back to the old
     // heuristics rather than refusing it.
     let catalog = node_catalog(&url).await;
 
-    // Must have at least one LoadImage node
     let inputs = crate::comfyui::detect_inputs(&payload.workflow, catalog.as_deref());
-    let has_load_image = inputs.iter().any(|i| i.node_type == "LoadImage");
-    if !has_load_image {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
     let outputs = crate::comfyui::detect_outputs(&payload.workflow);
 
     let id = uuid::Uuid::new_v4().to_string();
-    let workflow_json =
-        serde_json::to_string(&payload.workflow).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let inputs_json =
-        serde_json::to_string(&inputs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let outputs_json =
-        serde_json::to_string(&outputs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let workflow_json = serde_json::to_string(&payload.workflow)
+        .map_err(|_| ApiError::bad_request("The workflow is not serialisable JSON."))?;
+    let inputs_json = serde_json::to_string(&inputs).map_err(|_| ApiError::internal())?;
+    let outputs_json = serde_json::to_string(&outputs).map_err(|_| ApiError::internal())?;
 
-    let mut conn = state
-        .pool
-        .get()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut conn = state.pool.get().map_err(|_| ApiError::internal())?;
 
     diesel::insert_into(comfyui_workflows::table)
         .values(NewComfyuiWorkflow {
@@ -281,7 +334,7 @@ pub(super) async fn comfyui_import_workflow(
         .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to insert workflow: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::internal()
         })?;
 
     Ok(Json(serde_json::json!({
@@ -396,6 +449,12 @@ pub(super) struct EnhancePayload {
     workflow_id: String,
     /// Optional: specific file to use as source. If omitted, the original file is used.
     source_file_id: Option<String>,
+    /// Which part of a video source to feed the workflow: `first_frame`,
+    /// `last_frame`, `at_time:<ms>`, `keyframe:<n>` or `whole_video`.
+    ///
+    /// Omit it to let the workflow decide — a graph with a video loader takes
+    /// the whole clip, anything else takes the first frame. Ignored for stills.
+    source_mode: Option<String>,
     #[serde(default)]
     text_overrides: std::collections::HashMap<String, String>,
 }
@@ -409,6 +468,7 @@ pub(super) struct EnhancePayload {
     request_body = EnhancePayload,
     responses(
         (status = 200, description = "Enhancement task queued"),
+        (status = 400, description = "Unrecognised source_mode, or one this workflow cannot take"),
         (status = 404, description = "Shot or workflow not found"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "ComfyUI not configured"),
@@ -417,12 +477,19 @@ pub(super) struct EnhancePayload {
 pub(super) async fn comfyui_enhance(
     UState(state): UState,
     Json(payload): Json<EnhancePayload>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let _ = require_comfyui(&state)?;
-    let mut conn = state
-        .pool
-        .get()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Reject an unreadable source mode here rather than storing it and letting
+    // the worker fall back to a default the caller did not ask for.
+    let explicit_mode = payload
+        .source_mode
+        .as_deref()
+        .map(|m| m.parse::<crate::comfyui::SourceMode>())
+        .transpose()
+        .map_err(ApiError::bad_request)?;
+
+    let mut conn = state.pool.get().map_err(|_| ApiError::internal())?;
 
     // Verify shot exists
     let shot_exists: bool = shots::table
@@ -433,21 +500,80 @@ pub(super) async fn comfyui_enhance(
         .unwrap_or(false);
 
     if !shot_exists {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     }
 
-    // Verify workflow exists
-    let wf_exists: bool = comfyui_workflows::table
+    // Verify workflow exists, and that it can take the mode the caller picked —
+    // a `whole_video` against a graph with only image loaders (or a frame
+    // against a video-only graph) would otherwise queue a task guaranteed to
+    // fail. Same check the worker enforces; here it is a 400 instead of a
+    // failed task discovered later.
+    let workflow_json: Option<String> = comfyui_workflows::table
         .filter(comfyui_workflows::id.eq(&payload.workflow_id))
-        .count()
-        .get_result::<i64>(&mut conn)
-        .map(|c| c > 0)
-        .unwrap_or(false);
-
-    if !wf_exists {
-        return Err(StatusCode::NOT_FOUND);
+        .select(comfyui_workflows::workflow_json)
+        .first::<String>(&mut conn)
+        .optional()
+        .map_err(|_| ApiError::internal())?;
+    let Some(workflow_json) = workflow_json else {
+        return Err(StatusCode::NOT_FOUND.into());
+    };
+    if explicit_mode.is_some() {
+        if let Ok(workflow) = serde_json::from_str::<serde_json::Value>(&workflow_json) {
+            // A still resolves every mode to a frame, so `whole_video` is only
+            // checked when the source really is a video; frame modes always
+            // produce an image and are checkable regardless.
+            let source_is_video = source_mime(&mut conn, &payload)
+                .map(|m| m.starts_with("video/"))
+                .unwrap_or(false);
+            let resolved = crate::comfyui::SourceMode::resolve(
+                payload.source_mode.as_deref(),
+                crate::comfyui::takes_video(&workflow),
+                source_is_video,
+            );
+            crate::comfyui::check_source_kind(&workflow, resolved.loader_kind())
+                .map_err(ApiError::bad_request)?;
+        }
     }
 
+    queue_enhancement(&mut conn, &payload)
+}
+
+/// The mime type of the file a task would read: the one the payload names, or
+/// the shot's original. `None` when there is nothing to say — the worker will
+/// name the real problem if the file is missing.
+fn source_mime(
+    conn: &mut diesel::sqlite::SqliteConnection,
+    payload: &EnhancePayload,
+) -> Option<String> {
+    let mime_sql = diesel::dsl::sql::<diesel::sql_types::Text>("COALESCE(mime_type, '')");
+    if let Some(file_id) = &payload.source_file_id {
+        files::table
+            .filter(
+                files::id
+                    .eq(file_id)
+                    .and(files::shot_id.eq(&payload.shot_id)),
+            )
+            .select(mime_sql)
+            .first::<String>(conn)
+            .ok()
+    } else {
+        files::table
+            .filter(
+                files::shot_id
+                    .eq(&payload.shot_id)
+                    .and(files::is_original.eq(true)),
+            )
+            .order(files::created_at.asc())
+            .select(mime_sql)
+            .first::<String>(conn)
+            .ok()
+    }
+}
+
+fn queue_enhancement(
+    conn: &mut diesel::sqlite::SqliteConnection,
+    payload: &EnhancePayload,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let task_id = uuid::Uuid::new_v4().to_string();
     let text_overrides_json =
         serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
@@ -459,8 +585,9 @@ pub(super) async fn comfyui_enhance(
             workflow_id: &payload.workflow_id,
             text_overrides: Some(&text_overrides_json),
             source_file_id: payload.source_file_id.as_deref(),
+            source_mode: payload.source_mode.as_deref(),
         })
-        .execute(&mut conn)
+        .execute(conn)
         .map_err(|e| {
             tracing::error!("Failed to insert enhancement task: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -506,7 +633,12 @@ pub(super) async fn comfyui_list_tasks(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let limit = query.limit.unwrap_or(50).min(200);
-    let result = query_tasks(&mut conn, query.shot_id.as_ref(), query.cursor.as_ref(), limit)?;
+    let result = query_tasks(
+        &mut conn,
+        query.shot_id.as_ref(),
+        query.cursor.as_ref(),
+        limit,
+    )?;
 
     Ok(Json(result))
 }
@@ -532,9 +664,17 @@ struct TaskRow {
 }
 
 type TaskTuple = (
-    String, String, String, String, String,
-    Option<String>, Option<i32>, Option<String>,
-    Option<String>, Option<String>, Option<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
     Option<String>,
 );
 
@@ -625,12 +765,10 @@ fn query_tasks(
         query = query.filter(enhancement_tasks::created_at.lt(c));
     }
 
-    let mut tuples: Vec<TaskTuple> = query
-        .load(conn)
-        .map_err(|e| {
-            tracing::error!("Failed to query tasks: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let mut tuples: Vec<TaskTuple> = query.load(conn).map_err(|e| {
+        tracing::error!("Failed to query tasks: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let has_more = tuples.len() as i64 > limit;
     if has_more {
@@ -661,8 +799,12 @@ fn query_tasks(
         .map(|(id, _, pid)| (id.clone(), pid.clone()))
         .collect();
 
-    let person_ids: Vec<String> = shot_rows.iter().filter_map(|(_, _, pid)| pid.clone()).collect();
-    let person_names: std::collections::HashMap<String, Option<String>> = if !person_ids.is_empty() {
+    let person_ids: Vec<String> = shot_rows
+        .iter()
+        .filter_map(|(_, _, pid)| pid.clone())
+        .collect();
+    let person_names: std::collections::HashMap<String, Option<String>> = if !person_ids.is_empty()
+    {
         people::table
             .filter(people::id.eq_any(&person_ids))
             .select((people::id, people::name))
@@ -704,12 +846,11 @@ fn query_tasks(
                 .cloned()
                 .flatten()
                 .and_then(|pid| person_names.get(&pid).cloned().flatten());
-            let source_name = t
-                .11
-                .clone()
-                .or_else(|| main_fid.clone())
-                .and_then(|fid| file_paths.get(&fid).cloned())
-                .and_then(|path| path.rsplit('/').next().map(|s| s.to_string()));
+            let source_name =
+                t.11.clone()
+                    .or_else(|| main_fid.clone())
+                    .and_then(|fid| file_paths.get(&fid).cloned())
+                    .and_then(|path| path.rsplit('/').next().map(|s| s.to_string()));
             task_tuple_to_row(t, main_fid, person_name, source_name)
         })
         .collect();
@@ -913,12 +1054,13 @@ pub(super) async fn comfyui_cancel_task(
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         let claimed = diesel::update(
-            enhancement_tasks::table.filter(
-                enhancement_tasks::id.eq(&id).and(
-                    enhancement_tasks::status
-                        .ne_all(&["completed", "failed", crate::comfyui::STATUS_CANCELLED]),
-                ),
-            ),
+            enhancement_tasks::table.filter(enhancement_tasks::id.eq(&id).and(
+                enhancement_tasks::status.ne_all(&[
+                    "completed",
+                    "failed",
+                    crate::comfyui::STATUS_CANCELLED,
+                ]),
+            )),
         )
         .set((
             enhancement_tasks::status.eq(crate::comfyui::STATUS_CANCELLED),

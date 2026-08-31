@@ -281,6 +281,30 @@ impl Library {
                 workflow_id,
                 text_overrides: Some(&overrides),
                 source_file_id: None,
+                source_mode: None,
+            })
+            .execute(&mut self.conn())
+            .unwrap();
+        id
+    }
+
+    /// Queue a task that reads a specific file in a specific shape, as the
+    /// enhance dialog does when the user picks a variant and a source mode.
+    fn queue_task_from(
+        &self,
+        workflow_id: &str,
+        source_file_id: &str,
+        source_mode: &str,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        diesel::insert_into(enhancement_tasks::table)
+            .values(NewEnhancementTask {
+                id: &id,
+                shot_id: &self.shot_id,
+                workflow_id,
+                text_overrides: Some("{}"),
+                source_file_id: Some(source_file_id),
+                source_mode: Some(source_mode),
             })
             .execute(&mut self.conn())
             .unwrap();
@@ -439,6 +463,19 @@ fn odd_sized_video_workflow() -> Value {
         "2": { "class_type": "CreateVideo", "inputs": { "images": ["1", 0], "fps": 8.0 } },
         "3": { "class_type": "SaveVideo",   "inputs": { "video": ["2", 0], "filename_prefix": "video/ComfyUI",
                                                         "format": "mp4", "codec": "h264" } }
+    })
+}
+
+/// LoadVideo → SaveVideo: the graph a video source goes *into* whole. The
+/// interesting contract is upstream of the graph itself: `LoadVideo.file` is a
+/// combo whose options are listed from the input directory at node-definition
+/// time — on a fresh server that list is *empty* — so this pins that `/prompt`
+/// accepts a name uploaded after the list was built, with no refresh dance.
+fn video_passthrough_workflow() -> Value {
+    json!({
+        "1": { "class_type": "LoadVideo", "inputs": { "file": "replaced-by-phos.mp4" } },
+        "2": { "class_type": "SaveVideo", "inputs": { "video": ["1", 0], "filename_prefix": "video/ComfyUI",
+                                                      "format": "mp4", "codec": "h264" } }
     })
 }
 
@@ -615,6 +652,55 @@ fn a_video_workflow_round_trips_into_the_library(url: &str) {
         "SaveVideo did not write {}/{}_00001_.mp4",
         subfolder,
         stem
+    );
+}
+
+/// The scenario #110 exists for, end to end: a video goes *in* as a video and
+/// a video comes back. Everything the PR could not verify without a server is
+/// on this path — that `/upload/image` takes an mp4 (streamed, with its own
+/// content type) and reports a usable name, that `LoadVideo` will load a file
+/// uploaded after its combo list was computed, and that the binding puts the
+/// clip into the video loader rather than a frame into nothing.
+///
+/// The source clip is not a fixture: the image→video workflow above already
+/// produces a real mp4 *into the library*, so this chains two runs — the
+/// second consumes the first's output via `source_file_id` + `whole_video`,
+/// exactly as the enhance dialog queues it for a variant.
+fn a_whole_video_goes_in_as_a_video_and_comes_back(url: &str) {
+    let lib = Library::new();
+
+    // Leg 1: manufacture a clip in the library.
+    let make = lib.add_workflow("one-frame-video", &one_frame_video_workflow());
+    let made = lib.run_until_done(url, &lib.queue_task(&make), STEP_BUDGET);
+    assert_eq!(made.status, "completed", "{:?}", made);
+    let clip_file_id = made.output_file_id.clone().expect("leg 1 made a file");
+
+    // Leg 2: feed it in whole.
+    let wf = lib.add_workflow("video-passthrough", &video_passthrough_workflow());
+    let task_id = lib.queue_task_from(&wf, &clip_file_id, "whole_video");
+    let task = lib.run_until_done(url, &task_id, STEP_BUDGET);
+    assert_eq!(
+        task.status, "completed",
+        "video-in → video-out failed — if the error is a /prompt validation \
+         refusal naming LoadVideo.file, ComfyUI stopped accepting combo values \
+         uploaded after the options list was built: {:?}",
+        task
+    );
+    assert_eq!(task.retry_count, 0, "a clean run must not spend retries");
+
+    let (path, row) = lib.output_file(&task);
+    assert!(
+        row.path.ends_with(".mp4"),
+        "unexpected output {:?}",
+        row.path
+    );
+    assert_eq!(row.mime_type.as_deref(), Some("video/mp4"));
+    assert_eq!(row.is_original, Some(false));
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[4..8], b"ftyp", "not an ISO media file");
+    assert_ne!(
+        task.output_file_id, made.output_file_id,
+        "leg 2 must produce its own file, not adopt leg 1's"
     );
 }
 
@@ -1008,6 +1094,10 @@ fn comfyui_contract() {
         (
             "a video workflow round-trips into the library",
             a_video_workflow_round_trips_into_the_library,
+        ),
+        (
+            "a whole video goes in as a video and comes back",
+            a_whole_video_goes_in_as_a_video_and_comes_back,
         ),
         (
             "a rejected prompt fails at once with ComfyUI's reason",
