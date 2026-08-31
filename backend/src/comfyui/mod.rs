@@ -79,7 +79,8 @@ pub use worker::spawn_enhancement_worker;
 pub use workflow::detect_outputs;
 
 /// The node catalogue for this server, read from `/object_info` and cached
-/// until the health check sees ComfyUI come back from being down.
+/// for a few minutes, or until the health check sees ComfyUI come back from
+/// being down.
 ///
 /// `None` whenever nothing could be learned — unreachable, too old to have the
 /// endpoint, or an answer nothing parsed out of. Every caller treats that as
@@ -88,6 +89,14 @@ pub use workflow::detect_outputs;
 /// Blocking: call it from `spawn_blocking`, not from an async handler.
 pub fn node_catalog(client: &ComfyUiClient) -> Option<std::sync::Arc<NodeCatalog>> {
     nodes::catalog_for(client)
+}
+
+/// [`node_catalog`], but read from ComfyUI now regardless of what is cached —
+/// for a client that knows the installed models just changed.
+///
+/// Blocking, like [`node_catalog`].
+pub fn refresh_node_catalog(client: &ComfyUiClient) -> Option<std::sync::Arc<NodeCatalog>> {
+    nodes::refresh_for(client)
 }
 
 /// Statuses the worker owns, and that the API and queue UI switch on.

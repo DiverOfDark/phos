@@ -18,17 +18,20 @@
 //!
 //! # The cache
 //!
-//! Kept in memory, keyed by base URL, dropped when the health check sees
-//! ComfyUI come back after being down — which is exactly when the installed
-//! model list may have changed. Deliberately *not* a database table: a cache
-//! that must be invalidated on reconnect does not want to outlive the process,
-//! and skipping it keeps this change migration-free.
+//! Kept in memory, keyed by base URL. Three things end an entry's life: it
+//! ages past [`CATALOG_TTL`]; the health check sees ComfyUI come back after
+//! being down, which is exactly when the installed model list may have
+//! changed; or a client asks for a fresh read outright (`refresh=true` on
+//! `/api/comfyui/nodes`). Deliberately *not* a database table: a cache that
+//! must be invalidated on reconnect does not want to outlive the process, and
+//! skipping it keeps this change migration-free.
 
 use super::client::ComfyUiClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// How many enum entries a workflow's stored input snapshot keeps.
 ///
@@ -60,13 +63,19 @@ pub enum WidgetSpec {
     },
     /// An int ComfyUI marks with `control_after_generate` — a seed. Worth its
     /// own kind because the control for one is an int box *and* a re-roll.
+    ///
+    /// The bounds are [`WideInt`]s because ComfyUI declares a seed's `max` as
+    /// `0xffffffffffffffff`, and a graph can carry a seed from the upper half
+    /// of that range. Narrowing to `i64` would make the snapshot claim such a
+    /// seed is out of range, and a client that validates against the range
+    /// could then neither reproduce nor pick it.
     Seed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        default: Option<i64>,
+        default: Option<WideInt>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        min: Option<i64>,
+        min: Option<WideInt>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        max: Option<i64>,
+        max: Option<WideInt>,
     },
     Float {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,10 +92,16 @@ pub enum WidgetSpec {
         default: Option<bool>,
     },
     /// An enum, and what is actually in it on this box.
+    ///
+    /// Choices are JSON scalars, not strings: ComfyUI enums are usually
+    /// filenames or mode names, but a custom pack can enumerate numbers
+    /// (`[512, 768, 1024]`) or booleans, and the graph then carries the value
+    /// with that same type. Stringifying would leave a client unable to
+    /// submit what the node actually accepts.
     Combo {
-        choices: Vec<String>,
+        choices: Vec<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        default: Option<String>,
+        default: Option<Value>,
         /// Set when `choices` was cut down to [`MAX_STORED_CHOICES`].
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
@@ -95,6 +110,55 @@ pub enum WidgetSpec {
     /// `LATENT`, a custom pack's own type). Recorded so the catalogue can
     /// describe a whole class, never offered as something to override.
     Link { data_type: String },
+}
+
+/// An integer wide enough for anything a JSON document can hold — every `i64`
+/// and every `u64` — written back out as the plain integer it came from.
+///
+/// serde_json will *write* an `i128` but its text deserializer will not read
+/// one, so the reading side is spelled out here: a JSON integer past `i64`
+/// arrives as a `u64`, and both fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WideInt(pub i128);
+
+impl Serialize for WideInt {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i128(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for WideInt {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = WideInt;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an integer")
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<WideInt, E> {
+                Ok(WideInt(v as i128))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<WideInt, E> {
+                Ok(WideInt(v as i128))
+            }
+            fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<WideInt, E> {
+                Ok(WideInt(v))
+            }
+            fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<WideInt, E> {
+                i128::try_from(v)
+                    .map(WideInt)
+                    .map_err(|_| E::custom("integer out of range"))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<WideInt, E> {
+                if v.is_finite() {
+                    Ok(WideInt(v as i128))
+                } else {
+                    Err(E::custom("not a finite number"))
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 impl WidgetSpec {
@@ -282,11 +346,6 @@ fn parse_widget(field: &str, spec: &Value) -> Option<WidgetSpec> {
     let type_name = type_slot.as_str()?;
     Some(match type_name {
         "INT" => {
-            let (default, min, max) = (
-                opts.and_then(|o| as_int(o.get("default"))),
-                opts.and_then(|o| as_int(o.get("min"))),
-                opts.and_then(|o| as_int(o.get("max"))),
-            );
             // `control_after_generate` is ComfyUI's own marker for a seed. Older
             // servers did not send it, and their frontend went by the name, so
             // accept both rather than losing the seed control on an old box.
@@ -296,12 +355,16 @@ fn parse_widget(field: &str, spec: &Value) -> Option<WidgetSpec> {
                 || field == "seed"
                 || field == "noise_seed";
             if is_seed {
-                WidgetSpec::Seed { default, min, max }
+                WidgetSpec::Seed {
+                    default: opts.and_then(|o| as_wide_int(o.get("default"))),
+                    min: opts.and_then(|o| as_wide_int(o.get("min"))),
+                    max: opts.and_then(|o| as_wide_int(o.get("max"))),
+                }
             } else {
                 WidgetSpec::Int {
-                    default,
-                    min,
-                    max,
+                    default: opts.and_then(|o| as_int(o.get("default"))),
+                    min: opts.and_then(|o| as_int(o.get("min"))),
+                    max: opts.and_then(|o| as_int(o.get("max"))),
                     step: opts.and_then(|o| as_int(o.get("step"))),
                 }
             }
@@ -344,22 +407,18 @@ fn parse_widget(field: &str, spec: &Value) -> Option<WidgetSpec> {
     })
 }
 
+/// A value a combo can hold: a string, a number or a boolean, kept with its
+/// JSON type. Objects, arrays and nulls are not enum members.
+fn is_scalar(v: &Value) -> bool {
+    matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_))
+}
+
 fn combo(choices: &[Value], opts: Option<&serde_json::Map<String, Value>>) -> WidgetSpec {
-    // ComfyUI enums are lists of filenames or mode names, but a pack can put
-    // numbers in one; keep whatever renders as a string and drop the rest.
-    let choices: Vec<String> = choices
-        .iter()
-        .filter_map(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
-            Value::Bool(b) => Some(b.to_string()),
-            _ => None,
-        })
-        .collect();
+    let choices: Vec<Value> = choices.iter().filter(|v| is_scalar(v)).cloned().collect();
     let default = opts
         .and_then(|o| o.get("default"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
+        .filter(|v| is_scalar(v))
+        .cloned()
         // ComfyUI defaults an enum to its first entry.
         .or_else(|| choices.first().cloned());
     WidgetSpec::Combo {
@@ -369,10 +428,27 @@ fn combo(choices: &[Value], opts: Option<&serde_json::Map<String, Value>>) -> Wi
     }
 }
 
-/// An integer from JSON, whatever the number turned out to be.
-///
-/// A seed's `max` is `0xffffffffffffffff`, which is not an `i64` — reading it
-/// with `as_i64` alone silently loses the range on every seed in the graph.
+/// An integer from JSON as a [`WideInt`], so nothing ComfyUI can declare is
+/// narrowed: JSON integers are at most a `u64` or an `i64`, and both fit.
+/// Used for seeds, whose `max` is `0xffffffffffffffff`.
+fn as_wide_int(v: Option<&Value>) -> Option<WideInt> {
+    let v = v?;
+    if let Some(i) = v.as_i64() {
+        return Some(WideInt(i as i128));
+    }
+    if let Some(u) = v.as_u64() {
+        return Some(WideInt(u as i128));
+    }
+    let f = v.as_f64()?;
+    if !f.is_finite() {
+        return None;
+    }
+    Some(WideInt(f as i128))
+}
+
+/// An integer from JSON as an `i64`, for ordinary ints. A value past the
+/// `i64` range is clamped rather than dropped, so a pack that declares a huge
+/// `max` still gets a bounded control instead of none.
 fn as_int(v: Option<&Value>) -> Option<i64> {
     let v = v?;
     if let Some(i) = v.as_i64() {
@@ -394,8 +470,30 @@ fn as_float(v: Option<&Value>) -> Option<f64> {
 
 // ===== Cache ================================================================
 
-fn cache() -> &'static Mutex<HashMap<String, Arc<NodeCatalog>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<NodeCatalog>>>> = OnceLock::new();
+/// How long a cached catalogue is trusted before it is read again.
+///
+/// The reconnect rule below catches a restart, but a person can drop a new
+/// checkpoint or LoRA into ComfyUI's model directory while it stays up, and
+/// ComfyUI lists it on the next `/object_info` without restarting. Without an
+/// expiry that model would be missing from every import for the life of this
+/// process. Five minutes is long enough that back-to-back imports share one
+/// read of a document that can run to megabytes, and short enough that a
+/// model installed before an import is there for it.
+pub(crate) const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
+
+struct Cached {
+    fetched_at: Instant,
+    catalog: Arc<NodeCatalog>,
+}
+
+impl Cached {
+    fn is_fresh(&self) -> bool {
+        self.fetched_at.elapsed() < CATALOG_TTL
+    }
+}
+
+fn cache() -> &'static Mutex<HashMap<String, Cached>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Cached>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -404,16 +502,42 @@ fn last_health() -> &'static Mutex<HashMap<String, bool>> {
     HEALTH.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The catalogue for this server, fetching it once and remembering it.
+/// The catalogue for this server, read from ComfyUI and remembered for
+/// [`CATALOG_TTL`].
 ///
 /// `None` means "ask ComfyUI later": unreachable, or an answer nothing could be
 /// read out of. A failure is deliberately *not* cached, so a box that comes
 /// back up is picked up on the next import without waiting for a health check.
+/// Past the TTL the document is read again; if that read fails, the copy
+/// already held is returned rather than nothing — an older list of models is
+/// still a better basis for an import than the name-sniffing fallback.
 pub(crate) fn catalog_for(client: &ComfyUiClient) -> Option<Arc<NodeCatalog>> {
     let key = client.base_url().to_string();
-    if let Some(hit) = cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
-        return Some(hit);
+    let stale = match cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&key).map(|hit| (hit.is_fresh(), hit.catalog.clone())))
+    {
+        Some((true, hit)) => return Some(hit),
+        Some((false, hit)) => Some(hit),
+        None => None,
+    };
+    match fetch(client) {
+        Some(catalog) => Some(catalog),
+        None => stale,
     }
+}
+
+/// The catalogue for this server, read from ComfyUI *now* whatever the cache
+/// holds. For a client that knows the models just changed.
+pub(crate) fn refresh_for(client: &ComfyUiClient) -> Option<Arc<NodeCatalog>> {
+    invalidate(client.base_url());
+    fetch(client)
+}
+
+/// One read of `/object_info`, remembered if it parsed to anything.
+fn fetch(client: &ComfyUiClient) -> Option<Arc<NodeCatalog>> {
+    let key = client.base_url().to_string();
     let doc = match client.object_info() {
         Ok(doc) => doc,
         Err(e) => {
@@ -429,7 +553,13 @@ pub(crate) fn catalog_for(client: &ComfyUiClient) -> Option<Arc<NodeCatalog>> {
         return None;
     }
     if let Ok(mut c) = cache().lock() {
-        c.insert(key, catalog.clone());
+        c.insert(
+            key,
+            Cached {
+                fetched_at: Instant::now(),
+                catalog: catalog.clone(),
+            },
+        );
     }
     Some(catalog)
 }
@@ -460,15 +590,30 @@ pub(crate) fn invalidate(base_url: &str) {
 
 #[cfg(test)]
 pub(crate) fn remember_for_test(base_url: &str, catalog: NodeCatalog) {
-    cache()
-        .lock()
-        .unwrap()
-        .insert(base_url.to_string(), Arc::new(catalog));
+    cache().lock().unwrap().insert(
+        base_url.to_string(),
+        Cached {
+            fetched_at: Instant::now(),
+            catalog: Arc::new(catalog),
+        },
+    );
+}
+
+/// Pretend the cached entry was read `age` ago.
+#[cfg(test)]
+pub(crate) fn backdate_for_test(base_url: &str, age: Duration) {
+    if let Some(hit) = cache().lock().unwrap().get_mut(base_url) {
+        hit.fetched_at = Instant::now() - age;
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn cached_for_test(base_url: &str) -> Option<Arc<NodeCatalog>> {
-    cache().lock().unwrap().get(base_url).cloned()
+    cache()
+        .lock()
+        .unwrap()
+        .get(base_url)
+        .map(|hit| hit.catalog.clone())
 }
 
 #[cfg(test)]
@@ -751,20 +896,56 @@ mod tests {
         assert_eq!(
             widget(&catalog, "KSampler", "seed"),
             WidgetSpec::Seed {
-                default: Some(0),
-                min: Some(0),
-                // 0xffffffffffffffff does not fit an i64; clamping it keeps the
-                // range instead of silently dropping it.
-                max: Some(i64::MAX),
+                default: Some(WideInt(0)),
+                min: Some(WideInt(0)),
+                // 0xffffffffffffffff does not fit an i64. It must be kept as
+                // declared, not clamped: a graph can carry a seed from the
+                // upper half of that range, and a snapshot claiming it is out
+                // of range would stop a client reproducing it.
+                max: Some(WideInt(u64::MAX as i128)),
             }
         );
         // An older server sends no marker, and its own frontend went by name.
         assert_eq!(
             widget(&catalog, "SamplerCustom", "noise_seed"),
             WidgetSpec::Seed {
-                default: Some(0),
-                min: Some(0),
-                max: Some(i64::MAX),
+                default: Some(WideInt(0)),
+                min: Some(WideInt(0)),
+                max: Some(WideInt(u64::MAX as i128)),
+            }
+        );
+    }
+
+    #[test]
+    fn a_seed_from_the_upper_half_of_the_u64_range_survives_the_wire() {
+        // What ComfyUI declares, what a graph can hold, and what a snapshot
+        // in SQLite must give back — all the same number.
+        let spec = WidgetSpec::Seed {
+            default: Some(WideInt(u64::MAX as i128 - 1)),
+            min: Some(WideInt(0)),
+            max: Some(WideInt(u64::MAX as i128)),
+        };
+        let text = serde_json::to_string(&spec).unwrap();
+        assert!(
+            text.contains("18446744073709551615"),
+            "max must be written as the plain integer ComfyUI declared: {}",
+            text
+        );
+        assert_eq!(serde_json::from_str::<WidgetSpec>(&text).unwrap(), spec);
+        // `to_value` is the path the API takes; it must not refuse the number.
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(value["max"].as_u64(), Some(u64::MAX));
+        // A seed field a custom pack allows to go negative (-1 for "random")
+        // is not lost either.
+        let doc = json!({ "X": { "input": { "required": {
+            "seed": ["INT", { "default": -1, "min": -1, "max": 18446744073709551615u64 }]
+        } } } });
+        assert_eq!(
+            widget(&parse_object_info(&doc), "X", "seed"),
+            WidgetSpec::Seed {
+                default: Some(WideInt(-1)),
+                min: Some(WideInt(-1)),
+                max: Some(WideInt(u64::MAX as i128))
             }
         );
     }
@@ -781,7 +962,10 @@ mod tests {
         };
         assert_eq!(
             choices,
-            ["sd_xl_base_1.0.safetensors", "v1-5-pruned-emaonly.ckpt"]
+            [
+                json!("sd_xl_base_1.0.safetensors"),
+                json!("v1-5-pruned-emaonly.ckpt")
+            ]
         );
 
         let WidgetSpec::Combo { choices, .. } =
@@ -791,16 +975,69 @@ mod tests {
         };
         assert_eq!(
             choices,
-            ["add_detail.safetensors", "film_grain.safetensors"]
+            [
+                json!("add_detail.safetensors"),
+                json!("film_grain.safetensors")
+            ]
+        );
+    }
+
+    #[test]
+    fn an_enum_of_numbers_or_booleans_keeps_their_types() {
+        // A custom pack enumerating resolutions, and one enumerating a flag.
+        // The graph carries `1024` and `true`, not `"1024"` and `"true"`, and
+        // a client must be able to submit the same thing back.
+        let doc = json!({ "Sizes": { "input": { "required": {
+            "size": [[512, 768, 1024], { "default": 1024 }],
+            "flag": [[true, false]],
+            "mixed": [["a", 1, null, ["nested"], { "o": 1 }]],
+            "odd_default": [["a", "b"], { "default": ["not", "a", "scalar"] }]
+        } } } });
+        let catalog = parse_object_info(&doc);
+        assert_eq!(
+            widget(&catalog, "Sizes", "size"),
+            WidgetSpec::Combo {
+                choices: vec![json!(512), json!(768), json!(1024)],
+                default: Some(json!(1024)),
+                truncated: false,
+            }
+        );
+        assert_eq!(
+            widget(&catalog, "Sizes", "flag"),
+            WidgetSpec::Combo {
+                choices: vec![json!(true), json!(false)],
+                default: Some(json!(true)),
+                truncated: false,
+            }
+        );
+        // Only scalars are enum members; the rest is dropped, not stringified.
+        assert_eq!(
+            widget(&catalog, "Sizes", "mixed"),
+            WidgetSpec::Combo {
+                choices: vec![json!("a"), json!(1)],
+                default: Some(json!("a")),
+                truncated: false,
+            }
+        );
+        // A default that is not a scalar is not a default.
+        assert_eq!(
+            widget(&catalog, "Sizes", "odd_default"),
+            WidgetSpec::Combo {
+                choices: vec![json!("a"), json!("b")],
+                default: Some(json!("a")),
+                truncated: false,
+            }
         );
     }
 
     #[test]
     fn a_huge_enum_is_cut_down_for_storage_and_says_so() {
-        let many: Vec<String> = (0..1000).map(|i| format!("file_{}.png", i)).collect();
+        let many: Vec<Value> = (0..1000)
+            .map(|i| json!(format!("file_{}.png", i)))
+            .collect();
         let full = WidgetSpec::Combo {
             choices: many,
-            default: Some("file_0.png".into()),
+            default: Some(json!("file_0.png")),
             truncated: false,
         };
         let WidgetSpec::Combo {
@@ -814,7 +1051,7 @@ mod tests {
 
         // A short one is left exactly as it was.
         let short = WidgetSpec::Combo {
-            choices: vec!["a".into()],
+            choices: vec![json!("a")],
             default: None,
             truncated: false,
         };
@@ -1023,6 +1260,48 @@ mod tests {
             cached_for_test(url).is_none(),
             "reconnect kept a stale cache"
         );
+    }
+
+    #[test]
+    fn a_stale_entry_is_read_again_and_a_refresh_does_not_wait_for_that() {
+        // A catalogue that knows one class, then a server that knows two: the
+        // second is what a person who just installed a node pack expects.
+        let old = parse_object_info(&json!({ "Old": {} }));
+        let mut newer = object_info();
+        newer["Newer"] = json!({});
+
+        // Fresh: served from memory, no request made.
+        let url = serve_once(http("200 OK", "application/json", &newer.to_string()));
+        let client = ComfyUiClient::new(&url);
+        remember_for_test(&url, old.clone());
+        assert!(catalog_for(&client).unwrap().get("Old").is_some(), "fresh");
+
+        // Past the TTL: read again.
+        backdate_for_test(&url, CATALOG_TTL + Duration::from_secs(1));
+        let read = catalog_for(&client).expect("stale entry should be re-read");
+        assert!(read.get("Newer").is_some(), "the re-read was not served");
+        assert!(read.get("Old").is_none());
+        // ...and the re-read is now the fresh entry, so the (gone) server is
+        // not asked again.
+        assert!(catalog_for(&client).unwrap().get("Newer").is_some());
+
+        // Past the TTL with ComfyUI down: the copy already held is better than
+        // falling back to name-sniffing, so it is returned, not dropped.
+        backdate_for_test(&url, CATALOG_TTL + Duration::from_secs(1));
+        let held = catalog_for(&client).expect("a stale copy beats nothing");
+        assert!(held.get("Newer").is_some());
+
+        // An explicit refresh ignores a fresh entry and asks the server now.
+        let url = serve_once(http("200 OK", "application/json", &newer.to_string()));
+        let client = ComfyUiClient::new(&url);
+        remember_for_test(&url, old);
+        assert!(catalog_for(&client).unwrap().get("Old").is_some());
+        let fresh = refresh_for(&client).expect("refresh should read the server");
+        assert!(fresh.get("Newer").is_some());
+        // A refresh that fails leaves nothing behind: the caller asked for the
+        // truth, and a stale copy handed back as the answer would not be it.
+        assert!(refresh_for(&client).is_none());
+        assert!(cached_for_test(&url).is_none());
     }
 
     // === What a real server does, over a real socket =======================

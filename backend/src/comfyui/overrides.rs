@@ -194,7 +194,7 @@ fn heuristic_inputs(ctx: &Node, out: &mut Vec<WorkflowInput>) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::nodes::{fixtures::object_info, parse_object_info};
+    use super::super::nodes::{fixtures::object_info, parse_object_info, WideInt};
     use super::*;
     use serde_json::json;
 
@@ -320,9 +320,9 @@ mod tests {
         assert_eq!(
             find(&inputs, "3.seed").widget,
             Some(WidgetSpec::Seed {
-                default: Some(0),
-                min: Some(0),
-                max: Some(i64::MAX)
+                default: Some(WideInt(0)),
+                min: Some(WideInt(0)),
+                max: Some(WideInt(u64::MAX as i128))
             })
         );
         assert_eq!(
@@ -368,16 +368,16 @@ mod tests {
         let Some(WidgetSpec::Combo { choices, .. }) = &find(&inputs, "4.ckpt_name").widget else {
             panic!("ckpt_name should be an enum");
         };
-        assert!(choices.contains(&"sd_xl_base_1.0.safetensors".to_string()));
+        assert!(choices.contains(&json!("sd_xl_base_1.0.safetensors")));
         let Some(WidgetSpec::Combo { choices, .. }) = &find(&inputs, "10.lora_name").widget else {
             panic!("lora_name should be an enum");
         };
-        assert!(choices.contains(&"film_grain.safetensors".to_string()));
+        assert!(choices.contains(&json!("film_grain.safetensors")));
         let Some(WidgetSpec::Combo { choices, .. }) = &find(&inputs, "3.sampler_name").widget
         else {
             panic!("sampler_name should be an enum");
         };
-        assert!(choices.contains(&"dpmpp_2m".to_string()));
+        assert!(choices.contains(&json!("dpmpp_2m")));
     }
 
     #[test]

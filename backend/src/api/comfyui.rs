@@ -62,10 +62,22 @@ pub(super) async fn comfyui_health(
 /// old to have `/object_info`, or answering something unparseable — and every
 /// caller treats that as ordinary rather than as an error.
 async fn node_catalog(url: &str) -> Option<std::sync::Arc<crate::comfyui::NodeCatalog>> {
+    read_node_catalog(url, false).await
+}
+
+/// `refresh` bypasses the cache and asks ComfyUI now.
+async fn read_node_catalog(
+    url: &str,
+    refresh: bool,
+) -> Option<std::sync::Arc<crate::comfyui::NodeCatalog>> {
     let url = url.to_string();
     tokio::task::spawn_blocking(move || {
         let client = crate::comfyui::ComfyUiClient::new(&url);
-        crate::comfyui::node_catalog(&client)
+        if refresh {
+            crate::comfyui::refresh_node_catalog(&client)
+        } else {
+            crate::comfyui::node_catalog(&client)
+        }
     })
     .await
     .unwrap_or_else(|e| {
@@ -74,12 +86,16 @@ async fn node_catalog(url: &str) -> Option<std::sync::Arc<crate::comfyui::NodeCa
     })
 }
 
-/// GET /api/comfyui/nodes?classes=A,B — what ComfyUI says its nodes take
+/// GET /api/comfyui/nodes?classes=A,B&refresh=true — what ComfyUI says its nodes take
 #[derive(Deserialize, utoipa::IntoParams)]
 pub(super) struct NodesQuery {
     /// Comma-separated class names to return. Omit for the whole catalogue,
     /// which on a loaded install is several megabytes.
     classes: Option<String>,
+    /// Read `/object_info` from ComfyUI now instead of serving the cached
+    /// copy. For after installing a model or a node pack.
+    #[serde(default)]
+    refresh: bool,
 }
 
 #[utoipa::path(
@@ -90,9 +106,10 @@ pub(super) struct NodesQuery {
     description = "What ComfyUI says its installed node classes take: every input's name, \
                    type, default and range, and for an enum its contents — the checkpoints, \
                    samplers, schedulers and LoRAs installed on that server. Cached in memory \
-                   and re-read when ComfyUI comes back after being down. Always 200: a server \
-                   that is unreachable or too old to have /object_info answers \
-                   `available: false`, and the console falls back to plain text boxes.",
+                   for five minutes and re-read when ComfyUI comes back after being down; \
+                   `refresh=true` re-reads it now. Always 200: a server that is unreachable \
+                   or too old to have /object_info answers `available: false`, and the \
+                   console falls back to plain text boxes.",
     params(NodesQuery),
     responses(
         (status = 200, description = "Node definitions, or available=false"),
@@ -104,7 +121,7 @@ pub(super) async fn comfyui_nodes(
     Query(query): Query<NodesQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let url = require_comfyui(&state)?;
-    let Some(catalog) = node_catalog(&url).await else {
+    let Some(catalog) = read_node_catalog(&url, query.refresh).await else {
         return Ok(Json(serde_json::json!({
             "available": false,
             "nodes": {},

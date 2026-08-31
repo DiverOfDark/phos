@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import WorkflowGraph from '@/components/WorkflowGraph.vue'
-import { isTextInput } from '@/lib/utils'
+import { isEditableInput, isComboInput, comboChoices } from '@/lib/utils'
 
 // --- Connection health ---
 const comfyuiHealthy = ref(false)
@@ -154,7 +154,7 @@ async function createPreset() {
   const overrides = {}
   const inputs = selectedWorkflow.value?.inputs || []
   for (const input of inputs) {
-    if (isTextInput(input)) {
+    if (isEditableInput(input)) {
       overrides[`${input.node_id}.${input.field_name}`] = String(input.current_value ?? '')
     }
   }
@@ -374,16 +374,16 @@ function shortId(id) {
   return String(id || '').slice(0, 7)
 }
 
-/** Text inputs of a workflow — LoadImage is fed by the shot, never by hand. */
-function textInputsOf(wf) {
-  return (wf?.inputs || []).filter(isTextInput)
+/** Editable inputs of a workflow — LoadImage is fed by the shot, never by hand. */
+function editableInputsOf(wf) {
+  return (wf?.inputs || []).filter(isEditableInput)
 }
 
 const importReady = computed(() => importName.value.trim() && importJson.value.trim())
 
 /** Node ids the Enhance dialog can override — the graph marks them as editable. */
 const editableNodeIds = computed(() =>
-  textInputsOf(selectedWorkflow.value).map((i) => String(i.node_id))
+  editableInputsOf(selectedWorkflow.value).map((i) => String(i.node_id))
 )
 
 function formatRelativeTime(dateStr) {
@@ -489,7 +489,7 @@ defineExpose({ loadData: fetchWorkflows })
           <span class="font-mono text-[13px] font-medium text-ink">{{ wf.name }}</span>
           <span v-if="wf.description" class="text-xs font-light text-ink-secondary">{{ wf.description }}</span>
           <span class="font-mono text-[11px] text-ink-tertiary">
-            {{ textInputsOf(wf).length }} input(s) · {{ (wf.outputs || []).length }} output(s)
+            {{ editableInputsOf(wf).length }} input(s) · {{ (wf.outputs || []).length }} output(s)
           </span>
         </button>
 
@@ -639,16 +639,29 @@ defineExpose({ loadData: fetchWorkflows })
                 >remove</button>
               </div>
 
-              <template v-if="textInputsOf(selectedWorkflow).length">
+              <template v-if="editableInputsOf(selectedWorkflow).length">
                 <div
-                  v-for="input in textInputsOf(selectedWorkflow)"
+                  v-for="input in editableInputsOf(selectedWorkflow)"
                   :key="`${preset.id}-${input.node_id}.${input.field_name}`"
                   class="flex flex-col gap-1"
                 >
                   <span class="font-mono text-[11px] text-ink-tertiary">
                     {{ input.node_id }} · {{ input.field_name }}
                   </span>
+                  <select
+                    v-if="isComboInput(input)"
+                    class="w-full bg-surface border border-line rounded-sm px-3 py-2 font-mono text-xs text-ink"
+                    :value="preset.text_overrides?.[`${input.node_id}.${input.field_name}`] || ''"
+                    @change="updatePresetOverrides(preset, `${input.node_id}.${input.field_name}`, $event.target.value)"
+                  >
+                    <option
+                      v-for="choice in comboChoices(input, preset.text_overrides?.[`${input.node_id}.${input.field_name}`] || '')"
+                      :key="choice"
+                      :value="choice"
+                    >{{ choice }}</option>
+                  </select>
                   <textarea
+                    v-else
                     rows="2"
                     spellcheck="false"
                     class="w-full bg-surface border border-line rounded-sm px-3 py-2 font-mono text-xs text-ink"
@@ -658,7 +671,7 @@ defineExpose({ loadData: fetchWorkflows })
                 </div>
               </template>
               <span v-else class="text-xs font-light text-ink-secondary">
-                No text inputs in this workflow — the preset runs node defaults.
+                No editable inputs in this workflow — the preset runs node defaults.
               </span>
             </div>
           </div>
