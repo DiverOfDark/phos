@@ -49,3 +49,7 @@ mime_guess = "2"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
+
+[dev-dependencies]
+# Contract tests against a real ComfyUI (tests/comfyui_contract_test.rs).
+testcontainers = { version = "0.28", features = ["blocking", "http_wait"] }

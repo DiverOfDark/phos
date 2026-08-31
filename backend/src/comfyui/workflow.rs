@@ -190,7 +190,7 @@ pub(crate) fn has_slow_output(workflow: &Value) -> bool {
 pub(crate) fn expected_output_suffixes(workflow: &Value) -> Vec<&'static str> {
     let mut suffixes: Vec<&'static str> = Vec::new();
     for output in detect_outputs(workflow) {
-        for suffix in suffixes_for(saver_kind(&output.node_type)) {
+        for suffix in suffixes_for(saver_kind(&output.node_type), &output.node_type) {
             if !suffixes.contains(suffix) {
                 suffixes.push(suffix);
             }
@@ -199,18 +199,27 @@ pub(crate) fn expected_output_suffixes(workflow: &Value) -> Vec<&'static str> {
     if suffixes.is_empty() {
         // No recognisable saver — an unparseable graph, or one whose output
         // node we could not classify. Guess the common few rather than nothing.
-        suffixes.extend_from_slice(&["_00001_.png", "_00001_.webp", "_00001.mp4"]);
+        suffixes.extend_from_slice(&["_00001_.png", "_00001_.webp", "_00001_.mp4"]);
     }
     suffixes
 }
 
-fn suffixes_for(kind: SaverKind) -> &'static [&'static str] {
+/// The counter spelling is per node family, not per media type. Every core
+/// saver — `SaveImage`, `SaveVideo`, `SaveAudio`, `SaveAnimatedWEBP` — goes
+/// through `get_save_image_path` and writes `<prefix>_00001_.<ext>` with a
+/// trailing underscore. `VHS_VideoCombine` formats its own name and drops it:
+/// `<prefix>_00001.mp4`. Getting this wrong is silent — the by-name probe just
+/// never hits — which is why `tests/comfyui_contract_test.rs` checks it
+/// against a real server.
+fn suffixes_for(kind: SaverKind, node_type: &str) -> &'static [&'static str] {
     match kind {
         SaverKind::Image => &["_00001_.png", "_00001_.webp", "_00001_.jpg"],
         SaverKind::Animated => &["_00001_.webp", "_00001_.png", "_00001_.gif"],
-        // VHS_VideoCombine drops the trailing underscore, and can be configured
-        // to emit a gif or an animated webp instead of a video.
-        SaverKind::Video => &["_00001.mp4", "_00001.webm", "_00001.gif", "_00001_.webp"],
+        SaverKind::Video if node_type.contains("VideoCombine") => {
+            // Can also be configured to emit a gif or an animated webp.
+            &["_00001.mp4", "_00001.webm", "_00001.gif", "_00001_.webp"]
+        }
+        SaverKind::Video => &["_00001_.mp4", "_00001_.webm", "_00001_.mkv"],
         SaverKind::Audio => &["_00001_.flac", "_00001_.mp3"],
     }
 }
@@ -310,13 +319,25 @@ mod tests {
         assert_eq!(suffixes, ["_00001_.png", "_00001_.webp", "_00001_.jpg"]);
         assert!(!suffixes.iter().any(|s| s.ends_with(".mp4")));
 
-        // The video combiners drop the trailing underscore.
+        // VHS_VideoCombine drops the trailing underscore.
         let video = json!({
             "12": { "class_type": "VHS_VideoCombine",
                     "inputs": { "filename_prefix": "AnimateDiff" } }
         });
         assert!(expected_output_suffixes(&video).contains(&"_00001.mp4"));
         assert!(!expected_output_suffixes(&video).contains(&"_00001_.jpg"));
+
+        // Core SaveVideo keeps it, like every other core saver. Verified
+        // against a real ComfyUI by `a_lost_video_prompt_is_recovered_by_name`
+        // in tests/comfyui_contract_test.rs — the probe silently missed the
+        // file until this was told apart from VHS.
+        let core_video = json!({
+            "12": { "class_type": "SaveVideo",
+                    "inputs": { "filename_prefix": "video/ComfyUI", "format": "mp4" } }
+        });
+        let suffixes = expected_output_suffixes(&core_video);
+        assert_eq!(suffixes[0], "_00001_.mp4", "{:?}", suffixes);
+        assert!(!suffixes.contains(&"_00001.mp4"), "{:?}", suffixes);
 
         // Core SaveVideo and SaveAudio are classified by name too.
         let audio = json!({
@@ -337,7 +358,7 @@ mod tests {
         });
         let suffixes = expected_output_suffixes(&mixed);
         assert!(suffixes.contains(&"_00001_.png"));
-        assert!(suffixes.contains(&"_00001.mp4"));
+        assert!(suffixes.contains(&"_00001_.mp4"));
         let mut deduped = suffixes.clone();
         deduped.sort_unstable();
         deduped.dedup();

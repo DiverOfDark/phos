@@ -115,6 +115,102 @@ jobs:
         run: |
           cd backend
           cargo test -- --test-threads=1
+  # A CPU-only ComfyUI for the contract tests. The tag is the hash of the
+  # Dockerfile, so an unchanged Dockerfile costs one manifest lookup and a
+  # changed one (say, a COMFYUI_VERSION bump) rebuilds and pushes once.
+  comfyui-test-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Name the image after the Dockerfile's content
+        id: tag
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          tag="$(sha256sum docker/comfyui-test/Dockerfile | cut -c1-12)"
+          echo "image=ghcr.io/${owner}/comfyui-test:${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether it is already published
+        id: published
+        run: |
+          if docker manifest inspect "${{ steps.tag.outputs.image }}" >/dev/null 2>&1; then
+            echo "yes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "yes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.published.outputs.yes != 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        if: steps.published.outputs.yes != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: docker/comfyui-test
+          push: true
+          tags: ${{ steps.tag.outputs.image }}
+
+  # Drives the real enhancement worker against that ComfyUI with workflows
+  # built from core nodes. See backend/tests/comfyui_contract_test.rs.
+  comfyui-contract:
+    needs: comfyui-test-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      RUSTFLAGS: -C target-cpu=x86-64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev libavutil-dev libavformat-dev libavcodec-dev libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev nasm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ComfyUI contract tests
+        env:
+          PHOS_COMFYUI_TEST_IMAGE: ${{ needs.comfyui-test-image.outputs.image }}
+          RUST_LOG: info
+        run: |
+          cd backend
+          cargo test --test comfyui_contract_test -- --test-threads=1 --nocapture
+
   docker:
     runs-on: ubuntu-latest
     permissions:
