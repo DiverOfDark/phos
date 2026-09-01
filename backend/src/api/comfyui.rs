@@ -7,6 +7,7 @@ use diesel::prelude::*;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
+use crate::comfyui::{ParameterMap, VaryMap};
 use crate::models::{NewComfyuiWorkflow, NewEnhancementTask, NewWorkflowPreset};
 use crate::schema::{comfyui_workflows, enhancement_tasks, files, people, shots, workflow_presets};
 
@@ -457,6 +458,31 @@ pub(super) struct EnhancePayload {
     source_mode: Option<String>,
     #[serde(default)]
     text_overrides: std::collections::HashMap<String, String>,
+    /// Typed values for the workflow's non-text inputs, keyed
+    /// `"<node_id>.<field_name>"`: `{"3.seed": 4242, "3.cfg": 6.5,
+    /// "4.ckpt_name": "sd_xl_base_1.0.safetensors"}`. Each value keeps its own
+    /// JSON type, which is what `text_overrides` cannot do.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    parameters: ParameterMap,
+    /// Parameters to sweep rather than pin, keyed like `parameters`. Each entry
+    /// multiplies the number of tasks queued.
+    ///
+    /// A value is one of three spellings: a count (`{"3.seed": 4}` — four runs
+    /// with four fresh seeds), an explicit list (`{"3.cfg": [4.0, 6.0, 8.0]}` —
+    /// three runs), or a `VarySpec` for the long form. Both of those together is
+    /// twelve runs; past 64 the request is refused.
+    ///
+    /// Every value is resolved here, so each task is written with its own
+    /// complete parameter map and is replayable from its row.
+    ///
+    /// Described as a free-form object rather than as a union of the three: the
+    /// generated Android client builds every model in the spec even though it
+    /// calls none of these endpoints, and an untagged union of a number, an
+    /// array and an object is not worth making it compile.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    vary: VaryMap,
 }
 
 #[utoipa::path(
@@ -464,11 +490,13 @@ pub(super) struct EnhancePayload {
     path = "/api/comfyui/enhance",
     tag = "comfyui",
     summary = "Queue enhancement task",
-    description = "Queue an image enhancement task using a ComfyUI workflow. Creates a background task that processes the shot's original file.",
+    description = "Queue an image enhancement task using a ComfyUI workflow. Creates a background \
+                   task that processes the shot's original file. A `vary` map queues one task per \
+                   combination instead, and the response lists them in order.",
     request_body = EnhancePayload,
     responses(
-        (status = 200, description = "Enhancement task queued"),
-        (status = 400, description = "Unrecognised source_mode, or one this workflow cannot take"),
+        (status = 200, description = "Enhancement task(s) queued"),
+        (status = 400, description = "Unrecognised source_mode, one this workflow cannot take, or an unusable sweep"),
         (status = 404, description = "Shot or workflow not found"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "ComfyUI not configured"),
@@ -487,6 +515,12 @@ pub(super) async fn comfyui_enhance(
         .as_deref()
         .map(|m| m.parse::<crate::comfyui::SourceMode>())
         .transpose()
+        .map_err(ApiError::bad_request)?;
+
+    // Work out what this request actually asks for before touching the
+    // database: a sweep that cannot be read is the caller's mistake, and a
+    // half-queued fan-out is nobody's idea of one.
+    let runs = crate::comfyui::expand(&payload.parameters, &payload.vary)
         .map_err(ApiError::bad_request)?;
 
     let mut conn = state.pool.get().map_err(|_| ApiError::internal())?;
@@ -517,6 +551,15 @@ pub(super) async fn comfyui_enhance(
     let Some(workflow_json) = workflow_json else {
         return Err(StatusCode::NOT_FOUND.into());
     };
+    // A sweep whose key names no rewritable field would queue N tasks that all
+    // run the same graph while their rows claim distinct values — refuse it
+    // here, where it is still one request and one message.
+    if !payload.vary.is_empty() {
+        if let Ok(workflow) = serde_json::from_str::<serde_json::Value>(&workflow_json) {
+            crate::comfyui::check_sweep_targets(&workflow, &payload.vary)
+                .map_err(ApiError::bad_request)?;
+        }
+    }
     if explicit_mode.is_some() {
         if let Ok(workflow) = serde_json::from_str::<serde_json::Value>(&workflow_json) {
             // A still resolves every mode to a frame, so `whole_video` is only
@@ -535,7 +578,7 @@ pub(super) async fn comfyui_enhance(
         }
     }
 
-    queue_enhancement(&mut conn, &payload)
+    queue_enhancement(&mut conn, &payload, &runs)
 }
 
 /// The mime type of the file a task would read: the one the payload names, or
@@ -573,29 +616,49 @@ fn source_mime(
 fn queue_enhancement(
     conn: &mut diesel::sqlite::SqliteConnection,
     payload: &EnhancePayload,
+    runs: &[crate::comfyui::ParameterMap],
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let task_id = uuid::Uuid::new_v4().to_string();
     let text_overrides_json =
         serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
 
-    diesel::insert_into(enhancement_tasks::table)
-        .values(NewEnhancementTask {
-            id: &task_id,
-            shot_id: &payload.shot_id,
-            workflow_id: &payload.workflow_id,
-            text_overrides: Some(&text_overrides_json),
-            source_file_id: payload.source_file_id.as_deref(),
-            source_mode: payload.source_mode.as_deref(),
+    // One transaction for the whole fan-out. Four tasks that are four separate
+    // rows are still one thing the user asked for; queueing two of them and
+    // then failing would leave a sweep with holes in it.
+    let task_ids: Vec<String> = conn
+        .transaction::<_, diesel::result::Error, _>(|conn| {
+            let mut ids = Vec::with_capacity(runs.len());
+            for run in runs {
+                let task_id = uuid::Uuid::new_v4().to_string();
+                let parameters_json =
+                    serde_json::to_string(run).unwrap_or_else(|_| "{}".to_string());
+                diesel::insert_into(enhancement_tasks::table)
+                    .values(NewEnhancementTask {
+                        id: &task_id,
+                        shot_id: &payload.shot_id,
+                        workflow_id: &payload.workflow_id,
+                        text_overrides: Some(&text_overrides_json),
+                        source_file_id: payload.source_file_id.as_deref(),
+                        source_mode: payload.source_mode.as_deref(),
+                        parameters: Some(&parameters_json),
+                    })
+                    .execute(conn)?;
+                ids.push(task_id);
+            }
+            Ok(ids)
         })
-        .execute(conn)
         .map_err(|e| {
-            tracing::error!("Failed to insert enhancement task: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            tracing::error!("Failed to insert enhancement task(s): {}", e);
+            ApiError::internal()
         })?;
 
+    // `id` and `status` are what a single-task caller has always read; `tasks`
+    // is the ordered list a sweep produced, which is also where FR5 will hang a
+    // run over the same rows.
     Ok(Json(serde_json::json!({
-        "id": task_id,
+        "id": task_ids.first(),
         "status": "pending",
+        "tasks": task_ids,
+        "count": task_ids.len(),
     })))
 }
 
@@ -1140,7 +1203,7 @@ fn cancel_on_comfyui(url: &str, prompt_id: &str) {
     path = "/api/comfyui/generations/{shot_id}",
     tag = "comfyui",
     summary = "Get shot generation history",
-    description = "Returns the workflow and text overrides used to generate each non-original file for a shot.",
+    description = "Returns the workflow, text overrides and typed parameters used to generate each non-original file for a shot.",
     params(("shot_id" = String, Path, description = "Shot ID")),
     responses(
         (status = 200, description = "List of generations"),
@@ -1158,13 +1221,16 @@ pub(super) async fn comfyui_shot_generations(
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let rows: Vec<(String, Option<String>, Option<String>)> = files::table
+    // file id, workflow id, text overrides, provenance manifest
+    type GenerationRow = (String, Option<String>, Option<String>, Option<String>);
+    let rows: Vec<GenerationRow> = files::table
         .filter(files::shot_id.eq(&shot_id))
         .filter(files::source_workflow_id.is_not_null())
         .select((
             files::id,
             files::source_workflow_id,
             files::source_text_overrides,
+            files::manifest_json,
         ))
         .order(files::created_at.desc())
         .load(&mut conn)
@@ -1175,14 +1241,23 @@ pub(super) async fn comfyui_shot_generations(
 
     let generations: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(file_id, workflow_id, overrides_str)| {
+        .map(|(file_id, workflow_id, overrides_str, manifest_str)| {
             let overrides: serde_json::Value = overrides_str
                 .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::json!({}));
+            // The typed values that made this file live in its provenance
+            // manifest; a file written before they existed reads back `{}`,
+            // which is also what a run that set nothing recorded.
+            let parameters = manifest_str
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .map(|m| m["parameters"].clone())
+                .filter(serde_json::Value::is_object)
                 .unwrap_or(serde_json::json!({}));
             serde_json::json!({
                 "file_id": file_id,
                 "workflow_id": workflow_id,
                 "text_overrides": overrides,
+                "parameters": parameters,
             })
         })
         .collect();
@@ -1198,6 +1273,11 @@ pub(super) struct PresetPayload {
     name: String,
     #[serde(default)]
     text_overrides: std::collections::HashMap<String, String>,
+    /// The preset's typed values, keyed like a task's `parameters`. A preset
+    /// that can pin a prompt but not a seed or a step count is half a preset.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    parameters: ParameterMap,
     sort_order: Option<i64>,
 }
 
@@ -1241,10 +1321,19 @@ pub(super) async fn comfyui_list_presets(
         .map(|p| {
             let overrides: serde_json::Value =
                 serde_json::from_str(&p.text_overrides).unwrap_or(serde_json::json!({}));
+            // A preset saved before FR4 has no typed half; it reads back as an
+            // empty map rather than as a missing key, so the console does not
+            // have to know which era it came from.
+            let parameters: serde_json::Value = p
+                .parameters
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::json!({}));
             serde_json::json!({
                 "id": p.id,
                 "name": p.name,
                 "text_overrides": overrides,
+                "parameters": parameters,
                 "sort_order": p.sort_order.unwrap_or(0),
                 "created_at": p.created_at,
             })
@@ -1296,6 +1385,8 @@ pub(super) async fn comfyui_create_preset(
     let id = uuid::Uuid::new_v4().to_string();
     let overrides_json =
         serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
+    let parameters_json =
+        serde_json::to_string(&payload.parameters).unwrap_or_else(|_| "{}".to_string());
     let sort_order = payload.sort_order.unwrap_or(0) as i32;
 
     diesel::insert_into(workflow_presets::table)
@@ -1305,6 +1396,7 @@ pub(super) async fn comfyui_create_preset(
             name: &payload.name,
             text_overrides: &overrides_json,
             sort_order: Some(sort_order),
+            parameters: Some(&parameters_json),
         })
         .execute(&mut conn)
         .map_err(|e| {
@@ -1316,6 +1408,7 @@ pub(super) async fn comfyui_create_preset(
         "id": id,
         "name": payload.name,
         "text_overrides": payload.text_overrides,
+        "parameters": payload.parameters,
         "sort_order": sort_order,
     })))
 }
@@ -1352,6 +1445,8 @@ pub(super) async fn comfyui_update_preset(
 
     let overrides_json =
         serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
+    let parameters_json =
+        serde_json::to_string(&payload.parameters).unwrap_or_else(|_| "{}".to_string());
     let sort_order = payload.sort_order.unwrap_or(0) as i32;
 
     let updated = diesel::update(
@@ -1362,6 +1457,7 @@ pub(super) async fn comfyui_update_preset(
     .set((
         workflow_presets::name.eq(&payload.name),
         workflow_presets::text_overrides.eq(&overrides_json),
+        workflow_presets::parameters.eq(&parameters_json),
         workflow_presets::sort_order.eq(sort_order),
     ))
     .execute(&mut conn)
@@ -1378,6 +1474,7 @@ pub(super) async fn comfyui_update_preset(
         "id": preset_id,
         "name": payload.name,
         "text_overrides": payload.text_overrides,
+        "parameters": payload.parameters,
         "sort_order": sort_order,
     })))
 }
@@ -1476,4 +1573,84 @@ pub(super) async fn comfyui_delete_task(
         })?;
 
     Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::connection::SimpleConnection;
+
+    /// A migrated library with one workflow to hang presets off.
+    fn library() -> (tempfile::TempDir, diesel::SqliteConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".phos.db");
+        crate::db::init_and_migrate(&db_path).unwrap();
+        let mut conn = crate::db::open_diesel_connection(&db_path).unwrap();
+        conn.batch_execute(
+            "INSERT INTO comfyui_workflows (id, name, workflow_json)
+             VALUES ('wf-1', 'Portrait', '{}');",
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn a_preset_saves_a_seed_and_a_step_count_alongside_its_prompts() {
+        let (_dir, mut conn) = library();
+        let parameters: ParameterMap = serde_json::from_value(serde_json::json!({
+            "3.seed": 4242, "3.steps": 28, "4.ckpt_name": "sd_xl_base_1.0.safetensors"
+        }))
+        .unwrap();
+
+        diesel::insert_into(workflow_presets::table)
+            .values(NewWorkflowPreset {
+                id: "preset-1",
+                workflow_id: "wf-1",
+                name: "Golden hour",
+                text_overrides: r#"{"6.text":"a lighthouse at dusk"}"#,
+                sort_order: Some(0),
+                parameters: Some(&serde_json::to_string(&parameters).unwrap()),
+            })
+            .execute(&mut conn)
+            .unwrap();
+
+        let stored: crate::models::WorkflowPreset = workflow_presets::table
+            .filter(workflow_presets::id.eq("preset-1"))
+            .first(&mut conn)
+            .unwrap();
+        let read_back: ParameterMap =
+            serde_json::from_str(stored.parameters.as_deref().unwrap()).unwrap();
+        assert_eq!(read_back, parameters);
+        assert_eq!(read_back["3.seed"], serde_json::json!(4242));
+        assert!(read_back["3.seed"].is_i64(), "a preset's seed is a number");
+        // The prompt half is untouched by any of this.
+        assert_eq!(
+            stored.text_overrides,
+            r#"{"6.text":"a lighthouse at dusk"}"#
+        );
+    }
+
+    #[test]
+    fn a_preset_saved_before_the_column_existed_still_loads() {
+        let (_dir, mut conn) = library();
+        conn.batch_execute(
+            "INSERT INTO workflow_presets (id, workflow_id, name, text_overrides)
+             VALUES ('preset-old', 'wf-1', 'Old', '{\"6.text\":\"a photograph\"}');",
+        )
+        .unwrap();
+
+        let stored: crate::models::WorkflowPreset = workflow_presets::table
+            .filter(workflow_presets::id.eq("preset-old"))
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(stored.parameters, None);
+        // Which the list endpoint hands the console as an empty map, so it does
+        // not have to know which era a preset came from.
+        let as_served: serde_json::Value = stored
+            .parameters
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(serde_json::json!({}));
+        assert_eq!(as_served, serde_json::json!({}));
+    }
 }

@@ -133,6 +133,13 @@ const provenanceRows = computed(() => {
   for (const [node, text] of Object.entries(m.text_overrides || {})) {
     rows.push([`prompt/${node}`, text])
   }
+  // The typed values this take ran with. The seed already has its own row
+  // above, so it is not repeated here.
+  for (const [key, value] of Object.entries(m.parameters || {})) {
+    const field = key.split('.').pop()
+    if (field === 'seed' || field === 'noise_seed') continue
+    rows.push([`set/${key}`, String(value)])
+  }
   return rows
 })
 

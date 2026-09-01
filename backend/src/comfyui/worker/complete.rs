@@ -34,6 +34,9 @@ pub(super) struct ActiveTask {
     pub workflow_id: String,
     pub workflow_json: String,
     pub text_overrides: String,
+    /// The run's resolved typed values as stored JSON. Read here so the
+    /// manifest the output carries can say which take of a fan-out it is.
+    pub parameters: String,
     pub status: String,
     pub output_prefix: Option<String>,
     pub settle_until: Option<String>,
@@ -41,6 +44,7 @@ pub(super) struct ActiveTask {
 }
 
 type ActiveTaskRow = (
+    String,
     String,
     String,
     String,
@@ -87,6 +91,9 @@ pub(super) fn poll_active_tasks(
             diesel::dsl::sql::<diesel::sql_types::Text>(
                 "COALESCE(enhancement_tasks.text_overrides, '{}')",
             ),
+            diesel::dsl::sql::<diesel::sql_types::Text>(
+                "COALESCE(enhancement_tasks.parameters, '{}')",
+            ),
             enhancement_tasks::status,
             enhancement_tasks::output_prefix,
             enhancement_tasks::settle_until,
@@ -111,10 +118,11 @@ pub(super) fn poll_active_tasks(
             workflow_id: row.3,
             workflow_json: row.4,
             text_overrides: row.5,
-            status: row.6,
-            output_prefix: row.7,
-            settle_until: row.8,
-            retry_count: row.9,
+            parameters: row.6,
+            status: row.7,
+            output_prefix: row.8,
+            settle_until: row.9,
+            retry_count: row.10,
         };
         poll_one_task(conn, client, library_root, &task, now_dt);
     }

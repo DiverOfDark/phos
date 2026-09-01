@@ -163,6 +163,8 @@ use utoipa::OpenApi;
             comfyui::ImportWorkflowPayload,
             comfyui::EnhancePayload,
             comfyui::PresetPayload,
+            crate::comfyui::VarySpec,
+            crate::comfyui::VaryMode,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
