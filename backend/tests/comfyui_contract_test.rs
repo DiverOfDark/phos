@@ -282,7 +282,27 @@ impl Library {
                 text_overrides: Some(&overrides),
                 source_file_id: None,
                 source_mode: None,
-            parameters: None,
+                parameters: None,
+            })
+            .execute(&mut self.conn())
+            .unwrap();
+        id
+    }
+
+    /// Queue a task with typed parameters keyed `node_id.field`, as a sweep's
+    /// rows are written by `POST /api/comfyui/enhance`.
+    fn queue_task_typed(&self, workflow_id: &str, parameters: &Value) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let parameters = serde_json::to_string(parameters).unwrap();
+        diesel::insert_into(enhancement_tasks::table)
+            .values(NewEnhancementTask {
+                id: &id,
+                shot_id: &self.shot_id,
+                workflow_id,
+                text_overrides: Some("{}"),
+                source_file_id: None,
+                source_mode: None,
+                parameters: Some(&parameters),
             })
             .execute(&mut self.conn())
             .unwrap();
@@ -1066,6 +1086,55 @@ fn a_combo_override_reaches_comfyui(url: &str) {
     assert_eq!(task.retry_count, 0);
 }
 
+/// A typed value travels the new channel — the `parameters` column, the
+/// substitution in `prepare_workflow` — into a graph ComfyUI *accepts*. This
+/// is the hop the unit tests cannot pin: that a node declaring `INT` takes
+/// the integer we write, and that ComfyUI's own validation still sees the
+/// value (proven, as with combos, by sending one it must refuse).
+fn a_typed_parameter_reaches_comfyui(url: &str) {
+    let lib = Library::new();
+    let wf = lib.add_workflow("scale", &scale_and_prompt_workflow());
+
+    // Integers written as integers: the run completes at the size the
+    // parameters asked for, not the 32×32 the graph's author saved.
+    let task_id = lib.queue_task_typed(&wf, &json!({ "4.width": 64, "4.height": 48 }));
+    let task = lib.run_until_done(url, &task_id, STEP_BUDGET);
+    assert_eq!(task.status, "completed", "{:?}", task);
+    assert_eq!(task.retry_count, 0, "a clean run must not spend retries");
+    let (path, _) = lib.output_file(&task);
+    assert_eq!(
+        image::open(&path).unwrap().to_rgb8().dimensions(),
+        (64, 48),
+        "the typed width and height should be what actually rendered"
+    );
+
+    // A float into a float field, through the same channel: `CreateVideo.fps`
+    // is the model-free FLOAT a bare server has.
+    let vf = lib.add_workflow("one-frame-video", &one_frame_video_workflow());
+    let task_id = lib.queue_task_typed(&vf, &json!({ "2.fps": 12.0 }));
+    let task = lib.run_until_done(url, &task_id, STEP_BUDGET);
+    assert_eq!(task.status, "completed", "{:?}", task);
+
+    // Out of the node's declared range: rejected at validation, naming the
+    // field, and not retried — so the typed value demonstrably reached
+    // ComfyUI's own checks rather than being dropped on the way.
+    let task_id = lib.queue_task_typed(&wf, &json!({ "4.width": -64 }));
+    let task = lib.run_until_done(url, &task_id, STEP_BUDGET);
+    assert_eq!(task.status, "failed", "{:?}", task);
+    let message = task.error_message.clone().unwrap_or_default();
+    assert!(
+        message.contains("ComfyUI rejected the prompt"),
+        "an out-of-range INT is a validation failure, got: {}",
+        message
+    );
+    assert!(
+        message.contains("width"),
+        "the message should name the field, got: {}",
+        message
+    );
+    assert_eq!(task.retry_count, 0);
+}
+
 // ===== The test ==============================================================
 
 /// One scenario, given the server's URL. Panics to fail.
@@ -1132,6 +1201,10 @@ fn comfyui_contract() {
         (
             "a combo override reaches ComfyUI",
             a_combo_override_reaches_comfyui,
+        ),
+        (
+            "a typed parameter reaches ComfyUI",
+            a_typed_parameter_reaches_comfyui,
         ),
     ];
 
