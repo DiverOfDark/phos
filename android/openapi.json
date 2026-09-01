@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/synthetic-provenance"
+    "version": "rb/typed-params"
   },
   "paths": {
     "/api/auth/callback": {
@@ -250,7 +250,7 @@
           "comfyui"
         ],
         "summary": "Queue enhancement task",
-        "description": "Queue an image enhancement task using a ComfyUI workflow. Creates a background task that processes the shot's original file.",
+        "description": "Queue an image enhancement task using a ComfyUI workflow. Creates a background task that processes the shot's original file. A `vary` map queues one task per combination instead, and the response lists them in order.",
         "operationId": "comfyui_enhance",
         "requestBody": {
           "content": {
@@ -264,10 +264,10 @@
         },
         "responses": {
           "200": {
-            "description": "Enhancement task queued"
+            "description": "Enhancement task(s) queued"
           },
           "400": {
-            "description": "Unrecognised source_mode"
+            "description": "Unrecognised source_mode, one this workflow cannot take, or an unusable sweep"
           },
           "404": {
             "description": "Shot or workflow not found"
@@ -2621,6 +2621,10 @@
           "workflow_id"
         ],
         "properties": {
+          "parameters": {
+            "type": "object",
+            "description": "Typed values for the workflow's non-text inputs, keyed\n`\"<node_id>.<field_name>\"`: `{\"3.seed\": 4242, \"3.cfg\": 6.5,\n\"4.ckpt_name\": \"sd_xl_base_1.0.safetensors\"}`. Each value keeps its own\nJSON type, which is what `text_overrides` cannot do."
+          },
           "shot_id": {
             "type": "string"
           },
@@ -2646,6 +2650,10 @@
             "propertyNames": {
               "type": "string"
             }
+          },
+          "vary": {
+            "type": "object",
+            "description": "Parameters to sweep rather than pin, keyed like `parameters`. Each entry\nmultiplies the number of tasks queued.\n\nA value is one of three spellings: a count (`{\"3.seed\": 4}` — four runs\nwith four fresh seeds), an explicit list (`{\"3.cfg\": [4.0, 6.0, 8.0]}` —\nthree runs), or a `VarySpec` for the long form. Both of those together is\ntwelve runs; past 64 the request is refused.\n\nEvery value is resolved here, so each task is written with its own\ncomplete parameter map and is replayable from its row.\n\nDescribed as a free-form object rather than as a union of the three: the\ngenerated Android client builds every model in the spec even though it\ncalls none of these endpoints, and an untagged union of a number, an\narray and an object is not worth making it compile."
           },
           "workflow_id": {
             "type": "string"
@@ -3095,6 +3103,10 @@
           "name": {
             "type": "string"
           },
+          "parameters": {
+            "type": "object",
+            "description": "The preset's typed values, keyed like a task's `parameters`. A preset\nthat can pin a prompt but not a seed or a step count is half a preset."
+          },
           "sort_order": {
             "type": [
               "integer",
@@ -3160,13 +3172,17 @@
             ],
             "description": "The name ComfyUI gave the output, before Phos renamed it into the\nlibrary — the last thread back to the run that made it."
           },
+          "parameters": {
+            "type": "object",
+            "description": "The typed values this run ran with, `\"<node_id>.<field_name>\"` → value,\nexactly as the task row carried them.\n\nThis is what makes a fanned-out run reproducible one file at a time: four\ntakes of the same prompt differ only here, and without it their manifests\nare indistinguishable."
+          },
           "seed": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
-            "description": "The seed the sampler actually ran with."
+            "description": "The seed the sampler actually ran with, lifted out of [`Self::parameters`]\nbecause it is the value asked for most often. A graph with two samplers\nhas two seeds; this is the first in key order, and the map beside it is\nthe complete answer."
           },
           "source_file_id": {
             "type": [
@@ -3656,6 +3672,55 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "VaryMode": {
+        "type": "string",
+        "description": "How a swept parameter picks its values when no explicit list is given.",
+        "enum": [
+          "random",
+          "increment"
+        ]
+      },
+      "VarySpec": {
+        "type": "object",
+        "description": "The long form of a sweep, for when it needs to say how.",
+        "properties": {
+          "count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Or: how many values to generate. Ignored when `values` is given.",
+            "minimum": 0
+          },
+          "max": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "min": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The range a generated value stays inside — the node's own bounds, when\nthe catalogue knew them."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/VaryMode",
+            "description": "How to generate them."
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Run exactly these values, in this order."
           }
         }
       },

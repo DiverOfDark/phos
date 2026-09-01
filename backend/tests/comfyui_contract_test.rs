@@ -282,6 +282,7 @@ impl Library {
                 text_overrides: Some(&overrides),
                 source_file_id: None,
                 source_mode: None,
+            parameters: None,
             })
             .execute(&mut self.conn())
             .unwrap();
@@ -305,6 +306,7 @@ impl Library {
                 text_overrides: Some("{}"),
                 source_file_id: Some(source_file_id),
                 source_mode: Some(source_mode),
+                parameters: None,
             })
             .execute(&mut self.conn())
             .unwrap();
