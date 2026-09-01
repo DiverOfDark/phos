@@ -13,6 +13,7 @@ import {
   parameterValue,
   parseValueList,
   randomSeed,
+  rangeError,
   runCount,
   MAX_SAFE_SEED,
 } from "./utils.js";
@@ -125,6 +126,21 @@ test("a swept list is read as the field's type, or refused", () => {
   // Unless the stored list was capped, in which case it cannot say.
   const truncated = input({ kind: "combo", choices: ["a.safetensors"], truncated: true }, "a.safetensors");
   assert.deepEqual(parseValueList("z.safetensors", truncated), ["z.safetensors"]);
+});
+
+test("a number outside the node's declared range is named, not sent", () => {
+  // The HTML min/max stop the spinner, not the keyboard; the dialog gates
+  // submission on this instead.
+  assert.equal(rangeError(STEPS, 0), "below the node's minimum of 1");
+  assert.equal(rangeError(STEPS, 10001), "above the node's maximum of 10000");
+  assert.equal(rangeError(CFG, 100.5), "above the node's maximum of 100");
+  assert.equal(rangeError(SEED, -1), "below the node's minimum of 0");
+  assert.equal(rangeError(STEPS, 20), "");
+  assert.equal(rangeError(CFG, 6.5), "");
+  // Non-numbers are someone else's problem: an enum picks from a list, and a
+  // field with no declared bounds cannot be out of them.
+  assert.equal(rangeError(CKPT, "z.safetensors"), "");
+  assert.equal(rangeError(input({ kind: "int" }, 5), 999999), "");
 });
 
 test("the run count is the product of the axes", () => {

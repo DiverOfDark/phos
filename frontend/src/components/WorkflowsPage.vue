@@ -153,10 +153,17 @@ async function createPreset() {
   if (!newPresetName.value.trim() || !selectedWorkflowId.value) return
   // A new preset starts where the workflow does: its author's own prompts and
   // its author's own seed, steps and model, so saving one changes nothing until
-  // it is edited.
+  // it is edited. The fields the source picker fills are left out — a preset
+  // that pinned a loader's filename would override the uploaded source at run
+  // time, since typed parameters are applied after the binding.
+  const loaders = selectedWorkflow.value?.loaders || []
+  const isLoaderField = (input) =>
+    input.node_type === 'LoadImage' ||
+    loaders.some(l => l.node_id === input.node_id && l.field === input.field_name)
   const overrides = {}
   const parameters = {}
   for (const input of selectedWorkflow.value?.inputs || []) {
+    if (isLoaderField(input)) continue
     if (isTextInput(input)) overrides[inputKey(input)] = String(input.current_value ?? '')
     else if (isParameterInput(input)) parameters[inputKey(input)] = parameterValue(input)
   }
@@ -210,6 +217,10 @@ const presetSaveTimers = new Map()
 
 /** Save a preset's values a moment after the last edit to it. */
 function savePresetValues(preset) {
+  // Captured now, not when the timer fires: selecting another workflow inside
+  // the debounce window would otherwise send this preset to that workflow's
+  // URL, where the backend answers 404 and the edit is silently lost.
+  const workflowId = selectedWorkflowId.value
   clearTimeout(presetSaveTimers.get(preset.id))
   presetSaveTimers.set(
     preset.id,
@@ -217,7 +228,7 @@ function savePresetValues(preset) {
       presetSaveTimers.delete(preset.id)
       try {
         const res = await fetch(
-          `/api/comfyui/workflows/${selectedWorkflowId.value}/presets/${preset.id}`,
+          `/api/comfyui/workflows/${workflowId}/presets/${preset.id}`,
           {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
@@ -661,7 +672,7 @@ defineExpose({ loadData: fetchWorkflows })
                 v-model:text-overrides="preset.text_overrides"
                 v-model:parameters="preset.parameters"
                 :inputs="selectedWorkflow.inputs || []"
-                :loader-node-ids="(selectedWorkflow.loaders || []).map(l => l.node_id)"
+                :loader-keys="(selectedWorkflow.loaders || []).map(l => `${l.node_id}.${l.field}`)"
                 @dirty="savePresetValues(preset)"
               />
               <span v-else class="text-xs font-light text-ink-secondary">

@@ -145,6 +145,24 @@ export function parameterValue(input, raw) {
   }
 }
 
+/**
+ * Why this number cannot be sent for this input, or `""` when it can.
+ *
+ * The `<input>`'s own `min`/`max` stop the spinner arrows, not the keyboard,
+ * and the Enhance button is a separate element the browser will not hold back
+ * — so a value outside the node's declared range has to be caught here.
+ */
+export function rangeError(input, value) {
+  const kind = controlKind(input);
+  if (kind !== "int" && kind !== "float" && kind !== "seed") return "";
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "not a number";
+  const { min, max } = numberBounds(input);
+  if (min !== null && n < min) return `below the node's minimum of ${min}`;
+  if (max !== null && n > max) return `above the node's maximum of ${max}`;
+  return "";
+}
+
 /** Key a stored override or parameter by, matching what the backend expects. */
 export function inputKey(input) {
   return `${input.node_id}.${input.field_name}`;

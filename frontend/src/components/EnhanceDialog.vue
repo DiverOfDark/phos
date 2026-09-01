@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
-import { isTextInput, isParameterInput, inputKey, parameterValue, runCount, MAX_FANOUT } from '@/lib/utils'
+import { isTextInput, inputKey, runCount, MAX_FANOUT } from '@/lib/utils'
 
 const props = defineProps({
   open: Boolean,
@@ -40,9 +40,17 @@ const generations = ref([])
 // Two channels, matching the backend: prompts (and anything ComfyUI could not
 // describe) as strings, everything else typed. `vary` turns one of those into
 // several runs.
+//
+// `parameters` holds only what was actually set — by hand or by a preset.
+// An untouched field is *absent*, so the graph's own value runs verbatim: a
+// workflow can carry a seed above 2^53 that JSON.parse already rounded here,
+// and echoing every field back would overwrite the exact one with the rounded
+// one. The controls fall back to displaying the workflow's value themselves.
 const textOverrides = ref({})
 const parameters = ref({})
 const vary = ref({})
+/** What is wrong with a row, if anything — set by the controls, gates Enhance. */
+const inputProblem = ref('')
 
 // --- Source mode (videos only) ---
 // A still has no frames to choose between, so the whole section stays out of
@@ -128,20 +136,23 @@ function workflowHasGeneration(workflowId) {
   return generations.value.some(g => g.workflow_id === workflowId)
 }
 
-// Check if a preset's overrides match any existing generation for the selected workflow
+// Check if a preset's overrides and parameters match any existing generation
+// for the selected workflow
 function presetHasGeneration(preset) {
   return generations.value.some(g => {
     if (g.workflow_id !== selectedWorkflowId.value) return false
     return overridesMatch(g.text_overrides, preset.text_overrides)
+      && parametersMatch(g.parameters, preset.parameters)
   })
 }
 
-// Check if current text overrides match any existing generation
+// Check if the current overrides and parameters match any existing generation
 const currentMatchesGeneration = computed(() => {
   if (!selectedWorkflowId.value) return false
   return generations.value.some(g => {
     if (g.workflow_id !== selectedWorkflowId.value) return false
     return overridesMatch(g.text_overrides, textOverrides.value)
+      && parametersMatch(g.parameters, parameters.value)
   })
 })
 
@@ -157,10 +168,24 @@ function overridesMatch(a, b) {
   return true
 }
 
-// A loader node is fed by the source picker, not by a text box.
+// Typed values compare as JSON, so 6.5 matches 6.5 and "a.safetensors" only
+// itself. Both sides hold only what a run actually set, so a changed seed is
+// a different setup even when the prompt is the same.
+function parametersMatch(a, b) {
+  const allKeys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})])
+  for (const key of allKeys) {
+    if (JSON.stringify((a || {})[key]) !== JSON.stringify((b || {})[key])) return false
+  }
+  return true
+}
+
+// The one field the source picker fills on a loader node. Its other fields —
+// a video loader's frame limits, say — keep their controls.
 function isLoaderInput(wf, input) {
   if (input.node_type === 'LoadImage') return true
-  return (wf?.loaders || []).some(l => l.node_id === input.node_id)
+  return (wf?.loaders || []).some(
+    l => l.node_id === input.node_id && l.field === input.field_name,
+  )
 }
 
 function defaultOverrides(wf) {
@@ -175,20 +200,9 @@ function defaultOverrides(wf) {
   return overrides
 }
 
-/** Every typed field, starting at whatever the workflow's author saved. */
-function defaultParameters(wf) {
-  const params = {}
-  for (const input of wf?.inputs || []) {
-    if (isLoaderInput(wf, input)) continue
-    if (!isParameterInput(input)) continue
-    params[inputKey(input)] = parameterValue(input)
-  }
-  return params
-}
-
-/** The node ids the source picker fills, so the control list can skip them. */
-const loaderNodeIds = computed(() =>
-  (selectedWorkflow.value?.loaders || []).map(l => l.node_id),
+/** The loader fields the source picker fills, so the control list can skip them. */
+const loaderKeys = computed(() =>
+  (selectedWorkflow.value?.loaders || []).map(l => `${l.node_id}.${l.field}`),
 )
 
 // Initialize overrides when workflow changes
@@ -202,7 +216,7 @@ watch(selectedWorkflow, (wf) => {
     return
   }
   textOverrides.value = defaultOverrides(wf)
-  parameters.value = defaultParameters(wf)
+  parameters.value = {}
   vary.value = {}
   selectedPresetId.value = null
   // Follow the workflow's own default until the user says otherwise.
@@ -233,14 +247,15 @@ function selectPreset(preset) {
     // Deselect — restore workflow defaults
     selectedPresetId.value = null
     textOverrides.value = defaultOverrides(selectedWorkflow.value)
-    parameters.value = defaultParameters(selectedWorkflow.value)
+    parameters.value = {}
     return
   }
+  // A preset lands on the workflow's own values, never on whatever the last
+  // preset left behind — a prompt-only preset saved before parameters existed
+  // must run the workflow's seed and model, not its predecessor's.
   selectedPresetId.value = preset.id
-  textOverrides.value = { ...textOverrides.value, ...(preset.text_overrides || {}) }
-  // A preset saved before parameters existed has none, and leaves the
-  // workflow's own values in place rather than blanking them.
-  parameters.value = { ...parameters.value, ...(preset.parameters || {}) }
+  textOverrides.value = { ...defaultOverrides(selectedWorkflow.value), ...(preset.text_overrides || {}) }
+  parameters.value = { ...(preset.parameters || {}) }
 }
 
 const outputType = computed(() => {
@@ -437,8 +452,9 @@ async function enhance() {
               v-model:text-overrides="textOverrides"
               v-model:parameters="parameters"
               v-model:vary="vary"
+              v-model:problem="inputProblem"
               :inputs="selectedWorkflow.inputs || []"
-              :loader-node-ids="loaderNodeIds"
+              :loader-keys="loaderKeys"
               allow-vary
               @dirty="selectedPresetId = null"
             />
@@ -460,8 +476,8 @@ async function enhance() {
       <div class="border-t border-line px-6 py-4 flex items-center gap-4 flex-none">
         <button
           class="bg-signal text-signal-fg rounded px-6 py-2 text-[13px] font-medium whitespace-nowrap hover:bg-signal-hover transition-colors disabled:opacity-50"
-          :title="tooManyRuns ? `${runs} runs is more than the ${MAX_FANOUT} one request may queue` : ''"
-          :disabled="submitting || !selectedWorkflowId || tooManyRuns"
+          :title="tooManyRuns ? `${runs} runs is more than the ${MAX_FANOUT} one request may queue` : inputProblem"
+          :disabled="submitting || !selectedWorkflowId || tooManyRuns || !!inputProblem"
           @click="enhance"
         >{{ submitting ? 'Queuing…' : (runs > 1 ? `Enhance ×${runs}` : 'Enhance') }}</button>
         <span v-if="submitSuccess" class="font-mono text-xs text-ready">

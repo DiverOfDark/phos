@@ -13,7 +13,7 @@
  * model pickers go into `parameters`, each keeping its own JSON type. `vary`
  * carries the sweeps — a parameter set to run several values rather than one.
  */
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, watchEffect, onMounted } from 'vue'
 import {
   controlKind,
   kindLabel,
@@ -22,12 +22,17 @@ import {
   parameterValue,
   parseValueList,
   randomSeed,
+  rangeError,
 } from '@/lib/utils'
 
 const props = defineProps({
   inputs: { type: Array, default: () => [] },
-  /** Node ids the source picker already fills — never asked for as a control. */
-  loaderNodeIds: { type: Array, default: () => [] },
+  /**
+   * `"<node_id>.<field_name>"` keys the source picker already fills — never
+   * asked for as controls. Only the loader's filename field: a video loader
+   * also carries frame limits and a frame rate, and those stay editable.
+   */
+  loaderKeys: { type: Array, default: () => [] },
   /** Presets pin values; only a queue request can sweep them. */
   allowVary: { type: Boolean, default: false },
 })
@@ -37,12 +42,14 @@ const emit = defineEmits(['dirty'])
 const textOverrides = defineModel('textOverrides', { type: Object, default: () => ({}) })
 const parameters = defineModel('parameters', { type: Object, default: () => ({}) })
 const vary = defineModel('vary', { type: Object, default: () => ({}) })
+/** The first thing wrong with a row, or '' — the parent gates submission on it. */
+const problem = defineModel('problem', { type: String, default: '' })
 
 // --- Which inputs get a row ------------------------------------------------
 
 function isLoaderInput(input) {
   if (input.node_type === 'LoadImage') return true
-  return props.loaderNodeIds.includes(input.node_id)
+  return props.loaderKeys.includes(inputKey(input))
 }
 
 const rows = computed(() =>
@@ -62,7 +69,7 @@ function choicesFor(input) {
   // snapshot lists at most a few hundred choices, and a model can be
   // uninstalled after the workflow was imported — a <select> that cannot show
   // its own value renders as something else while the stored value stays put.
-  const current = parameters[inputKey(input)] ?? parameterValue(input)
+  const current = parameters.value[inputKey(input)] ?? parameterValue(input)
   if (typeof current === 'string' && current !== '' && !choices.includes(current)) {
     return [current, ...choices]
   }
@@ -208,6 +215,24 @@ function sweepSize(input) {
   return Array.isArray(axis.values) ? axis.values.length : axis.count || 1
 }
 
+// --- What is wrong, if anything --------------------------------------------
+// A row can be wrong two ways: a value list that cannot be read, or a pinned
+// number outside the node's declared range. Either way the row says so — and
+// the parent hears about it, because a dialog that stays submittable while a
+// row shows red queues something nobody asked for.
+
+/** A pinned number the node would refuse. Untouched fields are not judged. */
+function fixedError(input) {
+  const key = inputKey(input)
+  if (isSweeping(input) || !(key in parameters.value)) return ''
+  return rangeError(input, parameters.value[key])
+}
+
+watchEffect(() => {
+  const wrong = rows.value.find((input) => sweepError(input) || fixedError(input))
+  problem.value = wrong ? `${inputKey(wrong)}: ${sweepError(wrong) || fixedError(wrong)}` : ''
+})
+
 // A workflow change replaces the maps wholesale; forget the half-typed text too.
 watch(
   () => props.inputs,
@@ -271,6 +296,11 @@ defineExpose({ rows })
             class="w-52 bg-surface border border-line rounded-sm px-3 py-1.5 font-mono text-xs text-ink disabled:opacity-40"
             @input="setParameter(input, $event.target.value)"
           />
+          <span
+            v-if="fixedError(input)"
+            class="font-mono text-[10px] whitespace-nowrap"
+            style="color: var(--status-error)"
+          >{{ fixedError(input) }}</span>
           <button
             v-if="seedPolicy(input) !== 'random'"
             title="draw a new seed"
@@ -346,7 +376,12 @@ defineExpose({ rows })
               @input="setParameter(input, $event.target.value)"
             />
             <span
-              v-if="numberBounds(input).min !== null && controlKind(input) !== 'combo'"
+              v-if="fixedError(input)"
+              class="font-mono text-[10px] whitespace-nowrap"
+              style="color: var(--status-error)"
+            >{{ fixedError(input) }}</span>
+            <span
+              v-else-if="numberBounds(input).min !== null && controlKind(input) !== 'combo'"
               class="font-mono text-[10px] text-ink-tertiary"
             >{{ numberBounds(input).min }}–{{ numberBounds(input).max }}</span>
           </template>
