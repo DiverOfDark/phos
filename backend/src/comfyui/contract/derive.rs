@@ -66,16 +66,27 @@ fn output_media(
     workflow: &Value,
     catalog: Option<&NodeCatalog>,
 ) -> Option<MediaType> {
+    let wired = wired_link_types(node_id, node_type, workflow, catalog);
+    // A saver that is handed anything media-shaped is a media saver, whatever
+    // else is wired into it: plenty of custom savers also take a caption or the
+    // compiled prompt as a `STRING`, and that socket says nothing about what
+    // the node writes.
+    let fed_media = ["IMAGE", "VIDEO", "LATENT", "AUDIO"]
+        .iter()
+        .any(|t| wired.contains(*t));
+
     // 1. Text first, because a `PreviewText` is named like nothing in
     //    particular and would otherwise fall through to "a picture". The
     //    catalogue is definitive here: a terminal node fed a `STRING` socket
-    //    emits a sentence, not a file.
-    if wired_link_types(node_id, node_type, workflow, catalog).contains("STRING") {
-        return Some(MediaType::Text);
-    }
-    let t = node_type.to_ascii_lowercase();
-    if t.contains("text") || t.contains("string") || t.contains("caption") {
-        return Some(MediaType::Text);
+    //    and nothing media-shaped emits a sentence, not a file.
+    if !fed_media {
+        if wired.contains("STRING") {
+            return Some(MediaType::Text);
+        }
+        let t = node_type.to_ascii_lowercase();
+        if t.contains("text") || t.contains("string") || t.contains("caption") {
+            return Some(MediaType::Text);
+        }
     }
 
     // 2. Moving pictures, by the rule the worker already trusts. It has to come
@@ -88,7 +99,6 @@ fn output_media(
     }
 
     // 3. Otherwise take ComfyUI's word for what it was handed.
-    let wired = wired_link_types(node_id, node_type, workflow, catalog);
     if wired.contains("VIDEO") {
         return Some(MediaType::Video);
     }
@@ -276,10 +286,19 @@ fn slot(input: &WorkflowInput, name: String) -> PromptSlot {
 }
 
 /// Two slots cannot share a name — a compiler binds by it.
+///
+/// The node id is the first tiebreak; a counter after that, because two fields
+/// on the *same* node corrected to the same name would otherwise collide on
+/// the very string meant to keep them apart.
 fn unique(name: &str, node_id: &str, used: &mut BTreeSet<String>) -> String {
     let mut candidate = name.to_string();
     if used.contains(&candidate) {
         candidate = format!("{}_{}", name, node_id);
+    }
+    let mut n = 2;
+    while used.contains(&candidate) {
+        candidate = format!("{}_{}_{}", name, node_id, n);
+        n += 1;
     }
     used.insert(candidate.clone());
     candidate

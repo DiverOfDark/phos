@@ -401,8 +401,12 @@ impl StageContract {
         roles.sort_by_key(|r| node_order(&r.node_id));
 
         let produces = derive_produces(workflow, catalog, &mut warnings);
+        // Parameter inference reads the *effective* output type: `length` is a
+        // frame count exactly when the contract says video, and a person
+        // correcting an oddly named saver to video has said video.
+        let effective_produces = corrections.produces.unwrap_or(produces);
         let slots = derive_slots(workflow, &inputs, &loaders, &corrections);
-        let params = derive_params(&inputs, produces, &corrections);
+        let params = derive_params(&inputs, effective_produces, &corrections);
 
         let derived_accepts = if roles.iter().any(|r| r.kind == LoaderKind::Video) {
             Accepts::Video
@@ -422,7 +426,7 @@ impl StageContract {
         StageContract {
             version: CONTRACT_VERSION,
             accepts: corrections.accepts.unwrap_or(derived_accepts),
-            produces: corrections.produces.unwrap_or(produces),
+            produces: effective_produces,
             roles,
             slots,
             params,
@@ -438,6 +442,17 @@ impl StageContract {
     /// once, when the catalogue is available.
     pub fn wants_catalog(&self) -> bool {
         self.warnings.contains(&ContractWarning::NoCatalog)
+    }
+
+    /// Could a later derivation still say more than this one did?
+    ///
+    /// Two ways yes: it was derived blind ([`Self::wants_catalog`]), or the
+    /// catalogue was read but the graph used classes it did not contain — a
+    /// custom pack not yet installed. Installing the pack changes what the
+    /// catalogue answers, so such a contract is worth deriving again rather
+    /// than being treated as settled forever.
+    pub fn under_informed(&self) -> bool {
+        self.wants_catalog() || self.warnings.contains(&ContractWarning::UnknownClasses)
     }
 
     /// The slot with this name, if the graph has one.
@@ -458,9 +473,12 @@ impl StageContract {
     ///
     /// A loader its author mistitled is corrected once, on the contract, and
     /// every run then binds the upload to the slot it really fills. The binder
-    /// already reads `role:<node_id>` out of a task's overrides (see
-    /// [`super::loaders::role_directives`]), so that is where the correction
-    /// joins the run — no new plumbing, and nothing in the worker to change.
+    /// already reads `role:<node_id>` out of an override map (see
+    /// [`super::loaders::role_directives`]), so the dispatcher folds the
+    /// correction into the map it holds in memory, just before binding.
+    /// Deliberately *not* at enqueue: a task row records what the caller asked
+    /// for, and a persisted `role:` directive would surface as provenance and
+    /// be shown back as a prompt.
     ///
     /// Anything the caller said explicitly is left exactly as they said it.
     pub fn apply_role_corrections(
@@ -556,6 +574,11 @@ mod tests {
                 "conditioning": ["CONDITIONING"] } }, "output": ["CONDITIONING"] },
             "PrimitiveStringMultiline": { "input": { "required": {
                 "value": ["STRING", { "multiline": true }] } }, "output": ["STRING"] },
+            "SaveImageExtended": { "input": { "required": {
+                "images": ["IMAGE"],
+                "caption": ["string"],
+                "filename_prefix": ["STRING", { "default": "out" }] } },
+                "output": [], "output_node": true },
             "QwenVLLoader": { "input": { "required": {
                 "model": [["Qwen2.5-VL-7B-Instruct"]] } }, "output": ["QWENVL"] },
             "QwenVLRun": { "input": { "required": {
@@ -1229,6 +1252,24 @@ mod tests {
     }
 
     #[test]
+    fn a_saver_handed_frames_and_a_caption_is_still_an_image_saver() {
+        // Plenty of custom savers also take the compiled prompt or a caption
+        // through a string socket. That socket says what the node *reads*, not
+        // what it writes — a graph like this must not type as a describe stage.
+        let wf = json!({
+            "1": { "class_type": "LoadImage", "inputs": { "image": "a.png" } },
+            "2": { "class_type": "PrimitiveStringMultiline",
+                   "inputs": { "value": "the compiled prompt" } },
+            "9": { "class_type": "SaveImageExtended", "inputs": {
+                     "images": ["1", 0], "caption": ["2", 0],
+                     "filename_prefix": "out" } }
+        });
+        let c = StageContract::derive(&wf, Some(&catalog()));
+        assert_eq!(c.produces, MediaType::Image);
+        assert!(!c.warnings.contains(&ContractWarning::MixedOutputs));
+    }
+
+    #[test]
     fn a_graph_of_the_wrong_shape_is_a_contract_rather_than_a_panic() {
         for wrong in [json!([]), json!("nope"), json!(null), json!({ "1": {} })] {
             for cat in [None, Some(catalog())] {
@@ -1264,6 +1305,84 @@ mod tests {
         assert!(!again.wants_catalog());
         assert_eq!(slot_names(&again), ["positive"]);
         assert_eq!(again.corrections.produces, Some(MediaType::Text));
+    }
+
+    #[test]
+    fn correcting_the_output_type_re_types_the_parameters_with_it() {
+        // A video saver named like nothing in particular: the graph types as a
+        // still, and a person corrects `produces` to video. `length` must
+        // become a frame count in the same breath — the returned contract may
+        // not disagree with itself.
+        let oddly_saved = json!({
+            "1": { "class_type": "LoadImage", "inputs": { "image": "a.png" } },
+            "2": { "class_type": "WanImageToVideo", "inputs": {
+                     "width": 512, "height": 512, "length": 81, "batch_size": 1 } },
+            "9": { "class_type": "SaveImage",
+                   "inputs": { "images": ["2", 0], "filename_prefix": "out" } }
+        });
+        let c = StageContract::derive(&oddly_saved, Some(&catalog()));
+        assert_eq!(c.produces, MediaType::Image);
+        assert_eq!(c.params_named(ParamName::Frames).count(), 0);
+
+        let c = StageContract::derive_with(
+            &oddly_saved,
+            Some(&catalog()),
+            ContractCorrections {
+                produces: Some(MediaType::Video),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.produces, MediaType::Video);
+        assert_eq!(
+            c.params_named(ParamName::Frames)
+                .map(|p| p.override_key())
+                .collect::<Vec<_>>(),
+            ["2.length"]
+        );
+
+        // And the inverse: corrected down to a still, the spurious frame count
+        // goes away with it.
+        let c = StageContract::derive_with(
+            &i2v(),
+            Some(&catalog()),
+            ContractCorrections {
+                produces: Some(MediaType::Image),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.params_named(ParamName::Frames).count(), 0);
+    }
+
+    #[test]
+    fn two_fields_on_one_node_corrected_to_the_same_name_stay_apart() {
+        // The tiebreak for a duplicate name is the node id — which two fields
+        // on the *same* node share, so the tiebreak itself needs a tiebreak.
+        let wf = json!({
+            "1": { "class_type": "LoadImage", "inputs": { "image": "a.png" } },
+            "5": { "class_type": "TripleTextPrompt",
+                   "inputs": { "text_a": "a", "text_b": "b", "text_c": "c" } },
+            "9": { "class_type": "SaveImage",
+                   "inputs": { "images": ["5", 0], "filename_prefix": "out" } }
+        });
+        let corrections = ContractCorrections {
+            slots: [
+                ("5.text_a".to_string(), Some("positive".to_string())),
+                ("5.text_b".to_string(), Some("positive".to_string())),
+                ("5.text_c".to_string(), Some("positive".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let c = StageContract::derive_with(&wf, None, corrections);
+        let names = slot_names(&c);
+        assert_eq!(names.len(), 3);
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), 3, "slot names must stay unique: {:?}", names);
+        // Each one is reachable through the name it was given.
+        for name in names {
+            assert!(c.slot(name).is_some());
+        }
     }
 
     #[test]

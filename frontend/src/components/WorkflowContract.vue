@@ -79,33 +79,56 @@ function isCorrected(kind, key) {
   return map[kind] != null && Object.prototype.hasOwnProperty.call(map[kind], key)
 }
 
+/**
+ * PUTs are strictly serialised. Each request replaces the *whole* corrections
+ * object, so two quick edits must not clone the same stale set — the second
+ * would silently drop the first — and the replies must not land out of order.
+ * The queue makes each edit read the corrections the previous response
+ * returned, and the board shows the last reply, never an earlier one.
+ */
+let queue = Promise.resolve()
+let inFlight = 0
+
+function enqueue(build) {
+  inFlight += 1
+  saving.value = true
+  queue = queue
+    .then(() => put(build()))
+    .catch(() => {})
+    .finally(() => {
+      inFlight -= 1
+      if (inFlight === 0) saving.value = false
+    })
+}
+
 /** The whole corrections object, with one entry changed, then PUT. */
-async function apply(mutate) {
-  const next = JSON.parse(JSON.stringify(corrections.value || {}))
-  next.roles ||= {}
-  next.slots ||= {}
-  next.params ||= {}
-  mutate(next)
-  await put(next)
+function apply(mutate) {
+  enqueue(() => {
+    const next = JSON.parse(JSON.stringify(corrections.value || {}))
+    next.roles ||= {}
+    next.slots ||= {}
+    next.params ||= {}
+    mutate(next)
+    return next
+  })
 }
 
 async function put(next) {
-  saving.value = true
   error.value = ''
-  try {
-    const res = await fetch(`/api/comfyui/workflows/${props.workflowId}/contract`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(next),
-    })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    local.value = await res.json()
-    emit('updated')
-  } catch (e) {
+  const res = await fetch(`/api/comfyui/workflows/${props.workflowId}/contract`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(next),
+  }).catch((e) => {
     error.value = e.message || 'could not save the correction'
-  } finally {
-    saving.value = false
+    throw e
+  })
+  if (!res.ok) {
+    error.value = `HTTP ${res.status}`
+    throw new Error(error.value)
   }
+  local.value = await res.json()
+  emit('updated')
 }
 
 const setAccepts = (v) => apply((n) => { n.accepts = v })
@@ -119,8 +142,33 @@ const setParam = (key, v) => apply((n) => { n.params[key] = v === '' ? null : v 
 const clearParam = (key) => apply((n) => { delete n.params[key] })
 
 function clearAll() {
-  put({})
+  enqueue(() => ({}))
 }
+
+/**
+ * Rows a correction excluded ("not a prompt" / "not a setting") vanish from
+ * the derived contract, but the *row* must stay on the board: its revert
+ * button is the only way to undo that one exclusion without resetting
+ * everything else. The excluded entries are synthesised back from the
+ * corrections map, with the empty name the "not a…" option selects on.
+ */
+function withExcluded(rows, exclusions, extra) {
+  const out = [...rows]
+  const have = new Set(out.map(keyOf))
+  for (const [key, val] of Object.entries(exclusions || {})) {
+    if (val !== null || have.has(key)) continue
+    const dot = key.indexOf('.')
+    out.push({ name: '', node_id: key.slice(0, dot), field: key.slice(dot + 1), ...extra })
+  }
+  return out
+}
+
+const displaySlots = computed(() =>
+  withExcluded(c.value?.slots || [], corrections.value.slots, { node_title: null, default: null }),
+)
+const displayParams = computed(() =>
+  withExcluded(c.value?.params || [], corrections.value.params, { widget: null, current_value: null }),
+)
 
 const edited = computed(() => {
   const m = corrections.value
@@ -283,7 +331,7 @@ function shortValue(v) {
     </div>
 
     <!-- Prompt slots: what a person, or a describe stage, writes into. -->
-    <div v-if="(c.slots || []).length" class="flex flex-col gap-1 mt-2">
+    <div v-if="displaySlots.length" class="flex flex-col gap-1 mt-2">
       <div class="label">Prompt slots</div>
       <div class="border border-line rounded overflow-hidden overflow-x-auto">
         <div
@@ -296,7 +344,7 @@ function shortValue(v) {
           <span class="label">Author's text</span>
         </div>
         <div
-          v-for="s in c.slots"
+          v-for="s in displaySlots"
           :key="keyOf(s)"
           class="grid gap-4 items-center px-3 py-1.5 border-b border-line font-mono text-xs min-w-[560px]"
           style="grid-template-columns: 56px 1fr 160px 1fr"
@@ -315,7 +363,7 @@ function shortValue(v) {
                 :class="isCorrected('slots', keyOf(s)) ? 'text-signal' : 'text-ink'"
                 @change="setSlot(keyOf(s), $event.target.value)"
               >
-                <option v-if="!SLOTS.includes(s.name)" :value="s.name">{{ s.name }}</option>
+                <option v-if="s.name && !SLOTS.includes(s.name)" :value="s.name">{{ s.name }}</option>
                 <option v-for="o in SLOTS" :key="o" :value="o">{{ o }}</option>
                 <option value="">not a prompt</option>
               </select>
@@ -333,7 +381,7 @@ function shortValue(v) {
     </div>
 
     <!-- Parameters: the settings a line can dial without knowing the graph. -->
-    <div v-if="(c.params || []).length" class="flex flex-col gap-1 mt-2">
+    <div v-if="displayParams.length" class="flex flex-col gap-1 mt-2">
       <div class="label">Parameters</div>
       <div class="border border-line rounded overflow-hidden overflow-x-auto">
         <div
@@ -347,7 +395,7 @@ function shortValue(v) {
           <span class="label">Value</span>
         </div>
         <div
-          v-for="p in c.params"
+          v-for="p in displayParams"
           :key="keyOf(p)"
           class="grid gap-4 items-center px-3 py-1.5 border-b border-line font-mono text-xs min-w-[600px]"
           style="grid-template-columns: 56px 1fr 150px 150px 100px"

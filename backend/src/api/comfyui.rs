@@ -647,21 +647,17 @@ pub(super) async fn comfyui_enhance(
         return Err(StatusCode::NOT_FOUND.into());
     }
 
-    // Verify the workflow exists, that it can take the mode the caller picked —
-    // a `whole_video` against a graph with only image loaders (or a frame
-    // against a video-only graph) would otherwise queue a task guaranteed to
-    // fail — and pick up any loader roles a person corrected on its contract.
-    // One read, because both answers live on the same row.
-    let stored: Option<(String, Option<String>)> = comfyui_workflows::table
+    // Verify the workflow exists and that it can take the mode the caller
+    // picked — a `whole_video` against a graph with only image loaders (or a
+    // frame against a video-only graph) would otherwise queue a task
+    // guaranteed to fail.
+    let stored: Option<String> = comfyui_workflows::table
         .filter(comfyui_workflows::id.eq(&payload.workflow_id))
-        .select((
-            comfyui_workflows::workflow_json,
-            comfyui_workflows::contract_json,
-        ))
+        .select(comfyui_workflows::workflow_json)
         .first(&mut conn)
         .optional()
         .map_err(|_| ApiError::internal())?;
-    let Some((workflow_json, stored_contract)) = stored else {
+    let Some(workflow_json) = stored else {
         return Err(StatusCode::NOT_FOUND.into());
     };
     // A sweep whose key names no rewritable field would queue N tasks that all
@@ -691,20 +687,13 @@ pub(super) async fn comfyui_enhance(
         }
     }
 
-    // A role the workflow's author mistitled is corrected once, on the
-    // contract, and every run then binds the upload to the loader it really
-    // belongs in. The binder already reads `role:<node_id>` out of the task's
-    // override map, so the correction rides in there — and anything the caller
-    // said explicitly wins, because they meant it.
-    let mut text_overrides = payload.text_overrides.clone();
-    if let Some(contract) = stored_contract
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<StageContract>(s).ok())
-    {
-        contract.apply_role_corrections(&mut text_overrides);
-    }
-
-    queue_enhancement(&mut conn, &payload, &text_overrides, &runs)
+    // Contract role corrections are deliberately *not* folded in here: a task
+    // row records what the caller asked for, and `role:` directives written
+    // into it would be persisted as provenance and shown back as prompts. The
+    // dispatcher reads the contract beside the graph and applies them at run
+    // time instead — which also means correcting a contract fixes tasks
+    // already queued against it.
+    queue_enhancement(&mut conn, &payload, &runs)
 }
 
 /// The mime type of the file a task would read: the one the payload names, or
@@ -742,11 +731,10 @@ fn source_mime(
 fn queue_enhancement(
     conn: &mut diesel::sqlite::SqliteConnection,
     payload: &EnhancePayload,
-    text_overrides: &std::collections::HashMap<String, String>,
     runs: &[crate::comfyui::ParameterMap],
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let text_overrides_json =
-        serde_json::to_string(&text_overrides).unwrap_or_else(|_| "{}".to_string());
+        serde_json::to_string(&payload.text_overrides).unwrap_or_else(|_| "{}".to_string());
 
     // One transaction for the whole fan-out. Four tasks that are four separate
     // rows are still one thing the user asked for; queueing two of them and

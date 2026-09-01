@@ -49,20 +49,24 @@ pub(super) fn backfill_contracts(
         }
     };
 
-    let pending: Vec<(String, String, Option<StageContract>)> = rows
+    // What the row said when it was read is kept verbatim: the update below is
+    // conditional on it, so a correction a person saves while this pass is off
+    // fetching the catalogue is never overwritten with a stale derivation.
+    let pending: Vec<(String, String, Option<String>, Option<StageContract>)> = rows
         .into_iter()
         .filter_map(|(id, graph, stored)| match stored.as_deref() {
             // Never derived.
-            None => Some((id, graph, None)),
+            None => Some((id, graph, None, None)),
             Some(json) => match serde_json::from_str::<StageContract>(json) {
-                // Derived blind; worth another go now.
-                Ok(c) if c.wants_catalog() => Some((id, graph, Some(c))),
+                // Derived blind, or over a catalogue missing some of this
+                // graph's classes; worth another go now.
+                Ok(c) if c.under_informed() => Some((id, graph, stored.clone(), Some(c))),
                 Ok(_) => None,
                 // Written by something that is not this type any more. Redo it
                 // rather than leaving a row nothing can read.
                 Err(e) => {
                     debug!("Workflow {} has an unreadable contract: {}", id, e);
-                    Some((id, graph, None))
+                    Some((id, graph, stored.clone(), None))
                 }
             },
         })
@@ -73,31 +77,59 @@ pub(super) fn backfill_contracts(
     }
 
     let catalog = crate::comfyui::node_catalog(client);
-    if catalog.is_none() && pending.iter().all(|(_, _, existing)| existing.is_some()) {
-        // Every outstanding row already has the best contract a blind
-        // derivation can give. Nothing would change; try again later.
-        debug!(
-            "{} workflow contract(s) still want ComfyUI's node catalogue",
-            pending.len()
-        );
-        return false;
-    }
 
     let mut written = 0usize;
-    for (id, graph_json, existing) in &pending {
+    let mut unsettled = 0usize;
+    for (id, graph_json, stored_raw, existing) in &pending {
         let graph: Value = serde_json::from_str(graph_json).unwrap_or(Value::Null);
         let corrections = existing
             .as_ref()
             .map(|c| c.corrections.clone())
             .unwrap_or_default();
         let contract = StageContract::derive_with(&graph, catalog.as_deref(), corrections);
+        // A graph whose classes the server still does not have stays on the
+        // list: installing the pack changes the answer, and this pass is the
+        // only thing that would notice.
+        if contract.under_informed() {
+            unsettled += 1;
+        }
+        if existing.as_ref() == Some(&contract) {
+            // Nothing new to say — a blind derivation over a blind one, or the
+            // same missing pack as last time. Do not churn the row.
+            continue;
+        }
         let Ok(encoded) = serde_json::to_string(&contract) else {
             continue;
         };
-        match diesel::update(comfyui_workflows::table.filter(comfyui_workflows::id.eq(id)))
+        // Guarded by what was read at the top: zero rows means someone (the
+        // correction endpoint) wrote meanwhile, and their write — made against
+        // fresher input — stands. The row shows up again next pass if it still
+        // wants anything.
+        let result = match stored_raw {
+            Some(raw) => diesel::update(
+                comfyui_workflows::table.filter(
+                    comfyui_workflows::id
+                        .eq(id)
+                        .and(comfyui_workflows::contract_json.eq(raw)),
+                ),
+            )
             .set(comfyui_workflows::contract_json.eq(&encoded))
-            .execute(conn)
-        {
+            .execute(conn),
+            None => diesel::update(
+                comfyui_workflows::table.filter(
+                    comfyui_workflows::id
+                        .eq(id)
+                        .and(comfyui_workflows::contract_json.is_null()),
+                ),
+            )
+            .set(comfyui_workflows::contract_json.eq(&encoded))
+            .execute(conn),
+        };
+        match result {
+            Ok(0) => debug!(
+                "Workflow {} was corrected while this pass ran; leaving it",
+                id
+            ),
             Ok(_) => written += 1,
             Err(e) => warn!("Could not store the contract for workflow {}: {}", id, e),
         }
@@ -114,7 +146,7 @@ pub(super) fn backfill_contracts(
             }
         );
     }
-    catalog.is_some()
+    unsettled == 0
 }
 
 #[cfg(test)]
@@ -282,6 +314,42 @@ mod tests {
             &client_with_nothing_behind_it()
         ));
         assert_eq!(stored(&mut conn).unwrap(), first);
+    }
+
+    #[test]
+    fn a_graph_using_an_uninstalled_pack_is_rederived_once_the_pack_arrives() {
+        // Imported while the server was up but missing a pack: the catalogue
+        // was read, some classes were not in it. Not the same as derived blind
+        // — and not settled either, because installing the pack changes what
+        // the catalogue answers.
+        let graph_value: Value = serde_json::from_str(graph()).unwrap();
+        let mut doc = object_info();
+        doc.as_object_mut().unwrap().remove("KSampler");
+        let missing_pack = parse_object_info(&doc);
+        let partial = StageContract::derive(&graph_value, Some(&missing_pack));
+        assert!(partial.under_informed());
+        assert!(!partial.wants_catalog());
+
+        let (_dir, mut conn) = library(Some(&serde_json::to_string(&partial).unwrap()));
+
+        // While the pack is still missing, the pass keeps asking — and does
+        // not churn the row with an identical rewrite.
+        let url = "http://backfill-still-missing.test";
+        remember_for_test(url, parse_object_info(&doc));
+        assert!(!backfill_contracts(
+            &mut conn,
+            &crate::comfyui::ComfyUiClient::new(url)
+        ));
+        assert_eq!(stored(&mut conn).unwrap(), partial);
+
+        // The pack is installed: the next pass finishes the job.
+        assert!(backfill_contracts(
+            &mut conn,
+            &client_with_a_catalogue("backfill-pack-installed")
+        ));
+        let c = stored(&mut conn).unwrap();
+        assert!(!c.under_informed());
+        assert_eq!(c.params_named(ParamName::Seed).count(), 1);
     }
 
     #[test]
