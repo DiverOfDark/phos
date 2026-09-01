@@ -6,11 +6,7 @@
     "license": {
       "name": "MIT"
     },
-<<<<<<< HEAD
-    "version": "feat/synthetic-provenance"
-=======
-    "version": "feat/comfyui-stage-contracts"
->>>>>>> 84d42e3 (feat(api): serve stage contracts, and let a person correct one in place)
+    "version": "rb/stage-contracts"
   },
   "paths": {
     "/api/auth/callback": {
@@ -271,7 +267,7 @@
             "description": "Enhancement task queued"
           },
           "400": {
-            "description": "Unrecognised source_mode"
+            "description": "Unrecognised source_mode, or one this workflow cannot take"
           },
           "404": {
             "description": "Shot or workflow not found"
