@@ -523,7 +523,6 @@ pub(super) async fn comfyui_enhance(
     let runs = crate::comfyui::expand(&payload.parameters, &payload.vary)
         .map_err(ApiError::bad_request)?;
 
-
     let mut conn = state.pool.get().map_err(|_| ApiError::internal())?;
 
     // Verify shot exists
@@ -552,6 +551,15 @@ pub(super) async fn comfyui_enhance(
     let Some(workflow_json) = workflow_json else {
         return Err(StatusCode::NOT_FOUND.into());
     };
+    // A sweep whose key names no rewritable field would queue N tasks that all
+    // run the same graph while their rows claim distinct values — refuse it
+    // here, where it is still one request and one message.
+    if !payload.vary.is_empty() {
+        if let Ok(workflow) = serde_json::from_str::<serde_json::Value>(&workflow_json) {
+            crate::comfyui::check_sweep_targets(&workflow, &payload.vary)
+                .map_err(ApiError::bad_request)?;
+        }
+    }
     if explicit_mode.is_some() {
         if let Ok(workflow) = serde_json::from_str::<serde_json::Value>(&workflow_json) {
             // A still resolves every mode to a frame, so `whole_video` is only
@@ -1195,7 +1203,7 @@ fn cancel_on_comfyui(url: &str, prompt_id: &str) {
     path = "/api/comfyui/generations/{shot_id}",
     tag = "comfyui",
     summary = "Get shot generation history",
-    description = "Returns the workflow and text overrides used to generate each non-original file for a shot.",
+    description = "Returns the workflow, text overrides and typed parameters used to generate each non-original file for a shot.",
     params(("shot_id" = String, Path, description = "Shot ID")),
     responses(
         (status = 200, description = "List of generations"),
@@ -1213,13 +1221,16 @@ pub(super) async fn comfyui_shot_generations(
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let rows: Vec<(String, Option<String>, Option<String>)> = files::table
+    // file id, workflow id, text overrides, provenance manifest
+    type GenerationRow = (String, Option<String>, Option<String>, Option<String>);
+    let rows: Vec<GenerationRow> = files::table
         .filter(files::shot_id.eq(&shot_id))
         .filter(files::source_workflow_id.is_not_null())
         .select((
             files::id,
             files::source_workflow_id,
             files::source_text_overrides,
+            files::manifest_json,
         ))
         .order(files::created_at.desc())
         .load(&mut conn)
@@ -1230,14 +1241,23 @@ pub(super) async fn comfyui_shot_generations(
 
     let generations: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(file_id, workflow_id, overrides_str)| {
+        .map(|(file_id, workflow_id, overrides_str, manifest_str)| {
             let overrides: serde_json::Value = overrides_str
                 .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::json!({}));
+            // The typed values that made this file live in its provenance
+            // manifest; a file written before they existed reads back `{}`,
+            // which is also what a run that set nothing recorded.
+            let parameters = manifest_str
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .map(|m| m["parameters"].clone())
+                .filter(serde_json::Value::is_object)
                 .unwrap_or(serde_json::json!({}));
             serde_json::json!({
                 "file_id": file_id,
                 "workflow_id": workflow_id,
                 "text_overrides": overrides,
+                "parameters": parameters,
             })
         })
         .collect();

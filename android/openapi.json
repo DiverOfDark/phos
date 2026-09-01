@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "rb/typed-params"
+    "version": "feat/comfyui-typed-params"
   },
   "paths": {
     "/api/auth/callback": {
@@ -287,7 +287,7 @@
           "comfyui"
         ],
         "summary": "Get shot generation history",
-        "description": "Returns the workflow and text overrides used to generate each non-original file for a shot.",
+        "description": "Returns the workflow, text overrides and typed parameters used to generate each non-original file for a shot.",
         "operationId": "comfyui_shot_generations",
         "parameters": [
           {
@@ -3717,10 +3717,8 @@
           },
           "values": {
             "type": "array",
-            "items": {
-              "type": "object"
-            },
-            "description": "Run exactly these values, in this order."
+            "items": {},
+            "description": "Run exactly these values, in this order.\n\nAny scalar JSON value: `[4.0, 6.0, 8.0]` for a cfg,\n`[\"sd15.safetensors\", \"sdxl.safetensors\"]` for a checkpoint. Declared\nas unconstrained values, not objects — `Vec<Object>` would make a\ngenerated client refuse every valid list."
           }
         }
       },

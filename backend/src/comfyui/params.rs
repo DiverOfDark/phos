@@ -75,8 +75,13 @@ pub enum VaryMode {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
 pub struct VarySpec {
     /// Run exactly these values, in this order.
+    ///
+    /// Any scalar JSON value: `[4.0, 6.0, 8.0]` for a cfg,
+    /// `["sd15.safetensors", "sdxl.safetensors"]` for a checkpoint. Declared
+    /// as unconstrained values, not objects — `Vec<Object>` would make a
+    /// generated client refuse every valid list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<Value>)]
     pub values: Vec<Value>,
     /// Or: how many values to generate. Ignored when `values` is given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,6 +135,61 @@ impl Variation {
 
 /// The sweeps a queue request asked for, keyed like [`ParameterMap`].
 pub type VaryMap = BTreeMap<String, Variation>;
+
+// ===== Validation ===========================================================
+
+/// Can each swept key actually change the graph it is aimed at?
+///
+/// [`apply_to_node`] silently skips a key that names no node, no field, or a
+/// wired socket — right for a pinned parameter (a preset can outlive a graph
+/// edit), and wrong for a sweep: a typo like `"3.sead"` would queue up to
+/// [`MAX_FANOUT`] tasks that all run the same graph while their rows claim
+/// distinct values. So a sweep's targets are checked against the workflow
+/// before anything is queued, and the caller gets a 400 naming the key.
+///
+/// `filename_prefix` is refused too, although it is a literal: the output
+/// prefix is pinned after substitution precisely so nothing can take it away,
+/// and a sweep over it would also be N identical runs.
+pub fn check_sweep_targets(workflow: &Value, vary: &VaryMap) -> Result<(), String> {
+    for key in vary.keys() {
+        let Some((node_id, field)) = key.split_once('.') else {
+            return Err(format!(
+                "'{}' is not a sweepable parameter; keys look like \"<node_id>.<field_name>\".",
+                key
+            ));
+        };
+        let current = workflow.get(node_id).map(|node| &node["inputs"][field]);
+        match current {
+            None => {
+                return Err(format!(
+                    "'{}' names a node this workflow does not have.",
+                    key
+                ))
+            }
+            Some(Value::Null) => {
+                return Err(format!(
+                    "'{}' names a field node {} does not have.",
+                    key, node_id
+                ))
+            }
+            Some(Value::Array(_)) | Some(Value::Object(_)) => {
+                return Err(format!(
+                    "'{}' is wired from another node, not a value to sweep.",
+                    key
+                ))
+            }
+            Some(_) if field == "filename_prefix" => {
+                return Err(format!(
+                    "'{}' is the output prefix, which Phos pins; sweeping it would run \
+                     the same graph every time.",
+                    key
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
 
 // ===== Expansion ============================================================
 
@@ -378,6 +438,50 @@ mod tests {
         assert_eq!(map["3.seed"].spec().count, Some(4));
         assert_eq!(map["3.seed"].spec().mode, VaryMode::Random);
         assert_eq!(map["3.cfg"].spec().values.len(), 3);
+    }
+
+    // === Sweep targets ======================================================
+
+    #[test]
+    fn a_sweep_may_target_any_rewritable_literal() {
+        let graph = json!({
+            "3": { "class_type": "KSampler",
+                   "inputs": { "seed": 42, "cfg": 8.0, "sampler_name": "euler",
+                               "add_noise": true, "model": ["4", 0] } },
+            "9": { "class_type": "SaveImage",
+                   "inputs": { "images": ["3", 0], "filename_prefix": "ComfyUI" } }
+        });
+        for ok in ["3.seed", "3.cfg", "3.sampler_name", "3.add_noise"] {
+            assert_eq!(
+                check_sweep_targets(&graph, &vary(json!({ ok: 2 }))),
+                Ok(()),
+                "{} is a literal and sweepable",
+                ok
+            );
+        }
+        assert_eq!(check_sweep_targets(&graph, &VaryMap::new()), Ok(()));
+    }
+
+    #[test]
+    fn a_sweep_that_cannot_change_the_graph_is_named_and_refused() {
+        let graph = json!({
+            "3": { "class_type": "KSampler",
+                   "inputs": { "seed": 42, "model": ["4", 0] } },
+            "9": { "class_type": "SaveImage",
+                   "inputs": { "images": ["3", 0], "filename_prefix": "ComfyUI" } }
+        });
+        // The typo that would otherwise queue N identical runs with rows
+        // claiming distinct values.
+        for bad in [
+            "3.sead",            // no such field
+            "7.seed",            // no such node
+            "3.model",           // wired from another node
+            "9.filename_prefix", // pinned by Phos after substitution
+            "no-dot-here",       // not even a key
+        ] {
+            let err = check_sweep_targets(&graph, &vary(json!({ bad: 2 }))).unwrap_err();
+            assert!(err.contains(bad), "'{}' should be named: {}", bad, err);
+        }
     }
 
     // === Fan-out ============================================================

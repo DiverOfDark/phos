@@ -99,7 +99,7 @@ pub use overrides::detect_inputs;
 // this module directly and has no use for it, which is what the allow is for.
 #[allow(unused_imports)]
 pub use overrides::WorkflowInput;
-pub use params::{expand, ParameterMap, VaryMap, VaryMode, VarySpec};
+pub use params::{check_sweep_targets, expand, ParameterMap, VaryMap, VaryMode, VarySpec};
 pub use source::SourceMode;
 pub use worker::spawn_enhancement_worker;
 pub use workflow::detect_outputs;
