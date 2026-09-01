@@ -988,7 +988,13 @@ mod tests {
             },
         )
         .unwrap();
-        let prepared = crate::comfyui::workflow::prepare_workflow(&wf, &plan, &overrides, None);
+        let prepared = crate::comfyui::workflow::prepare_workflow(
+            &wf,
+            &plan,
+            &overrides,
+            &crate::comfyui::ParameterMap::new(),
+            None,
+        );
         assert_eq!(
             prepared["7"]["inputs"]["text"].as_str(),
             Some("written by a describe stage")
