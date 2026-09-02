@@ -750,7 +750,7 @@ fn queue_enhancement(
     let label: String = comfyui_workflows::table
         .filter(comfyui_workflows::id.eq(&payload.workflow_id))
         .select(comfyui_workflows::name)
-        .first(&mut conn)
+        .first(&mut *conn)
         .unwrap_or_else(|_| "Enhancement".to_string());
 
     // One transaction for the whole fan-out. Four tasks that are four separate

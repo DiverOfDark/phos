@@ -99,7 +99,7 @@ mod workflow;
 
 pub use client::ComfyUiClient;
 pub use contract::{Accepts, ContractCorrections, MediaType, ParamName, StageContract};
-pub use line::{validate_chain, LineError, RunState, StageTyping};
+pub use line::{RunState, StageTyping};
 pub use loaders::{
     check_source_kind, default_binding_warnings, detect_loaders, importable, takes_video,
     LoaderKind, SourceRole,
