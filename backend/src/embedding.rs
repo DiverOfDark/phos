@@ -26,7 +26,9 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let embedding = vec![1.0f32, -2.5, 0.0, 3.14, f32::MAX, f32::MIN];
+        // 0.1 is not exactly representable in binary, which is the point: a
+        // value that survives the round trip proves the bytes, not the maths.
+        let embedding = vec![1.0f32, -2.5, 0.0, 0.1, f32::MAX, f32::MIN];
         let blob = encode_embedding(&embedding);
         assert_eq!(blob.len(), embedding.len() * 4);
         let decoded = decode_embedding(&blob).unwrap();
