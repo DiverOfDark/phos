@@ -1149,6 +1149,15 @@ defineExpose({ loadData: fetchWorkflows })
         </div>
       </div>
 
+      <!-- Export and delete fail from the list, not the form, so their errors
+           have to show here too — a download that silently does not happen
+           reads as a dead button. -->
+      <div
+        v-if="lineError && !showLineForm"
+        class="font-mono text-xs"
+        style="color: var(--status-error)"
+      >{{ lineError }}</div>
+
       <div class="card-ab overflow-hidden">
         <div
           v-for="ln in lines"

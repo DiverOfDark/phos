@@ -575,7 +575,13 @@ pub fn create_router(state: AppState) -> Router {
         // Before `/lines/{id}`: a literal segment and a path parameter both
         // match `/lines/import`, and axum takes the literal only if it is
         // there to take.
-        .route("/api/comfyui/lines/import", post(line_io::import_line))
+        .route(
+            "/api/comfyui/lines/import",
+            // A bundle carries every stage's whole graph, so a line of
+            // workflows that each fit axum's 2 MiB default can add up to a
+            // file that does not.
+            post(line_io::import_line).layer(DefaultBodyLimit::max(64 * 1024 * 1024)), // 64 MB
+        )
         .route(
             "/api/comfyui/lines/{id}",
             get(lines::get_line)

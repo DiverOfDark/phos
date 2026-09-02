@@ -27,9 +27,11 @@
 //!
 //! * **A name already in use.** The import is renamed, never merged over the
 //!   top of what is there, and the response says what it ended up called.
-//! * **A workflow already present.** Matched on the graph itself
-//!   ([`canonical_graph`]), so re-importing a line you exported reuses the
-//!   workflows it came from instead of leaving a second copy of each.
+//! * **A workflow already present.** Matched on the graph plus the contract
+//!   corrections it travels with ([`workflow_identity`]), so re-importing a
+//!   line you exported reuses the workflows it came from instead of leaving a
+//!   second copy of each — while a bundle whose corrections disagree with the
+//!   row already here gets its own row rather than someone else's contract.
 //! * **A contract from another box.** Re-derived here, against this ComfyUI's
 //!   catalogue — a contract is a fact about the machine that will run the graph.
 //!   The `corrections` inside it are kept verbatim, because a correction is the
@@ -45,7 +47,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use crate::comfyui::portable::{
-    available_name, canonical_graph, BundleLine, BundleStage, BundleWorkflow, LineBundle,
+    available_name, workflow_identity, BundleLine, BundleStage, BundleWorkflow, LineBundle,
 };
 use crate::comfyui::runs::contract_of;
 use crate::comfyui::{ContractCorrections, NodeCatalog, StageContract};
@@ -237,10 +239,6 @@ pub(super) async fn import_line(
 
     let mut conn = state.pool.get().map_err(|_| ApiError::internal())?;
 
-    let taken: Vec<String> = production_lines::table
-        .select(production_lines::name)
-        .load(&mut conn)
-        .map_err(|_| ApiError::internal())?;
     let desired = query
         .name
         .as_deref()
@@ -250,17 +248,22 @@ pub(super) async fn import_line(
     if desired.is_empty() {
         return Err(ApiError::bad_request("A line needs a name."));
     }
-    let name = available_name(&desired, &taken);
-    let renamed_from = (name != desired).then(|| desired.clone());
 
     if query.dry_run {
-        // Nothing is written, so the workflow plan is what *would* happen.
-        let existing = existing_graphs(&mut conn).map_err(|_| ApiError::internal())?;
+        // Nothing is written, so the name and the workflow plan are what
+        // *would* happen.
+        let taken: Vec<String> = production_lines::table
+            .select(production_lines::name)
+            .load(&mut conn)
+            .map_err(|_| ApiError::internal())?;
+        let name = available_name(&desired, &taken);
+        let renamed_from = (name != desired).then(|| desired.clone());
+        let existing = existing_workflows(&mut conn).map_err(|_| ApiError::internal())?;
         let preview: Vec<serde_json::Value> = bundle
             .workflows
             .iter()
             .map(|(key, wf)| {
-                let reused = existing.get(&canonical_graph(&wf.graph));
+                let reused = existing.get(&workflow_identity(&wf.graph, &bundle_corrections(wf)));
                 serde_json::json!({
                     "key": key,
                     "name": wf.name,
@@ -284,9 +287,17 @@ pub(super) async fn import_line(
 
     let line_id = uuid::Uuid::new_v4().to_string();
     // One transaction: a line whose workflows landed but whose stages did not
-    // would leave graphs nobody asked for lying about the library.
-    let resolved = conn
-        .transaction::<_, ImportFailure, _>(|conn| {
+    // would leave graphs nobody asked for lying about the library. Immediate,
+    // and the name is picked inside it: `production_lines.name` has no unique
+    // index, so two overlapping imports that both read the taken names before
+    // either wrote would both pick the same suffix. The write lock an
+    // immediate transaction takes up front is what serialises that read.
+    let (resolved, name) = conn
+        .immediate_transaction::<_, ImportFailure, _>(|conn| {
+            let taken: Vec<String> = production_lines::table
+                .select(production_lines::name)
+                .load(conn)?;
+            let name = available_name(&desired, &taken);
             let resolved = resolve_workflows(conn, &bundle, catalog.as_deref())?;
 
             let payload = LinePayload {
@@ -328,7 +339,7 @@ pub(super) async fn import_line(
                 })
                 .execute(conn)?;
             insert_stages(conn, &line_id, &payload)?;
-            Ok(resolved)
+            Ok((resolved, name))
         })
         .map_err(|e| match e {
             ImportFailure::Refused(api) => api,
@@ -337,6 +348,7 @@ pub(super) async fn import_line(
                 ApiError::internal()
             }
         })?;
+    let renamed_from = (name != desired).then(|| desired.clone());
 
     let stages = crate::comfyui::runs::stages_of_line(&mut conn, &line_id)
         .map_err(|_| ApiError::internal())?;
@@ -369,45 +381,67 @@ pub(super) async fn import_line(
     })))
 }
 
-/// Every workflow in this library, keyed by what its graph canonically is.
+/// The corrections a bundle's workflow travels with. A hand-written template
+/// carries none.
+fn bundle_corrections(wf: &BundleWorkflow) -> ContractCorrections {
+    wf.contract
+        .as_ref()
+        .map(|c| c.corrections.clone())
+        .unwrap_or_default()
+}
+
+/// Every workflow in this library, keyed by its [`workflow_identity`].
 ///
 /// Loading every graph to compare them is affordable because a library holds
 /// tens of workflows, not thousands, and because this happens once per import
 /// rather than once per request.
-fn existing_graphs(conn: &mut SqliteConnection) -> QueryResult<BTreeMap<String, (String, String)>> {
-    let rows: Vec<(String, String, String)> = comfyui_workflows::table
+fn existing_workflows(
+    conn: &mut SqliteConnection,
+) -> QueryResult<BTreeMap<String, (String, String)>> {
+    let rows: Vec<(String, String, String, Option<String>)> = comfyui_workflows::table
         .select((
             comfyui_workflows::id,
             comfyui_workflows::name,
             comfyui_workflows::workflow_json,
+            comfyui_workflows::contract_json,
         ))
         .load(conn)?;
     Ok(rows
         .into_iter()
-        .filter_map(|(id, name, json)| {
+        .filter_map(|(id, name, json, contract)| {
             let graph: serde_json::Value = serde_json::from_str(&json).ok()?;
-            Some((canonical_graph(&graph), (id, name)))
+            let corrections = contract
+                .and_then(|c| serde_json::from_str::<StageContract>(&c).ok())
+                .map(|c| c.corrections)
+                .unwrap_or_default();
+            Some((workflow_identity(&graph, &corrections), (id, name)))
         })
         .collect())
 }
 
 /// Find each of the bundle's workflows here, or create it.
 ///
-/// Deduplication is on the graph and nothing else: the same nodes with the same
-/// values is the same workflow however it is named, and one different value is
-/// a different workflow however familiar it looks. A workflow created earlier
-/// in this same import counts as present, so a bundle naming one graph under
-/// two keys makes one row.
+/// Deduplication is on [`workflow_identity`] — the graph plus its corrections:
+/// the same nodes with the same values is the same workflow however it is
+/// named, and one different value *or one different correction* is a different
+/// workflow however familiar it looks. Reusing a row whose corrections differ
+/// would validate and dispatch the imported line against a contract its author
+/// never saw. A workflow created earlier in this same import counts as
+/// present, so a bundle naming one graph under two keys makes one row.
 fn resolve_workflows(
     conn: &mut SqliteConnection,
     bundle: &LineBundle,
     catalog: Option<&NodeCatalog>,
 ) -> Result<BTreeMap<String, ResolvedWorkflow>, ImportFailure> {
-    let mut existing = existing_graphs(conn)?;
+    let mut existing = existing_workflows(conn)?;
     let mut resolved = BTreeMap::new();
     for (key, wf) in &bundle.workflows {
-        let canonical = canonical_graph(&wf.graph);
-        if let Some((id, name)) = existing.get(&canonical) {
+        // A contract is a fact about the box that runs the graph, so it is
+        // derived again here. Corrections travel — they are the part of a
+        // contract that is a person's judgement rather than a derivation.
+        let corrections = bundle_corrections(wf);
+        let identity = workflow_identity(&wf.graph, &corrections);
+        if let Some((id, name)) = existing.get(&identity) {
             resolved.insert(
                 key.clone(),
                 ResolvedWorkflow {
@@ -419,14 +453,6 @@ fn resolve_workflows(
             continue;
         }
 
-        // A contract is a fact about the box that runs the graph, so it is
-        // derived again here. Corrections travel — they are the part of a
-        // contract that is a person's judgement rather than a derivation.
-        let corrections = wf
-            .contract
-            .as_ref()
-            .map(|c| c.corrections.clone())
-            .unwrap_or_else(ContractCorrections::default);
         let contract = StageContract::derive_with(&wf.graph, catalog, corrections);
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -454,7 +480,7 @@ fn resolve_workflows(
             })
             .execute(conn)?;
 
-        existing.insert(canonical, (id.clone(), wf.name.clone()));
+        existing.insert(identity, (id.clone(), wf.name.clone()));
         resolved.insert(
             key.clone(),
             ResolvedWorkflow {
@@ -470,7 +496,7 @@ fn resolve_workflows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comfyui::portable::Requirements;
+    use crate::comfyui::portable::{canonical_graph, Requirements};
     use crate::schema::line_stages;
     use diesel::connection::SimpleConnection;
     use serde_json::json;
@@ -800,6 +826,61 @@ mod tests {
             .unwrap();
         assert_ne!(ids[0], "wf-1", "stage 1 got the new graph");
         assert_eq!(ids[1], "wf-2", "stage 2 reused the identical one");
+    }
+
+    #[test]
+    fn a_graph_arriving_with_different_corrections_is_a_different_workflow() {
+        let (_dir, mut conn) = seeded();
+        let mut bundle = export(&mut conn, "line-1");
+        // Same graph, but the file says node 6's text box is the negative
+        // prompt — a judgement the row already here never heard. Reusing that
+        // row would run the imported line against a contract without it.
+        bundle
+            .workflows
+            .get_mut("wf-1")
+            .unwrap()
+            .contract
+            .as_mut()
+            .unwrap()
+            .corrections
+            .slots
+            .insert("6.text".to_string(), Some("negative".to_string()));
+
+        let (imported_id, _) = import(&mut conn, &bundle, None).unwrap();
+        let count: i64 = comfyui_workflows::table
+            .count()
+            .get_result(&mut conn)
+            .unwrap();
+        assert_eq!(count, 3, "the corrected graph is its own workflow");
+
+        // The new row carries the corrections it travelled with…
+        let ids: Vec<String> = line_stages::table
+            .filter(line_stages::line_id.eq(&imported_id))
+            .order(line_stages::stage_idx.asc())
+            .select(line_stages::workflow_id)
+            .load(&mut conn)
+            .unwrap();
+        assert_ne!(ids[0], "wf-1", "stage 1 got its own row");
+        assert_eq!(ids[1], "wf-2", "stage 2's corrections agree, so it reuses");
+        let stored: Option<String> = comfyui_workflows::table
+            .filter(comfyui_workflows::id.eq(&ids[0]))
+            .select(comfyui_workflows::contract_json)
+            .first(&mut conn)
+            .unwrap();
+        let contract: StageContract = serde_json::from_str(&stored.unwrap()).unwrap();
+        assert_eq!(
+            contract.corrections.slots.get("6.text"),
+            Some(&Some("negative".to_string()))
+        );
+
+        // …and importing the same file again finds it rather than making a
+        // fourth.
+        import(&mut conn, &bundle, None).unwrap();
+        let count: i64 = comfyui_workflows::table
+            .count()
+            .get_result(&mut conn)
+            .unwrap();
+        assert_eq!(count, 3);
     }
 
     #[test]

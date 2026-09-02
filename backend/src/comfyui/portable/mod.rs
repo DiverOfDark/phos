@@ -197,7 +197,14 @@ impl LineBundle {
                     stage.workflow
                 ));
             };
-            if !wf.graph.is_object() {
+            // `{}` and `{"a": 1}` are objects too, and a graph with no nodes
+            // would import cleanly and then fail on the first run — the worst
+            // of the two places to find out.
+            let has_node = wf
+                .graph
+                .as_object()
+                .is_some_and(|nodes| nodes.values().any(|n| n.get("class_type").is_some()));
+            if !has_node {
                 return Err(format!(
                     "Stage {} ({}) carries no ComfyUI API-format graph.",
                     idx + 1,
@@ -247,6 +254,28 @@ pub fn canonical_graph(graph: &Value) -> String {
     let mut out = String::new();
     write_canonical(graph, &mut out);
     out
+}
+
+/// What makes two workflows the same workflow: the graph, plus the corrections
+/// a person made to its contract.
+///
+/// Corrections are in the identity because they change what a workflow *is* to
+/// the rest of the system — "node 7 is the negative prompt" makes a different
+/// stage picker entry and a different chain check than the derivation alone.
+/// Reusing an existing row whose corrections differ would validate and
+/// dispatch the imported line against a contract its author never saw; two
+/// rows sharing a graph but not a judgement is the honest answer.
+pub fn workflow_identity(
+    graph: &Value,
+    corrections: &super::contract::ContractCorrections,
+) -> String {
+    let corrections =
+        serde_json::to_value(corrections).unwrap_or(Value::Object(Default::default()));
+    format!(
+        "{}\n{}",
+        canonical_graph(graph),
+        canonical_graph(&corrections)
+    )
 }
 
 fn write_canonical(value: &Value, out: &mut String) {
@@ -369,6 +398,17 @@ mod tests {
         let err = LineBundle::parse(&doc).unwrap_err();
         assert!(err.contains("Stage 1"), "{}", err);
         assert!(err.contains("Portrait"), "{}", err);
+    }
+
+    #[test]
+    fn a_graph_with_no_nodes_is_refused_before_it_can_fail_a_run() {
+        for empty in [json!({}), json!({"not_a_node": 1})] {
+            let mut doc = bundle_doc();
+            doc["workflows"]["wf-a"]["graph"] = empty;
+            let err = LineBundle::parse(&doc).unwrap_err();
+            assert!(err.contains("Stage 1"), "{}", err);
+            assert!(err.contains("Portrait"), "{}", err);
+        }
     }
 
     #[test]

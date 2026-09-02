@@ -325,7 +325,7 @@ mod tests {
                 name: field.to_string(),
                 required: true,
                 widget: WidgetSpec::Combo {
-                    choices: choices.iter().map(|c| c.to_string()).collect(),
+                    choices: choices.iter().map(|c| json!(c)).collect(),
                     default: None,
                     truncated,
                 },
