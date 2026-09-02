@@ -177,6 +177,15 @@ jobs:
           cd backend
           cargo test -- --test-threads=1
 
+      # Not `-D warnings`: the tree carries ~21 of them and turning them into
+      # errors is a separate decision. This catches the deny-by-default
+      # correctness lints, which is the class that had `cargo clippy` refusing
+      # to run at all until this commit.
+      - name: Clippy
+        run: |
+          cd backend
+          cargo clippy --all-targets
+
       - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
@@ -191,6 +200,36 @@ jobs:
         run: |
           cd backend
           cargo test --test comfyui_contract_test -- --nocapture
+
+  frontend-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        run: |
+          cd frontend
+          npm ci
+
+      # The Docker build compiles the frontend too, but only after the backend
+      # has built — so a broken component used to surface minutes late, behind
+      # an unrelated stage. This answers in seconds.
+      - name: Build
+        run: |
+          cd frontend
+          npm run build
+
+      - name: Tests
+        run: |
+          cd frontend
+          npm test
 
   # The image is built only from a commit whose tests passed and whose APK
   # built; the Dockerfile itself runs no tests.
