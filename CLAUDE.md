@@ -62,7 +62,7 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
-- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to) and `workflow.rs` (graph analysis and rewriting) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `worker/` holds the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine
+- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting) and `contract/` (what a workflow accepts and produces) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `worker/` holds the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine
 
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
@@ -86,6 +86,20 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   does not get a vote
 
 ### Key Design Decisions
+- **A workflow knows what it takes and what it gives.** `comfyui_workflows.contract_json` holds a
+  `comfyui::StageContract`: `accepts` (image / video / text / **none**, because a text-to-image graph
+  begins a line rather than continuing one), `produces` (image / video / text), which loader fills
+  which slot, the prompt slots a person or a describe stage writes into, and the canonical settings
+  (seed, steps, cfg, frames…) with the node's own ranges. It is what lets one workflow be chained
+  after another. `text` is modelled although nothing produces it yet — a describe stage creates no
+  file at all, and a type system that learns that later has to be reshaped later
+- **A contract is derived, then corrected — never the other way round.** The derivation is
+  heuristic and *will* be wrong on an unusual graph, so `contract_json` stores the corrections a
+  person made alongside the derived answer, and `StageContract::derive_with` folds them back into
+  the *next* derivation instead of patching its result. That is what lets "node 7 is the negative
+  prompt" name a text box the heuristics never offered, and lets a contract worked out while
+  ComfyUI was down be re-derived, properly typed, without losing what anyone said. The worker
+  re-runs that pass every five minutes until the catalogue can be read
 - **Generated media never enters the person model.** `files.synthetic` is the rule and the whole
   face pipeline reads it: `scanner.rs` skips detection, `cluster_faces` filters those faces out,
   the overlap sweep ignores those files, and a generated box cannot decide a shot's primary person.
@@ -118,6 +132,7 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `PUT /api/import/upload` — Store an uploaded file and queue it for analysis (`202`; the analysis runs on the per-library ingest worker, not on the request)
 - `GET /api/import/status` — Ingest queue depth for the caller's library, polled by the import UI
 - `POST /api/faces/dedupe?dry_run=` — Collapse overlapping boxes drawn on one face (never merges two boxes assigned to different people; skips reviewed shots). Also runs at startup and after each upload batch is analyzed
+- `PUT /api/comfyui/workflows/{id}/contract` — Replace the corrections applied to a workflow's derived stage contract, and get back the contract that results. Sending `{}` discards every correction and takes the derivation as it stands
 - `GET /api/files/{id}/manifest` — Whether a file was generated, and the provenance manifest recording how. Answers for any file; a photograph comes back `synthetic: false` with no manifest
 - `GET /api/client/version` — Bundled Android APK metadata for the in-app updater (no auth)
 

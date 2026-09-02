@@ -259,6 +259,7 @@ impl Library {
                 workflow_json: &graph_json,
                 inputs_json: None,
                 outputs_json: None,
+                contract_json: None,
             })
             .execute(&mut self.conn())
             .unwrap();

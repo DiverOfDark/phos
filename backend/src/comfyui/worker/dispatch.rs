@@ -31,6 +31,11 @@ struct PendingTask {
     id: String,
     shot_id: String,
     workflow_json: String,
+    /// The workflow's stored stage contract, read for its role corrections.
+    /// They are applied here, at dispatch, rather than written into the task
+    /// row: a task records what the caller asked for, and `role:` directives
+    /// persisted in `text_overrides` would surface as provenance and prompts.
+    contract_json: Option<String>,
     text_overrides: String,
     /// This run's typed parameters as stored JSON. Already resolved when the
     /// row was written, so dispatch decides nothing about them.
@@ -44,6 +49,7 @@ type PendingRow = (
     String,
     String,
     String,
+    Option<String>,
     String,
     String,
     Option<String>,
@@ -124,6 +130,7 @@ fn pending_tasks(
             enhancement_tasks::id,
             enhancement_tasks::shot_id,
             comfyui_workflows::workflow_json,
+            comfyui_workflows::contract_json,
             diesel::dsl::sql::<diesel::sql_types::Text>(
                 "COALESCE(enhancement_tasks.text_overrides, '{}')",
             ),
@@ -144,11 +151,12 @@ fn pending_tasks(
             id: row.0,
             shot_id: row.1,
             workflow_json: row.2,
-            text_overrides: row.3,
-            parameters: row.4,
-            source_file_id: row.5,
-            source_mode: row.6,
-            retry_count: row.7,
+            contract_json: row.3,
+            text_overrides: row.4,
+            parameters: row.5,
+            source_file_id: row.6,
+            source_mode: row.7,
+            retry_count: row.8,
         })
         .collect())
 }
@@ -180,8 +188,18 @@ fn dispatch_one(
     // source step should hand it.
     let workflow: Value = serde_json::from_str(&task.workflow_json)
         .map_err(|e| StepFailure::new(FailureSite::WorkflowJson, "Invalid workflow JSON", e))?;
-    let text_overrides: std::collections::HashMap<String, String> =
+    let mut text_overrides: std::collections::HashMap<String, String> =
         serde_json::from_str(&task.text_overrides).unwrap_or_default();
+    // A loader role a person corrected on the workflow's contract joins the
+    // run here, in memory only — anything the task itself says wins, and the
+    // row on disk never carries a `role:` directive it did not ask for.
+    if let Some(contract) = task
+        .contract_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<crate::comfyui::StageContract>(s).ok())
+    {
+        contract.apply_role_corrections(&mut text_overrides);
+    }
     // A parameter map that will not parse is a corrupt row, not a reason to fail
     // the run: the graph's own defaults are still a valid thing to submit.
     let parameters: ParameterMap = serde_json::from_str(&task.parameters).unwrap_or_default();
@@ -338,8 +356,15 @@ mod tests {
     /// three lines `dispatch_one` runs, minus the parts that need a server.
     fn submitted(task: &PendingTask) -> Value {
         let workflow: Value = serde_json::from_str(&task.workflow_json).unwrap();
-        let text_overrides: std::collections::HashMap<String, String> =
+        let mut text_overrides: std::collections::HashMap<String, String> =
             serde_json::from_str(&task.text_overrides).unwrap_or_default();
+        if let Some(contract) = task
+            .contract_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<crate::comfyui::StageContract>(s).ok())
+        {
+            contract.apply_role_corrections(&mut text_overrides);
+        }
         let parameters: ParameterMap = serde_json::from_str(&task.parameters).unwrap_or_default();
         let (target_role, role_overrides) = role_directives(&text_overrides);
         let binding = SourceBinding {
@@ -397,6 +422,49 @@ mod tests {
         assert_eq!(prepared["3"]["inputs"]["seed"], json!(1));
         assert_eq!(prepared["3"]["inputs"]["steps"], json!(20));
         assert_eq!(prepared["6"]["inputs"]["text"], json!("unchanged"));
+    }
+
+    #[test]
+    fn a_contract_role_correction_reaches_the_run_without_touching_the_row() {
+        // Two untitled image loaders both default to `start`, so the upload
+        // would land in both. The person corrected node 5 to `end` on the
+        // workflow's contract — the run must honour that, and the task row must
+        // stay exactly what the caller asked for, with no `role:` directive
+        // persisted where provenance would pick it up.
+        let two_loader_graph = r#"{
+            "3": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ["4", 0]}},
+            "4": {"class_type": "LoadImage", "inputs": {"image": "first.png"}},
+            "5": {"class_type": "LoadImage", "inputs": {"image": "second.png"}}
+        }"#;
+        let graph: Value = serde_json::from_str(two_loader_graph).unwrap();
+        let contract = crate::comfyui::StageContract::derive_with(
+            &graph,
+            None,
+            crate::comfyui::ContractCorrections {
+                roles: [("5".to_string(), SourceRole::End)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        let rows = format!(
+            "INSERT INTO comfyui_workflows (id, name, workflow_json, contract_json) \
+             VALUES ('wf-2', 'Interpolate', '{}', '{}');\n\
+             INSERT INTO enhancement_tasks (id, shot_id, workflow_id, status) \
+             VALUES ('task-1', 'shot-1', 'wf-2', 'pending');",
+            two_loader_graph.replace('\'', "''"),
+            serde_json::to_string(&contract)
+                .unwrap()
+                .replace('\'', "''")
+        );
+        let (_dir, mut conn) = library(&rows);
+
+        let tasks = pending_tasks(&mut conn, "2026-08-30 12:00:00").unwrap();
+        assert_eq!(tasks.len(), 1);
+        // The row carries no role directive of its own…
+        assert_eq!(tasks[0].text_overrides, "{}");
+        // …and the run still binds the upload to the start frame alone.
+        let prepared = submitted(&tasks[0]);
+        assert_eq!(prepared["4"]["inputs"]["image"], json!("phos_upload.png"));
+        assert_eq!(prepared["5"]["inputs"]["image"], json!("second.png"));
     }
 
     #[test]
