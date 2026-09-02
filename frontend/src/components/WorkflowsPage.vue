@@ -488,6 +488,109 @@ async function deleteLine(id) {
   }
 }
 
+// --- Lines travel ---
+//
+// A line lives in its library's own .phos.db, so without this there is no way
+// to move one to another library, another install, or another person. Export
+// is a download; import shows what the line needs before it commits anything.
+// The editor proper is FR5b — this is deliberately two buttons.
+
+async function exportLine(ln) {
+  lineError.value = ''
+  try {
+    const res = await fetch(`/api/comfyui/lines/${ln.id}/export`)
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || `HTTP ${res.status}`)
+    }
+    const bundle = await res.json()
+    const url = URL.createObjectURL(
+      new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' }),
+    )
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${ln.name.replace(/[^\w.-]+/g, '-').toLowerCase() || 'line'}.phos-line.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (e) {
+    lineError.value = e.message || 'Failed to export line'
+  }
+}
+
+const showLineImport = ref(false)
+const importLineJson = ref('')
+const importLineName = ref('')
+const importLineReport = ref(null)
+const importLineError = ref('')
+const importingLine = ref(false)
+
+function openLineImport() {
+  showLineImport.value = true
+  importLineJson.value = ''
+  importLineName.value = ''
+  importLineReport.value = null
+  importLineError.value = ''
+}
+
+async function onLineFile(event) {
+  const file = event.target.files?.[0]
+  if (!file) return
+  importLineJson.value = await file.text()
+  // A file the person picked is a file they mean; check it straight away.
+  await checkLineImport()
+}
+
+/** POST the bundle with `dry_run`, so the report is on screen before anything
+ *  is written. This is the whole point of the dialog. */
+async function checkLineImport() {
+  return sendLineImport(true)
+}
+
+async function sendLineImport(dryRun) {
+  importLineError.value = ''
+  let bundle
+  try {
+    bundle = JSON.parse(importLineJson.value)
+  } catch {
+    importLineError.value = 'That is not JSON.'
+    importLineReport.value = null
+    return
+  }
+
+  importingLine.value = true
+  try {
+    const params = new URLSearchParams()
+    if (dryRun) params.set('dry_run', 'true')
+    if (importLineName.value.trim()) params.set('name', importLineName.value.trim())
+    const res = await fetch(`/api/comfyui/lines/import?${params}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(bundle),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+    importLineReport.value = data
+    if (!dryRun) {
+      showLineImport.value = false
+      await fetchLines()
+    }
+  } catch (e) {
+    importLineError.value = e.message || 'Failed to import line'
+    if (dryRun) importLineReport.value = null
+  } finally {
+    importingLine.value = false
+  }
+}
+
+/** ready / missing / unchecked — the only three, and the only three colours. */
+function reportColor(status) {
+  switch (status) {
+    case 'ready': return 'var(--status-ready)'
+    case 'missing': return 'var(--status-error)'
+    default: return 'var(--status-degraded)'
+  }
+}
+
 /**
  * The statuses the backend actually writes: pending → uploading → queued →
  * processing → downloading → completed, with awaiting_output when ComfyUI says
@@ -882,11 +985,117 @@ defineExpose({ loadData: fetchWorkflows })
         </div>
         <span class="flex-1"></span>
         <button
+          v-if="!showLineImport"
+          class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors whitespace-nowrap"
+          @click="openLineImport"
+        >Import line</button>
+        <button
           v-if="!showLineForm"
           class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors whitespace-nowrap"
           :disabled="workflows.length === 0"
           @click="startLineForm"
         >New line</button>
+      </div>
+
+      <!-- Import a line from a file. The requirements report comes first: a
+           line naming a node this ComfyUI does not have has to say so here,
+           not four stages into a run. -->
+      <div v-if="showLineImport" class="card-ab p-4 flex flex-col gap-3">
+        <div class="flex items-center gap-3">
+          <span class="label w-24 flex-none">Bundle</span>
+          <input
+            type="file"
+            accept="application/json,.json"
+            class="flex-1 min-w-0 font-mono text-xs text-ink-secondary file:mr-3 file:border file:border-line-strong file:rounded-sm file:bg-base file:px-3 file:py-1 file:font-mono file:text-[11px] file:text-ink-secondary"
+            @change="onLineFile"
+          />
+        </div>
+        <div class="flex items-center gap-3">
+          <span class="label w-24 flex-none">Name as</span>
+          <input
+            v-model="importLineName"
+            placeholder="leave blank to keep the file's name"
+            class="flex-1 min-w-0 bg-base border border-line rounded-sm px-3 py-1.5 text-[13px] text-ink"
+          />
+        </div>
+
+        <div v-if="importLineError" class="font-mono text-xs" style="color: var(--status-error)">
+          {{ importLineError }}
+        </div>
+
+        <!-- What this box can and cannot run. -->
+        <div
+          v-if="importLineReport"
+          class="border rounded-sm p-3 flex flex-col gap-2"
+          :style="{ borderColor: reportColor(importLineReport.report_status) }"
+        >
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="tag" :style="{ color: reportColor(importLineReport.report_status) }">
+              {{ importLineReport.report_status }}
+            </span>
+            <span class="font-mono text-[11px] tracking-[0.08em] uppercase text-ink-tertiary">
+              {{ importLineReport.name }} · {{ importLineReport.stage_count }}
+              {{ importLineReport.stage_count === 1 ? 'stage' : 'stages' }}
+            </span>
+          </div>
+          <div class="text-[13px] text-ink-secondary">{{ importLineReport.report_headline }}</div>
+
+          <div v-if="importLineReport.report?.missing_nodes?.length" class="flex flex-col gap-1">
+            <span class="label">Missing nodes</span>
+            <span class="font-mono text-[11px]" style="color: var(--status-error)">
+              {{ importLineReport.report.missing_nodes.join(', ') }}
+            </span>
+          </div>
+          <div v-if="importLineReport.report?.missing_models?.length" class="flex flex-col gap-1">
+            <span class="label">Missing models</span>
+            <span
+              v-for="m in importLineReport.report.missing_models"
+              :key="`${m.class_type}.${m.field}.${m.name}`"
+              class="font-mono text-[11px]"
+              style="color: var(--status-error)"
+            >{{ m.name }} <span class="text-ink-tertiary">({{ m.class_type }}.{{ m.field }})</span></span>
+          </div>
+          <div
+            v-for="w in importLineReport.report?.warnings || []"
+            :key="w"
+            class="font-mono text-[11px]"
+            style="color: var(--status-degraded)"
+          >{{ w }}</div>
+
+          <div v-if="importLineReport.workflows?.length" class="flex flex-col gap-1">
+            <span class="label">Workflows</span>
+            <span
+              v-for="wf in importLineReport.workflows"
+              :key="wf.key"
+              class="font-mono text-[11px] text-ink-tertiary"
+            >{{ wf.name }} · {{ wf.reused ? `reuses ${wf.reused_as}` : 'new' }}</span>
+          </div>
+          <div
+            v-if="importLineReport.renamed_from"
+            class="font-mono text-[11px] text-ink-tertiary"
+          >
+            "{{ importLineReport.renamed_from }}" is taken, so this comes in as
+            "{{ importLineReport.name }}".
+          </div>
+        </div>
+
+        <div class="flex items-center gap-3">
+          <button
+            class="bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors disabled:opacity-50"
+            :disabled="!importLineJson || importingLine"
+            @click="sendLineImport(false)"
+          >{{ importingLine ? 'Working…' : 'Import' }}</button>
+          <button
+            class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+            :disabled="!importLineJson || importingLine"
+            @click="checkLineImport"
+          >re-check</button>
+          <span class="flex-1"></span>
+          <button
+            class="font-mono text-[11px] text-ink-tertiary hover:text-ink transition-colors"
+            @click="showLineImport = false"
+          >cancel</button>
+        </div>
       </div>
 
       <!-- Draw a line: name it, then pick a workflow per stage. -->
@@ -940,6 +1149,15 @@ defineExpose({ loadData: fetchWorkflows })
         </div>
       </div>
 
+      <!-- Export and delete fail from the list, not the form, so their errors
+           have to show here too — a download that silently does not happen
+           reads as a dead button. -->
+      <div
+        v-if="lineError && !showLineForm"
+        class="font-mono text-xs"
+        style="color: var(--status-error)"
+      >{{ lineError }}</div>
+
       <div class="card-ab overflow-hidden">
         <div
           v-for="ln in lines"
@@ -965,6 +1183,11 @@ defineExpose({ loadData: fetchWorkflows })
           <span class="font-mono text-[11px] tracking-[0.08em] uppercase text-ink-tertiary whitespace-nowrap">
             {{ ln.stage_count }} {{ ln.stage_count === 1 ? 'stage' : 'stages' }}
           </span>
+          <button
+            class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+            title="Download this line, its stages and every workflow behind them as one file."
+            @click="exportLine(ln)"
+          >export</button>
           <button
             class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
             @click="deleteLine(ln.id)"
