@@ -48,7 +48,7 @@ fn contract_with(slots: Vec<(&str, &str, &str)>) -> StageContract {
 
 #[test]
 fn the_instruction_carries_the_names_clustering_found() {
-    let text = describe_instruction(&facts(), &Intent::default());
+    let text = describe_instruction(&facts());
     assert!(text.contains("Anna"), "{}", text);
     assert!(text.contains("Bjorn"), "{}", text);
     // And says not to invent others, which is the reason for naming them.
@@ -57,7 +57,7 @@ fn the_instruction_carries_the_names_clustering_found() {
 
 #[test]
 fn the_instruction_carries_the_exif_date_and_place() {
-    let text = describe_instruction(&facts(), &Intent::default());
+    let text = describe_instruction(&facts());
     assert!(text.contains("2019-07-14 19:12:03"), "{}", text);
     assert!(text.contains("59.3293"), "{}", text);
     assert!(text.contains("18.0686"), "{}", text);
@@ -65,7 +65,7 @@ fn the_instruction_carries_the_exif_date_and_place() {
 
 #[test]
 fn the_instruction_carries_the_library_caption_without_being_it() {
-    let text = describe_instruction(&facts(), &Intent::default());
+    let text = describe_instruction(&facts());
     assert!(
         text.contains("a woman sitting on a wooden jetty"),
         "{}",
@@ -77,21 +77,20 @@ fn the_instruction_carries_the_library_caption_without_being_it() {
 }
 
 #[test]
-fn the_instruction_carries_the_intent_the_style_and_the_constraints() {
-    let text = describe_instruction(&facts(), &intent());
-    assert!(
-        text.contains("a slow push-in as the light fades"),
-        "{}",
-        text
-    );
-    assert!(text.contains("35mm film, muted palette"), "{}", text);
-    assert!(text.contains("Must not: change face"), "{}", text);
-    assert!(text.contains("Must not: add people"), "{}", text);
+fn the_instruction_never_carries_the_run_intent() {
+    // The answer is cached per shot and reused by every line over it, so the
+    // instruction must be a function of the photograph alone. The intent, the
+    // style and the constraints are folded in by `compile_prompt`, where they
+    // cost nothing to change.
+    let text = describe_instruction(&facts());
+    assert!(!text.contains("a slow push-in as the light fades"), "{}", text);
+    assert!(!text.contains("35mm film, muted palette"), "{}", text);
+    assert!(!text.contains("Must not"), "{}", text);
 }
 
 #[test]
 fn a_shot_phos_knows_nothing_about_still_gets_an_instruction() {
-    let text = describe_instruction(&ShotFacts::default(), &Intent::default());
+    let text = describe_instruction(&ShotFacts::default());
     assert!(!text.contains("What the library already knows"), "{}", text);
     assert!(text.contains("Answer with one JSON object"), "{}", text);
 }

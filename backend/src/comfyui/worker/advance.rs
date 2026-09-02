@@ -244,6 +244,17 @@ fn continue_one(conn: &mut SqliteConnection, c: &Continuation) -> Result<(), Str
                 .unwrap_or_default();
             let intent = prompt::Intent::from_overrides(&plan.text_overrides)
                 .inherit(prompt::Intent::from_overrides(&upstream));
+            // `phos:slot` is written on the describe stage — "put my answer in
+            // *that* box of the stage after me" — but `bind_description` reads
+            // the map it binds into, so the directive has to ride down with the
+            // description. The downstream stage's own say still wins.
+            if !plan.text_overrides.contains_key(prompt::SLOT_KEY) {
+                if let Some(slot) = upstream.get(prompt::SLOT_KEY).filter(|s| !s.trim().is_empty())
+                {
+                    plan.text_overrides
+                        .insert(prompt::SLOT_KEY.to_string(), slot.clone());
+                }
+            }
             let compiled = prompt::compile_from_text(text, &intent);
             prompt::bind_description(&stage.contract, &mut plan.text_overrides, &compiled)
                 .map_err(|e| e.message)?;
@@ -1200,8 +1211,10 @@ mod tests {
         let run = lib.start();
 
         // Stage 1 is the describe stage, and Phos wrote its instruction: the
-        // names clustering found, the EXIF date and place, the caption, and
-        // what the person asked for.
+        // names clustering found, the EXIF date and place, the caption. Not
+        // the person's intent or constraints — the answer is cached per shot
+        // and reused by lines with different ones, so the description must be
+        // about the photograph alone.
         let instruction = lib.overrides_of(&run.task_ids[0])["2.prompt"].clone();
         assert!(instruction.contains("Anna"), "{}", instruction);
         assert!(instruction.contains("2019-07-14"), "{}", instruction);
@@ -1211,8 +1224,9 @@ mod tests {
             "{}",
             instruction
         );
+        assert!(!instruction.contains("change face"), "{}", instruction);
         assert!(
-            instruction.contains("Must not: change face"),
+            !instruction.contains("a slow push-in as the light fades"),
             "{}",
             instruction
         );
@@ -1277,6 +1291,25 @@ mod tests {
         // one the workflow's author already wrote.
         assert!(!positive.contains("change face"), "{}", positive);
         assert_eq!(overrides["7.text"], "blurry, warp hands, change face");
+    }
+
+    #[test]
+    fn the_slot_directive_on_the_describe_stage_names_the_next_stages_box() {
+        // `phos:slot` is typed on the describe stage — "put my answer in that
+        // box of the stage after me" — and has to survive the trip down, since
+        // `bind_description` reads the map it binds into.
+        let mut lib = Library::describe_then_generate(r#"{"phos:slot": "negative"}"#);
+        let run = lib.start();
+        lib.describe(&run.task_ids[0], "A woman sits on a jetty at dusk.");
+        lib.advance();
+        let stage2 = lib.pending_at(1);
+        let overrides = lib.overrides_of(&stage2[0]);
+        assert!(
+            overrides["7.text"].contains("A woman sits on a jetty at dusk"),
+            "{:?}",
+            overrides
+        );
+        assert!(!overrides.contains_key("6.text"), "{:?}", overrides);
     }
 
     #[test]

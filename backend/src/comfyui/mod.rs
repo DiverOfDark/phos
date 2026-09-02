@@ -85,9 +85,9 @@
 //!   like any other — a vision model running inside ComfyUI — whose product is
 //!   a sentence rather than a file. [`prompt`] writes the instruction it is
 //!   given (the person names clustering found, the EXIF date and place, the
-//!   library caption, the user's intent and the stage's constraints), reads
-//!   what comes back, and compiles it into the two strings the stage after it
-//!   takes. Binding it there is one `text_overrides` entry, because FR5a keys
+//!   library caption — never the run's intent, because the answer is cached
+//!   per shot), reads what comes back, and compiles it, intent and all, into
+//!   the two strings the stage after it takes. Binding it there is one `text_overrides` entry, because FR5a keys
 //!   prompt slots by exactly the key [`workflow::prepare_workflow`] substitutes
 //!   on.
 

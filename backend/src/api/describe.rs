@@ -177,7 +177,7 @@ pub(super) async fn describe_shot(
     // The cheap answer first: a description this shot already carries is a
     // description, and compiling a prompt from it costs nothing.
     if !payload.refresh {
-        if let Some(cached) = prompt::cached_analysis(&mut conn, &payload.shot_id) {
+        if let Some(cached) = prompt::cached_analysis_for(&mut conn, &payload.shot_id, None) {
             return Ok(Json(ready(
                 payload.shot_id,
                 facts,
@@ -198,7 +198,7 @@ pub(super) async fn describe_shot(
         overrides.insert(prompt::REFRESH_KEY.to_string(), "1".to_string());
     }
     contract.apply_role_corrections(&mut overrides);
-    let instruction = prompt::describe_instruction(&facts, &intent);
+    let instruction = prompt::describe_instruction(&facts);
     if let Err(e) = prompt::bind_instruction(&contract, &mut overrides, &instruction) {
         return Err(ApiError::bad_request(e.message));
     }
@@ -328,7 +328,7 @@ pub(super) async fn get_description(
         }
     }
 
-    match prompt::cached_analysis(&mut conn, &shot_id) {
+    match prompt::cached_analysis_for(&mut conn, &shot_id, None) {
         Some(cached) => Ok(Json(ready(shot_id, facts, &intent, &cached.text, true))),
         None => Ok(Json(DescribeResponse {
             shot_id,

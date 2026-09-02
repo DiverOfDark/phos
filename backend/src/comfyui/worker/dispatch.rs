@@ -233,6 +233,11 @@ fn check_stage_admits(task: &PendingTask, source_mime: &str) -> Result<(), StepF
 /// What differs between runs — the intent, the style, the constraints — is
 /// applied when the prompt is *compiled* downstream, not baked in here.
 ///
+/// It is tied to the *file* the stage would read, though: a mid-line describe
+/// stage reads the stage before it, and a description of that intermediate
+/// must not answer for the photograph — nor a stale one for a file since
+/// promoted to original. [`prompt::cached_analysis_for`] makes that check.
+///
 /// A run that wants a fresh look says so with the `phos:refresh` directive.
 ///
 /// Returns whether the task was finished here.
@@ -246,7 +251,9 @@ fn serve_describe_from_cache(
     if contract.produces != MediaType::Text || prompt::wants_refresh(text_overrides) {
         return false;
     }
-    let Some(cached) = prompt::cached_analysis(conn, &task.shot_id) else {
+    let Some(cached) =
+        prompt::cached_analysis_for(conn, &task.shot_id, task.source_file_id.as_deref())
+    else {
         return false;
     };
     if cached.text.trim().is_empty() {
@@ -664,7 +671,8 @@ mod tests {
     }
 
     const CACHED: &str = r#"{"version":1,"text":"a woman on a jetty at dusk",
-        "workflow_id":"wf-describe","generated_at":"2026-08-30 12:00:00"}"#;
+        "workflow_id":"wf-describe","source_file_id":"file-orig",
+        "generated_at":"2026-08-30 12:00:00"}"#;
 
     #[test]
     fn a_second_line_over_the_same_shot_does_not_describe_it_again() {
@@ -742,6 +750,27 @@ mod tests {
         let overrides: std::collections::HashMap<String, String> =
             serde_json::from_str(&task.text_overrides).unwrap();
         assert!(!serve_describe_from_cache(&mut conn, &task, &overrides));
+    }
+
+    #[test]
+    fn a_description_of_a_different_file_does_not_answer_for_this_one() {
+        // A mid-line describe stage reads the stage before it, not the shot's
+        // photograph, and a description of that intermediate must not be
+        // served to it — nor the intermediate's description to a later stage
+        // reading the original.
+        let (_dir, mut conn) = describe_library(Some(CACHED), "{}");
+        conn.batch_execute(
+            "INSERT INTO files (id, shot_id, path, hash, mime_type, is_original, synthetic) \
+               VALUES ('file-mid', 'shot-1', 'phos/mid.png', 'h1', 'image/png', 0, 1);
+             UPDATE enhancement_tasks SET source_file_id = 'file-mid' WHERE id = 'task-1';",
+        )
+        .unwrap();
+        let task = the_task(&mut conn);
+        assert!(!serve_describe_from_cache(
+            &mut conn,
+            &task,
+            &std::collections::HashMap::new()
+        ));
     }
 
     #[test]

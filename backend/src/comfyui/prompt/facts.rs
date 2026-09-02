@@ -109,6 +109,12 @@ pub(crate) struct AnalysisCache {
     /// is still a description, but a reader deserves to know.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
+    /// Which file the describe stage actually read. A describe stage mid-line
+    /// reads the stage before it, not the shot's original, and a description
+    /// of an intermediate must not answer for the photograph — nor the other
+    /// way round once a different file is promoted to original.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_at: Option<String>,
 }
@@ -128,8 +134,44 @@ pub(crate) fn cached_analysis(conn: &mut SqliteConnection, shot_id: &str) -> Opt
     serde_json::from_str(stored.as_deref()?).ok()
 }
 
+/// The shot's cached description, but only if it describes the file this
+/// reader is about to read.
+///
+/// `source_file_id` is what the reader would feed the describe stage — the
+/// upstream output on a mid-line describe, `None` meaning the shot's original.
+/// A cache entry for any other file, or one that never recorded what it read,
+/// is a miss rather than a wrong answer.
+pub(crate) fn cached_analysis_for(
+    conn: &mut SqliteConnection,
+    shot_id: &str,
+    source_file_id: Option<&str>,
+) -> Option<AnalysisCache> {
+    let cached = cached_analysis(conn, shot_id)?;
+    let reads = source_file_id
+        .map(str::to_string)
+        .or_else(|| original_file_id(conn, shot_id))?;
+    (cached.source_file_id.as_deref() == Some(reads.as_str())).then_some(cached)
+}
+
+/// The file a describe stage reads when nothing names one: the shot's original.
+///
+/// The same row [`crate::comfyui::source::resolve_source_file`] resolves, so
+/// the cache is validated against the file that would actually be described.
+pub(crate) fn original_file_id(conn: &mut SqliteConnection, shot_id: &str) -> Option<String> {
+    files::table
+        .filter(files::shot_id.eq(shot_id).and(files::is_original.eq(true)))
+        .order(files::created_at.asc())
+        .select(files::id)
+        .first(conn)
+        .ok()
+}
+
 /// Remember what a describe stage said, so the next line over this shot does
 /// not pay for it again.
+///
+/// `source_file_id` is what the stage read — `None` meaning the shot's
+/// original, which is resolved to its concrete row here so a later promotion
+/// of a different file to original reads as the mismatch it is.
 ///
 /// A failure to write is logged and swallowed: the description is already on
 /// the task that produced it, and losing a cache entry costs a GPU round-trip
@@ -139,11 +181,15 @@ pub(crate) fn cache_analysis(
     shot_id: &str,
     text: &str,
     workflow_id: &str,
+    source_file_id: Option<&str>,
 ) {
     let entry = AnalysisCache {
         version: cache_version(),
         text: text.to_string(),
         workflow_id: Some(workflow_id.to_string()),
+        source_file_id: source_file_id
+            .map(str::to_string)
+            .or_else(|| original_file_id(conn, shot_id)),
         generated_at: Some(crate::comfyui::timestamp::format_ts(
             chrono::Utc::now().naive_utc(),
         )),

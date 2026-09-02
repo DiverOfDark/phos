@@ -52,6 +52,10 @@ pub(super) struct ActiveTask {
     pub output_prefix: Option<String>,
     pub settle_until: Option<String>,
     pub retry_count: i32,
+    /// What this task reads — the upstream stage's output mid-line, `None`
+    /// meaning the shot's original. Recorded with a describe stage's answer so
+    /// the cache knows which file it describes.
+    pub source_file_id: Option<String>,
     /// This stage's contract says it hands on a sentence rather than a file.
     /// Read here rather than guessed from the history entry: a describe graph
     /// may well preview the photograph it read, and that preview is not the
@@ -71,6 +75,7 @@ type ActiveTaskRow = (
     Option<String>,
     Option<String>,
     i32,
+    Option<String>,
     Option<String>,
 );
 
@@ -118,6 +123,7 @@ pub(super) fn poll_active_tasks(
                 "COALESCE(enhancement_tasks.retry_count, 0)",
             ),
             comfyui_workflows::contract_json,
+            enhancement_tasks::source_file_id,
         ))
         .load::<ActiveTaskRow>(conn)
     {
@@ -143,6 +149,7 @@ pub(super) fn poll_active_tasks(
             output_prefix: row.8,
             settle_until: row.9,
             retry_count: row.10,
+            source_file_id: row.12,
             produces_text,
         };
         poll_one_task(conn, client, library_root, &task, now_dt);
@@ -273,11 +280,13 @@ fn finish_text_task(conn: &mut SqliteConnection, task: &ActiveTask, text: &str) 
             .execute(conn)
     {
         // Without the text there is nothing to hand the next stage, and marking
-        // the task completed would advance the run with an empty prompt.
+        // the task completed would advance the run with an empty prompt. The
+        // answer is still in history, so a transient site lets the next poll
+        // read it again and retry the write.
         handle_failure(
             conn,
             &task.id,
-            FailureSite::Download,
+            FailureSite::History,
             &format!(
                 "Could not record the description this stage produced: {}",
                 e
@@ -289,7 +298,13 @@ fn finish_text_task(conn: &mut SqliteConnection, task: &ActiveTask, text: &str) 
 
     // Remember it against the shot, so a second line over the same photograph
     // does not pay for the description again.
-    crate::comfyui::prompt::cache_analysis(conn, &task.shot_id, text, &task.workflow_id);
+    crate::comfyui::prompt::cache_analysis(
+        conn,
+        &task.shot_id,
+        text,
+        &task.workflow_id,
+        task.source_file_id.as_deref(),
+    );
     info!(
         "Task {} described shot {} in {} characters",
         task.id,
@@ -566,6 +581,7 @@ mod tests {
             output_prefix: Some("phos/task-1".to_string()),
             settle_until: None,
             retry_count: 0,
+            source_file_id: None,
             produces_text: true,
         }
     }
@@ -610,6 +626,10 @@ mod tests {
             .expect("the shot should now carry its description");
         assert_eq!(cached.text, "a woman on a jetty at dusk");
         assert_eq!(cached.workflow_id.as_deref(), Some("wf-describe"));
+        // A task reading the shot's original records the original's concrete
+        // row, so promoting a different file to original later reads as the
+        // mismatch it is.
+        assert_eq!(cached.source_file_id.as_deref(), Some("file-orig"));
         assert!(cached.generated_at.is_some());
     }
 

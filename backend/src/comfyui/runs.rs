@@ -178,8 +178,7 @@ pub(crate) fn compile_describe_instruction(
         return;
     }
     let facts = prompt::shot_facts(conn, shot_id);
-    let intent = prompt::Intent::from_overrides(overrides);
-    let instruction = prompt::describe_instruction(&facts, &intent);
+    let instruction = prompt::describe_instruction(&facts);
     if let Err(e) = prompt::bind_instruction(contract, overrides, &instruction) {
         tracing::warn!(
             "Describe stage for shot {} kept its own prompt: {}",

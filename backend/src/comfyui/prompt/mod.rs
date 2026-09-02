@@ -11,11 +11,12 @@
 //! reads a photograph very well and cannot possibly know that the woman on the
 //! jetty is Anna, that it was July 2019, or that this line must not touch her
 //! face. So Phos writes the *instruction* — [`describe_instruction`] — carrying
-//! the person names from clustering, the EXIF date and place, the library
-//! caption, the user's one-line intent, the style preset and the stage's
-//! constraints. The model answers with [`Analysis`], and
-//! [`compile_prompt`] turns that back into the two strings a generation stage
-//! actually takes.
+//! the person names from clustering, the EXIF date and place and the library
+//! caption. The user's intent, the style preset and the stage's constraints
+//! deliberately stay out of it: the answer is cached per shot, so the
+//! description must be about the photograph and nothing else. The model answers
+//! with [`Analysis`], and [`compile_prompt`] folds the intent in as it turns
+//! that into the two strings a generation stage actually takes.
 //!
 //! # Why it is all pure
 //!
@@ -46,7 +47,10 @@ pub use compile::{
     bind_description, bind_instruction, compile_from_text, parse_analysis, wants_refresh, Analysis,
     CompiledPrompt,
 };
-pub(crate) use facts::{cache_analysis, cached_analysis, shot_facts};
+pub(crate) use facts::{cache_analysis, cached_analysis_for, shot_facts};
+// The raw entry, unvalidated: only the tests read it, to see what was written.
+#[cfg(test)]
+pub(crate) use facts::cached_analysis;
 
 // ===== What the run says it wants ==========================================
 
@@ -113,10 +117,6 @@ impl Intent {
         } else {
             overrides.insert(DO_NOT_KEY.to_string(), self.do_not.join("\n"));
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.intent.is_none() && self.style.is_none() && self.do_not.is_empty()
     }
 
     /// Fill in anything this stage did not say from the describe stage that fed
@@ -238,7 +238,13 @@ const ANALYSIS_SCHEMA: &str = r#"{
 ///
 /// Deterministic, so a test can prove that the person names and the EXIF date
 /// actually reach it — the whole claim of this feature is that they do.
-pub fn describe_instruction(facts: &ShotFacts, intent: &Intent) -> String {
+///
+/// A function of the *photograph* alone, on purpose: the run's intent, style
+/// and constraints are applied when the prompt is compiled downstream, never
+/// sent to the vision model. The answer is cached per shot
+/// ([`cache_analysis`]), and a description steered by one line's intent would
+/// be quietly wrong for the next line over the same shot.
+pub fn describe_instruction(facts: &ShotFacts) -> String {
     let mut out = String::new();
     out.push_str(
         "You are looking at one photograph. Describe it so that a video model can \
@@ -261,19 +267,6 @@ pub fn describe_instruction(facts: &ShotFacts, intent: &Intent) -> String {
         }
     }
 
-    if !intent.is_empty() {
-        out.push_str("\nWhat this run is for:\n");
-        if let Some(what) = &intent.intent {
-            out.push_str(&format!("- Intent: {}\n", what));
-        }
-        if let Some(style) = &intent.style {
-            out.push_str(&format!("- Style: {}\n", style));
-        }
-        for rule in &intent.do_not {
-            out.push_str(&format!("- Must not: {}\n", rule));
-        }
-    }
-
     out.push_str("\nAnswer with one JSON object and nothing else, in this shape:\n");
     out.push_str(ANALYSIS_SCHEMA);
     out.push_str(
@@ -284,8 +277,7 @@ pub fn describe_instruction(facts: &ShotFacts, intent: &Intent) -> String {
          rather than guessing.\n\
          - `motion_affordance` is the useful one: say what in this frame could \
          plausibly move, and what is fixed because of how the subject is posed or held.\n\
-         - Carry every \"must not\" above into `do_not`, and add anything else this \
-         photograph would be damaged by.\n",
+         - Put anything this photograph would be damaged by into `do_not`.\n",
     );
     out
 }

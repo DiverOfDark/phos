@@ -141,9 +141,11 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - **The prompt is compiled from the library, not retyped.** A *describe* stage is a workflow like
   any other — a vision-language model running inside ComfyUI, editable there like every other graph;
   there is no second service, no `PHOS_LLM_URL` and no LLM client in this tree. Phos writes its
-  **instruction** (`comfyui/prompt/`): the person names clustering found, the EXIF date and place,
-  the Florence-2 caption, the user's one-line intent, the style preset and the stage's `do_not`
-  constraints. The model supplies the looking; Phos supplies the knowing. It answers with
+  **instruction** (`comfyui/prompt/`): the person names clustering found, the EXIF date and place
+  and the Florence-2 caption. The user's intent, the style preset and the `do_not` constraints stay
+  *out* of it — the answer is cached per shot, so the description must be about the photograph and
+  nothing else; the intent is folded in when the prompt is compiled, where changing it costs
+  nothing. The model supplies the looking; Phos supplies the knowing. It answers with
   `{subject, setting, lighting, camera, motion_affordance, do_not}`, and that compiles to a positive
   prompt and a negative one — constraints never reach the positive prompt, because "do not add
   people" in a positive prompt adds people. Everything but the two DB reads is a pure function, so
@@ -155,9 +157,11 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   entry** — `StageContract::slot("positive").override_key()` is exactly the `"<node_id>.<field>"` key
   `prepare_workflow` already substitutes on, so binding a description needed no new plumbing at all
 - **A description is paid for once per shot.** `shots.analysis_json` caches what a describe stage
-  said (with which workflow, and when), and `dispatch` completes a describe task straight from it —
-  no upload, no queued prompt, no GPU. A run that wants a fresh look sets the `phos:refresh`
-  directive. The compiler's directives (`phos:intent`, `phos:style`, `phos:do_not`, `phos:slot`,
+  said (with which workflow, of which file, and when), and `dispatch` completes a describe task
+  straight from it — no upload, no queued prompt, no GPU. The entry records the *file* it describes,
+  and is a miss for any other: a mid-line describe stage reads the stage before it, and its answer
+  must not stand in for the photograph's — nor a stale one for a file since promoted to original. A
+  run that wants a fresh look sets the `phos:refresh` directive. The compiler's directives (`phos:intent`, `phos:style`, `phos:do_not`, `phos:slot`,
   `phos:refresh`) ride in `text_overrides` beside the `role:<node>` ones, so they are already stored
   on the stage, stored on the task, exported with a line and read by both the dispatch path and the
   advance pass. A stage inherits anything it did not say from the describe stage that fed it

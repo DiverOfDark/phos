@@ -226,6 +226,27 @@ test("using a compiled prompt replaces the positive and grows the negative", () 
   assert.equal(before["6.text"], "a leftover default");
 });
 
+test("a deleted constraint stays deleted when the prompt is applied again", () => {
+  const baseline = "blurry, watermark";
+  const first = applyCompiledPrompt(
+    CLIP_WORKFLOW,
+    { "7.text": baseline },
+    { positive: "Anna.", negative: "change face, add people" },
+    baseline,
+  );
+  assert.equal(first["7.text"], "blurry, watermark, change face, add people");
+  // The person deletes "add people" from the compiled box and presses again:
+  // the merge runs against the baseline, not against the first application, so
+  // the deleted term does not come back.
+  const second = applyCompiledPrompt(
+    CLIP_WORKFLOW,
+    first,
+    { positive: "Anna.", negative: "change face" },
+    baseline,
+  );
+  assert.equal(second["7.text"], "blurry, watermark, change face");
+});
+
 test("a constraint already in the negative prompt is not repeated", () => {
   assert.equal(mergeConstraints("blurry, Change Face", "change face, warp hands"),
     "blurry, Change Face, warp hands");

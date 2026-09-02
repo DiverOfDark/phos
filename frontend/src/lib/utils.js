@@ -263,16 +263,23 @@ export function slotKey(wf, name) {
  * the prompt, which is why it was compiled — and the constraints are *appended*
  * to the negative one, which is usually a tuned list somebody meant.
  *
+ * `negativeBaseline` is the negative slot's value from *before* any compiled
+ * prompt was applied. Merging against it rather than the current value is what
+ * lets a person delete a constraint from the compiled box and press the button
+ * again without the first application resurrecting it. Leave it undefined on
+ * the first application, where the current value is the baseline.
+ *
  * Returns a new map; the one passed in is left alone.
  */
-export function applyCompiledPrompt(wf, overrides, prompt) {
+export function applyCompiledPrompt(wf, overrides, prompt, negativeBaseline) {
   const next = { ...(overrides || {}) };
   const positiveKey = slotKey(wf, "positive");
   if (positiveKey && prompt?.positive) next[positiveKey] = prompt.positive;
 
   const negativeKey = slotKey(wf, "negative");
   if (negativeKey && prompt?.negative) {
-    next[negativeKey] = mergeConstraints(next[negativeKey], prompt.negative);
+    const base = negativeBaseline !== undefined ? negativeBaseline : next[negativeKey];
+    next[negativeKey] = mergeConstraints(base, prompt.negative);
   }
   return next;
 }

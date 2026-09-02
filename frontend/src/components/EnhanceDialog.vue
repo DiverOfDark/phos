@@ -111,7 +111,14 @@ const describeFacts = ref(null)
 /** The compiled prompt, editable. What is in these boxes is what gets queued. */
 const compiled = ref(null)
 const promptApplied = ref(false)
+/**
+ * The negative slot's value before any compiled prompt touched it. Applying
+ * merges against this, never against the last application's result, so a
+ * constraint deleted from the compiled box stays deleted on the next press.
+ */
+const negativeBaseline = ref(undefined)
 let describePoll = null
+let recompileTimer = null
 
 /** Is there a workflow that can describe a photograph at all? */
 const describeWorkflow = computed(() => workflows.value.find(isDescribeWorkflow) || null)
@@ -127,6 +134,10 @@ function stopDescribePoll() {
   if (describePoll) {
     clearTimeout(describePoll)
     describePoll = null
+  }
+  if (recompileTimer) {
+    clearTimeout(recompileTimer)
+    recompileTimer = null
   }
 }
 
@@ -205,10 +216,38 @@ function pollDescription(attempt = 0) {
 /** Write what is in the boxes into the workflow's prompt slots. */
 function useCompiledPrompt() {
   if (!promptTarget.value || !compiled.value) return
-  textOverrides.value = applyCompiledPrompt(promptTarget.value, textOverrides.value, compiled.value)
+  const negKey = slotKey(promptTarget.value, 'negative')
+  if (negKey && negativeBaseline.value === undefined) {
+    negativeBaseline.value = textOverrides.value[negKey] ?? ''
+  }
+  textOverrides.value = applyCompiledPrompt(
+    promptTarget.value,
+    textOverrides.value,
+    compiled.value,
+    negativeBaseline.value,
+  )
   selectedPresetId.value = null
   promptApplied.value = true
 }
+
+// A prompt compiled for one intent is stale the moment the intent is retyped,
+// and "Use this prompt" must never quietly queue the old words. Compiling is a
+// pure function of the description — the cheap GET — so the boxes follow the
+// typing without describing the photograph again.
+watch([intent, stylePreset, doNot], () => {
+  if (describeState.value !== 'ready' || !props.shotId) return
+  if (recompileTimer) clearTimeout(recompileTimer)
+  recompileTimer = setTimeout(async () => {
+    try {
+      const res = await fetch(`/api/comfyui/describe/${props.shotId}?${describeParams()}`)
+      if (!res.ok) return
+      const data = await res.json()
+      if (data.state === 'ready') readDescription(data)
+    } catch {
+      // Keep the prompt we have; the next edit or describe will try again.
+    }
+  }, 400)
+})
 
 // --- Submit state ---
 const submitting = ref(false)
@@ -368,12 +407,14 @@ watch(selectedWorkflow, (wf) => {
     vary.value = {}
     presets.value = []
     selectedPresetId.value = null
+    negativeBaseline.value = undefined
     return
   }
   textOverrides.value = defaultOverrides(wf)
   parameters.value = {}
   vary.value = {}
   selectedPresetId.value = null
+  negativeBaseline.value = undefined
   // Follow the workflow's own default until the user says otherwise.
   if (!sourceModeTouched.value) sourceModeKey.value = defaultSourceModeKey()
   fetchPresets(wf.id)
@@ -393,6 +434,7 @@ watch(dialogOpen, (val) => {
     describeFacts.value = null
     compiled.value = null
     promptApplied.value = false
+    negativeBaseline.value = undefined
     fetchWorkflows()
     fetchLines()
     if (props.shotId) {
@@ -424,6 +466,7 @@ function selectPreset(preset) {
     selectedPresetId.value = null
     textOverrides.value = defaultOverrides(selectedWorkflow.value)
     parameters.value = {}
+    negativeBaseline.value = undefined
     return
   }
   // A preset lands on the workflow's own values, never on whatever the last
@@ -432,6 +475,7 @@ function selectPreset(preset) {
   selectedPresetId.value = preset.id
   textOverrides.value = { ...defaultOverrides(selectedWorkflow.value), ...(preset.text_overrides || {}) }
   parameters.value = { ...(preset.parameters || {}) }
+  negativeBaseline.value = undefined
 }
 
 const outputType = computed(() => {
