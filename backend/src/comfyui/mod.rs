@@ -81,6 +81,15 @@
 //!   frame of the clip (the first, the last, one at a timestamp, one of the
 //!   indexed keyframes) or the file itself, which is the default whenever the
 //!   graph has a video loader to read it.
+//! * **A prompt is compiled, not retyped.** A *describe* stage is a workflow
+//!   like any other — a vision model running inside ComfyUI — whose product is
+//!   a sentence rather than a file. [`prompt`] writes the instruction it is
+//!   given (the person names clustering found, the EXIF date and place, the
+//!   library caption — never the run's intent, because the answer is cached
+//!   per shot), reads what comes back, and compiles it, intent and all, into
+//!   the two strings the stage after it takes. Binding it there is one `text_overrides` entry, because FR5a keys
+//!   prompt slots by exactly the key [`workflow::prepare_workflow`] substitutes
+//!   on.
 
 mod client;
 pub mod contract;
@@ -94,6 +103,7 @@ mod overrides;
 pub mod params;
 mod policy;
 pub mod portable;
+pub mod prompt;
 pub mod runs;
 mod source;
 mod timestamp;
@@ -118,6 +128,7 @@ pub use params::{check_sweep_targets, expand, ParameterMap, VaryMap, VaryMode, V
 pub use portable::{
     BundleLine, BundleStage, BundleWorkflow, LineBundle, ModelRef, Requirements, RequirementsReport,
 };
+pub use prompt::{Analysis, CompiledPrompt, Intent, ShotFacts};
 pub use source::SourceMode;
 pub(crate) use worker::advance::{cancel_run, retry_run};
 pub use worker::spawn_enhancement_worker;

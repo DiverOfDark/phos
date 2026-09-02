@@ -1,5 +1,6 @@
 pub mod client;
 mod comfyui;
+mod describe;
 mod faces;
 mod files;
 mod line_io;
@@ -117,6 +118,8 @@ use utoipa::OpenApi;
         lines::cancel_run,
         line_io::export_line,
         line_io::import_line,
+        describe::describe_shot,
+        describe::get_description,
         // Settings
         settings::get_webdav_settings,
         settings::set_webdav_settings,
@@ -197,6 +200,13 @@ use utoipa::OpenApi;
             crate::comfyui::Requirements,
             crate::comfyui::RequirementsReport,
             crate::comfyui::ModelRef,
+            describe::DescribePayload,
+            describe::DescribeResponse,
+            describe::DescribeState,
+            crate::comfyui::Analysis,
+            crate::comfyui::CompiledPrompt,
+            crate::comfyui::Intent,
+            crate::comfyui::ShotFacts,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
@@ -596,6 +606,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/comfyui/runs/{id}", get(lines::get_run))
         .route("/api/comfyui/runs/{id}/retry", post(lines::retry_run))
         .route("/api/comfyui/runs/{id}/cancel", post(lines::cancel_run))
+        // The prompt a shot's own contents compile to.
+        .route("/api/comfyui/describe", post(describe::describe_shot))
+        .route(
+            "/api/comfyui/describe/{shot_id}",
+            get(describe::get_description),
+        )
         .route("/api/version", get(stats::get_version))
         // Settings
         .route(

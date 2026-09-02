@@ -9,11 +9,22 @@
 //! retry what it names, and probe `/view` for the filenames we pinned before
 //! the run started — a file on disk beats a silent history entry, and history
 //! is silent after a ComfyUI restart.
+//!
+//! # A describe stage never names a file, and never will
+//!
+//! A stage whose contract says `produces: text` publishes its whole answer
+//! inline in the history entry. There is no file to download, no `files` row to
+//! write and nothing to probe `/view` for, so it takes a different path out of
+//! here: [`finish_text_task`] puts the sentence on the task's `text_output` and
+//! caches it against the shot. Waiting for a file that cannot exist would have
+//! meant a describe stage failing after its settle budget every single time.
 
 use super::status::{handle_failure, live_task, mark_completed, task_has_output};
 use super::store::download_and_save_output;
 use crate::comfyui::client::ComfyUiClient;
-use crate::comfyui::history::{execution_error_traceback, interpret_history, HistoryVerdict};
+use crate::comfyui::history::{
+    execution_error_traceback, interpret_history, text_outputs, HistoryVerdict,
+};
 use crate::comfyui::outputs::{fallback_output_candidates, OutputRef};
 use crate::comfyui::policy::{decide_settle, settle_budget, FailureSite, SettleDecision};
 use crate::comfyui::timestamp::{format_ts, parse_ts};
@@ -41,6 +52,15 @@ pub(super) struct ActiveTask {
     pub output_prefix: Option<String>,
     pub settle_until: Option<String>,
     pub retry_count: i32,
+    /// What this task reads — the upstream stage's output mid-line, `None`
+    /// meaning the shot's original. Recorded with a describe stage's answer so
+    /// the cache knows which file it describes.
+    pub source_file_id: Option<String>,
+    /// This stage's contract says it hands on a sentence rather than a file.
+    /// Read here rather than guessed from the history entry: a describe graph
+    /// may well preview the photograph it read, and that preview is not the
+    /// product.
+    pub produces_text: bool,
 }
 
 type ActiveTaskRow = (
@@ -55,6 +75,8 @@ type ActiveTaskRow = (
     Option<String>,
     Option<String>,
     i32,
+    Option<String>,
+    Option<String>,
 );
 
 /// Poll tasks that are queued/processing/settling against ComfyUI history.
@@ -100,6 +122,8 @@ pub(super) fn poll_active_tasks(
             diesel::dsl::sql::<diesel::sql_types::Integer>(
                 "COALESCE(enhancement_tasks.retry_count, 0)",
             ),
+            comfyui_workflows::contract_json,
+            enhancement_tasks::source_file_id,
         ))
         .load::<ActiveTaskRow>(conn)
     {
@@ -111,6 +135,8 @@ pub(super) fn poll_active_tasks(
     };
 
     for row in rows {
+        let produces_text = crate::comfyui::runs::contract_of(row.11.as_deref(), &row.4).produces
+            == crate::comfyui::MediaType::Text;
         let task = ActiveTask {
             id: row.0,
             shot_id: row.1,
@@ -123,6 +149,8 @@ pub(super) fn poll_active_tasks(
             output_prefix: row.8,
             settle_until: row.9,
             retry_count: row.10,
+            source_file_id: row.12,
+            produces_text,
         };
         poll_one_task(conn, client, library_root, &task, now_dt);
     }
@@ -161,6 +189,19 @@ fn poll_one_task(
         // settle path gets its chance to find the file by name.
         None => HistoryVerdict::NoOutputs,
     };
+
+    // A describe stage's answer is in the entry, not on a disk somewhere. Read
+    // it before the file paths are considered at all: such a graph often
+    // previews the photograph it read, and that preview would otherwise be
+    // downloaded and filed as the stage's output.
+    if task.produces_text && !matches!(verdict, HistoryVerdict::Running | HistoryVerdict::Failed(_))
+    {
+        let text = history.as_ref().map(text_outputs).unwrap_or_default();
+        if !text.is_empty() {
+            finish_text_task(conn, task, &text.join("\n\n"));
+            return;
+        }
+    }
 
     match verdict {
         HistoryVerdict::Running => {
@@ -207,7 +248,10 @@ fn poll_one_task(
                 );
             }
         }
-        HistoryVerdict::NoOutputs => {
+        // Text where no file was expected. The contract says this stage makes a
+        // picture, so the sentence is a preview and not the product — settle,
+        // exactly as an entry naming nothing at all would.
+        HistoryVerdict::Text(_) | HistoryVerdict::NoOutputs => {
             settle_task(
                 conn,
                 client,
@@ -219,6 +263,55 @@ fn poll_one_task(
             );
         }
     }
+}
+
+/// Land a text stage: the sentence goes on the task, and nothing goes in
+/// `files`.
+///
+/// That absence is the point. FR5a modelled `produces: text` precisely because
+/// a describe stage's product is not a degenerate image, and a `files` row for
+/// it would put a machine's sentence in a library of photographs, give the
+/// sweep something to delete, and hand the next stage a text file to upload
+/// into an image loader.
+fn finish_text_task(conn: &mut SqliteConnection, task: &ActiveTask, text: &str) {
+    if let Err(e) =
+        diesel::update(enhancement_tasks::table.filter(enhancement_tasks::id.eq(&task.id)))
+            .set(enhancement_tasks::text_output.eq(text))
+            .execute(conn)
+    {
+        // Without the text there is nothing to hand the next stage, and marking
+        // the task completed would advance the run with an empty prompt. The
+        // answer is still in history, so a transient site lets the next poll
+        // read it again and retry the write.
+        handle_failure(
+            conn,
+            &task.id,
+            FailureSite::History,
+            &format!(
+                "Could not record the description this stage produced: {}",
+                e
+            ),
+            task.retry_count,
+        );
+        return;
+    }
+
+    // Remember it against the shot, so a second line over the same photograph
+    // does not pay for the description again.
+    crate::comfyui::prompt::cache_analysis(
+        conn,
+        &task.shot_id,
+        text,
+        &task.workflow_id,
+        task.source_file_id.as_deref(),
+    );
+    info!(
+        "Task {} described shot {} in {} characters",
+        task.id,
+        task.shot_id,
+        text.chars().count()
+    );
+    mark_completed(conn, &task.id);
 }
 
 /// Read the prompt's history entry.
@@ -326,8 +419,13 @@ fn settle_task(
 
     // The file may already be on disk under the deterministic prefix even though
     // history is silent about it. One hit finishes the task. Only the names this
-    // graph's savers could have written are worth asking for.
-    if let Some(prefix) = task.output_prefix.as_deref() {
+    // graph's savers could have written are worth asking for — and a text stage
+    // has none, so it is not asked at all.
+    if let Some(prefix) = task
+        .output_prefix
+        .as_deref()
+        .filter(|_| !task.produces_text)
+    {
         let suffixes = expected_output_suffixes(&workflow);
         for candidate in fallback_output_candidates(prefix, &suffixes) {
             // A miss is the normal case for most candidates — only the right
@@ -442,5 +540,116 @@ fn gave_up_message(
             prefix,
             budget.as_secs()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::connection::SimpleConnection;
+
+    /// A migrated library with one shot, its photograph, and one describe task
+    /// that has already run.
+    fn library() -> (tempfile::TempDir, SqliteConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".phos.db");
+        crate::db::init_and_migrate(&db_path).unwrap();
+        let mut conn = crate::db::open_diesel_connection(&db_path).unwrap();
+        conn.batch_execute(
+            "INSERT INTO comfyui_workflows (id, name, workflow_json) \
+               VALUES ('wf-describe', 'Describe', '{}');
+             INSERT INTO shots (id) VALUES ('shot-1');
+             INSERT INTO files (id, shot_id, path, hash, mime_type, is_original) \
+               VALUES ('file-orig', 'shot-1', 'original.jpg', 'h0', 'image/jpeg', 1);
+             INSERT INTO enhancement_tasks (id, shot_id, workflow_id, status) \
+               VALUES ('task-1', 'shot-1', 'wf-describe', 'processing');",
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn a_describe_task() -> ActiveTask {
+        ActiveTask {
+            id: "task-1".to_string(),
+            shot_id: "shot-1".to_string(),
+            prompt_id: "prompt-abcd".to_string(),
+            workflow_id: "wf-describe".to_string(),
+            workflow_json: "{}".to_string(),
+            text_overrides: "{}".to_string(),
+            parameters: "{}".to_string(),
+            status: "processing".to_string(),
+            output_prefix: Some("phos/task-1".to_string()),
+            settle_until: None,
+            retry_count: 0,
+            source_file_id: None,
+            produces_text: true,
+        }
+    }
+
+    #[test]
+    fn a_text_stage_lands_its_sentence_and_writes_no_file() {
+        let (_dir, mut conn) = library();
+        finish_text_task(&mut conn, &a_describe_task(), "a woman on a jetty at dusk");
+
+        let (status, text, output_file): (String, Option<String>, Option<String>) =
+            enhancement_tasks::table
+                .filter(enhancement_tasks::id.eq("task-1"))
+                .select((
+                    enhancement_tasks::status,
+                    enhancement_tasks::text_output,
+                    enhancement_tasks::output_file_id,
+                ))
+                .first(&mut conn)
+                .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(text.as_deref(), Some("a woman on a jetty at dusk"));
+        assert_eq!(output_file, None);
+
+        // The point of `produces: text`: there is no file, so there is no row.
+        // One here would put a machine's sentence in a library of photographs
+        // and hand the next stage a text file to load as an image.
+        assert_eq!(
+            crate::schema::files::table
+                .filter(crate::schema::files::is_original.eq(false))
+                .count()
+                .get_result::<i64>(&mut conn)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn the_description_is_remembered_against_the_shot() {
+        let (_dir, mut conn) = library();
+        finish_text_task(&mut conn, &a_describe_task(), "a woman on a jetty at dusk");
+        let cached = crate::comfyui::prompt::cached_analysis(&mut conn, "shot-1")
+            .expect("the shot should now carry its description");
+        assert_eq!(cached.text, "a woman on a jetty at dusk");
+        assert_eq!(cached.workflow_id.as_deref(), Some("wf-describe"));
+        // A task reading the shot's original records the original's concrete
+        // row, so promoting a different file to original later reads as the
+        // mismatch it is.
+        assert_eq!(cached.source_file_id.as_deref(), Some("file-orig"));
+        assert!(cached.generated_at.is_some());
+    }
+
+    #[test]
+    fn florence_2s_caption_is_left_exactly_where_it_was() {
+        // `shots.description` is what library search matches on. The prompt
+        // compiler reads it and never writes it.
+        let (_dir, mut conn) = library();
+        diesel::update(crate::schema::shots::table)
+            .set(crate::schema::shots::description.eq("a woman sitting on a wooden jetty"))
+            .execute(&mut conn)
+            .unwrap();
+        finish_text_task(&mut conn, &a_describe_task(), "something else entirely");
+        let caption: Option<String> = crate::schema::shots::table
+            .select(crate::schema::shots::description)
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(
+            caption.as_deref(),
+            Some("a woman sitting on a wooden jetty")
+        );
     }
 }

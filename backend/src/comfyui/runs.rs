@@ -25,6 +25,7 @@
 use super::contract::{MediaType, StageContract};
 use super::line::{self, LineError, StageTyping};
 use super::params::{ParameterMap, VaryMap};
+use super::prompt;
 use crate::models::{NewEnhancementTask, NewRun};
 use crate::schema::{comfyui_workflows, enhancement_tasks, files, line_stages, runs, shots};
 use diesel::prelude::*;
@@ -67,6 +68,19 @@ impl StageRow {
             accepts: self.contract.accepts,
             produces: self.contract.produces,
         }
+    }
+
+    /// The stage as something queueable, with everything only Phos can supply
+    /// already written into its override map.
+    ///
+    /// Today that is one thing: a **describe** stage is handed the instruction
+    /// compiled from what the library knows about this shot — the person names
+    /// clustering found, the EXIF date and place, the caption — which is the
+    /// whole point of FR9 and is a single `text_overrides` entry.
+    pub fn plan_for(&self, conn: &mut SqliteConnection, shot_id: &str) -> StagePlan<'_> {
+        let mut plan = self.plan();
+        compile_describe_instruction(conn, shot_id, &self.contract, &mut plan.text_overrides);
+        plan
     }
 
     /// The stage as something queueable: its stored JSON parsed, and the
@@ -142,6 +156,36 @@ pub(crate) fn stages_of_line(
             contract: contract_of(r.8.as_deref(), &r.9),
         })
         .collect())
+}
+
+/// Write the instruction Phos composed into a describe stage's prompt box.
+///
+/// A no-op on any stage that does not produce text, which is every stage but
+/// one. The instruction carries what a vision model cannot see for itself, and
+/// binding it is one `text_overrides` entry keyed `"<node_id>.<field>"` —
+/// exactly the key `prepare_workflow` substitutes on.
+///
+/// A graph with no text box at all is left alone with a warning rather than
+/// refused: its author may have wired the instruction in, and a describe stage
+/// that runs with its own prompt is better than a run that will not start.
+pub(crate) fn compile_describe_instruction(
+    conn: &mut SqliteConnection,
+    shot_id: &str,
+    contract: &StageContract,
+    overrides: &mut HashMap<String, String>,
+) {
+    if contract.produces != MediaType::Text {
+        return;
+    }
+    let facts = prompt::shot_facts(conn, shot_id);
+    let instruction = prompt::describe_instruction(&facts);
+    if let Err(e) = prompt::bind_instruction(contract, overrides, &instruction) {
+        tracing::warn!(
+            "Describe stage for shot {} kept its own prompt: {}",
+            shot_id,
+            e
+        );
+    }
 }
 
 /// The stored contract, or one derived on the spot for a workflow that has
@@ -334,31 +378,41 @@ pub(crate) fn start_line_run(
     }
 
     // And the one check the design-time pass cannot make, because a line is
-    // drawn once and run against many shots.
-    if let Some(source) = shot_media_type(conn, shot_id) {
-        line::admits_source(&typings[0], source).map_err(StartError::Rejected)?;
-    } else {
-        // Even a stage that declares it reads nothing is dispatched from the
-        // shot's original today — `resolve_source_file` has no other answer —
-        // so a shot without one is refused here, where the caller can see why,
-        // rather than failing asynchronously after a successful start.
-        let has_original: i64 = files::table
-            .filter(files::shot_id.eq(shot_id).and(files::is_original.eq(true)))
-            .count()
-            .get_result(conn)
-            .map_err(|e| StartError::Db(e.to_string()))?;
-        if has_original == 0 || line::reads_source(typings[0].accepts) {
-            return Err(StartError::Rejected(LineError {
-                stage_idx: 0,
-                message: "This shot has no original file for the line to read.".to_string(),
-            }));
+    // drawn once and run against many shots. Asked of every stage that reads
+    // the run's source, which is more than the first once the line opens with a
+    // describe stage: a describe stage makes no file, so the stage after it
+    // reads the same photograph rather than its output.
+    let readers = line::source_readers(&typings);
+    match shot_media_type(conn, shot_id) {
+        Some(source) => {
+            for reader in &readers {
+                line::admits_source(reader, source).map_err(StartError::Rejected)?;
+            }
+        }
+        None => {
+            // Even a stage that declares it reads nothing is dispatched from
+            // the shot's original today — `resolve_source_file` has no other
+            // answer — so a shot without one is refused here, where the caller
+            // can see why, rather than failing asynchronously after a
+            // successful start.
+            let has_original: i64 = files::table
+                .filter(files::shot_id.eq(shot_id).and(files::is_original.eq(true)))
+                .count()
+                .get_result(conn)
+                .map_err(|e| StartError::Db(e.to_string()))?;
+            if has_original == 0 || !readers.is_empty() {
+                return Err(StartError::Rejected(LineError {
+                    stage_idx: readers.first().map(|r| r.stage_idx).unwrap_or(0),
+                    message: "This shot has no original file for the line to read.".to_string(),
+                }));
+            }
         }
     }
 
     let stage_count = stages.len() as i32;
     conn.transaction::<_, diesel::result::Error, _>(|conn| {
         let run_id = open_run(conn, Some(line_id), shot_id, &label, stage_count)?;
-        let plan = stages[0].plan();
+        let plan = stages[0].plan_for(conn, shot_id);
         let task_ids = queue_stage(conn, &run_id, shot_id, &plan, None, None)
             .map_err(|e| diesel::result::Error::QueryBuilderError(e.into()))?;
         Ok(RunStart {
