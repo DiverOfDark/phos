@@ -570,7 +570,7 @@
           {
             "name": "cursor",
             "in": "query",
-            "description": "Cursor: `created_at` of the last run from the previous page",
+            "description": "Cursor: `next_cursor` from the previous page — `created_at|id` of its\nlast run. The id is the tie-breaker: a migrated backlog can put dozens\nof runs on the same second, and a timestamp alone would skip the rest\nof them.",
             "required": false,
             "schema": {
               "type": [
@@ -1008,6 +1008,9 @@
           },
           "404": {
             "description": "Workflow not found"
+          },
+          "409": {
+            "description": "A production line still uses this workflow"
           },
           "500": {
             "description": "Internal server error"

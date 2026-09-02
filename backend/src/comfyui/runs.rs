@@ -304,15 +304,55 @@ pub(crate) fn start_line_run(
     // re-imported, or its contract corrected, between the two.
     line::validate_chain(&typings).map_err(StartError::Rejected)?;
 
+    // The fan-out cap, cumulative: sweeps multiply down a line, and a line
+    // stored before the cap existed (or written straight into the database)
+    // must not become millions of tasks because each stage passed alone.
+    let mut branches: usize = 1;
+    for stage in &stages {
+        let plan = stage.plan();
+        let takes = super::params::expand(&plan.parameters, &plan.vary)
+            .map_err(|message| {
+                StartError::Rejected(LineError {
+                    stage_idx: stage.stage_idx,
+                    message: format!("Stage {}: {}", stage.stage_idx + 1, message),
+                })
+            })?
+            .len();
+        branches = branches.saturating_mul(takes);
+        if branches > super::params::MAX_FANOUT {
+            return Err(StartError::Rejected(LineError {
+                stage_idx: stage.stage_idx,
+                message: format!(
+                    "Stage {}: the line's sweeps multiply to {} takes by this stage, more \
+                     than the {} one run may become.",
+                    stage.stage_idx + 1,
+                    branches,
+                    super::params::MAX_FANOUT
+                ),
+            }));
+        }
+    }
+
     // And the one check the design-time pass cannot make, because a line is
     // drawn once and run against many shots.
     if let Some(source) = shot_media_type(conn, shot_id) {
         line::admits_source(&typings[0], source).map_err(StartError::Rejected)?;
-    } else if line::reads_source(typings[0].accepts) {
-        return Err(StartError::Rejected(LineError {
-            stage_idx: 0,
-            message: "This shot has no original file for the line to read.".to_string(),
-        }));
+    } else {
+        // Even a stage that declares it reads nothing is dispatched from the
+        // shot's original today — `resolve_source_file` has no other answer —
+        // so a shot without one is refused here, where the caller can see why,
+        // rather than failing asynchronously after a successful start.
+        let has_original: i64 = files::table
+            .filter(files::shot_id.eq(shot_id).and(files::is_original.eq(true)))
+            .count()
+            .get_result(conn)
+            .map_err(|e| StartError::Db(e.to_string()))?;
+        if has_original == 0 || line::reads_source(typings[0].accepts) {
+            return Err(StartError::Rejected(LineError {
+                stage_idx: 0,
+                message: "This shot has no original file for the line to read.".to_string(),
+            }));
+        }
     }
 
     let stage_count = stages.len() as i32;
@@ -458,6 +498,37 @@ mod tests {
         assert_eq!(stage_idx, Some(0));
         assert_eq!(parent, None, "stage 1 eats the shot, not another task");
         assert_eq!(wf, "wf-1");
+    }
+
+    #[test]
+    fn a_lines_sweeps_may_not_multiply_past_the_cap() {
+        let (_dir, mut conn) = library();
+        // Each stage's sweep of 16 passes alone; 16 × 16 = 256 leaves does not.
+        conn.batch_execute(&format!(
+            "INSERT INTO comfyui_workflows (id, name, workflow_json) \
+             VALUES ('wf-1', 'Takes', '{g}'), ('wf-2', 'More takes', '{g}');
+             INSERT INTO production_lines (id, name) VALUES ('line-1', 'Fan');
+             INSERT INTO line_stages (id, line_id, stage_idx, workflow_id, parameters, vary) \
+             VALUES ('st-1', 'line-1', 0, 'wf-1', '{{\"3.seed\":1}}', \
+                     '{{\"3.seed\":{{\"count\":16,\"mode\":\"increment\"}}}}'), \
+                    ('st-2', 'line-1', 1, 'wf-2', '{{\"3.seed\":1}}', \
+                     '{{\"3.seed\":{{\"count\":16,\"mode\":\"increment\"}}}}');
+             INSERT INTO shots (id) VALUES ('shot-1');
+             INSERT INTO files (id, shot_id, path, hash, mime_type, is_original) \
+             VALUES ('file-1', 'shot-1', 'a.jpg', 'h1', 'image/jpeg', 1);",
+            g = IMAGE_GRAPH.replace('\'', "''")
+        ))
+        .unwrap();
+
+        let err = start_line_run(&mut conn, "line-1", "shot-1").unwrap_err();
+        assert!(
+            matches!(&err, StartError::Rejected(e) if e.stage_idx == 1
+                && e.message.contains("multiply to 256 takes")),
+            "{}",
+            err
+        );
+        let runs_count: i64 = runs::table.count().get_result(&mut conn).unwrap();
+        assert_eq!(runs_count, 0, "refused before anything was queued");
     }
 
     #[test]

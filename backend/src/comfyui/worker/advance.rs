@@ -476,12 +476,21 @@ pub(crate) fn cancel_run(conn: &mut SqliteConnection, run_id: &str) -> QueryResu
     ))
     .execute(conn)?;
 
-    diesel::update(runs::table.filter(runs::id.eq(run_id)))
-        .set((
-            runs::status.eq(RunState::Cancelled.as_str()),
-            runs::finished_at.eq(&now),
-        ))
-        .execute(conn)?;
+    // Only a run still in flight can be cancelled. A cancel that arrives after
+    // the run settled — or races the worker past its last landing — must not
+    // overwrite a terminal verdict with `cancelled`.
+    diesel::update(
+        runs::table.filter(
+            runs::id
+                .eq(run_id)
+                .and(runs::status.eq(RunState::Running.as_str())),
+        ),
+    )
+    .set((
+        runs::status.eq(RunState::Cancelled.as_str()),
+        runs::finished_at.eq(&now),
+    ))
+    .execute(conn)?;
     Ok(stopped)
 }
 
@@ -909,6 +918,22 @@ mod tests {
             vec![(0, "completed".to_string()), (1, "cancelled".to_string())]
         );
         assert_eq!(lib.run_status(&run.run_id).0, "cancelled");
+    }
+
+    #[test]
+    fn cancelling_a_run_that_already_landed_does_not_rewrite_its_verdict() {
+        let mut lib = Library::with_workflows(1);
+        lib.line(1, &[]);
+        let run = lib.start();
+        lib.land(&run.task_ids[0]);
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "completed");
+
+        // A cancel that arrives after the fact stops nothing and changes
+        // nothing: completed is a verdict, not a phase.
+        let stopped = crate::comfyui::cancel_run(&mut lib.conn, &run.run_id).unwrap();
+        assert_eq!(stopped, 0);
+        assert_eq!(lib.run_status(&run.run_id).0, "completed");
     }
 
     #[test]

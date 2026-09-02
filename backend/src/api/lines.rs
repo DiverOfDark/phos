@@ -267,6 +267,10 @@ fn check_payload(
     }
 
     let mut typings = Vec::with_capacity(payload.stages.len());
+    // Fan-out multiplies down a line: every take at stage k expands stage k+1's
+    // sweep again. Each stage's own sweep is capped by `expand`, but it is the
+    // running product that says how many tasks one request can become.
+    let mut branches: usize = 1;
     for (idx, stage) in payload.stages.iter().enumerate() {
         let row: Option<(String, Option<String>, String)> = comfyui_workflows::table
             .filter(comfyui_workflows::id.eq(&stage.workflow_id))
@@ -299,8 +303,19 @@ fn check_payload(
 
         // A sweep that cannot be read is the caller's mistake, and finding out
         // at the moment the stage is queued would be finding out too late.
-        crate::comfyui::expand(&stage.parameters, &stage.vary)
-            .map_err(|e| ApiError::bad_request(format!("Stage {}: {}", idx + 1, e)))?;
+        let takes = crate::comfyui::expand(&stage.parameters, &stage.vary)
+            .map_err(|e| ApiError::bad_request(format!("Stage {}: {}", idx + 1, e)))?
+            .len();
+        branches = branches.saturating_mul(takes);
+        if branches > crate::comfyui::params::MAX_FANOUT {
+            return Err(ApiError::bad_request(format!(
+                "Stage {}: the line's sweeps multiply to {} takes by this stage, more than \
+                 the {} one run may become.",
+                idx + 1,
+                branches,
+                crate::comfyui::params::MAX_FANOUT
+            )));
+        }
 
         let contract = contract_of(contract_json.as_deref(), &workflow_json);
         typings.push(StageTyping {
@@ -412,6 +427,30 @@ fn has_live_runs(conn: &mut SqliteConnection, line_id: &str) -> bool {
         > 0
 }
 
+/// Why a line mutation's transaction rolled back: the database said no, or the
+/// live-run check did.
+///
+/// The check runs *inside* the same immediate transaction as the write — asked
+/// before it, a run could start in the gap and find its line rewritten under
+/// its feet mid-walk.
+enum MutateError {
+    Db(diesel::result::Error),
+    LiveRuns,
+}
+
+impl From<diesel::result::Error> for MutateError {
+    fn from(e: diesel::result::Error) -> Self {
+        MutateError::Db(e)
+    }
+}
+
+fn live_runs_conflict(action: &str) -> ApiError {
+    ApiError::conflict(format!(
+        "A run of this line is still in flight. Wait for it, or cancel it, before {}.",
+        action
+    ))
+}
+
 #[utoipa::path(
     put,
     path = "/api/comfyui/lines/{id}",
@@ -445,18 +484,16 @@ pub(super) async fn update_line(
     if exists == 0 {
         return Err(StatusCode::NOT_FOUND.into());
     }
-    if has_live_runs(&mut conn, &id) {
-        return Err(ApiError::conflict(
-            "A run of this line is still in flight. Wait for it, or cancel it, before editing.",
-        ));
-    }
     check_payload(&mut conn, &payload)?;
 
     let now = chrono::Utc::now()
         .naive_utc()
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
-    conn.transaction::<_, diesel::result::Error, _>(|conn| {
+    conn.immediate_transaction::<_, MutateError, _>(|conn| {
+        if has_live_runs(conn, &id) {
+            return Err(MutateError::LiveRuns);
+        }
         diesel::update(production_lines::table.filter(production_lines::id.eq(&id)))
             .set((
                 production_lines::name.eq(payload.name.trim()),
@@ -465,11 +502,15 @@ pub(super) async fn update_line(
             ))
             .execute(conn)?;
         diesel::delete(line_stages::table.filter(line_stages::line_id.eq(&id))).execute(conn)?;
-        insert_stages(conn, &id, &payload)
+        insert_stages(conn, &id, &payload)?;
+        Ok(())
     })
-    .map_err(|e| {
-        tracing::error!("Failed to update line: {}", e);
-        ApiError::internal()
+    .map_err(|e| match e {
+        MutateError::LiveRuns => live_runs_conflict("editing"),
+        MutateError::Db(e) => {
+            tracing::error!("Failed to update line: {}", e);
+            ApiError::internal()
+        }
     })?;
 
     let stages =
@@ -504,13 +545,11 @@ pub(super) async fn delete_line(
     let _ = require_comfyui(&state)?;
     let mut conn = state.pool.get().map_err(|_| ApiError::internal())?;
 
-    if has_live_runs(&mut conn, &id) {
-        return Err(ApiError::conflict(
-            "A run of this line is still in flight. Wait for it, or cancel it, before deleting.",
-        ));
-    }
     let deleted = conn
-        .transaction::<_, diesel::result::Error, _>(|conn| {
+        .immediate_transaction::<_, MutateError, _>(|conn| {
+            if has_live_runs(conn, &id) {
+                return Err(MutateError::LiveRuns);
+            }
             diesel::delete(line_stages::table.filter(line_stages::line_id.eq(&id)))
                 .execute(conn)?;
             // Finished runs keep their snapshotted label and stage count, so the
@@ -518,10 +557,15 @@ pub(super) async fn delete_line(
             diesel::update(runs::table.filter(runs::line_id.eq(&id)))
                 .set(runs::line_id.eq(None::<String>))
                 .execute(conn)?;
-            diesel::delete(production_lines::table.filter(production_lines::id.eq(&id)))
-                .execute(conn)
+            Ok(
+                diesel::delete(production_lines::table.filter(production_lines::id.eq(&id)))
+                    .execute(conn)?,
+            )
         })
-        .map_err(|_| ApiError::internal())?;
+        .map_err(|e| match e {
+            MutateError::LiveRuns => live_runs_conflict("deleting"),
+            MutateError::Db(_) => ApiError::internal(),
+        })?;
 
     if deleted == 0 {
         return Err(StatusCode::NOT_FOUND.into());
@@ -593,7 +637,10 @@ pub(super) struct RunsQuery {
     shot_id: Option<String>,
     /// Max items to return (default 50)
     limit: Option<i64>,
-    /// Cursor: `created_at` of the last run from the previous page
+    /// Cursor: `next_cursor` from the previous page — `created_at|id` of its
+    /// last run. The id is the tie-breaker: a migrated backlog can put dozens
+    /// of runs on the same second, and a timestamp alone would skip the rest
+    /// of them.
     cursor: Option<String>,
 }
 
@@ -669,14 +716,26 @@ pub(super) async fn list_runs(
             runs::created_at,
             runs::finished_at,
         ))
-        .order(runs::created_at.desc())
+        .order((runs::created_at.desc(), runs::id.desc()))
         .limit(limit + 1)
         .into_boxed();
     if let Some(shot_id) = &query.shot_id {
         q = q.filter(runs::shot_id.eq(shot_id));
     }
     if let Some(cursor) = &query.cursor {
-        q = q.filter(runs::created_at.lt(cursor));
+        // `created_at|id`, matching the ordering above. A bare timestamp (an
+        // old client, or a hand-typed cursor) still works — it just re-reads
+        // the runs that share that second.
+        match cursor.split_once('|') {
+            Some((ts, id)) => {
+                q = q.filter(
+                    runs::created_at.lt(ts.to_string()).or(runs::created_at
+                        .eq(ts.to_string())
+                        .and(runs::id.lt(id.to_string()))),
+                );
+            }
+            None => q = q.filter(runs::created_at.le(cursor)),
+        }
     }
 
     let mut tuples: Vec<RunTuple> = q.load(&mut conn).map_err(|e| {
@@ -705,7 +764,8 @@ pub(super) async fn list_runs(
 
     let items = decorate_runs(&mut conn, &rows);
     let next_cursor = if has_more {
-        rows.last().and_then(|r| r.created_at.clone())
+        rows.last()
+            .and_then(|r| r.created_at.as_ref().map(|ts| format!("{}|{}", ts, r.id)))
     } else {
         None
     };

@@ -106,7 +106,7 @@ CREATE INDEX idx_enhancement_tasks_parent ON enhancement_tasks (parent_task_id);
 -- somebody left running. Each becomes its own one-stage run; the task's id is
 -- reused as the run's, which is unique by construction and readable in a
 -- `sqlite3` session.
-INSERT INTO runs (id, line_id, shot_id, label, status, stage_count, created_at, finished_at)
+INSERT INTO runs (id, line_id, shot_id, label, status, stage_count, error_message, created_at, finished_at)
 SELECT t.id,
        NULL,
        t.shot_id,
@@ -118,6 +118,9 @@ SELECT t.id,
             ELSE 'running'
        END,
        1,
+       -- The board reads failure reasons off the run, so a task that failed
+       -- before the upgrade keeps saying why after it.
+       t.error_message,
        t.created_at,
        t.completed_at
 FROM enhancement_tasks t

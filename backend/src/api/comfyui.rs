@@ -9,7 +9,10 @@ use utoipa::ToSchema;
 
 use crate::comfyui::{ContractCorrections, ParameterMap, StageContract, VaryMap};
 use crate::models::{NewComfyuiWorkflow, NewEnhancementTask, NewWorkflowPreset};
-use crate::schema::{comfyui_workflows, enhancement_tasks, files, people, shots, workflow_presets};
+use crate::schema::{
+    comfyui_workflows, enhancement_tasks, files, line_stages, people, production_lines, shots,
+    workflow_presets,
+};
 
 use super::{AppState, UState};
 
@@ -532,6 +535,7 @@ pub(super) async fn comfyui_correct_contract(
     responses(
         (status = 200, description = "Workflow deleted successfully"),
         (status = 404, description = "Workflow not found"),
+        (status = 409, description = "A production line still uses this workflow"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "ComfyUI not configured"),
     )
@@ -539,22 +543,42 @@ pub(super) async fn comfyui_correct_contract(
 pub(super) async fn comfyui_delete_workflow(
     Path(id): Path<String>,
     UState(state): UState,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let _ = require_comfyui(&state)?;
-    let mut conn = state
-        .pool
-        .get()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut conn = state.pool.get().map_err(|_| ApiError::internal())?;
+
+    // A line holds this workflow as a stage. SQLite is not enforcing the
+    // foreign key, and deleting anyway would not fail the line — worse, it
+    // would silently shorten it: `stages_of_line`'s join just skips the orphan,
+    // and a three-stage line quietly delivers a two-stage product.
+    let mut lines_using: Vec<String> = line_stages::table
+        .inner_join(production_lines::table)
+        .filter(line_stages::workflow_id.eq(&id))
+        .select(production_lines::name)
+        .distinct()
+        .load(&mut conn)
+        .map_err(|_| ApiError::internal())?;
+    if !lines_using.is_empty() {
+        lines_using.sort();
+        return Err(ApiError::conflict(format!(
+            "This workflow is a stage of {}. Remove it from the line, or delete the line, first.",
+            lines_using
+                .iter()
+                .map(|n| format!("'{}'", n))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
 
     let deleted = diesel::delete(comfyui_workflows::table.filter(comfyui_workflows::id.eq(&id)))
         .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to delete workflow: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::internal()
         })?;
 
     if deleted == 0 {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     }
 
     Ok(Json(serde_json::json!({"status": "ok"})))
