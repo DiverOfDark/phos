@@ -111,6 +111,12 @@ pub(crate) enum FailureSite {
     /// empty history entry, so it waits out the same budget rather than a fixed
     /// handful of retries.
     Settle,
+    /// A stage of a line was handed something its contract says it cannot read.
+    /// The line was validated when it was drawn, so this means the workflow has
+    /// been re-imported or its contract corrected since. Permanent: it will be
+    /// handed the same file next time, and the fix is to the contract or the
+    /// line rather than to the run.
+    StageMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +131,8 @@ pub(crate) fn classify_failure(site: FailureSite, message: &str) -> FailureKind 
         FailureSite::SourceImage
         | FailureSite::WorkflowJson
         | FailureSite::Execution
-        | FailureSite::Settle => FailureKind::Permanent,
+        | FailureSite::Settle
+        | FailureSite::StageMismatch => FailureKind::Permanent,
         // A rejected prompt is a validation failure; anything else on /prompt is
         // transport.
         FailureSite::Queue => {

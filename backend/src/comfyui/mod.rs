@@ -66,6 +66,11 @@
 //! * **Failures are split by site.** A refused graph or a node exception fails
 //!   at once with the real message; a dropped connection backs off and tries
 //!   again.
+//! * **A task is a step of a run.** One workflow against one photo is a
+//!   one-stage run; photo → clip → interpolate → 4K upscale is a four-stage
+//!   one, and the difference is a row in `line_stages`. [`line`] decides what
+//!   a line may be and what happens after a stage lands, [`runs`] puts runs on
+//!   disk, and [`worker::advance`] is the pass that walks one along.
 //! * **Everything this module creates is marked synthetic.** A generated file
 //!   is flagged on its row and carries a [`manifest::ProvenanceManifest`]. The
 //!   flag keeps machine-made faces out of the person model; the manifest is how
@@ -78,6 +83,7 @@
 mod client;
 pub mod contract;
 mod history;
+pub mod line;
 mod loaders;
 mod manifest;
 pub mod nodes;
@@ -85,6 +91,7 @@ mod outputs;
 mod overrides;
 pub mod params;
 mod policy;
+pub mod runs;
 mod source;
 mod timestamp;
 mod worker;
@@ -92,6 +99,7 @@ mod workflow;
 
 pub use client::ComfyUiClient;
 pub use contract::{Accepts, ContractCorrections, MediaType, ParamName, StageContract};
+pub use line::{RunState, StageTyping};
 pub use loaders::{
     check_source_kind, default_binding_warnings, detect_loaders, importable, takes_video,
     LoaderKind, SourceRole,
@@ -105,6 +113,7 @@ pub use overrides::detect_inputs;
 pub use overrides::WorkflowInput;
 pub use params::{check_sweep_targets, expand, ParameterMap, VaryMap, VaryMode, VarySpec};
 pub use source::SourceMode;
+pub(crate) use worker::advance::{cancel_run, retry_run};
 pub use worker::spawn_enhancement_worker;
 pub use workflow::detect_outputs;
 

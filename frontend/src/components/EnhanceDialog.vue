@@ -109,6 +109,34 @@ async function fetchWorkflows() {
   }
 }
 
+// --- Lines ---
+//
+// A line is a chain of workflows run as one thing: photo → clip → interpolate
+// → 4K upscale, each stage reading what the one before it made. Picking one
+// takes the place of picking a workflow, because the line already says which
+// graphs run, in what order, and with what set on each of them.
+const lines = ref([])
+const selectedLineId = ref(null)
+const selectedLine = computed(() => lines.value.find(l => l.id === selectedLineId.value) || null)
+
+async function fetchLines() {
+  try {
+    const res = await fetch('/api/comfyui/lines')
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    // A line whose stages no longer fit together cannot be run, and offering
+    // it here would only move the refusal later.
+    lines.value = (await res.json()).items.filter(l => l.valid)
+  } catch (e) {
+    console.error('Failed to fetch lines', e)
+    lines.value = []
+  }
+}
+
+function selectLine(id) {
+  selectedLineId.value = selectedLineId.value === id ? null : id
+  submitError.value = ''
+}
+
 async function fetchPresets(workflowId) {
   try {
     const res = await fetch(`/api/comfyui/workflows/${workflowId}/presets`)
@@ -145,6 +173,11 @@ function presetHasGeneration(preset) {
       && parametersMatch(g.parameters, preset.parameters)
   })
 }
+
+// Slots this workflow gives Phos no way to choose between — two untitled
+// LoadImage nodes, say. The backend binds the first and leaves the rest alone;
+// without this the user's only clue would be a clip that does not move.
+const bindingWarnings = computed(() => selectedWorkflow.value?.warnings || [])
 
 // Check if the current overrides and parameters match any existing generation
 const currentMatchesGeneration = computed(() => {
@@ -231,7 +264,9 @@ watch(dialogOpen, (val) => {
     submitSuccess.value = false
     sourceModeTouched.value = false
     sourceModeKey.value = defaultSourceModeKey()
+    selectedLineId.value = null
     fetchWorkflows()
+    fetchLines()
     if (props.shotId) {
       fetchGenerations(props.shotId)
     }
@@ -267,11 +302,46 @@ const outputType = computed(() => {
 const runs = computed(() => runCount(vary.value))
 const tooManyRuns = computed(() => runs.value > MAX_FANOUT)
 
+/**
+ * Start the picked line against this shot.
+ *
+ * The stages after the first are queued by the worker as each one lands, so
+ * this queues one task and answers with the run the board will show.
+ */
+async function startLineRun() {
+  const res = await fetch('/api/comfyui/runs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ line_id: selectedLineId.value, shot_id: props.shotId }),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.error || `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
 async function enhance() {
-  if (!selectedWorkflowId.value || !props.shotId) return
+  if (!props.shotId) return
+  if (!selectedLineId.value && !selectedWorkflowId.value) return
   submitting.value = true
   submitError.value = ''
   submitSuccess.value = false
+
+  if (selectedLineId.value) {
+    try {
+      const run = await startLineRun()
+      submitSuccess.value = true
+      emit('taskCreated', run)
+      setTimeout(() => { dialogOpen.value = false }, 800)
+    } catch (e) {
+      console.error('Run failed to start', e)
+      submitError.value = e.message || 'Failed to start the line'
+    } finally {
+      submitting.value = false
+    }
+    return
+  }
 
   try {
     const res = await fetch('/api/comfyui/enhance', {
@@ -335,8 +405,35 @@ async function enhance() {
         </div>
 
         <template v-else>
+          <!-- Line. Picking one replaces picking a workflow: the chain already
+               says which graphs run and in what order. -->
+          <div v-if="lines.length" class="flex flex-col gap-2">
+            <div class="label">Line</div>
+            <div class="flex flex-wrap gap-2">
+              <button
+                v-for="ln in lines"
+                :key="ln.id"
+                class="flex items-center gap-1.5 whitespace-nowrap border rounded px-3 py-1.5 font-mono text-xs transition-colors"
+                :class="selectedLineId === ln.id
+                  ? 'border-signal bg-surface text-signal'
+                  : 'border-line text-ink-secondary hover:bg-raised'"
+                @click="selectLine(ln.id)"
+              >
+                {{ ln.name }}
+                <span class="text-[10px] tracking-[0.08em] uppercase text-ink-tertiary">
+                  {{ ln.stage_count }} st
+                </span>
+              </button>
+            </div>
+            <div v-if="selectedLine" class="font-mono text-[11px] text-ink-tertiary">
+              <template v-for="(st, i) in selectedLine.stages" :key="st.stage_idx">
+                <span v-if="i">&nbsp;→&nbsp;</span>{{ st.workflow_name }}
+              </template>
+            </div>
+          </div>
+
           <!-- Workflow -->
-          <div class="flex flex-col gap-2">
+          <div v-if="!selectedLineId" class="flex flex-col gap-2">
             <div class="label">Workflow</div>
             <div class="flex flex-wrap gap-2">
               <button
@@ -360,7 +457,7 @@ async function enhance() {
           </div>
 
           <!-- Source (videos only — a still has no frames to choose between) -->
-          <div v-if="sourceIsVideo" class="flex flex-col gap-2">
+          <div v-if="sourceIsVideo && !selectedLineId" class="flex flex-col gap-2">
             <div class="label">Source</div>
             <div class="flex flex-wrap gap-2">
               <button
@@ -405,7 +502,7 @@ async function enhance() {
           </div>
 
           <!-- Preset -->
-          <div v-if="presets.length" class="flex flex-col gap-2">
+          <div v-if="presets.length && !selectedLineId" class="flex flex-col gap-2">
             <div class="label">Preset</div>
             <div class="flex flex-wrap gap-2">
               <button
@@ -428,7 +525,7 @@ async function enhance() {
           </div>
 
           <!-- Input overrides -->
-          <div v-if="selectedWorkflow" class="flex flex-col gap-2">
+          <div v-if="selectedWorkflow && !selectedLineId" class="flex flex-col gap-2">
             <div class="flex items-baseline gap-2">
               <div class="label">Inputs</div>
               <span class="flex-1"></span>
@@ -460,8 +557,21 @@ async function enhance() {
             />
           </div>
 
+          <!-- Slots more than one loader claims, with nothing in the graph to
+               tell them apart. The run still goes ahead with the first, so this
+               is the only place a person finds out there was a choice. -->
           <div
-            v-if="currentMatchesGeneration"
+            v-for="(warning, i) in (selectedLineId ? [] : bindingWarnings)"
+            :key="i"
+            class="flex items-start gap-2 px-3 py-2 border rounded font-mono text-xs"
+            style="border-color: var(--status-degraded); color: var(--status-degraded)"
+          >
+            <span class="signal-dot mt-1 flex-none" style="width:6px;height:6px;background:var(--status-degraded)"></span>
+            <span>{{ warning }}</span>
+          </div>
+
+          <div
+            v-if="currentMatchesGeneration && !selectedLineId"
             class="flex items-center gap-2 px-3 py-2 border rounded font-mono text-xs"
             style="border-color: var(--status-degraded); color: var(--status-degraded)"
           >
@@ -477,15 +587,20 @@ async function enhance() {
         <button
           class="bg-signal text-signal-fg rounded px-6 py-2 text-[13px] font-medium whitespace-nowrap hover:bg-signal-hover transition-colors disabled:opacity-50"
           :title="tooManyRuns ? `${runs} runs is more than the ${MAX_FANOUT} one request may queue` : inputProblem"
-          :disabled="submitting || !selectedWorkflowId || tooManyRuns || !!inputProblem"
+          :disabled="submitting || (!selectedLineId && (!selectedWorkflowId || tooManyRuns || !!inputProblem))"
           @click="enhance"
-        >{{ submitting ? 'Queuing…' : (runs > 1 ? `Enhance ×${runs}` : 'Enhance') }}</button>
+        >{{ submitting ? 'Queuing…' : selectedLineId ? 'Run line' : (runs > 1 ? `Enhance ×${runs}` : 'Enhance') }}</button>
         <span v-if="submitSuccess" class="font-mono text-xs text-ready">
-          {{ runs > 1 ? `${runs} tasks queued` : 'task queued' }} — see Workflows › Queue
+          {{ selectedLineId ? 'run started' : runs > 1 ? `${runs} tasks queued` : 'task queued' }} — see Workflows › Queue
         </span>
         <span class="flex-1"></span>
         <span class="font-mono text-[11px] text-ink-tertiary whitespace-nowrap">
-          output attaches as a new file<template v-if="outputType"> · {{ outputType }}</template>
+          <template v-if="selectedLine">
+            {{ selectedLine.stage_count }}-stage line · intermediates are swept when it lands
+          </template>
+          <template v-else>
+            output attaches as a new file<template v-if="outputType"> · {{ outputType }}</template>
+          </template>
         </span>
       </div>
     </div>

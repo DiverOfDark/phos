@@ -11,6 +11,7 @@
 
 use super::status::{handle_failure, live_task};
 use crate::comfyui::client::ComfyUiClient;
+use crate::comfyui::line::{admits_upstream_output, media_type_of_mime, StageTyping};
 use crate::comfyui::loaders::{
     bind_targets, check_source_kind, role_directives, takes_video, SourceBinding, SourceRole,
 };
@@ -43,6 +44,13 @@ struct PendingTask {
     source_file_id: Option<String>,
     source_mode: Option<String>,
     retry_count: i32,
+    /// Which step of a line this is, 0-based. `None` on a row written before
+    /// runs existed; `Some(0)` is a run's first stage, which reads the shot
+    /// rather than another stage's output.
+    stage_idx: Option<i32>,
+    /// The workflow's name, so a stage handed something it cannot read can
+    /// say which stage and what it wanted.
+    workflow_name: String,
 }
 
 type PendingRow = (
@@ -55,6 +63,8 @@ type PendingRow = (
     Option<String>,
     Option<String>,
     i32,
+    Option<i32>,
+    String,
 );
 
 /// A step that failed, tagged with where it failed. The site is what decides
@@ -142,6 +152,8 @@ fn pending_tasks(
             diesel::dsl::sql::<diesel::sql_types::Integer>(
                 "COALESCE(enhancement_tasks.retry_count, 0)",
             ),
+            enhancement_tasks::stage_idx,
+            comfyui_workflows::name,
         ))
         .load::<PendingRow>(conn)?;
 
@@ -157,8 +169,53 @@ fn pending_tasks(
             source_file_id: row.6,
             source_mode: row.7,
             retry_count: row.8,
+            stage_idx: row.9,
+            workflow_name: row.10,
         })
         .collect())
+}
+
+/// Does this stage's contract still admit what it has actually been handed?
+///
+/// The line was checked when it was drawn — every join asked
+/// [`crate::comfyui::Accepts::admits`] — but a workflow can be re-imported, or
+/// its contract corrected, at any point between then and now. This is the cheap
+/// second look, taken where the source has just been read and its real type is
+/// known rather than declared.
+///
+/// Only asked of a continuation. Stage 1 reads the shot, and what a person may
+/// run against their own photograph is not this function's business: an ad-hoc
+/// enhance that ComfyUI will refuse should be refused by ComfyUI, with its
+/// message, exactly as it always has been.
+fn check_stage_admits(task: &PendingTask, source_mime: &str) -> Result<(), StepFailure> {
+    let Some(stage_idx) = task.stage_idx.filter(|idx| *idx > 0) else {
+        return Ok(());
+    };
+    let contract =
+        crate::comfyui::runs::contract_of(task.contract_json.as_deref(), &task.workflow_json);
+    let typing = StageTyping {
+        stage_idx,
+        name: task.workflow_name.clone(),
+        accepts: contract.accepts,
+        produces: contract.produces,
+    };
+    // Not a second rule: the same function the line editor's validation calls,
+    // asked of the file that actually turned up.
+    match media_type_of_mime(source_mime) {
+        Some(handed) => admits_upstream_output(&typing, handed).map_err(|e| StepFailure {
+            site: FailureSite::StageMismatch,
+            message: e.message,
+        }),
+        None => Err(StepFailure {
+            site: FailureSite::StageMismatch,
+            message: format!(
+                "Stage {} ({}) was handed a {}, which a line cannot carry.",
+                stage_idx + 1,
+                task.workflow_name,
+                source_mime
+            ),
+        }),
+    }
 }
 
 /// Take one task from `pending` to `queued`, or say where it fell over.
@@ -213,6 +270,11 @@ fn dispatch_one(
         library_root,
     )
     .map_err(|e| StepFailure::new(FailureSite::SourceImage, "Source file lookup failed", e))?;
+
+    // A continuation reads what the stage before it made. Check that is still
+    // something this stage can read before uploading a gigabyte of it.
+    check_stage_admits(task, &source.mime_type)?;
+
     let mode = SourceMode::resolve(
         task.source_mode.as_deref(),
         takes_video(&workflow),

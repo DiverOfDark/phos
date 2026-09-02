@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import WorkflowGraph from '@/components/WorkflowGraph.vue'
 import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
 import WorkflowContract from '@/components/WorkflowContract.vue'
-import { controlKind, isParameterInput, isTextInput, inputKey, parameterValue } from '@/lib/utils'
+import { controlKind, isParameterInput, isTextInput, inputKey, parameterValue, formatDuration, stageOf } from '@/lib/utils'
 
 // --- Connection health ---
 const comfyuiHealthy = ref(false)
@@ -269,42 +269,51 @@ watch(selectedWorkflowId, (id) => {
   }
 })
 
-// ===== QUEUE TAB =====
-const tasks = ref([])
-const loadingTasks = ref(false)
+// ===== QUEUE TAB — the board shows runs, not tasks =====
+//
+// A four-stage line is four rows in `enhancement_tasks` and one thing the user
+// asked for. So the board is a schedule of runs: one row each, saying which
+// stage it is on, of how many, and what that stage is running. The tasks
+// underneath stay reachable — a row opens to show them — but they are not the
+// unit anybody reads.
+const runs = ref([])
+const loadingRuns = ref(false)
 const loadingMore = ref(false)
 const nextCursor = ref(null)
 let taskRefreshInterval = null
 
-async function fetchTasks() {
-  loadingTasks.value = true
+/** The run whose tasks are open beneath it, and those tasks. */
+const openRunId = ref(null)
+const openRunTasks = ref([])
+
+async function fetchRuns() {
+  loadingRuns.value = true
   try {
-    const res = await fetch('/api/comfyui/tasks?limit=50')
+    const res = await fetch('/api/comfyui/runs?limit=50')
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
-    tasks.value = data.items
+    runs.value = data.items
     nextCursor.value = data.next_cursor
   } catch (e) {
-    console.error('Failed to fetch tasks', e)
+    console.error('Failed to fetch runs', e)
   } finally {
-    loadingTasks.value = false
+    loadingRuns.value = false
   }
 }
 
-async function fetchMoreTasks() {
+async function fetchMoreRuns() {
   if (!nextCursor.value || loadingMore.value) return
   loadingMore.value = true
   try {
-    const res = await fetch(`/api/comfyui/tasks?limit=50&cursor=${encodeURIComponent(nextCursor.value)}`)
+    const res = await fetch(`/api/comfyui/runs?limit=50&cursor=${encodeURIComponent(nextCursor.value)}`)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
     // Deduplicate by id in case polling shifted items
-    const existingIds = new Set(tasks.value.map(t => t.id))
-    const newItems = data.items.filter(t => !existingIds.has(t.id))
-    tasks.value = [...tasks.value, ...newItems]
+    const existingIds = new Set(runs.value.map(r => r.id))
+    runs.value = [...runs.value, ...data.items.filter(r => !existingIds.has(r.id))]
     nextCursor.value = data.next_cursor
   } catch (e) {
-    console.error('Failed to fetch more tasks', e)
+    console.error('Failed to fetch more runs', e)
   } finally {
     loadingMore.value = false
   }
@@ -315,16 +324,40 @@ const taskListRef = ref(null)
 function onTaskListScroll(event) {
   const el = event.target
   if (el.scrollHeight - el.scrollTop - el.clientHeight < 200) {
-    fetchMoreTasks()
+    fetchMoreRuns()
   }
 }
 
-const hasActiveTasks = computed(() => tasks.value.some(t => isInFlight(t.status)))
+const hasActiveRuns = computed(() => runs.value.some(r => r.status === 'running'))
+
+/** The tasks under one run — the drill-down, fetched only when opened. */
+async function fetchOpenRunTasks() {
+  if (!openRunId.value) return
+  try {
+    const res = await fetch(`/api/comfyui/runs/${openRunId.value}`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    openRunTasks.value = (await res.json()).tasks || []
+  } catch (e) {
+    console.error('Failed to fetch run tasks', e)
+  }
+}
+
+async function toggleRun(runId) {
+  if (openRunId.value === runId) {
+    openRunId.value = null
+    openRunTasks.value = []
+    return
+  }
+  openRunId.value = runId
+  openRunTasks.value = []
+  await fetchOpenRunTasks()
+}
 
 function startTaskPolling() {
   stopTaskPolling()
   taskRefreshInterval = setInterval(() => {
-    fetchTasks()
+    fetchRuns()
+    fetchOpenRunTasks()
   }, 5000)
 }
 
@@ -335,33 +368,123 @@ function stopTaskPolling() {
   }
 }
 
-async function cancelTask(taskId) {
+async function runAction(runId, verb) {
   try {
-    const res = await fetch(`/api/comfyui/tasks/${taskId}/cancel`, { method: 'POST' })
+    const res = await fetch(`/api/comfyui/runs/${runId}/${verb}`, { method: 'POST' })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    await fetchTasks()
+    await fetchRuns()
+    await fetchOpenRunTasks()
   } catch (e) {
-    console.error('Failed to cancel task', e)
+    console.error(`Failed to ${verb} run`, e)
   }
 }
+
+const cancelRun = (id) => runAction(id, 'cancel')
+/** Resumes from the stage that failed. What already succeeded is not re-run. */
+const retryRun = (id) => runAction(id, 'retry')
 
 async function retryTask(taskId) {
   try {
     const res = await fetch(`/api/comfyui/tasks/${taskId}/retry`, { method: 'POST' })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    await fetchTasks()
+    await fetchRuns()
+    await fetchOpenRunTasks()
   } catch (e) {
     console.error('Failed to retry task', e)
   }
 }
 
-async function deleteTask(taskId) {
+async function cancelTask(taskId) {
   try {
-    const res = await fetch(`/api/comfyui/tasks/${taskId}`, { method: 'DELETE' })
+    const res = await fetch(`/api/comfyui/tasks/${taskId}/cancel`, { method: 'POST' })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    await fetchTasks()
+    await fetchRuns()
+    await fetchOpenRunTasks()
   } catch (e) {
-    console.error('Failed to delete task', e)
+    console.error('Failed to cancel task', e)
+  }
+}
+
+// ===== LINES TAB =====
+//
+// Enough to make a line and see whether it holds together. The editor proper —
+// reordering, per-stage prompts and parameters, hold points — is FR5b; this is
+// the affordance that makes the runtime reachable without one.
+const lines = ref([])
+const loadingLines = ref(false)
+const showLineForm = ref(false)
+const newLineName = ref('')
+const newLineStages = ref([])
+const lineError = ref('')
+const savingLine = ref(false)
+
+async function fetchLines() {
+  loadingLines.value = true
+  try {
+    const res = await fetch('/api/comfyui/lines')
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    lines.value = (await res.json()).items
+  } catch (e) {
+    console.error('Failed to fetch lines', e)
+  } finally {
+    loadingLines.value = false
+  }
+}
+
+function startLineForm() {
+  showLineForm.value = true
+  newLineName.value = ''
+  newLineStages.value = [{ workflow_id: workflows.value[0]?.id || '', keep_output: false }]
+  lineError.value = ''
+}
+
+function addLineStage() {
+  newLineStages.value.push({ workflow_id: workflows.value[0]?.id || '', keep_output: false })
+}
+
+function removeLineStage(idx) {
+  newLineStages.value.splice(idx, 1)
+}
+
+const lineReady = computed(() =>
+  newLineName.value.trim() !== '' &&
+  newLineStages.value.length > 0 &&
+  newLineStages.value.every(s => s.workflow_id)
+)
+
+async function createLine() {
+  savingLine.value = true
+  lineError.value = ''
+  try {
+    const res = await fetch('/api/comfyui/lines', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newLineName.value.trim(), stages: newLineStages.value }),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || `HTTP ${res.status}`)
+    }
+    showLineForm.value = false
+    await fetchLines()
+  } catch (e) {
+    // The refusal names the stage that does not fit; show it verbatim.
+    lineError.value = e.message || 'Failed to create line'
+  } finally {
+    savingLine.value = false
+  }
+}
+
+async function deleteLine(id) {
+  try {
+    const res = await fetch(`/api/comfyui/lines/${id}`, { method: 'DELETE' })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || `HTTP ${res.status}`)
+    }
+    await fetchLines()
+  } catch (e) {
+    lineError.value = e.message || 'Failed to delete line'
   }
 }
 
@@ -391,6 +514,19 @@ const IN_FLIGHT = ['pending', 'uploading', 'queued', 'processing', 'downloading'
 
 function isInFlight(status) {
   return IN_FLIGHT.includes(status)
+}
+
+/**
+ * A run has four states, not nine: it is walking its line, or it is however it
+ * ended. The nine belong to the tasks underneath.
+ */
+function runStatusColor(status) {
+  switch (status) {
+    case 'completed': return 'var(--status-ready)'
+    case 'failed': return 'var(--status-error)'
+    case 'cancelled': return 'var(--status-stopped)'
+    default: return 'var(--status-building)'
+  }
 }
 
 /** `awaiting_output` reads better as two words in the schedule register. */
@@ -436,15 +572,17 @@ function formatDate(dateStr) {
 // --- Active tab tracking (synced with URL) ---
 const route = useRoute()
 const router = useRouter()
-const activeTab = computed(() => route.query.tab === 'queue' ? 'queue' : 'workflows')
+const TABS = ['workflows', 'lines', 'queue']
+const activeTab = computed(() => TABS.includes(route.query.tab) ? route.query.tab : 'workflows')
 
 function onTabChange(val) {
   router.replace({ query: { ...route.query, tab: val === 'workflows' ? undefined : val } })
   if (val === 'queue') {
-    fetchTasks()
+    fetchRuns()
     startTaskPolling()
   } else {
     stopTaskPolling()
+    if (val === 'lines') fetchLines()
   }
 }
 
@@ -452,8 +590,9 @@ function onTabChange(val) {
 onMounted(() => {
   checkHealth()
   fetchWorkflows()
+  fetchLines()
   if (activeTab.value === 'queue') {
-    fetchTasks()
+    fetchRuns()
     startTaskPolling()
   }
 })
@@ -489,7 +628,8 @@ defineExpose({ loadData: fetchWorkflows })
       <button
         v-for="t in [
           { id: 'workflows', label: 'Workflows', count: workflows.length },
-          { id: 'queue', label: 'Queue', count: tasks.length },
+          { id: 'lines', label: 'Lines', count: lines.length },
+          { id: 'queue', label: 'Queue', count: runs.length },
         ]"
         :key="t.id"
         class="flex items-center gap-2 px-3 py-2 border-b-2 text-[13px] transition-colors"
@@ -731,124 +871,274 @@ defineExpose({ loadData: fetchWorkflows })
       :editable-node-ids="editableNodeIds"
     />
 
-    <!-- Queue tab -->
+    <!-- Lines tab — a chain of workflows run as one thing.
+         Enough to draw one and see whether it holds together; the editor
+         proper is FR5b. -->
+    <div v-else-if="activeTab === 'lines'" class="flex flex-col gap-3">
+      <div class="flex items-baseline gap-4">
+        <div class="text-[13px] font-light text-ink-secondary max-w-[560px]">
+          A line runs its workflows in order, each stage reading what the one before it made.
+          Start one from a shot's <span class="font-normal text-ink">Enhance</span> dialog.
+        </div>
+        <span class="flex-1"></span>
+        <button
+          v-if="!showLineForm"
+          class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors whitespace-nowrap"
+          :disabled="workflows.length === 0"
+          @click="startLineForm"
+        >New line</button>
+      </div>
+
+      <!-- Draw a line: name it, then pick a workflow per stage. -->
+      <div v-if="showLineForm" class="card-ab p-4 flex flex-col gap-3">
+        <input
+          v-model="newLineName"
+          placeholder="4K Restore"
+          class="bg-base border border-line rounded-sm px-3 py-2 text-[13px] text-ink"
+        />
+        <div
+          v-for="(stage, i) in newLineStages"
+          :key="i"
+          class="flex items-center gap-3"
+        >
+          <span class="label w-16 flex-none">St {{ i + 1 }}</span>
+          <select
+            v-model="stage.workflow_id"
+            class="flex-1 min-w-0 bg-base border border-line rounded-sm px-3 py-1.5 font-mono text-xs text-ink"
+          >
+            <option v-for="wf in workflows" :key="wf.id" :value="wf.id">{{ wf.name }}</option>
+          </select>
+          <label
+            class="flex items-center gap-1.5 font-mono text-[11px] text-ink-tertiary whitespace-nowrap"
+            title="Keep this stage's output once the run completes. The last stage's is kept regardless."
+          >
+            <input v-model="stage.keep_output" type="checkbox" class="accent-[var(--accent)]" />
+            keep
+          </label>
+          <button
+            class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
+            :disabled="newLineStages.length === 1"
+            @click="removeLineStage(i)"
+          >remove</button>
+        </div>
+        <div v-if="lineError" class="font-mono text-xs" style="color: var(--status-error)">{{ lineError }}</div>
+        <div class="flex items-center gap-3">
+          <button
+            class="bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors disabled:opacity-50"
+            :disabled="!lineReady || savingLine"
+            @click="createLine"
+          >{{ savingLine ? 'Saving…' : 'Save line' }}</button>
+          <button
+            class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+            @click="addLineStage"
+          >add stage</button>
+          <span class="flex-1"></span>
+          <button
+            class="font-mono text-[11px] text-ink-tertiary hover:text-ink transition-colors"
+            @click="showLineForm = false"
+          >cancel</button>
+        </div>
+      </div>
+
+      <div class="card-ab overflow-hidden">
+        <div
+          v-for="ln in lines"
+          :key="ln.id"
+          class="flex items-center gap-3 px-4 py-3 border-b border-line last:border-b-0"
+        >
+          <span class="min-w-0 flex-1">
+            <span class="block text-[13px] text-ink truncate">{{ ln.name }}</span>
+            <span class="block font-mono text-[11px] text-ink-tertiary truncate">
+              <template v-for="(st, i) in ln.stages" :key="st.stage_idx">
+                <span v-if="i">&nbsp;→&nbsp;</span>{{ st.workflow_name }}<span
+                  v-if="st.keep_output && i < ln.stages.length - 1"
+                  class="text-signal"
+                >&nbsp;·keep</span>
+              </template>
+            </span>
+            <span
+              v-if="!ln.valid"
+              class="block font-mono text-[11px]"
+              style="color: var(--status-error)"
+            >{{ ln.error }}</span>
+          </span>
+          <span class="font-mono text-[11px] tracking-[0.08em] uppercase text-ink-tertiary whitespace-nowrap">
+            {{ ln.stage_count }} {{ ln.stage_count === 1 ? 'stage' : 'stages' }}
+          </span>
+          <button
+            class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
+            @click="deleteLine(ln.id)"
+          >delete</button>
+        </div>
+        <div v-if="loadingLines && lines.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
+          loading lines…
+        </div>
+        <div v-else-if="lines.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
+          no lines yet
+        </div>
+      </div>
+    </div>
+
+    <!-- Queue tab — a schedule of runs.
+         A four-stage run is one row that says which stage it is on, not four
+         unrelated ones. The tasks underneath open on click. -->
     <div v-else class="flex flex-col gap-2">
       <div class="card-ab overflow-hidden overflow-x-auto" ref="taskListRef" @scroll="onTaskListScroll">
         <div
-          class="grid gap-3 px-4 py-2 border-b min-w-[760px]"
-          style="grid-template-columns: 52px minmax(0,1fr) 140px 76px 108px 108px; border-color: var(--border-strong)"
+          class="grid gap-3 px-4 py-2 border-b min-w-[860px]"
+          style="grid-template-columns: 52px minmax(0,1fr) 150px 168px 84px 108px 92px; border-color: var(--border-strong)"
         >
           <span></span>
-          <span class="label">Source</span>
-          <span class="label">Workflow</span>
-          <span class="label">Time</span>
+          <span class="label">Shot</span>
+          <span class="label">Line</span>
+          <span class="label">Stage</span>
+          <span class="label">Clock</span>
           <span class="label">Status</span>
           <span></span>
         </div>
-        <div
-          v-for="task in tasks"
-          :key="task.id"
-          class="grid gap-3 items-center px-4 py-2 border-b border-line hover:bg-raised transition-colors min-w-[760px]"
-          style="grid-template-columns: 52px minmax(0,1fr) 140px 76px 108px 108px"
-        >
-          <!-- What is being enhanced. A queue of ids tells you nothing about
-               which photo is stuck; the frame does. -->
-          <router-link
-            v-if="task.shot_id"
-            :to="{ name: 'shot-detail', params: { id: task.shot_id } }"
-            class="block w-[52px] h-10 rounded-sm bg-raised border border-line overflow-hidden hover:border-signal transition-colors"
-            :title="task.source_name || `shot/${shortId(task.shot_id)}`"
+
+        <template v-for="run in runs" :key="run.id">
+          <div
+            class="grid gap-3 items-center px-4 py-2 border-b border-line hover:bg-raised transition-colors min-w-[860px]"
+            style="grid-template-columns: 52px minmax(0,1fr) 150px 168px 84px 108px 92px"
           >
-            <img
-              v-if="task.thumbnail_url"
-              :src="task.thumbnail_url"
-              class="w-full h-full object-cover"
-              loading="lazy"
-            />
-            <span v-else class="w-full h-full flex items-center justify-center font-mono text-[10px] text-ink-tertiary">—</span>
-          </router-link>
-          <span v-else class="w-[52px] h-10 rounded-sm bg-raised border border-line"></span>
-
-          <span class="min-w-0">
+            <!-- What is being worked on. A queue of ids tells you nothing about
+                 which photo is stuck; the frame does. -->
             <router-link
-              v-if="task.shot_id"
-              :to="{ name: 'shot-detail', params: { id: task.shot_id } }"
-              class="block text-[13px] truncate hover:text-signal transition-colors"
-              :class="task.person_name ? 'text-ink' : 'text-ink-tertiary'"
-            >{{ task.person_name || 'unsorted' }}</router-link>
-            <span v-else class="block text-[13px] text-ink-tertiary">shot deleted</span>
-            <span class="block font-mono text-[11px] text-ink-tertiary truncate">
-              {{ task.source_name || `shot/${shortId(task.shot_id)}` }}
+              v-if="run.shot_id"
+              :to="{ name: 'shot-detail', params: { id: run.shot_id } }"
+              class="block w-[52px] h-10 rounded-sm bg-raised border border-line overflow-hidden hover:border-signal transition-colors"
+              :title="run.source_name || `shot/${shortId(run.shot_id)}`"
+            >
+              <img
+                v-if="run.thumbnail_url"
+                :src="run.thumbnail_url"
+                class="w-full h-full object-cover"
+                loading="lazy"
+              />
+              <span v-else class="w-full h-full flex items-center justify-center font-mono text-[10px] text-ink-tertiary">—</span>
+            </router-link>
+            <span v-else class="w-[52px] h-10 rounded-sm bg-raised border border-line"></span>
+
+            <span class="min-w-0">
+              <router-link
+                v-if="run.shot_id"
+                :to="{ name: 'shot-detail', params: { id: run.shot_id } }"
+                class="block text-[13px] truncate hover:text-signal transition-colors"
+                :class="run.person_name ? 'text-ink' : 'text-ink-tertiary'"
+              >{{ run.person_name || 'unsorted' }}</router-link>
+              <span class="block font-mono text-[11px] text-ink-tertiary truncate">
+                {{ run.source_name || `shot/${shortId(run.shot_id)}` }}
+              </span>
+              <!-- Why it stopped, said once, on the run that stopped. -->
+              <span
+                v-if="run.error_message"
+                class="block font-mono text-[11px] truncate"
+                style="color: var(--status-error)"
+                :title="run.error_message"
+              >{{ run.error_message }}</span>
             </span>
-            <!-- Why it failed, said once, where the failure is. -->
-            <span
-              v-if="task.error_message"
-              class="block font-mono text-[11px] truncate"
-              style="color: var(--status-error)"
-              :title="task.error_message"
-            >{{ task.error_message }}</span>
-          </span>
 
-          <span class="font-mono text-xs text-ink truncate">{{ task.workflow_name || task.workflow_id }}</span>
+            <span class="font-mono text-xs text-ink truncate uppercase tracking-[0.04em]">{{ run.label }}</span>
 
-          <span class="font-mono text-xs text-ink-tertiary">
-            {{ formatRelativeTime(task.created_at) }}
-          </span>
+            <!-- The one thing a task queue could never say: how far along the
+                 chain this is, and what it is doing right now. -->
+            <span class="flex items-baseline gap-2 min-w-0">
+              <span class="font-mono text-[11px] tracking-[0.08em] uppercase text-ink-secondary whitespace-nowrap">
+                stage {{ stageOf(run) }}
+              </span>
+              <span class="font-mono text-[11px] text-ink-tertiary truncate">{{ run.stage_label || '' }}</span>
+              <span v-if="run.in_flight > 1" class="font-mono text-[10px] text-signal whitespace-nowrap">×{{ run.in_flight }}</span>
+            </span>
 
-          <span class="flex flex-col gap-0.5">
+            <span class="font-mono text-xs text-ink-tertiary tabular-nums">{{ formatDuration(run.elapsed_seconds) }}</span>
+
             <span
               class="flex items-center gap-1.5 font-mono text-[11px] tracking-[0.08em] uppercase"
-              :style="{ color: statusColor(task.status) }"
+              :style="{ color: runStatusColor(run.status) }"
             >
               <span
                 class="signal-dot"
-                :class="{ 'signal-pulse': isInFlight(task.status) }"
+                :class="{ 'signal-pulse': run.status === 'running' }"
                 style="width:6px;height:6px"
-                :style="{ background: statusColor(task.status) }"
+                :style="{ background: runStatusColor(run.status) }"
               ></span>
-              {{ statusLabel(task.status) }}
+              {{ run.status }}
             </span>
-            <span v-if="task.retry_count > 0" class="font-mono text-[10px] text-ink-tertiary">
-              {{ task.retry_count }} {{ task.retry_count === 1 ? 'retry' : 'retries' }}
-            </span>
-          </span>
 
-          <span class="flex gap-3 justify-end">
-            <template v-if="isInFlight(task.status)">
+            <span class="flex gap-3 justify-end">
               <button
+                v-if="run.status === 'running'"
+                class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
+                @click="cancelRun(run.id)"
+              >cancel</button>
+              <button
+                v-else-if="run.status === 'failed' || run.status === 'cancelled'"
+                class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+                title="Resumes from the stage that stopped. What already succeeded is not re-run."
+                @click="retryRun(run.id)"
+              >resume</button>
+              <button
+                class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+                @click="toggleRun(run.id)"
+              >{{ openRunId === run.id ? 'hide' : 'stages' }}</button>
+            </span>
+          </div>
+
+          <!-- The tasks underneath: reachable, but not the top-level unit. -->
+          <div
+            v-if="openRunId === run.id"
+            class="px-4 py-2 border-b border-line bg-base min-w-[860px]"
+          >
+            <div
+              v-for="task in openRunTasks"
+              :key="task.id"
+              class="flex items-center gap-3 py-1"
+            >
+              <span class="label w-16 flex-none">St {{ (task.stage_idx ?? 0) + 1 }}</span>
+              <span class="font-mono text-[11px] text-ink-secondary w-40 flex-none truncate">{{ task.workflow_name }}</span>
+              <span
+                class="flex items-center gap-1.5 font-mono text-[11px] tracking-[0.08em] uppercase w-32 flex-none"
+                :style="{ color: statusColor(task.status) }"
+              >
+                <span
+                  class="signal-dot"
+                  :class="{ 'signal-pulse': isInFlight(task.status) }"
+                  style="width:6px;height:6px"
+                  :style="{ background: statusColor(task.status) }"
+                ></span>
+                {{ statusLabel(task.status) }}
+              </span>
+              <span class="font-mono text-[11px] text-ink-tertiary flex-1 min-w-0 truncate" :title="task.error_message">
+                {{ task.error_message || '' }}
+              </span>
+              <button
+                v-if="isInFlight(task.status)"
                 class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
                 @click="cancelTask(task.id)"
               >cancel</button>
-            </template>
-            <template v-else-if="task.status === 'failed' || task.status === 'cancelled'">
-              <!-- A stopped job is worth both verbs: run it again, or clear it out. -->
               <button
+                v-else-if="task.status === 'failed' || task.status === 'cancelled'"
                 class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
                 @click="retryTask(task.id)"
               >retry</button>
-              <button
-                class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
-                @click="deleteTask(task.id)"
-              >delete</button>
-            </template>
-            <template v-else>
               <router-link
-                v-if="task.status === 'completed' && task.shot_id"
-                :to="{ name: 'shot-detail', params: { id: task.shot_id } }"
+                v-else-if="task.output_file_id"
+                :to="{ name: 'shot-detail', params: { id: run.shot_id } }"
                 class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
               >open</router-link>
-              <button
-                class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
-                @click="deleteTask(task.id)"
-              >remove</button>
-            </template>
-          </span>
-        </div>
+              <span v-else class="font-mono text-[11px] text-ink-tertiary">discarded</span>
+            </div>
+            <div v-if="openRunTasks.length === 0" class="py-1 font-mono text-[11px] text-ink-tertiary">
+              no tasks — this run's steps have been swept
+            </div>
+          </div>
+        </template>
 
-        <div v-if="loadingTasks && tasks.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
+        <div v-if="loadingRuns && runs.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
           loading queue…
         </div>
-        <div v-else-if="tasks.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
+        <div v-else-if="runs.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
           nothing queued
         </div>
       </div>
@@ -857,12 +1147,13 @@ defineExpose({ loadData: fetchWorkflows })
         v-if="nextCursor"
         class="self-start border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors disabled:opacity-50"
         :disabled="loadingMore"
-        @click="fetchMoreTasks"
+        @click="fetchMoreRuns"
       >{{ loadingMore ? 'Loading…' : 'Load more' }}</button>
 
-      <div v-if="hasActiveTasks" class="font-mono text-[11px] text-ink-tertiary">
-        refreshing every 5s while tasks are active
+      <div v-if="hasActiveRuns" class="font-mono text-[11px] text-ink-tertiary">
+        refreshing every 5s while runs are active
       </div>
     </div>
+
   </div>
 </template>

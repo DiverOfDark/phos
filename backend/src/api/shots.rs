@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::UState;
-use crate::schema::{enhancement_tasks, faces, files, ignored_merges, people, shots, video_keyframes};
+use crate::schema::{
+    enhancement_tasks, faces, files, ignored_merges, people, runs, shots, video_keyframes,
+};
 
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ShotBrief {
@@ -544,6 +546,16 @@ pub(super) async fn delete_shot(
         .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to delete enhancement_tasks: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // And the runs those tasks belonged to. Left behind, a finished run is a
+    // permanent board row pointing at a shot that is gone, and a live one
+    // stays "running" forever — settlement skips a run with no tasks.
+    diesel::delete(runs::table.filter(runs::shot_id.eq(&id)))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to delete runs: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -1165,6 +1177,23 @@ pub(super) async fn merge_shots(
         .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to move files during shot merge: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // The source's runs and tasks move with its files: their outputs now hang
+    // off the target shot, so the board rows that explain them must follow.
+    diesel::update(runs::table.filter(runs::shot_id.eq(&payload.source_id)))
+        .set(runs::shot_id.eq(&payload.target_id))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to move runs during shot merge: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    diesel::update(enhancement_tasks::table.filter(enhancement_tasks::shot_id.eq(&payload.source_id)))
+        .set(enhancement_tasks::shot_id.eq(&payload.target_id))
+        .execute(&mut conn)
+        .map_err(|e| {
+            tracing::error!("Failed to move enhancement tasks during shot merge: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 

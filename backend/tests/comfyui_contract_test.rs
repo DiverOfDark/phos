@@ -284,6 +284,9 @@ impl Library {
                 source_file_id: None,
                 source_mode: None,
                 parameters: None,
+                run_id: None,
+                stage_idx: None,
+                parent_task_id: None,
             })
             .execute(&mut self.conn())
             .unwrap();
@@ -304,6 +307,9 @@ impl Library {
                 source_file_id: None,
                 source_mode: None,
                 parameters: Some(&parameters),
+                run_id: None,
+                stage_idx: None,
+                parent_task_id: None,
             })
             .execute(&mut self.conn())
             .unwrap();
@@ -328,6 +334,9 @@ impl Library {
                 source_file_id: Some(source_file_id),
                 source_mode: Some(source_mode),
                 parameters: None,
+                run_id: None,
+                stage_idx: None,
+                parent_task_id: None,
             })
             .execute(&mut self.conn())
             .unwrap();
