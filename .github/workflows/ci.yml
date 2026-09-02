@@ -134,9 +134,9 @@ jobs:
           push: true
           tags: ${{ steps.tag.outputs.image }}
 
-  # Every backend test in one job, one compilation: unit and integration tests
-  # first, then the ComfyUI contract test against the image above. See
-  # backend/tests/comfyui_contract_test.rs.
+  # Every backend test in one run, one compilation — including the ComfyUI
+  # contract test, which activates itself when PHOS_COMFYUI_TEST_IMAGE is set.
+  # See backend/tests/comfyui_contract_test.rs.
   backend-test:
     needs: comfyui-test-image
     runs-on: ubuntu-latest
@@ -172,7 +172,19 @@ jobs:
           restore-keys: |
             cargo-v2-${{ runner.os }}-
 
+      # The contract test pulls its ComfyUI image from GHCR, so log in before
+      # running tests, not after.
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Backend Tests
+        env:
+          PHOS_COMFYUI_TEST_IMAGE: ${{ needs.comfyui-test-image.outputs.image }}
+          RUST_LOG: info
         run: |
           cd backend
           cargo test -- --test-threads=1
@@ -185,21 +197,6 @@ jobs:
         run: |
           cd backend
           cargo clippy --all-targets
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: ComfyUI contract tests
-        env:
-          PHOS_COMFYUI_TEST_IMAGE: ${{ needs.comfyui-test-image.outputs.image }}
-          RUST_LOG: info
-        run: |
-          cd backend
-          cargo test --test comfyui_contract_test -- --nocapture
 
   frontend-test:
     runs-on: ubuntu-latest
