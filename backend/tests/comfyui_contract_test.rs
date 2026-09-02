@@ -266,6 +266,20 @@ impl Library {
         id
     }
 
+    /// A workflow stored with its stage contract, as an import or the
+    /// `/object_info` backfill leaves one. The offline heuristics cannot type
+    /// this graph — `PreviewAny`'s socket takes anything, so nothing says its
+    /// product is a sentence — which is the same reason a real describe
+    /// stage's custom VL node needs `contract_json` in production.
+    fn add_workflow_producing_text(&self, name: &str, graph: &Value) -> String {
+        let id = self.add_workflow(name, graph);
+        diesel::update(comfyui_workflows::table.filter(comfyui_workflows::id.eq(&id)))
+            .set(comfyui_workflows::contract_json.eq(r#"{"accepts":"image","produces":"text"}"#))
+            .execute(&mut self.conn())
+            .unwrap();
+        id
+    }
+
     /// Queue a task exactly as `POST /api/comfyui/tasks` does.
     fn queue_task(&self, workflow_id: &str) -> String {
         self.queue_task_with(workflow_id, &json!({}))
@@ -344,7 +358,15 @@ impl Library {
     }
 
     fn task(&self, id: &str) -> TaskRow {
-        let (status, error_message, output_file_id, retry_count, output_prefix) =
+        type Row = (
+            String,
+            Option<String>,
+            Option<String>,
+            i32,
+            Option<String>,
+            Option<String>,
+        );
+        let (status, error_message, output_file_id, retry_count, output_prefix, text_output) =
             enhancement_tasks::table
                 .filter(enhancement_tasks::id.eq(id))
                 .select((
@@ -353,10 +375,9 @@ impl Library {
                     enhancement_tasks::output_file_id,
                     diesel::dsl::sql::<diesel::sql_types::Integer>("COALESCE(retry_count, 0)"),
                     enhancement_tasks::output_prefix,
+                    enhancement_tasks::text_output,
                 ))
-                .first::<(String, Option<String>, Option<String>, i32, Option<String>)>(
-                    &mut self.conn(),
-                )
+                .first::<Row>(&mut self.conn())
                 .expect("task row");
         TaskRow {
             status,
@@ -364,6 +385,7 @@ impl Library {
             output_file_id,
             retry_count,
             output_prefix,
+            text_output,
         }
     }
 
@@ -448,6 +470,7 @@ struct TaskRow {
     output_file_id: Option<String>,
     retry_count: i32,
     output_prefix: Option<String>,
+    text_output: Option<String>,
 }
 
 #[derive(Debug)]
@@ -503,6 +526,20 @@ fn odd_sized_video_workflow() -> Value {
 /// combo whose options are listed from the input directory at node-definition
 /// time — on a fresh server that list is *empty* — so this pins that `/prompt`
 /// accepts a name uploaded after the list was built, with no refresh dance.
+/// A describe stage with no vision model: the photograph goes in through
+/// `LoadImage` exactly as a VL graph would read it, and the "answer" is a
+/// canned sentence through `PreviewAny` — core ComfyUI's only inline-text
+/// output node. The contract under test is where ComfyUI puts the sentence
+/// (`outputs.<id>.text`, inline in history, no file anywhere), not how a
+/// model words one.
+fn describe_shaped_workflow() -> Value {
+    json!({
+        "1": { "class_type": "LoadImage",       "inputs": { "image": "replaced-by-phos.png" } },
+        "2": { "class_type": "PrimitiveString", "inputs": { "value": "a woman on a jetty at dusk" } },
+        "3": { "class_type": "PreviewAny",      "inputs": { "source": ["2", 0] } }
+    })
+}
+
 fn video_passthrough_workflow() -> Value {
     json!({
         "1": { "class_type": "LoadVideo", "inputs": { "file": "replaced-by-phos.mp4" } },
@@ -734,6 +771,68 @@ fn a_whole_video_goes_in_as_a_video_and_comes_back(url: &str) {
         task.output_file_id, made.output_file_id,
         "leg 2 must produce its own file, not adopt leg 1's"
     );
+}
+
+/// FR9's payload shape, pinned against the real server: a stage whose
+/// contract says `produces: text` publishes its whole answer inline in the
+/// history entry, our worker lands it on the task with **no** `files` row,
+/// and the answer is cached against the shot so a second run never reaches
+/// the GPU at all.
+fn a_describe_stage_lands_its_sentence_with_no_file(url: &str) {
+    let lib = Library::new();
+    let wf = lib.add_workflow_producing_text("describe", &describe_shaped_workflow());
+    let task_id = lib.queue_task(&wf);
+
+    let task = lib.run_until_done(url, &task_id, STEP_BUDGET);
+    assert_eq!(task.status, "completed", "{:?}", task);
+    assert_eq!(task.error_message, None);
+    assert_eq!(task.retry_count, 0, "a clean run must not spend retries");
+
+    // The product is the sentence, read inline from history — never a file.
+    // `PreviewAny` publishes under `outputs.<id>.text`, which is the shape the
+    // unit tests assume; this is where that assumption meets the server.
+    assert_eq!(
+        task.text_output.as_deref(),
+        Some("a woman on a jetty at dusk"),
+        "{:?}",
+        task
+    );
+    assert_eq!(task.output_file_id, None, "a text stage points at no file");
+    let generated: i64 = files::table
+        .filter(files::is_original.eq(false))
+        .count()
+        .get_result(&mut lib.conn())
+        .unwrap();
+    assert_eq!(generated, 0, "a text stage writes no files row");
+
+    // The answer is remembered against the shot, keyed to the file it read.
+    let cached: Value = shots::table
+        .filter(shots::id.eq(&lib.shot_id))
+        .select(shots::analysis_json)
+        .first::<Option<String>>(&mut lib.conn())
+        .unwrap()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .expect("the shot should now carry its description");
+    assert_eq!(cached["text"], "a woman on a jetty at dusk");
+    let original_id: String = files::table
+        .filter(files::is_original.eq(true))
+        .select(files::id)
+        .first(&mut lib.conn())
+        .unwrap();
+    assert_eq!(cached["source_file_id"], Value::String(original_id));
+
+    // A second run over the same shot is answered from that cache: the task
+    // completes without ComfyUI ever being asked for anything.
+    let again = lib.queue_task(&wf);
+    let row = lib.run_until_done(url, &again, STEP_BUDGET);
+    assert_eq!(row.status, "completed", "{:?}", row);
+    assert_eq!(row.text_output.as_deref(), Some("a woman on a jetty at dusk"));
+    let prompt_id: Option<String> = enhancement_tasks::table
+        .filter(enhancement_tasks::id.eq(&again))
+        .select(enhancement_tasks::comfyui_prompt_id)
+        .first(&mut lib.conn())
+        .unwrap();
+    assert_eq!(prompt_id, None, "nothing was queued the second time");
 }
 
 fn a_rejected_prompt_fails_at_once_with_comfyuis_reason(url: &str) {
@@ -1179,6 +1278,10 @@ fn comfyui_contract() {
         (
             "a whole video goes in as a video and comes back",
             a_whole_video_goes_in_as_a_video_and_comes_back,
+        ),
+        (
+            "a describe stage lands its sentence with no file",
+            a_describe_stage_lands_its_sentence_with_no_file,
         ),
         (
             "a rejected prompt fails at once with ComfyUI's reason",
