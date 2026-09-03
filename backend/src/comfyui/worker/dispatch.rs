@@ -656,7 +656,7 @@ mod tests {
         );
         let (_dir, mut conn) = library(&rows);
 
-        let tasks = pending_tasks(&mut conn, "2026-08-30 12:00:00").unwrap();
+        let tasks = pending_tasks(&mut conn, "2026-08-30 12:00:00", DISPATCH_CHUNK).unwrap();
         assert_eq!(tasks.len(), 1);
         // The row carries no role directive of its own…
         assert_eq!(tasks[0].text_overrides, "{}");
