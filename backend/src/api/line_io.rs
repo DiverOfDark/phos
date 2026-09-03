@@ -155,6 +155,7 @@ pub(super) async fn export_line(
                 vary: serde_json::from_str(&s.vary).unwrap_or_default(),
                 source_mode: s.source_mode.clone(),
                 keep_output: s.keep_output,
+                exposed: s.exposed.clone(),
             })
             .collect(),
     };
@@ -314,6 +315,7 @@ pub(super) async fn import_line(
                         vary: s.vary.clone(),
                         source_mode: s.source_mode.clone(),
                         keep_output: s.keep_output,
+                        exposed: s.exposed.clone(),
                     })
                     .collect(),
             };
@@ -370,6 +372,7 @@ pub(super) async fn import_line(
             None,
             None,
             &stages,
+            0,
         ),
         "renamed_from": renamed_from,
         "workflows_created": created,
@@ -599,6 +602,7 @@ mod tests {
                         vary: serde_json::from_str(&s.vary).unwrap_or_default(),
                         source_mode: s.source_mode.clone(),
                         keep_output: s.keep_output,
+                        exposed: s.exposed.clone(),
                     })
                     .collect(),
             },
@@ -634,6 +638,7 @@ mod tests {
                         vary: s.vary.clone(),
                         source_mode: s.source_mode.clone(),
                         keep_output: s.keep_output,
+                        exposed: s.exposed.clone(),
                     })
                     .collect(),
             };
@@ -933,6 +938,7 @@ mod tests {
                         vary: Default::default(),
                         source_mode: None,
                         keep_output: false,
+                        exposed: Vec::new(),
                     })
                     .collect(),
             },
@@ -1010,6 +1016,7 @@ mod tests {
                     vary: Default::default(),
                     source_mode: None,
                     keep_output: false,
+                    exposed: Vec::new(),
                 }],
             },
             workflows,
@@ -1106,6 +1113,7 @@ mod tests {
                         vary: Default::default(),
                         source_mode: None,
                         keep_output: false,
+                        exposed: Vec::new(),
                     })
                     .collect(),
             },

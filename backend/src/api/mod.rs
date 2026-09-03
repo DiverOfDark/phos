@@ -3,6 +3,7 @@ mod comfyui;
 mod describe;
 mod faces;
 mod files;
+mod line_editor;
 mod line_io;
 mod lines;
 mod people;
@@ -120,6 +121,10 @@ use utoipa::OpenApi;
         line_io::import_line,
         describe::describe_shot,
         describe::get_description,
+        line_editor::list_stage_options,
+        line_editor::validate_line,
+        line_editor::duplicate_line,
+        line_editor::list_suggestions,
         // Settings
         settings::get_webdav_settings,
         settings::set_webdav_settings,
@@ -207,6 +212,7 @@ use utoipa::OpenApi;
             crate::comfyui::CompiledPrompt,
             crate::comfyui::Intent,
             crate::comfyui::ShotFacts,
+            line_editor::StageOptionsPayload,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
@@ -578,6 +584,22 @@ pub fn create_router(state: AppState) -> Router {
             post(comfyui::comfyui_cancel_task),
         )
         // Production lines: a chain of workflows, and the runs that walk one.
+        .route(
+            "/api/comfyui/lines/stage-options",
+            post(line_editor::list_stage_options),
+        )
+        .route(
+            "/api/comfyui/lines/validate",
+            post(line_editor::validate_line),
+        )
+        .route(
+            "/api/comfyui/lines/suggestions",
+            get(line_editor::list_suggestions),
+        )
+        .route(
+            "/api/comfyui/lines/{id}/duplicate",
+            post(line_editor::duplicate_line),
+        )
         .route(
             "/api/comfyui/lines",
             get(lines::list_lines).post(lines::create_line),

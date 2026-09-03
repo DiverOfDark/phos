@@ -4,7 +4,9 @@ import { useRoute, useRouter } from 'vue-router'
 import WorkflowGraph from '@/components/WorkflowGraph.vue'
 import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
 import WorkflowContract from '@/components/WorkflowContract.vue'
+import LineEditor from '@/components/LineEditor.vue'
 import { controlKind, isParameterInput, isTextInput, inputKey, parameterValue, formatDuration, stageOf } from '@/lib/utils'
+import { typeTrack } from '@/lib/lines'
 
 // --- Connection health ---
 const comfyuiHealthy = ref(false)
@@ -407,16 +409,19 @@ async function cancelTask(taskId) {
 
 // ===== LINES TAB =====
 //
-// Enough to make a line and see whether it holds together. The editor proper —
-// reordering, per-stage prompts and parameters, hold points — is FR5b; this is
-// the affordance that makes the runtime reachable without one.
+// Three ways to get a line, and blank is the last of them. Fork a template and
+// change a stage; promote a sequence Phos has watched somebody run by hand;
+// or, failing both, compose one. `LineEditor.vue` is the screen; everything
+// here is what it is shown and where its answers go.
 const lines = ref([])
 const loadingLines = ref(false)
-const showLineForm = ref(false)
-const newLineName = ref('')
-const newLineStages = ref([])
+const selectedLineId = ref(null)
+const composing = ref(false)
 const lineError = ref('')
-const savingLine = ref(false)
+
+const selectedLine = computed(() =>
+  lines.value.find((l) => l.id === selectedLineId.value) || null,
+)
 
 async function fetchLines() {
   loadingLines.value = true
@@ -431,57 +436,47 @@ async function fetchLines() {
   }
 }
 
-function startLineForm() {
-  showLineForm.value = true
-  newLineName.value = ''
-  newLineStages.value = [{ workflow_id: workflows.value[0]?.id || '', keep_output: false }]
+function selectLine(id) {
+  composing.value = false
+  selectedLineId.value = id
+}
+
+function startBlankLine() {
+  selectedLineId.value = null
+  composing.value = true
   lineError.value = ''
 }
 
-function addLineStage() {
-  newLineStages.value.push({ workflow_id: workflows.value[0]?.id || '', keep_output: false })
+async function onLineSaved(saved) {
+  composing.value = false
+  await fetchLines()
+  if (saved?.id) selectedLineId.value = saved.id
 }
 
-function removeLineStage(idx) {
-  newLineStages.value.splice(idx, 1)
-}
-
-const lineReady = computed(() =>
-  newLineName.value.trim() !== '' &&
-  newLineStages.value.length > 0 &&
-  newLineStages.value.every(s => s.workflow_id)
-)
-
-async function createLine() {
-  savingLine.value = true
+/** Fork: the default way to get a line, and the way to change a locked one. */
+async function duplicateLine(id) {
   lineError.value = ''
   try {
-    const res = await fetch('/api/comfyui/lines', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newLineName.value.trim(), stages: newLineStages.value }),
-    })
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}))
-      throw new Error(data.error || `HTTP ${res.status}`)
-    }
-    showLineForm.value = false
+    const res = await fetch(`/api/comfyui/lines/${id}/duplicate`, { method: 'POST' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const fork = await res.json()
     await fetchLines()
+    selectedLineId.value = fork.id
+    composing.value = true
   } catch (e) {
-    // The refusal names the stage that does not fit; show it verbatim.
-    lineError.value = e.message || 'Failed to create line'
-  } finally {
-    savingLine.value = false
+    lineError.value = e.message || 'Could not duplicate the line'
   }
 }
 
 async function deleteLine(id) {
+  if (!confirm('Delete this line?')) return
   try {
     const res = await fetch(`/api/comfyui/lines/${id}`, { method: 'DELETE' })
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
       throw new Error(data.error || `HTTP ${res.status}`)
     }
+    if (selectedLineId.value === id) selectedLineId.value = null
     await fetchLines()
   } catch (e) {
     lineError.value = e.message || 'Failed to delete line'
@@ -591,6 +586,70 @@ function reportColor(status) {
   }
 }
 
+
+// --- Promote from history -------------------------------------------------
+// Nobody sits down to design a four-stage chain; they run three workflows in a
+// row on twelve shots. Phos already recorded which file each run read, so the
+// sequence is written down and the only thing missing is somebody noticing.
+const suggestions = ref([])
+const dismissed = ref(new Set())
+
+async function fetchSuggestions() {
+  try {
+    const res = await fetch('/api/comfyui/lines/suggestions')
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    suggestions.value = (await res.json()).items
+  } catch (e) {
+    // Nothing to say: a suggestion nobody asked for that cannot be made is
+    // not worth a message.
+    console.warn('Could not read line suggestions', e)
+    suggestions.value = []
+  }
+}
+
+const liveSuggestions = computed(() =>
+  suggestions.value.filter((s) => !dismissed.value.has(s.name)),
+)
+
+function dismissSuggestion(name) {
+  dismissed.value = new Set([...dismissed.value, name])
+}
+
+async function acceptSuggestion(suggestion) {
+  lineError.value = ''
+  try {
+    const res = await fetch('/api/comfyui/lines', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: suggestion.name,
+        description: 'Promoted from what you have been running by hand.',
+        stages: suggestion.stages.map((s) => ({
+          workflow_id: s.workflow_id,
+          text_overrides: s.text_overrides || {},
+          parameters: s.parameters || {},
+          vary: {},
+          source_mode: s.source_mode ?? null,
+          keep_output: false,
+          exposed: s.exposed || [],
+        })),
+      }),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || `HTTP ${res.status}`)
+    }
+    const saved = await res.json()
+    dismissSuggestion(suggestion.name)
+    await Promise.all([fetchLines(), fetchSuggestions()])
+    selectedLineId.value = saved.id
+    composing.value = false
+  } catch (e) {
+    lineError.value = e.message || 'Could not save that line'
+  }
+}
+
+
 /**
  * The statuses the backend actually writes: pending → uploading → queued →
  * processing → downloading → completed, with awaiting_output when ComfyUI says
@@ -685,7 +744,10 @@ function onTabChange(val) {
     startTaskPolling()
   } else {
     stopTaskPolling()
-    if (val === 'lines') fetchLines()
+    if (val === 'lines') {
+      fetchLines()
+      fetchSuggestions()
+    }
   }
 }
 
@@ -694,6 +756,7 @@ onMounted(() => {
   checkHealth()
   fetchWorkflows()
   fetchLines()
+  fetchSuggestions()
   if (activeTab.value === 'queue') {
     fetchRuns()
     startTaskPolling()
@@ -975,10 +1038,10 @@ defineExpose({ loadData: fetchWorkflows })
     />
 
     <!-- Lines tab — a chain of workflows run as one thing.
-         Enough to draw one and see whether it holds together; the editor
-         proper is FR5b. -->
-    <div v-else-if="activeTab === 'lines'" class="flex flex-col gap-3">
-      <div class="flex items-baseline gap-4">
+         Three ways in, and blank is the last of them: fork one, promote a
+         sequence you have already been running by hand, or compose. -->
+    <div v-else-if="activeTab === 'lines'" class="flex flex-col gap-4">
+      <div class="flex flex-wrap items-baseline gap-4">
         <div class="text-[13px] font-light text-ink-secondary max-w-[560px]">
           A line runs its workflows in order, each stage reading what the one before it made.
           Start one from a shot's <span class="font-normal text-ink">Enhance</span> dialog.
@@ -990,10 +1053,9 @@ defineExpose({ loadData: fetchWorkflows })
           @click="openLineImport"
         >Import line</button>
         <button
-          v-if="!showLineForm"
-          class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors whitespace-nowrap"
+          class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors whitespace-nowrap disabled:opacity-50"
           :disabled="workflows.length === 0"
-          @click="startLineForm"
+          @click="startBlankLine"
         >New line</button>
       </div>
 
@@ -1098,106 +1160,101 @@ defineExpose({ loadData: fetchWorkflows })
         </div>
       </div>
 
-      <!-- Draw a line: name it, then pick a workflow per stage. -->
-      <div v-if="showLineForm" class="card-ab p-4 flex flex-col gap-3">
-        <input
-          v-model="newLineName"
-          placeholder="4K Restore"
-          class="bg-base border border-line rounded-sm px-3 py-2 text-[13px] text-ink"
-        />
-        <div
-          v-for="(stage, i) in newLineStages"
-          :key="i"
-          class="flex items-center gap-3"
-        >
-          <span class="label w-16 flex-none">St {{ i + 1 }}</span>
-          <select
-            v-model="stage.workflow_id"
-            class="flex-1 min-w-0 bg-base border border-line rounded-sm px-3 py-1.5 font-mono text-xs text-ink"
-          >
-            <option v-for="wf in workflows" :key="wf.id" :value="wf.id">{{ wf.name }}</option>
-          </select>
-          <label
-            class="flex items-center gap-1.5 font-mono text-[11px] text-ink-tertiary whitespace-nowrap"
-            title="Keep this stage's output once the run completes. The last stage's is kept regardless."
-          >
-            <input v-model="stage.keep_output" type="checkbox" class="accent-[var(--accent)]" />
-            keep
-          </label>
-          <button
-            class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
-            :disabled="newLineStages.length === 1"
-            @click="removeLineStage(i)"
-          >remove</button>
-        </div>
-        <div v-if="lineError" class="font-mono text-xs" style="color: var(--status-error)">{{ lineError }}</div>
-        <div class="flex items-center gap-3">
-          <button
-            class="bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors disabled:opacity-50"
-            :disabled="!lineReady || savingLine"
-            @click="createLine"
-          >{{ savingLine ? 'Saving…' : 'Save line' }}</button>
-          <button
-            class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
-            @click="addLineStage"
-          >add stage</button>
+      <!-- Promoted from history: the sequence somebody has already been
+           running one workflow at a time, offered as the line it is. -->
+      <div
+        v-for="s in liveSuggestions"
+        :key="s.name"
+        class="card-ab p-4 flex flex-col gap-2"
+        style="border-color: var(--accent-muted)"
+      >
+        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <span class="signal-dot" style="width:6px;height:6px;background:var(--accent)"></span>
+          <span class="label">Noticed</span>
+          <span class="text-[13px] text-ink">
+            You ran
+            <span class="font-mono">{{ s.stages.map(st => st.workflow_name || st.workflow_id).join(' → ') }}</span>
+            on {{ s.shot_count }} shots.
+          </span>
           <span class="flex-1"></span>
           <button
+            class="font-mono text-[11px] text-signal hover:underline underline-offset-2"
+            @click="acceptSuggestion(s)"
+          >save as a line</button>
+          <button
             class="font-mono text-[11px] text-ink-tertiary hover:text-ink transition-colors"
-            @click="showLineForm = false"
-          >cancel</button>
+            @click="dismissSuggestion(s.name)"
+          >dismiss</button>
+        </div>
+        <div
+          v-if="s.stages.some(st => (st.exposed || []).length)"
+          class="font-mono text-[11px] text-ink-tertiary"
+        >
+          The settings you changed every time will be asked for when the line is sent; the ones
+          you never changed are part of it.
         </div>
       </div>
 
-      <!-- Export and delete fail from the list, not the form, so their errors
-           have to show here too — a download that silently does not happen
-           reads as a dead button. -->
-      <div
-        v-if="lineError && !showLineForm"
-        class="font-mono text-xs"
-        style="color: var(--status-error)"
-      >{{ lineError }}</div>
+      <div v-if="lineError" class="font-mono text-xs" style="color: var(--status-error)">{{ lineError }}</div>
 
-      <div class="card-ab overflow-hidden">
-        <div
-          v-for="ln in lines"
-          :key="ln.id"
-          class="flex items-center gap-3 px-4 py-3 border-b border-line last:border-b-0"
-        >
-          <span class="min-w-0 flex-1">
-            <span class="block text-[13px] text-ink truncate">{{ ln.name }}</span>
-            <span class="block font-mono text-[11px] text-ink-tertiary truncate">
-              <template v-for="(st, i) in ln.stages" :key="st.stage_idx">
-                <span v-if="i">&nbsp;→&nbsp;</span>{{ st.workflow_name }}<span
-                  v-if="st.keep_output && i < ln.stages.length - 1"
-                  class="text-signal"
-                >&nbsp;·keep</span>
-              </template>
+      <div class="grid gap-6 items-start lg:grid-cols-[280px_minmax(0,1fr)]">
+        <!-- The lines this library holds. -->
+        <div class="flex flex-col gap-2">
+          <button
+            v-for="ln in lines"
+            :key="ln.id"
+            class="flex flex-col gap-1 p-3 border rounded text-left transition-colors"
+            :class="selectedLineId === ln.id ? 'border-signal bg-surface' : 'border-line hover:bg-raised'"
+            @click="selectLine(ln.id)"
+          >
+            <span class="flex items-baseline gap-2 min-w-0">
+              <span class="font-mono text-[13px] font-medium text-ink truncate">{{ ln.name }}</span>
+              <span class="flex-1"></span>
+              <span
+                v-if="!ln.valid"
+                class="signal-dot"
+                style="width:6px;height:6px;background:var(--status-error)"
+                title="This chain no longer fits together"
+              ></span>
+              <span
+                v-else-if="ln.live_runs"
+                class="signal-dot signal-pulse"
+                style="width:6px;height:6px;background:var(--status-building)"
+                title="A run is walking this line"
+              ></span>
             </span>
-            <span
-              v-if="!ln.valid"
-              class="block font-mono text-[11px]"
-              style="color: var(--status-error)"
-            >{{ ln.error }}</span>
-          </span>
-          <span class="font-mono text-[11px] tracking-[0.08em] uppercase text-ink-tertiary whitespace-nowrap">
-            {{ ln.stage_count }} {{ ln.stage_count === 1 ? 'stage' : 'stages' }}
-          </span>
-          <button
-            class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
-            title="Download this line, its stages and every workflow behind them as one file."
-            @click="exportLine(ln)"
-          >export</button>
-          <button
-            class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
-            @click="deleteLine(ln.id)"
-          >delete</button>
+            <span class="font-mono text-[11px] text-ink-tertiary truncate">
+              {{ ln.stages.map(st => st.workflow_name).join(' → ') }}
+            </span>
+            <span class="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-tertiary">
+              {{ ln.stage_count }} {{ ln.stage_count === 1 ? 'stage' : 'stages' }} · {{ typeTrack(ln) }}
+            </span>
+          </button>
+
+          <div v-if="loadingLines && lines.length === 0" class="font-mono text-xs text-ink-tertiary px-1">
+            loading lines…
+          </div>
+          <div v-else-if="lines.length === 0" class="font-mono text-xs text-ink-tertiary px-1">
+            no lines yet
+          </div>
         </div>
-        <div v-if="loadingLines && lines.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
-          loading lines…
-        </div>
-        <div v-else-if="lines.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
-          no lines yet
+
+        <!-- The editor. Read-only it draws as a route board; under edit it is a
+             list, and Add stage only offers what fits where it is going. -->
+        <LineEditor
+          v-if="selectedLine || composing"
+          :key="`${selectedLineId || 'new'}-${composing}`"
+          :line="selectedLine"
+          :workflows="workflows"
+          :start-editing="composing"
+          @saved="onLineSaved"
+          @cancelled="composing = false"
+          @duplicate="duplicateLine(selectedLineId)"
+          @export="exportLine(selectedLine)"
+          @delete="deleteLine(selectedLineId)"
+        />
+        <div v-else class="card-ab p-6 font-mono text-xs text-ink-tertiary">
+          select a line, or start one
         </div>
       </div>
     </div>
