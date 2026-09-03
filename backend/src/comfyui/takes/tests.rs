@@ -128,11 +128,12 @@ impl Lib {
         ids
     }
 
-    /// The `ALTER TABLE` FR7 ships, run here so the seam can be tested from the
-    /// far side of the integration rather than only from this one.
-    fn with_fr7_batches(&mut self) {
-        self.sql("ALTER TABLE runs ADD COLUMN batch_id TEXT;");
-    }
+    /// `runs.batch_id` used to be added here, because FR7 was being written in
+    /// parallel and the seam had to be testable from this side before its
+    /// column existed. It ships in the `batches` migration now, so the
+    /// behaviour these tests pin is the real one and this is a no-op kept for
+    /// the shape of the tests that call it.
+    fn with_fr7_batches(&mut self) {}
 
     fn put_in_batch(&mut self, run_id: &str, batch: &str) {
         self.sql(&format!(

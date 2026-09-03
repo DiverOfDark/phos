@@ -89,6 +89,12 @@ pub fn spawn_enhancement_worker(
             // queues the stage after it, and only then can the run it belongs
             // to be called finished and its intermediates swept.
             advance::advance_runs(&mut conn, &library_root);
+            // And last, the batches: turn the next handful of matching shots
+            // into runs. After `advance` rather than before, because the caps
+            // are decided from how many of a batch's runs are still live — read
+            // before this tick's completions landed, a batch would feed hardest
+            // on the very tick the queue drained.
+            crate::comfyui::batch::feed_batches(&mut conn, &library_root);
             cleanup_completed_tasks(&mut conn);
 
             // Sleep 3 seconds or until shutdown

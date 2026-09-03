@@ -412,6 +412,11 @@ pub(crate) fn queue_stage(
 }
 
 /// Open a run row. Callers queue its first stage in the same transaction.
+///
+/// `batch_id` is `None` for every run started one shot at a time, which is
+/// every run there was before FR7. A batch's runs carry it so the batch can
+/// count what it has open — which is how its caps are enforced — and so
+/// FR10b's Takes lane can give one verdict over a batch's held runs.
 pub(crate) fn open_run(
     conn: &mut SqliteConnection,
     line_id: Option<&str>,
@@ -419,6 +424,7 @@ pub(crate) fn open_run(
     label: &str,
     stage_count: i32,
     stage_values: Option<&str>,
+    batch_id: Option<&str>,
 ) -> QueryResult<String> {
     let run_id = uuid::Uuid::new_v4().to_string();
     diesel::insert_into(runs::table)
@@ -429,6 +435,7 @@ pub(crate) fn open_run(
             label,
             stage_count,
             stage_values,
+            batch_id,
         })
         .execute(conn)?;
     Ok(run_id)
@@ -473,6 +480,23 @@ pub(crate) fn start_line_run(
     line_id: &str,
     shot_id: &str,
     answers: &SuppliedByStage,
+) -> Result<RunStart, StartError> {
+    start_line_run_for_batch(conn, line_id, shot_id, answers, None)
+}
+
+/// [`start_line_run`], attributing the run to a batch.
+///
+/// The same function, and deliberately so: a batch's run is an ordinary run
+/// with a column filled in. Every check a hand-started run gets, a batch's run
+/// gets too — including `admits_source`, which is per-shot and is what tells a
+/// batch that a video does not fit an image line. The feeder reads a
+/// [`StartError::Rejected`] as "skip this shot", not as "stop this batch".
+pub(crate) fn start_line_run_for_batch(
+    conn: &mut SqliteConnection,
+    line_id: &str,
+    shot_id: &str,
+    answers: &SuppliedByStage,
+    batch_id: Option<&str>,
 ) -> Result<RunStart, StartError> {
     let label: String = crate::schema::production_lines::table
         .filter(crate::schema::production_lines::id.eq(line_id))
@@ -593,6 +617,7 @@ pub(crate) fn start_line_run(
             &label,
             stage_count,
             stage_values.as_deref(),
+            batch_id,
         )?;
         // Already checked above, so the `accept` inside this cannot refuse;
         // applied again because the plan is rebuilt inside the transaction.

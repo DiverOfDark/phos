@@ -5,8 +5,18 @@ import WorkflowGraph from '@/components/WorkflowGraph.vue'
 import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
 import WorkflowContract from '@/components/WorkflowContract.vue'
 import LineEditor from '@/components/LineEditor.vue'
+import BatchSheet from '@/components/BatchSheet.vue'
 import { controlKind, isParameterInput, isTextInput, inputKey, parameterValue, formatDuration, stageOf } from '@/lib/utils'
 import { typeTrack, continuationCost, heldLabel, takeSeed } from '@/lib/lines'
+import {
+  formatCount,
+  formatGpu,
+  formatBytes,
+  formatWindow,
+  batchStatusColor,
+  batchProgress,
+  selectionShorthand,
+} from '@/lib/batches'
 
 // --- Connection health ---
 const comfyuiHealthy = ref(false)
@@ -801,11 +811,92 @@ function formatDate(dateStr) {
   return new Date(dateStr).toLocaleDateString()
 }
 
-// ===== TEMPLATES TAB =====
+// ===== BATCHES TAB =====
+// A batch is a query, a line and a cursor — one row, however many shots it
+// names. The board shows what each one has opened so far against the number
+// agreed to at Send, and why it is not opening more if it is not.
+const batches = ref([])
+const savedSelections = ref([])
+const sheetOpen = ref(false)
+const sheetSelection = ref(null)
+const sheetLineId = ref('')
+const stoppingId = ref(null)
+let batchInterval = null
+
+async function fetchBatches() {
+  try {
+    const [b, s] = await Promise.all([
+      fetch('/api/comfyui/batches'),
+      fetch('/api/comfyui/selections'),
+    ])
+    if (b.ok) batches.value = await b.json()
+    if (s.ok) savedSelections.value = await s.json()
+  } catch (e) {
+    console.error('Failed to fetch batches', e)
+  }
+}
+
+function startBatchPolling() {
+  stopBatchPolling()
+  batchInterval = setInterval(fetchBatches, 4000)
+}
+
+function stopBatchPolling() {
+  if (batchInterval) clearInterval(batchInterval)
+  batchInterval = null
+}
+
+/** Open the confirm sheet on the whole library, which the sheet then narrows. */
+function openSheet(selection, lineId) {
+  sheetSelection.value = selection || { kind: 'query', query: {} }
+  sheetLineId.value = lineId || ''
+  sheetOpen.value = true
+}
+
+function sendSaved(sel) {
+  openSheet(sel.selection, sel.line_id || '')
+}
+
+async function forgetSaved(id) {
+  try {
+    await fetch(`/api/comfyui/selections/${id}`, { method: 'DELETE' })
+    await fetchBatches()
+  } catch (e) {
+    console.error('Failed to delete selection', e)
+  }
+}
+
+/** STOP. Instant, because most of the batch was never rows. */
+async function stopBatch(id) {
+  stoppingId.value = id
+  try {
+    const res = await fetch(`/api/comfyui/batches/${id}/stop`, { method: 'POST' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    await fetchBatches()
+  } catch (e) {
+    console.error('Failed to stop batch', e)
+  } finally {
+    stoppingId.value = null
+  }
+}
+
+/** The caps a batch carries, as one line of the schedule register. */
+function capsLine(batch) {
+  const parts = []
+  const c = batch.caps || {}
+  if (c.window_start_minute !== undefined && c.window_end_minute !== undefined) {
+    parts.push(formatWindow(c.window_start_minute, c.window_end_minute))
+  }
+  if (c.daily_task_cap) parts.push(`${formatCount(c.daily_task_cap)}/day`)
+  if (c.max_outstanding_holds) parts.push(`≤${formatCount(c.max_outstanding_holds)} held`)
+  if (c.disk_floor_bytes) parts.push(`≥${formatBytes(c.disk_floor_bytes)} free`)
+  return parts.join(' · ')
+}
+
 // --- Active tab tracking (synced with URL) ---
 const route = useRoute()
 const router = useRouter()
-const TABS = ['workflows', 'lines', 'queue']
+const TABS = ['workflows', 'lines', 'queue', 'batches']
 const activeTab = computed(() => TABS.includes(route.query.tab) ? route.query.tab : 'workflows')
 
 function onTabChange(val) {
@@ -819,7 +910,12 @@ function onTabChange(val) {
       fetchLines()
       fetchSuggestions()
     }
+    if (val === 'batches') {
+      fetchBatches()
+      startBatchPolling()
+    }
   }
+  if (val !== 'batches') stopBatchPolling()
 }
 
 // --- Lifecycle ---
@@ -832,10 +928,15 @@ onMounted(() => {
     fetchRuns()
     startTaskPolling()
   }
+  if (activeTab.value === 'batches') {
+    fetchBatches()
+    startBatchPolling()
+  }
 })
 
 onUnmounted(() => {
   stopTaskPolling()
+  stopBatchPolling()
 })
 
 defineExpose({ loadData: fetchWorkflows })
@@ -867,6 +968,7 @@ defineExpose({ loadData: fetchWorkflows })
           { id: 'workflows', label: 'Workflows', count: workflows.length },
           { id: 'lines', label: 'Lines', count: lines.length },
           { id: 'queue', label: 'Queue', count: runs.length },
+          { id: 'batches', label: 'Batches', count: batches.length },
         ]"
         :key="t.id"
         class="flex items-center gap-2 px-3 py-2 border-b-2 text-[13px] transition-colors"
@@ -1599,6 +1701,163 @@ defineExpose({ loadData: fetchWorkflows })
         refreshing every 5s while runs are active
       </div>
     </div>
+
+    <!-- Batches tab — a whole library's worth of shots sent to one line.
+         A batch is one row however many shots it names: the query and how far
+         the worker has got answering it. The board reads what it has opened
+         against what was agreed at Send, and — when nothing is moving — why. -->
+    <div v-else-if="activeTab === 'batches'" class="flex flex-col gap-4">
+      <div class="flex items-baseline justify-between gap-4 flex-wrap">
+        <div class="text-[13px] font-light text-ink-secondary max-w-[520px]">
+          Send a query rather than a list: <span class="font-normal text-ink">everything of
+          Grandma before 1990</span>, restore and upscale, run overnight. The runs open a
+          handful at a time, so stopping is instant and the queue stays a queue.
+        </div>
+        <button
+          class="bg-signal text-signal-fg rounded px-4 py-1.5 font-mono text-[11px] uppercase tracking-[0.08em] font-medium hover:bg-signal-hover shrink-0"
+          @click="openSheet(null, '')"
+        >New batch</button>
+      </div>
+
+      <!-- Saved selections. One click to repeat, and never a schedule. -->
+      <div v-if="savedSelections.length" class="flex flex-col gap-2">
+        <div class="label">Saved selections</div>
+        <div class="flex flex-wrap gap-2">
+          <div
+            v-for="sel in savedSelections"
+            :key="sel.id"
+            class="flex items-center gap-2 border border-line rounded px-3 py-1.5"
+          >
+            <button
+              class="flex flex-col items-start text-left hover:text-signal transition-colors"
+              @click="sendSaved(sel)"
+            >
+              <span class="text-[13px] text-ink">{{ sel.name }}</span>
+              <span class="font-mono text-[10px] text-ink-tertiary uppercase tracking-[0.08em]">
+                {{ selectionShorthand(sel.selection) }}
+              </span>
+            </button>
+            <button
+              class="font-mono text-[11px] text-ink-tertiary hover:text-signal"
+              :aria-label="`Forget ${sel.name}`"
+              @click="forgetSaved(sel.id)"
+            >✕</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card-ab overflow-hidden overflow-x-auto">
+        <div
+          class="grid gap-3 px-4 py-2 border-b min-w-[880px]"
+          style="grid-template-columns: minmax(0,1fr) 132px 148px 132px 96px 84px; border-color: var(--border-strong)"
+        >
+          <span class="label">Batch</span>
+          <span class="label">Opened</span>
+          <span class="label">Runs</span>
+          <span class="label">Caps</span>
+          <span class="label">Status</span>
+          <span></span>
+        </div>
+
+        <div
+          v-for="b in batches"
+          :key="b.id"
+          class="border-b border-line last:border-0 min-w-[880px]"
+        >
+        <div
+          class="grid gap-3 items-center px-4 py-2.5"
+          style="grid-template-columns: minmax(0,1fr) 132px 148px 132px 96px 84px"
+        >
+          <span class="min-w-0">
+            <span class="block text-[13px] text-ink truncate">{{ b.label }}</span>
+            <span class="block font-mono text-[11px] text-ink-tertiary truncate uppercase tracking-[0.08em]">
+              {{ selectionShorthand(b.selection) }}
+              <template v-if="!b.skip_if_generated"> · redo</template>
+            </span>
+          </span>
+
+          <!-- Against the number agreed at Send, not against a total that moves. -->
+          <span class="flex flex-col gap-1">
+            <span class="font-mono text-xs text-ink tabular-nums">
+              {{ formatCount(b.runs_opened) }}
+              <span class="text-ink-tertiary">/ {{ formatCount((b.matched_total || 0) - (b.skipped_total || 0)) }}</span>
+            </span>
+            <span class="h-[2px] bg-raised rounded-xs overflow-hidden">
+              <span
+                class="block h-full"
+                :style="{ width: batchProgress(b) + '%', background: batchStatusColor(b.status) }"
+              ></span>
+            </span>
+          </span>
+
+          <span class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 font-mono text-[11px] tabular-nums">
+            <span v-if="b.runs_running" style="color: var(--status-building)">{{ b.runs_running }} run</span>
+            <span v-if="b.runs_held" style="color: var(--status-degraded)">{{ b.runs_held }} held</span>
+            <span v-if="b.runs_completed" style="color: var(--status-ready)">{{ b.runs_completed }} done</span>
+            <span v-if="b.runs_failed" style="color: var(--status-error)">{{ b.runs_failed }} failed</span>
+            <span v-if="!b.runs_opened" class="text-ink-tertiary">—</span>
+          </span>
+
+          <span class="font-mono text-[11px] text-ink-tertiary truncate" :title="capsLine(b)">
+            {{ capsLine(b) || '—' }}
+          </span>
+
+          <span
+            class="flex items-center gap-1.5 font-mono text-[11px] tracking-[0.08em] uppercase"
+            :style="{ color: batchStatusColor(b.status) }"
+          >
+            <span
+              class="signal-dot"
+              :class="{ 'signal-pulse': b.status === 'running' }"
+              style="width:6px;height:6px"
+              :style="{ background: batchStatusColor(b.status) }"
+            ></span>
+            {{ b.status }}
+          </span>
+
+          <span class="flex justify-end">
+            <button
+              v-if="b.status === 'running' || b.status === 'paused'"
+              class="border rounded px-2.5 py-1 font-mono text-[11px] uppercase tracking-[0.08em] transition-colors disabled:opacity-40"
+              style="border-color: var(--status-error); color: var(--status-error)"
+              :disabled="stoppingId === b.id"
+              @click="stopBatch(b.id)"
+            >{{ stoppingId === b.id ? '…' : 'Stop' }}</button>
+          </span>
+        </div>
+
+        <!-- Why nothing is happening, on its own full-width row.
+             It used to sit in the Batch column, where a 196px cell at the
+             board's minimum width showed about thirty characters of a
+             hundred-and-ten-character sentence — cutting it off at "waiting on
+             a v…", which is precisely before the cap and before the half that
+             says whose move it is. The sentence is the answer to "why has
+             nothing happened for six hours"; it does not belong in a cell. -->
+        <div
+          v-if="b.paused_note"
+          class="px-4 pb-2.5 -mt-1 text-[12px] font-light"
+          style="color: var(--status-degraded)"
+        >{{ b.paused_note }}</div>
+        </div>
+
+        <div v-if="!batches.length" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
+          no batches yet
+        </div>
+      </div>
+
+      <div v-if="batches.some((b) => b.status === 'running')" class="font-mono text-[11px] text-ink-tertiary">
+        refreshing every 4s
+      </div>
+    </div>
+
+    <BatchSheet
+      :open="sheetOpen"
+      :selection="sheetSelection"
+      :lines="lines"
+      :line-id="sheetLineId"
+      @close="sheetOpen = false"
+      @sent="fetchBatches"
+    />
 
   </div>
 </template>
