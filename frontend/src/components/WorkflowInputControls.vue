@@ -35,6 +35,14 @@ const props = defineProps({
   loaderKeys: { type: Array, default: () => [] },
   /** Presets pin values; only a queue request can sweep them. */
   allowVary: { type: Boolean, default: false },
+  /**
+   * Offer the third disposition: *asked at send time*.
+   *
+   * Only a line has one — a preset and a queue request are both a set of
+   * values being decided right now, and a value that is being decided cannot
+   * also be left open.
+   */
+  allowExpose: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['dirty'])
@@ -44,6 +52,8 @@ const parameters = defineModel('parameters', { type: Object, default: () => ({})
 const vary = defineModel('vary', { type: Object, default: () => ({}) })
 /** The first thing wrong with a row, or '' — the parent gates submission on it. */
 const problem = defineModel('problem', { type: String, default: '' })
+/** Keys the line does not pin — see `allowExpose`. */
+const exposed = defineModel('exposed', { type: Array, default: () => [] })
 
 // --- Which inputs get a row ------------------------------------------------
 
@@ -233,6 +243,44 @@ watchEffect(() => {
   problem.value = wrong ? `${inputKey(wrong)}: ${sweepError(wrong) || fixedError(wrong)}` : ''
 })
 
+// --- Dispositions ----------------------------------------------------------
+// A line says one of three things about each of its stages' settings: it pins
+// the value, it sweeps it into several runs, or it leaves it to whoever sends
+// the line. FR9 adds a fourth — *compiled*, written by a describe stage — which
+// is another branch of `dispositionOf` and another segment here, and nothing
+// else about this row has to move to make room for it.
+
+function dispositionOf(input) {
+  const key = inputKey(input)
+  if (key in vary.value) return 'varied'
+  if (exposed.value.includes(key)) return 'exposed'
+  return 'pinned'
+}
+
+/** Take a key out of every disposition but the one being set. */
+function clearOthers(input) {
+  const key = inputKey(input)
+  const nextVary = { ...vary.value }
+  delete nextVary[key]
+  vary.value = nextVary
+  const text = { ...sweepText.value }
+  delete text[key]
+  sweepText.value = text
+  return key
+}
+
+function setPinned(input) {
+  const key = clearOthers(input)
+  exposed.value = exposed.value.filter((k) => k !== key)
+  emit('dirty')
+}
+
+function setExposed(input) {
+  const key = clearOthers(input)
+  if (!exposed.value.includes(key)) exposed.value = [...exposed.value, key]
+  emit('dirty')
+}
+
 // A workflow change replaces the maps wholesale; forget the half-typed text too.
 watch(
   () => props.inputs,
@@ -258,14 +306,48 @@ defineExpose({ rows })
           {{ input.node_id }} · {{ input.node_title || input.node_type }} · {{ input.field_name }}
         </span>
         <span class="flex-1"></span>
+        <!-- What the line says about this setting: it decides it, it sweeps it,
+             or it leaves it to whoever sends the line. -->
+        <span v-if="allowExpose" class="flex">
+          <button
+            v-for="(word, d) in ['pinned', 'asked']"
+            :key="word"
+            :title="word === 'pinned'
+              ? 'This line decides this value'
+              : 'This line asks for this value when it is sent'"
+            class="border px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.08em] transition-colors"
+            :class="[
+              d === 0 ? 'rounded-l-sm' : '-ml-px rounded-r-sm',
+              dispositionOf(input) === (word === 'asked' ? 'exposed' : 'pinned')
+                ? 'border-signal bg-surface text-signal relative z-10'
+                : 'border-line text-ink-tertiary hover:text-ink-secondary',
+            ]"
+            @click="word === 'asked' ? setExposed(input) : setPinned(input)"
+          >{{ word }}</button>
+          <span
+            v-if="dispositionOf(input) === 'varied'"
+            class="border border-signal rounded-r-sm -ml-px px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.08em] text-signal bg-surface"
+          >varied</span>
+        </span>
         <span class="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-tertiary whitespace-nowrap">
           {{ kindLabel(input) }}
         </span>
       </div>
 
+      <!-- Left open: there is no value here to show, because the point is that
+           the line does not have one. -->
+      <div
+        v-if="allowExpose && dispositionOf(input) === 'exposed'"
+        class="font-mono text-[11px] text-ink-tertiary"
+      >asked for when this line is sent</div>
+
+      <!-- An exposed row has no control: the whole point is that this line
+           does not hold a value for it. Everything below is the `v-else`. -->
+      <template v-if="allowExpose && dispositionOf(input) === 'exposed'" />
+
       <!-- Text: the channel that always existed. -->
       <textarea
-        v-if="controlKind(input) === 'textarea'"
+        v-else-if="controlKind(input) === 'textarea'"
         :value="textOverrides[inputKey(input)] ?? ''"
         :placeholder="String(input.current_value ?? '')"
         rows="2"

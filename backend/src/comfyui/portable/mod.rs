@@ -14,17 +14,6 @@
 //! dispatch. The graphs go in the file, and the importer either finds them
 //! already present or creates them.
 //!
-//! # This is also the template format
-//!
-//! FR6 ships bundled templates. A template is a line somebody else drew, which
-//! is exactly what this file is, so there is one format rather than two: a
-//! bundled template is an exported line, seeded through the same importer, and
-//! gets the same requirements report. Everything a template needs beyond a
-//! hand-written export is optional here — `contract` is re-derived when absent,
-//! `requirements` is recomputed rather than trusted, and workflow keys are
-//! arbitrary strings so a template can say `"upscale"` where an export says a
-//! uuid.
-//!
 //! # Nothing in this module touches a database or a network
 //!
 //! Parsing, canonicalising, deriving requirements, checking them against a
@@ -78,6 +67,17 @@ pub struct BundleStage {
     pub source_mode: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_output: bool,
+    /// Keys this stage leaves to whoever sends the line — the *exposed*
+    /// disposition. Optional, like everything else a hand-written template
+    /// would rather not say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exposed: Vec<String>,
+    /// Whether this stage parks its run and asks which of its takes go on —
+    /// FR5c's hold point. Travels for the same reason again: a `×4 → hold →
+    /// upscale` line carried somewhere without the hold is a line that spends
+    /// four hours where the original spent one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold_for_review: bool,
 }
 
 /// The line itself. Stage order is array order — there is no `stage_idx`,
@@ -135,6 +135,15 @@ pub struct LineBundle {
 }
 
 impl LineBundle {
+    pub fn workflow(&self, key: &str) -> Option<&BundleWorkflow> {
+        self.workflows.get(key)
+    }
+
+    /// The graphs, for anything that derives from all of them at once.
+    pub fn graphs(&self) -> impl Iterator<Item = &Value> {
+        self.workflows.values().map(|w| &w.graph)
+    }
+
     /// Read a bundle out of arbitrary JSON, with the refusals worth wording.
     ///
     /// Checks the discriminator before anything else, so pasting a ComfyUI
@@ -232,6 +241,7 @@ impl LineBundle {
             format: BUNDLE_FORMAT.to_string(),
             format_version: BUNDLE_VERSION,
             exported_at: None,
+            // A line somebody exports is theirs, not one Phos tracks.
             line,
             workflows,
             requirements,
@@ -468,6 +478,8 @@ mod tests {
                     vary: VaryMap::new(),
                     source_mode: None,
                     keep_output: false,
+                    exposed: Vec::new(),
+                    hold_for_review: false,
                 }],
             },
             workflows,

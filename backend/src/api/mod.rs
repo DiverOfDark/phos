@@ -2,13 +2,17 @@ pub mod client;
 mod comfyui;
 mod describe;
 mod faces;
-mod files;
+mod batches;
+pub(crate) mod files;
+mod holds;
+mod line_editor;
 mod line_io;
 mod lines;
 mod people;
 pub mod settings;
-mod shots;
+pub(crate) mod shots;
 mod stats;
+mod takes;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -116,10 +120,27 @@ use utoipa::OpenApi;
         lines::get_run,
         lines::retry_run,
         lines::cancel_run,
+        holds::get_hold,
+        holds::post_verdict,
+        takes::list_takes,
+        takes::put_rating,
+        // Batches: a whole library sent to one line
+        batches::preview_batch,
+        batches::create_batch,
+        batches::list_batches,
+        batches::get_batch,
+        batches::stop_batch,
+        batches::save_selection,
+        batches::list_selections,
+        batches::delete_selection,
         line_io::export_line,
         line_io::import_line,
         describe::describe_shot,
         describe::get_description,
+        line_editor::list_stage_options,
+        line_editor::validate_line,
+        line_editor::duplicate_line,
+        line_editor::list_suggestions,
         // Settings
         settings::get_webdav_settings,
         settings::set_webdav_settings,
@@ -169,6 +190,7 @@ use utoipa::OpenApi;
             faces::AddManualFacePayload,
             // Files
             files::FileManifestResponse,
+            takes::RatingPayload,
             crate::comfyui::ProvenanceManifest,
             // Import
             crate::ingest::IngestStatus,
@@ -192,7 +214,19 @@ use utoipa::OpenApi;
             lines::LinePayload,
             lines::LineStagePayload,
             lines::StartRunPayload,
-            // A line as a file — also the format bundled templates ship in.
+            holds::VerdictPayload,
+            // Batches
+            batches::BatchPayload,
+            batches::BatchPreview,
+            batches::BatchBrief,
+            batches::StagePreview,
+            batches::CapsPayload,
+            batches::SavedSelectionPayload,
+            batches::SavedSelectionBrief,
+            crate::comfyui::batch::selection::Selection,
+            crate::comfyui::batch::plan::Estimate,
+            crate::api::shots::ShotsQuery,
+            // A line as a file.
             crate::comfyui::LineBundle,
             crate::comfyui::BundleLine,
             crate::comfyui::BundleStage,
@@ -207,6 +241,7 @@ use utoipa::OpenApi;
             crate::comfyui::CompiledPrompt,
             crate::comfyui::Intent,
             crate::comfyui::ShotFacts,
+            line_editor::StageOptionsPayload,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
@@ -340,6 +375,7 @@ async fn get_or_create_user_pool(
         tracing::error!("Failed to run migrations for user {}: {}", user_sub, e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    // Every library gets the bundled lines, including one that comes into
     pools.insert(user_sub.to_string(), pool.clone());
     drop(pools);
 
@@ -519,6 +555,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/files/{id}/thumbnail", get(files::get_file_thumbnail))
         .route("/api/files/{id}/manifest", get(files::get_file_manifest))
         .route("/api/files/{id}/set-original", put(files::set_file_original))
+        // The Takes lane's 1-5 keys. Any file may carry one.
+        .route("/api/files/{id}/rating", put(takes::put_rating))
         .route("/api/files/{id}/faces", post(faces::add_manual_face))
         // Stats + organize
         .route("/api/stats", get(stats::get_stats))
@@ -579,6 +617,22 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Production lines: a chain of workflows, and the runs that walk one.
         .route(
+            "/api/comfyui/lines/stage-options",
+            post(line_editor::list_stage_options),
+        )
+        .route(
+            "/api/comfyui/lines/validate",
+            post(line_editor::validate_line),
+        )
+        .route(
+            "/api/comfyui/lines/suggestions",
+            get(line_editor::list_suggestions),
+        )
+        .route(
+            "/api/comfyui/lines/{id}/duplicate",
+            post(line_editor::duplicate_line),
+        )
+        .route(
             "/api/comfyui/lines",
             get(lines::list_lines).post(lines::create_line),
         )
@@ -604,8 +658,35 @@ pub fn create_router(state: AppState) -> Router {
             get(lines::list_runs).post(lines::start_run),
         )
         .route("/api/comfyui/runs/{id}", get(lines::get_run))
+        // Batches. `preview` is registered before `{id}` so the literal path
+        // wins the match, and it writes nothing: it is the confirm sheet.
+        .route(
+            "/api/comfyui/batches/preview",
+            post(batches::preview_batch),
+        )
+        .route(
+            "/api/comfyui/batches",
+            get(batches::list_batches).post(batches::create_batch),
+        )
+        .route("/api/comfyui/batches/{id}", get(batches::get_batch))
+        .route("/api/comfyui/batches/{id}/stop", post(batches::stop_batch))
+        .route(
+            "/api/comfyui/selections",
+            get(batches::list_selections).post(batches::save_selection),
+        )
+        .route(
+            "/api/comfyui/selections/{id}",
+            delete(batches::delete_selection),
+        )
         .route("/api/comfyui/runs/{id}/retry", post(lines::retry_run))
         .route("/api/comfyui/runs/{id}/cancel", post(lines::cancel_run))
+        // A run parked at a hold point, and the verdict that releases it.
+        .route(
+            "/api/comfyui/runs/{id}/hold",
+            get(holds::get_hold).post(holds::post_verdict),
+        )
+        // And every held run at once: the curation lane's contact sheet.
+        .route("/api/comfyui/takes", get(takes::list_takes))
         // The prompt a shot's own contents compile to.
         .route("/api/comfyui/describe", post(describe::describe_shot))
         .route(

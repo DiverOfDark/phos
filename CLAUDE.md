@@ -62,18 +62,43 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
-- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what happens after a stage lands, and whether a run is over) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `api/line_io.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
+- **`comfyui/`** — ComfyUI integration, split so the code that *decides* is pure and testable without a server. `tests/comfyui_contract_test.rs` then pins the contract itself against a real CPU-only ComfyUI (`docker/comfyui-test/`, built and pushed by CI as `ghcr.io/<owner>/comfyui-test:<dockerfile-sha>`) with model-free core-node workflows. `history.rs` (what did ComfyUI say), `outputs.rs` (which files a run produced, or might have), `policy.rs` (how long to wait, and whether a failure is worth retrying), `params.rs` (a run's typed values, and what a swept one expands to), `workflow.rs` (graph analysis and rewriting), `contract/` (what a workflow accepts and produces), `prompt/` (the instruction a describe stage is sent, the answer read back, and the prompt compiled out of it), `line.rs` (whether a chain of them holds together, what travels along each join, what happens after a stage lands, what a verdict on a hold point may say, and whether a run is over), `editor.rs` (what the line editor may offer, and what a join has to be asked), `promote.rs` (which chains somebody has been running by hand often enough to be worth saving), `queue.rs` (what order the pending queue drains in, and what a task's priority means — pure, and the dispatcher's `ORDER BY` is built from it), `batch/` (a whole library sent to one line: `plan.rs` is the cursor, the caps and the estimate with no database anywhere near them, `selection.rs` is what was pointed at, `store.rs` is the row and the counts, `feed.rs` is the tick and STOP) and `portable/` (a line as a file, and what it needs installed) take `serde_json::Value` in and give an answer out; `client.rs` holds the HTTP calls and decides nothing; `runs.rs`, `holds/` (`mod.rs` reads a hold, `verdict.rs` writes what was decided), `takes/` (the curation lane's read model over *every* held run, plus what a verdict deletes and how far it reaches — `bulk.rs` is the pure rule for that), `api/line_io.rs` and `worker/` hold the DB writes and the background loop. Start at `comfyui/mod.rs` — its module doc has the task state machine, and `worker/advance.rs` has the run one
 
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
-- **`components/ReviewDesk.vue`** — One screen, three lanes (`?lane=` → shots / duplicates / faces); `/variations` redirects into it
-- **`components/WorkflowsPage.vue`** — Three tabs: workflows, lines, and a queue that is a schedule
+- **`components/ReviewDesk.vue`** — One screen, four lanes (`?lane=` → shots / duplicates / faces / takes); `/variations` redirects into it
+- **`components/TakesQueue.vue`** — The Takes lane: a contact sheet over every run parked at a
+  hold point, keyboard-first, fitted to the window so the footer that says what `⏎` is about to
+  do never scrolls off. `lib/takes.js` holds the whole interaction model as a pure reducer —
+  `keyAction` turns an event into an intent, `reduce` turns an intent into the next state plus
+  effects — so the keyboard is tested by `node --test` rather than by driving a browser
+- **`components/WorkflowsPage.vue`** — Four tabs: workflows, lines, batches, and a queue that is a schedule
   board of **runs** — one row per run saying `STAGE 2/4 · UPSCALE · 00:03:12`, with the tasks
-  underneath one click away. A four-stage run as four unrelated rows is what it replaced
+  underneath one click away. A four-stage run as four unrelated rows is what it replaced. A run
+  parked at a hold point reads `HELD · 4 TAKES` and opens a review strip: its takes, tick the ones
+  worth the stages below, and the three verdicts. That strip is deliberately just enough to give a
+  verdict from without leaving the board; the keyboard-driven contact sheet over every held run at
+  once is the Review Desk's Takes lane, and both read the same `POST`
+- **`components/BatchSheet.vue`** — The confirm sheet: four rows, largest number
+  first, each narrowing the one above. Matched, already-generated (with the
+  `skip`/`redo` switch on the row it changes), what actually runs and what that
+  comes to in tasks, then GPU and disk. It says out loud where a number is a
+  guess and where a hold makes it an upper bound. `lib/batches.js` formats;
+  nothing in it counts or estimates
+- **`components/LineEditor.vue`** — A line, read as a route board and built as a vertical list.
+  Read-only it draws like `WorkflowContract.vue`; under edit it is a list whose `Add stage` picker
+  only offers what fits. `lib/lines.js` holds its bookkeeping and none of its rules
 - **`components/SettingsPage.vue`** — Settings as a route (library path, WebDAV, S3, dedupe maintenance, APK)
 - **`style.css`** — The AppBahn design system: raw tokens on `:root`, then a `@theme` block remapping Tailwind's palette, radii, shadows and fonts onto them, so utility classes render in the system. Semantic aliases (`bg-base`, `text-ink`, `border-line`, `text-signal`, `text-ready`…) are what components should use
 - **`components/ui/`** — shadcn-vue primitives, no longer used by any screen (only the unreferenced `PhotoLightbox.vue`)
 - **`lib/utils.js`** — `cn()` helper (clsx + tailwind-merge)
+- **`lib/takes.js`** — The Takes lane's rules and none of its drawing: the key map as data, the
+  reducer, what the next verdict will keep/reject/free, which parameters actually differ across a
+  sheet's takes, and what to say about the batch a run came from. `batchOf` reads FR7's
+  `GET /api/comfyui/batches` for a name and falls back to the batch id, so a missing or failing
+  endpoint costs a label and never a rendered run; `batchNotice` prints FR7's own `paused_note`
+  when a batch is paused on its outstanding-hold cap, because the person in this lane is the one
+  whose verdicts lift it
 
 ### Design System — AppBahn (Bauhaus Engineering)
 Both clients follow one system: dark by default, a single **signal amber** accent, status colour
@@ -110,27 +135,140 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   re-running an hour of upscaling because stage 4 hiccupped is not something the code *can* do
 - **Intermediates live exactly as long as they are useful.** Kept while the run is live (the next
   stage reads them, a failure wants them), swept when it *completes* — never when it fails.
-  `line_stages.keep_output` overrides that per stage, and the last stage's output is the product and
-  is always kept. `keeps_output` is a function of a `StageDisposition` rather than a column read,
-  because FR5c adds a third case (a stage feeding a hold point always keeps)
-- **A line is rejected when it is drawn.** Every join is checked with `Accepts::admits` — the same
-  function FR5b's stage picker will call, so the editor and the validator cannot disagree — on
-  `POST`/`PUT`, again on every read, again when a run starts (with the shot's own type), and once
-  more at dispatch against the file that actually turned up. A workflow can be re-imported or its
-  contract corrected long after a line was built
-- **A line travels as one file, and that file is also the template format.** `comfyui/portable/`
+  `line_stages.keep_output` overrides that per stage, the last stage's output is the product and is
+  always kept, and a hold point's takes are kept because choosing among them is the entire point of
+  the stage. `keeps_output` is a function of a `StageDisposition` (`is_final || keep_flag ||
+  feeds_hold`) rather than a column read, so the two paths where the choosing does *not* stand — a
+  run abandoned at its hold, and the generation a regenerate replaced — pass `feeds_hold: false`
+  and get the keep flag's answer instead
+- **A stage can park its run and ask.** `line_stages.hold_for_review` stops the line *after* that
+  stage, puts its takes in front of a person, and goes on with the ones they keep — so
+  `×4 extend → hold → upscale 4K` spends the hour of upscaling on the two clips somebody chose
+  rather than on all four. Three verdicts and no fourth: **continue** with a selection (more than
+  one is ordinary — a hold is a fan-*out* point as much as a filter), **regenerate** the held stage
+  with fresh seeds and nothing else changed, **cancel** the run. Wanting different parameters is an
+  edit and a new run, which is what keeps the verdict a button rather than a form
+- **A hold is where fan-in happens, and `advance_after` is where the shape gave.** It used to be a
+  total, local rule — a completed task not at the last stage continues, always. It now takes a
+  `HoldGate` (*does this stage hold; was this take kept; was it reviewed at all*) and can answer
+  `Advance::Hold`. Four takes converge on **one verdict**, which is the fan-in; the verdict fans
+  back out to the kept subset, and that needs no new code because each kept take is an ordinary
+  continuation. `run_holds` is append-only and carries **two** id lists: `kept_task_ids` and
+  `reviewed_task_ids`. The second is not redundant — without it a passed-over take is
+  indistinguishable from one nobody has seen, and the run parks again on it forever. It has exactly
+  `parent_task_id`'s property: it exists precisely when the thing it marks happened
+- **Reject arms; the verdict deletes.** The Takes lane's `X` marks a take and the bytes go when the
+  verdict is sent, not on the keystroke. That is what lets the key cost one press and no dialog
+  while staying reversible right up until it is not — and lets the footer print the megabytes the
+  next `⏎` will free *before* it is pressed. The safeguard is a number always on screen, not a
+  confirmation nobody reads. Rejecting is narrower than not-keeping: a take merely passed over is
+  disposed of by its stage's `keep_output` policy, which is the line author's decision, while a
+  rejected one goes regardless, which is the reviewer's. Both are recorded as *reviewed* on the same
+  `run_holds` row
+- **A verdict may cover a batch, but a rejection never travels.** `scope: "batch"` applies the same
+  verdict to every other run of the same FR7 batch held at the same stage of the same line — you
+  look at a handful of three thousand descriptions and let the rest through. `continue` resolves
+  there to *all* of that run's own waiting takes, because task ids are per run and the selection
+  made here does not exist there; `reject` is refused across a run nobody opened, because deleting
+  bytes is something you do to pictures you have seen. Which runs a verdict covers is
+  `comfyui/takes/bulk.rs`, pure and with no database near it. `runs.batch_id` is FR7's column and
+  is read by a raw-SQL probe that treats the question failing as the answer "no batches", so a
+  batch verdict is quietly a run verdict until FR7 lands
+- **A batch is a query, not a list.** `batches` holds the selection — an
+  `api::shots::ShotsQuery` verbatim, or an explicit id list — plus a keyset
+  cursor over `(COALESCE(shots.timestamp,''), shots.id)` ascending. The feeder
+  opens the next handful each tick; fifty thousand `runs` rows are never
+  inserted at once. That is what makes STOP instant (the runs that were never
+  opened were never rows), keeps the board a board, and lets a batch pick up
+  shots imported after it was sent. There is **one** filter language in Phos and
+  this reuses it: `api::shots::shot_conditions` builds the SQL for the gallery
+  and for the batch alike. Nothing runs on a timer — a batch exists because
+  somebody pressed Send, and a window only *paces* work already queued
+- **The queue drains by stage, not by run.** `comfyui/queue.rs` holds the order and nothing else,
+  pure and with no database near it: **interactive before batch**, then lower `stage_idx` first,
+  then grouped by `workflow_id`, then oldest, then by id so it is total. `worker/dispatch.rs` builds
+  its `ORDER BY` from the same two SQL fragments, and `DrainKey`'s `Ord` says the same thing a
+  second time — so "the database returns the order this module describes" is a test rather than two
+  files read side by side. A batch therefore walks its runs along **in lockstep**: every describe,
+  then every video generation, then every upscale. That loads each model once per pass instead of
+  once per task, and puts a whole pass in front of a person at once, which is what makes bulk
+  review in the Takes lane possible at all. The cost is deliberate and is per-run latency — no
+  single run finishes early — which is exactly why `priority` is the **first** key
+- **`enhancement_tasks.priority` says what used to be inferred.** Two values, `interactive` and
+  `batch`, and no third: the question is "is a person waiting", not "how important is this". It
+  replaces reading FR7's `runs.batch_id` — a fact about *provenance* — as a fact about *urgency*,
+  through a join, in the one query that runs every three seconds. Written at every insert rather
+  than left to the column default, and the default is `interactive`, so a row that forgets to say
+  fails towards the person. A continuation inherits its parent's, so a run's hurry is the run's
+  and not the stage it happens to be on. Retry, and a verdict given on the run in front of you,
+  promote what they release — a batch-scoped verdict does **not**, because three thousand runs
+  cutting the line is not a fast lane
+- **The lead is spent on the wave, not on the batch.** `plan::wave_lead` holds a batch's lead at
+  zero while any of its runs is past the first stage. That is what makes a pass complete as a unit
+  — topping the lead back up mid-wave would put brand-new first-stage tasks *in front of* a run one
+  task from done — and it is the starvation bound: while a wave is in flight the batch adds no work
+  at any stage, so the set of tasks that can outrank a given one is fixed when it is queued and only
+  shrinks. A **held** run does not count as advanced (it queued no later stage), so a batch keeps
+  describing while its takes wait for a person; what limits *that* pile is `max_outstanding_holds`.
+  `advanced_runs` is a `COUNT(*)` over `enhancement_tasks`, like every other number the caps read
+- **A batch's caps are the feature, not settings for later.** At this scale the
+  failure mode is not a crash, it is generating more than anyone will look at.
+  A confirm sheet before anything queues; a daily task cap; an optional window;
+  a disk floor; and a cap on **outstanding holds** — 3,329 shots through
+  `×4 extend → hold → upscale` park 13,316 clips in front of a person before any
+  upscale runs. That cap counts `runs.status='held'` and never joins to
+  `held_at_stage`, the one marker FR5c leaves that is not self-evidencing: a cap
+  that ignored a held run with a NULL stage would let the mountain grow past the
+  limit it exists to enforce. Every count the caps read is a `COUNT(*)`, never a
+  column, so none of them can disagree with what they describe
+- **A held run parks; it never blocks.** Both halves of the advance pass filter on
+  `status = running`, so a held run is read by nothing until a verdict releases it — 3,329 shots
+  through a hold point park 3,329 runs and the queue keeps feeding the GPU from everything else.
+  Held runs are never expired and never silently discarded: a hold with no verdict stays held.
+  `runs.status = 'held'` and `runs.held_at_stage` survive a restart because they are columns rather
+  than timers, and `RunState::live()` is what stops a line being edited under a held run
+- **What crosses a join is one function, asked by four callers.** `line::carried_into` answers
+  "what media type arrives at this stage", and the picker, the validator, the line reader that
+  draws the connector and the dispatcher all ask *it* rather than agreeing with it. Two rules live
+  inside it, both of which had been written more than once: a stage that produces **text** is
+  transparent to the media flow (a describe stage makes no file, so the photograph it read is the
+  photograph the stage after it reads), and a connector set to a **frame** of a clip —
+  `first_frame` / `last_frame` / `at_time` / `keyframe` — hands on a still, which is what makes
+  `photo → clip → restore` a line that can be built at all. `Accepts::admits` stays a pure
+  media-type match: it is the primitive underneath, not the rule
+- **A line is rejected when it is drawn.** Every join is `carried_into` and then `Accepts::admits`,
+  on `POST`/`PUT`, again on every read, again when a run starts (with the shot's own type), and
+  once more at dispatch against the file that actually turned up. A workflow can be re-imported or
+  its contract corrected long after a line was built
+- **A line travels as one file.** `comfyui/portable/`
   defines a `LineBundle`: the line and its ordered stages, **every stage's workflow graph** (a line
   exported as ids alone is a bundle of broken pointers), the derived contracts, and a requirements
   manifest of node classes and model files. Import checks those requirements against FR3's
   `NodeCatalog` and **reports what is missing before anything runs** — never at dispatch — but
   imports anyway, because the box holding the library is often not the box holding the GPU. An
-  absent catalogue yields `unchecked`, not a wrong answer and not a refusal. There is deliberately
-  **one** format: FR6 seeds bundled templates as `LineBundle`s through the same importer, so
-  everything optional in the file (`contract`, `requirements`, per-stage overrides) can be omitted
-  by a hand-written template. A `requirements` block in the file is documentation — the importer
+  absent catalogue yields `unchecked`, not a wrong answer and not a refusal. Everything optional in the file
+  (`contract`, `requirements`, per-stage overrides) can be omitted by a hand-written bundle. A
+  `requirements` block in the file is documentation — the importer
   recomputes it from the graphs, because the graphs are what will actually be run. Names collide by
   suffixing, never overwriting; workflows deduplicate on the **canonical graph** (sorted keys, no
-  whitespace), so a re-import reuses what is there and one changed seed does not
+  whitespace), so a re-import reuses what is there
+- **The stage picker asks the validator, it does not agree with it.** `comfyui/editor.rs` builds the
+  line each candidate *would* make and hands it to `validate_chain`; offered means accepted, and the
+  greyed row shows the validator's own sentence. Not a second rule to keep in step — which is why
+  the two rules above reached the picker without a line of it moving. What is left in `editor.rs`
+  is what there is to *decide* about a join rather than what it carries: which source mode, and
+  which of a multi-input graph's slots. The browser holds no copy of any of it:
+  `POST /api/comfyui/lines/stage-options` takes the draft and answers
+- **A stage says one of three things about each setting.** *Pinned* (`parameters`), *varied*
+  (`vary`, FR4's sweep) or *exposed* (`line_stages.exposed`) — asked for when the line is sent, and
+  the only keys `POST /runs` will accept values for. Answers are snapshotted onto
+  `runs.stage_values`, because the worker queues stage 4 long after the request that carried them.
+  A key claiming two dispositions is refused. FR9's fourth, *compiled*, is a binding between two
+  stages rather than a question for the sender, and belongs with the describe stage that fills it
+- **A line a run is walking is locked, not versioned.** `GET /lines/{id}` reports `live_runs` and
+  `editable` so the editor locks itself on load rather than discovering the `409` after ten minutes
+  of typing — and offers Duplicate, which is the honest way to change a line something is currently
+  reading
 - **A workflow knows what it takes and what it gives.** `comfyui_workflows.contract_json` holds a
   `comfyui::StageContract`: `accepts` (image / video / text / **none**, because a text-to-image graph
   begins a line rather than continuing one), `produces` (image / video / text), which loader fills
@@ -208,13 +346,25 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `POST /api/faces/dedupe?dry_run=` — Collapse overlapping boxes drawn on one face (never merges two boxes assigned to different people; skips reviewed shots). Also runs at startup and after each upload batch is analyzed
 - `PUT /api/comfyui/workflows/{id}/contract` — Replace the corrections applied to a workflow's derived stage contract, and get back the contract that results. Sending `{}` discards every correction and takes the derivation as it stands
 - `GET /api/files/{id}/manifest` — Whether a file was generated, and the provenance manifest recording how. Answers for any file; a photograph comes back `synthetic: false` with no manifest
-- `POST /api/comfyui/runs` — Start a line against a shot: `{ line_id, shot_id }`. Queues stage 1; the worker queues each stage after it as the one before lands. FR7 replaces `shot_id` with a query and adds a cursor, which is why the handler already resolves a *set* of shots and answers with a list of runs
+- `POST /api/comfyui/batches/preview` — What sending this selection to this line would cost: matched, already-generated, to-run, tasks, GPU seconds, disk, and per stage whether that cost was *measured* here or guessed. Writes nothing; this is the confirm sheet
+- `POST /api/comfyui/batches` — Send it. Writes **one** row holding the query and a cursor; the worker opens runs a handful at a time. `GET` lists them with their run counts and why one is paused
+- `POST /api/comfyui/batches/{id}/stop` — Instant. The batch is marked stopped *first*, so a concurrent tick opens nothing behind the cancel, and only then are its live runs cancelled and their prompts dropped from ComfyUI's queue. A held run goes through its hold's own Cancel verdict
+- `GET|POST /api/comfyui/selections`, `DELETE /api/comfyui/selections/{id}` — A query plus the line you usually send it to. One click to repeat; it never fires on its own, and there is no schedule column
+- `POST /api/comfyui/runs` — Start a line against a shot: `{ line_id, shot_id }`, plus optional `stage_values` answering what each stage left open. Queues stage 1; the worker queues each stage after it as the one before lands. FR7 replaces `shot_id` with a query and adds a cursor, which is why the handler already resolves a *set* of shots and answers with a list of runs
 - `GET /api/comfyui/runs` — The queue board: one row per run, with the stage it is on, of how many, what that stage is running, and its clock. `GET /api/comfyui/runs/{id}` is the drill-down to the tasks underneath
 - `POST /api/comfyui/runs/{id}/retry` — Resume from the stage that failed. What already succeeded is not re-run
+- `GET /api/comfyui/runs/{id}/hold` — The takes a held run is waiting on, and what continuing from one of them costs in tasks. `null` for a run that is not holding
+- `POST /api/comfyui/runs/{id}/hold` — The verdict: `continue` with the takes named (each walks the rest of the line for itself), `regenerate` the held stage with fresh seeds, or `cancel` the run. `reject` names takes whose files leave the library outright; `scope: "batch"` applies the verdict to the rest of the batch, carrying no rejection with it. `POST /runs/{id}/cancel` on a held run goes through this same path, so an abandoned hold is recorded like every other verdict
+- `GET /api/comfyui/takes` — Every run waiting on a verdict, oldest first: one page of held runs with their takes, the file each take was made from, the shot's current main file, and what continuing costs. The Takes lane draws a whole screen from one request
+- `PUT /api/files/{id}/rating` — One to five, or `null` to clear it. The Takes lane's `1`-`5` keys
 - `GET|POST /api/comfyui/lines`, `GET|PUT|DELETE /api/comfyui/lines/{id}` — Line CRUD. A chain whose stages do not fit together is refused with a message naming the stage; editing or deleting a line is refused with `409` while a run of it is in flight
 - `GET /api/comfyui/lines/{id}/export` — The line as one portable JSON bundle: stages, **the workflow graph behind each one**, the derived contracts, and a manifest of the node classes and model files it needs
 - `POST /api/comfyui/lines/import?dry_run=&name=` — Read a bundle back. `dry_run` writes nothing and answers with the requirements report alone
 - `POST /api/comfyui/describe` — Describe one shot and compile a prompt from it, together with the person names, EXIF and caption the library already holds. Answers instantly from `shots.analysis_json` unless `refresh` is set; otherwise queues a one-stage describe run. `GET /api/comfyui/describe/{shot_id}` polls it, and re-compiles for a different `intent`/`style`/`do_not` without describing the photograph again
+- `POST /api/comfyui/lines/stage-options` — Which workflows may go in one slot of a line being edited. Send the draft's workflow ids, the position and `insert`/`replace`; every workflow comes back offered or refused, with the validator's own reason
+- `POST /api/comfyui/lines/validate` — The same check `POST` and `PUT` make, with nothing written, plus each join's handoff. What the editor asks after a reorder
+- `POST /api/comfyui/lines/{id}/duplicate` — Fork a line, with everything its stages carry, under a numbered name
+- `GET /api/comfyui/lines/suggestions` — Sequences somebody has been running one workflow at a time, on enough different shots to be a habit, offered as lines ready to `POST`
 - `GET /api/client/version` — Bundled Android APK metadata for the in-app updater (no auth)
 
 ## AI Models

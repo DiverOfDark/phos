@@ -77,6 +77,14 @@
 //!   is flagged on its row and carries a [`manifest::ProvenanceManifest`]. The
 //!   flag keeps machine-made faces out of the person model; the manifest is how
 //!   anyone, years from now, can still tell which memories were real.
+//! * **A stage can park its run and ask.** A *hold point* stops the run after a
+//!   stage, puts its takes in front of a person, and goes on with the ones they
+//!   keep — so `×4 extend → hold → upscale 4K` spends the hour of upscaling on
+//!   the two clips somebody chose rather than on all four. [`line`] holds the
+//!   verdict rules, [`holds`] reads a hold and [`holds::verdict`] writes what
+//!   was decided, and a
+//!   held run is invisible to the advance pass until a verdict releases it, so
+//!   holds accumulate without ever blocking the queue.
 //! * **A video can go in whole.** [`source`] decides what a run consumes — a
 //!   frame of the clip (the first, the last, one at a timestamp, one of the
 //!   indexed keyframes) or the file itself, which is the default whenever the
@@ -90,10 +98,29 @@
 //!   the two strings the stage after it takes. Binding it there is one `text_overrides` entry, because FR5a keys
 //!   prompt slots by exactly the key [`workflow::prepare_workflow`] substitutes
 //!   on.
+//! * **A line can be pointed at a library, not a shot.** A *batch* is a query
+//!   plus a line plus a cursor: [`batch`] re-asks the query each tick, opens
+//!   runs for the next handful, and never inserts fifty thousand rows at once.
+//!   That is what makes STOP instant and the board fast, and it is why a batch
+//!   picks up shots imported after it was sent. The guardrails — a confirm
+//!   sheet before anything queues, a daily cap, a window, a disk floor, and a
+//!   cap on how many runs may sit held at once — are the feature, not settings
+//!   for later: at this scale the failure mode is not a crash, it is generating
+//!   more than anyone will ever look at.
+//! * **The queue drains by stage, not by run.** [`queue`] holds the order and
+//!   nothing else: interactive before batch, then lower stage first, then
+//!   grouped by workflow. A batch therefore walks its runs along in lockstep —
+//!   every description, then every video, then every upscale — which loads each
+//!   model once per pass instead of once per task and puts a whole pass in
+//!   front of a person at once. It costs per-run latency, which is why
+//!   `priority` is the *first* key: a click never queues behind a farm.
 
+pub mod batch;
 mod client;
 pub mod contract;
+pub mod editor;
 mod history;
+pub mod holds;
 pub mod line;
 mod loaders;
 mod manifest;
@@ -103,19 +130,22 @@ mod overrides;
 pub mod params;
 mod policy;
 pub mod portable;
+pub mod promote;
 pub mod prompt;
+pub(crate) mod queue;
 pub mod runs;
 mod source;
+pub mod takes;
 mod timestamp;
 mod worker;
 mod workflow;
 
 pub use client::ComfyUiClient;
 pub use contract::{Accepts, ContractCorrections, MediaType, ParamName, StageContract};
-pub use line::{RunState, StageTyping};
+pub use line::{validate_chain, LineError, RunState, StageTyping, Verdict};
 pub use loaders::{
-    check_source_kind, default_binding_warnings, detect_loaders, importable, takes_video,
-    LoaderKind, SourceRole,
+    check_source_kind, default_binding_warnings, detect_loaders, importable, takes_image,
+    takes_video, LoaderKind, SourceRole,
 };
 pub use manifest::ProvenanceManifest;
 pub use nodes::NodeCatalog;
@@ -130,7 +160,7 @@ pub use portable::{
 };
 pub use prompt::{Analysis, CompiledPrompt, Intent, ShotFacts};
 pub use source::SourceMode;
-pub(crate) use worker::advance::{cancel_run, retry_run};
+pub(crate) use worker::advance::{cancel_run, discard_outputs, retry_run};
 pub use worker::spawn_enhancement_worker;
 pub use workflow::detect_outputs;
 

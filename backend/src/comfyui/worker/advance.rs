@@ -14,9 +14,11 @@
 //!    the file that task produced. Fan-out needs no special case: four
 //!    completed takes each ask for themselves and each get their own
 //!    continuation, so four takes at stage 2 are four independent runners
-//!    through stages 3 and 4.
+//!    through stages 3 and 4. A take at a **hold point** is the one exception:
+//!    it queues nothing and parks its run instead.
 //! 2. **Settle.** Fold each live run's tasks into a state. A run is running
-//!    while anything is still moving, and then it is however its tasks ended.
+//!    while anything is still moving, and then it is however its tasks ended —
+//!    or, if it is holding takes nobody has looked at, it is *held*.
 //!
 //! Doing them the other way round would be a data-loss bug rather than a
 //! cosmetic one: a run whose stage-1 task has just completed but whose stage-2
@@ -24,7 +26,17 @@
 //! below would delete the intermediate the next stage was about to read. So a
 //! run with a continuation still owed is never settled in the same pass —
 //! [`queue_continuations`] hands back the ones it could not finish, and they
-//! wait a tick.
+//! wait a tick. A run that is holding is never settled either, for the same
+//! reason turned up a notch: its takes are the whole point.
+//!
+//! # Holds park, they do not block
+//!
+//! A held run stops being this pass's business entirely — both halves filter on
+//! `status = running`, so a held run is read by nothing here until a verdict
+//! puts it back. That is what makes holds safe at scale: 3,329 shots through
+//! `×4 extend → hold → upscale` park 3,329 runs and the queue keeps feeding the
+//! GPU from everything else. Held runs accumulate; they do not block. (Capping
+//! how many may accumulate is FR7's job, and belongs where batches are fed.)
 //!
 //! # Intermediates
 //!
@@ -32,13 +44,16 @@
 //! long as they are useful — the next stage reads them, and a failure wants
 //! them for inspection — and are swept when the run *completes*. Not when it
 //! fails: a failed run is retried from its failed stage, and that resumption
-//! reads the intermediate the stage before it made.
+//! reads the intermediate the stage before it made. A hold stage's takes are
+//! never swept on completion at all: they are what somebody chose between.
 
-use crate::comfyui::line::{self, RunState, StageDisposition, TaskPhase};
+use crate::comfyui::line::{self, Advance, HoldGate, RunState, StageDisposition, TaskPhase};
 use crate::comfyui::prompt;
 use crate::comfyui::runs::{queue_stage, stage_at};
 use crate::comfyui::timestamp::format_ts;
-use crate::schema::{enhancement_tasks, faces, files, line_stages, runs, video_keyframes};
+use crate::schema::{
+    enhancement_tasks, faces, files, line_stages, run_holds, runs, video_keyframes,
+};
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use std::collections::{HashMap, HashSet};
@@ -47,8 +62,8 @@ use tracing::{error, info, warn};
 
 /// One pass: continue what can be continued, then settle what is over.
 pub(super) fn advance_runs(conn: &mut SqliteConnection, library_root: &Path) {
-    let stalled = match queue_continuations(conn) {
-        Ok(stalled) => stalled,
+    let pass = match queue_continuations(conn) {
+        Ok(pass) => pass,
         Err(e) => {
             error!("Failed to queue run continuations: {}", e);
             // Settling anything now would risk calling a run finished while its
@@ -56,8 +71,29 @@ pub(super) fn advance_runs(conn: &mut SqliteConnection, library_root: &Path) {
             return;
         }
     };
-    if let Err(e) = settle_runs(conn, library_root, &stalled) {
+    if let Err(e) = settle_runs(conn, library_root, &pass) {
         error!("Failed to settle runs: {}", e);
+    }
+}
+
+/// What the continue half learned, and the settle half needs.
+#[derive(Default)]
+struct Pass {
+    /// Runs that still owe a continuation — a line edited out from under one,
+    /// say. Not settled this tick, because "nothing is in flight" would
+    /// otherwise read as "finished".
+    stalled: HashSet<String>,
+    /// Runs with takes waiting at a hold point, and the earliest stage each is
+    /// waiting at. Settled as *held* rather than as completed.
+    holding: HashMap<String, i32>,
+}
+
+impl Pass {
+    fn hold(&mut self, run_id: &str, stage_idx: i32) {
+        self.holding
+            .entry(run_id.to_string())
+            .and_modify(|at| *at = (*at).min(stage_idx))
+            .or_insert(stage_idx);
     }
 }
 
@@ -78,6 +114,15 @@ struct Continuation {
     /// The describe stage's own directives, so the stage after it inherits the
     /// intent and the constraints a person typed once.
     text_overrides: Option<String>,
+    /// What the sender answered for the stages that asked, snapshotted on the
+    /// run — the later stages are queued here, hours after the request that
+    /// carried them.
+    stage_values: Option<String>,
+    /// Whether a person is waiting on this run, carried down the chain from the
+    /// task that is being continued. A run's hurry is a property of the run and
+    /// not of the stage it happens to be on, so stage 4 of somebody's click is
+    /// still somebody's click — and a batch's stage 4 is still the farm's.
+    priority: String,
 }
 
 type ContinuationRow = (
@@ -91,6 +136,8 @@ type ContinuationRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    String,
 );
 
 /// What a completed stage hands the one after it.
@@ -106,14 +153,9 @@ enum Handoff {
     },
 }
 
-/// Queue the stage after every completed task that is owed one.
-///
-/// Returns the runs that still owe a continuation after this pass — a line
-/// edited out from under a live run, say. They are not settled this tick,
-/// because "nothing is in flight" would otherwise read as "finished".
-fn queue_continuations(
-    conn: &mut SqliteConnection,
-) -> Result<HashSet<String>, diesel::result::Error> {
+/// Queue the stage after every completed task that is owed one, and park the
+/// runs whose takes are waiting to be looked at.
+fn queue_continuations(conn: &mut SqliteConnection) -> Result<Pass, diesel::result::Error> {
     let rows: Vec<ContinuationRow> = enhancement_tasks::table
         .inner_join(runs::table.on(runs::id.nullable().eq(enhancement_tasks::run_id)))
         .filter(
@@ -133,6 +175,8 @@ fn queue_continuations(
             enhancement_tasks::source_file_id,
             enhancement_tasks::text_output,
             enhancement_tasks::text_overrides,
+            runs::stage_values,
+            enhancement_tasks::priority,
         ))
         .load(conn)?;
 
@@ -149,23 +193,20 @@ fn queue_continuations(
             source_file_id: r.7,
             text_output: r.8,
             text_overrides: r.9,
-        })
-        // The last stage owes nothing: its output is the product.
-        .filter(|c| {
-            matches!(
-                line::advance_after(c.stage_idx, c.stage_count),
-                line::Advance::Next(_)
-            )
+            stage_values: r.10,
+            priority: r.11,
         })
         .collect();
 
     if candidates.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(Pass::default());
     }
 
     // A continuation exists exactly when some row names this task as its
     // parent. That is the idempotence marker: no "advanced" flag to write, and
-    // no way for the marker and the thing it marks to disagree.
+    // no way for the marker and the thing it marks to disagree. It holds
+    // unchanged when one verdict continues several takes at once — each keeps
+    // naming its own parent, and one row per kept take is what a verdict is.
     let run_ids: Vec<&str> = candidates.iter().map(|c| c.run_id.as_str()).collect();
     let already_continued: HashSet<String> = enhancement_tasks::table
         .filter(
@@ -178,28 +219,107 @@ fn queue_continuations(
         .into_iter()
         .collect();
 
-    let mut stalled = HashSet::new();
+    let hold_stages = hold_stages_of(conn, &candidates)?;
+    let (reviewed, kept) = verdicts_over(conn, &run_ids)?;
+
+    let mut pass = Pass::default();
     for c in candidates {
         if already_continued.contains(&c.task_id) {
             continue;
         }
-        if let Err(reason) = continue_one(conn, &c) {
+        let asks = c
+            .line_id
+            .as_deref()
+            .is_some_and(|line| hold_stages.contains(&(line.to_string(), c.stage_idx)));
+        let gate = if asks {
+            HoldGate {
+                holds: true,
+                kept: kept.contains(&c.task_id),
+                reviewed: reviewed.contains(&c.task_id),
+            }
+        } else {
+            // A stage nobody is reviewing, which is every stage of every line
+            // that has no hold point in it.
+            HoldGate::open()
+        };
+        let next_idx = match line::advance_after(c.stage_idx, c.stage_count, gate) {
+            // The last stage owes nothing: its output is the product. Neither
+            // does a take somebody looked at and did not choose.
+            Advance::Finished => continue,
+            Advance::Hold(at) => {
+                pass.hold(&c.run_id, at);
+                continue;
+            }
+            Advance::Next(next_idx) => next_idx,
+        };
+        if let Err(reason) = continue_one(conn, &c, next_idx) {
             warn!(
                 "Run {} cannot continue past stage {}: {}",
                 c.run_id, c.stage_idx, reason
             );
             fail_run(conn, &c.run_id, &reason);
-            stalled.insert(c.run_id.clone());
+            pass.stalled.insert(c.run_id.clone());
         }
     }
-    Ok(stalled)
+    Ok(pass)
+}
+
+/// Which `(line_id, stage_idx)` pairs among these candidates ask for a verdict.
+///
+/// One query for the whole tick rather than one per task: a page of runs of one
+/// line is the ordinary case, and asking the same row fifty times is how a
+/// three-second loop becomes a hot loop.
+fn hold_stages_of(
+    conn: &mut SqliteConnection,
+    candidates: &[Continuation],
+) -> Result<HashSet<(String, i32)>, diesel::result::Error> {
+    let line_ids: Vec<&str> = candidates
+        .iter()
+        .filter_map(|c| c.line_id.as_deref())
+        .collect();
+    if line_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    Ok(line_stages::table
+        .filter(
+            line_stages::line_id
+                .eq_any(&line_ids)
+                .and(line_stages::hold_for_review.eq(true)),
+        )
+        .select((line_stages::line_id, line_stages::stage_idx))
+        .load::<(String, i32)>(conn)?
+        .into_iter()
+        .collect())
+}
+
+/// The takes these runs already have a verdict over, and the ones that verdict
+/// let through.
+///
+/// `reviewed` is the marker that matters: without it a passed-over take looks
+/// exactly like one nobody has seen, and the run parks again on it forever.
+fn verdicts_over(
+    conn: &mut SqliteConnection,
+    run_ids: &[&str],
+) -> Result<(HashSet<String>, HashSet<String>), diesel::result::Error> {
+    let rows: Vec<(String, String)> = run_holds::table
+        .filter(run_holds::run_id.eq_any(run_ids))
+        .select((run_holds::reviewed_task_ids, run_holds::kept_task_ids))
+        .load(conn)?;
+    let mut reviewed = HashSet::new();
+    let mut kept = HashSet::new();
+    for (r, k) in rows {
+        reviewed.extend(serde_json::from_str::<Vec<String>>(&r).unwrap_or_default());
+        kept.extend(serde_json::from_str::<Vec<String>>(&k).unwrap_or_default());
+    }
+    Ok((reviewed, kept))
 }
 
 /// Queue the stage after one completed task, reading what that task produced.
-fn continue_one(conn: &mut SqliteConnection, c: &Continuation) -> Result<(), String> {
-    let line::Advance::Next(next_idx) = line::advance_after(c.stage_idx, c.stage_count) else {
-        return Ok(());
-    };
+fn continue_one(
+    conn: &mut SqliteConnection,
+    c: &Continuation,
+    next_idx: i32,
+) -> Result<(), String> {
     let line_id = c
         .line_id
         .as_deref()
@@ -228,7 +348,13 @@ fn continue_one(conn: &mut SqliteConnection, c: &Continuation) -> Result<(), Str
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("stage {} is no longer part of the line", next_idx + 1))?;
 
-    let mut plan = stage.plan_for(conn, &c.shot_id);
+    // The answers this run was started with. A stage that asked for a value at
+    // send time gets it here, whichever hour of the run it is queued in — and
+    // `plan_for` folds them in before it compiles anything out of them.
+    let supplied = crate::comfyui::runs::supplied_for(c.stage_values.as_deref(), next_idx);
+    let mut plan = stage
+        .plan_for(conn, &c.shot_id, &supplied)
+        .map_err(|e| e.message)?;
     let source_file_id = match &handoff {
         Handoff::File(file_id) => Some(file_id.as_str()),
         Handoff::Description {
@@ -249,7 +375,9 @@ fn continue_one(conn: &mut SqliteConnection, c: &Continuation) -> Result<(), Str
             // the map it binds into, so the directive has to ride down with the
             // description. The downstream stage's own say still wins.
             if !plan.text_overrides.contains_key(prompt::SLOT_KEY) {
-                if let Some(slot) = upstream.get(prompt::SLOT_KEY).filter(|s| !s.trim().is_empty())
+                if let Some(slot) = upstream
+                    .get(prompt::SLOT_KEY)
+                    .filter(|s| !s.trim().is_empty())
                 {
                     plan.text_overrides
                         .insert(prompt::SLOT_KEY.to_string(), slot.clone());
@@ -269,6 +397,7 @@ fn continue_one(conn: &mut SqliteConnection, c: &Continuation) -> Result<(), Str
         &plan,
         source_file_id,
         Some(&c.task_id),
+        crate::comfyui::queue::Priority::parse(&c.priority),
     )?;
     info!(
         "Run {}: stage {}/{} queued as {} task(s) from {}",
@@ -285,7 +414,7 @@ fn continue_one(conn: &mut SqliteConnection, c: &Continuation) -> Result<(), Str
 fn settle_runs(
     conn: &mut SqliteConnection,
     library_root: &Path,
-    stalled: &HashSet<String>,
+    pass: &Pass,
 ) -> Result<(), diesel::result::Error> {
     let live: Vec<(String, Option<String>, i32)> = runs::table
         .filter(runs::status.eq(RunState::Running.as_str()))
@@ -322,7 +451,7 @@ fn settle_runs(
     }
 
     for (run_id, line_id, stage_count) in &live {
-        if stalled.contains(run_id) {
+        if pass.stalled.contains(run_id) {
             continue;
         }
         let tasks = by_run
@@ -339,6 +468,26 @@ fn settle_runs(
             continue;
         }
 
+        // Nothing is moving, and there are takes at a hold point nobody has
+        // looked at: the run is not over, it is waiting. Parked rather than
+        // finished, so the sweep below never runs and the takes stay.
+        //
+        // Only when everything landed. A failure outranks a hold — the run
+        // failed, retrying it re-runs the stage that broke, and the hold is
+        // what the retry arrives at.
+        if t.state == RunState::Completed {
+            if let Some(&at) = pass.holding.get(run_id.as_str()) {
+                park_run(conn, run_id, at)?;
+                info!(
+                    "Run {} held at stage {}/{} for review",
+                    run_id,
+                    at + 1,
+                    stage_count
+                );
+                continue;
+            }
+        }
+
         let error = first_error.get(run_id.as_str()).copied();
         finish_run(conn, run_id, t.state, error)?;
         info!(
@@ -353,9 +502,35 @@ fn settle_runs(
         // about to be retried from the stage that broke, and that resumption
         // reads what the stage before it made.
         if t.state == RunState::Completed {
-            discard_intermediates(conn, library_root, run_id, line_id.as_deref(), *stage_count);
+            discard_intermediates(
+                conn,
+                library_root,
+                run_id,
+                line_id.as_deref(),
+                *stage_count,
+                Sweep::Landed,
+            );
         }
     }
+    Ok(())
+}
+
+/// Park a run at a hold point.
+///
+/// Not `finished_at`: a held run has not finished, and stamping it would make
+/// the board's clock stop on a run that is still going to spend GPU time.
+fn park_run(
+    conn: &mut SqliteConnection,
+    run_id: &str,
+    stage_idx: i32,
+) -> Result<(), diesel::result::Error> {
+    diesel::update(runs::table.filter(runs::id.eq(run_id)))
+        .set((
+            runs::status.eq(RunState::Held.as_str()),
+            runs::held_at_stage.eq(stage_idx),
+            runs::error_message.eq(None::<String>),
+        ))
+        .execute(conn)?;
     Ok(())
 }
 
@@ -385,23 +560,46 @@ fn fail_run(conn: &mut SqliteConnection, run_id: &str, reason: &str) {
     let _ = finish_run(conn, run_id, RunState::Failed, Some(reason));
 }
 
-/// Sweep the outputs of a completed run's non-final, non-kept stages.
-fn discard_intermediates(
+/// Why a run's intermediates are being swept.
+///
+/// The two differ in exactly one place, and only for a hold stage: whether the
+/// takes it made are still something a person might choose between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sweep {
+    /// The run landed. A hold stage's takes are the alternatives somebody was
+    /// shown, and a run that finished does not throw away what it was picked
+    /// out of.
+    Landed,
+    /// The run was abandoned at its hold. Nobody is going to choose one of
+    /// those takes now, so only the stage's own keep flag saves them — which is
+    /// what "cancel removes intermediates unless the stage says keep" means.
+    Abandoned,
+}
+
+/// Sweep the outputs of a run's non-final, non-kept stages.
+pub(crate) fn discard_intermediates(
     conn: &mut SqliteConnection,
     library_root: &Path,
     run_id: &str,
     line_id: Option<&str>,
     stage_count: i32,
+    sweep: Sweep,
 ) {
-    // What the user asked to keep. An ad-hoc run has no line, and its one stage
-    // is final, so this stays empty and nothing is swept.
-    let keep_flags: HashMap<i32, bool> = match line_id {
+    // What the user asked to keep, and which stages asked for a verdict. An
+    // ad-hoc run has no line, and its one stage is final, so this stays empty
+    // and nothing is swept.
+    let flags: HashMap<i32, (bool, bool)> = match line_id {
         Some(line_id) => line_stages::table
             .filter(line_stages::line_id.eq(line_id))
-            .select((line_stages::stage_idx, line_stages::keep_output))
-            .load::<(i32, bool)>(conn)
+            .select((
+                line_stages::stage_idx,
+                line_stages::keep_output,
+                line_stages::hold_for_review,
+            ))
+            .load::<(i32, bool, bool)>(conn)
             .unwrap_or_default()
             .into_iter()
+            .map(|(idx, keep, holds)| (idx, (keep, holds)))
             .collect(),
         None => HashMap::new(),
     };
@@ -422,9 +620,11 @@ fn discard_intermediates(
 
     for (task_id, stage_idx, file_id) in outputs {
         let stage_idx = stage_idx.unwrap_or(0);
+        let (keep_flag, holds) = flags.get(&stage_idx).copied().unwrap_or((false, false));
         let disposition = StageDisposition {
-            keep_flag: keep_flags.get(&stage_idx).copied().unwrap_or(false),
+            keep_flag,
             is_final: stage_idx + 1 >= stage_count,
+            feeds_hold: holds && sweep == Sweep::Landed,
         };
         if line::keeps_output(disposition) {
             continue;
@@ -444,6 +644,63 @@ fn discard_intermediates(
                 e
             ),
         }
+    }
+}
+
+/// Take the outputs of named tasks out of the library.
+///
+/// What regenerating does with the generation it replaced, when the stage did
+/// not ask to keep it: those takes were looked at and a fresh set was asked
+/// for, so the same rule applies as to an abandoned run's.
+pub(crate) fn discard_outputs(
+    conn: &mut SqliteConnection,
+    library_root: &Path,
+    task_ids: &[String],
+) {
+    if task_ids.is_empty() {
+        return;
+    }
+    let outputs: Vec<(String, Option<String>)> = enhancement_tasks::table
+        .filter(
+            enhancement_tasks::id
+                .eq_any(task_ids)
+                .and(enhancement_tasks::output_file_id.is_not_null()),
+        )
+        .select((enhancement_tasks::id, enhancement_tasks::output_file_id))
+        .load(conn)
+        .unwrap_or_default();
+    for (task_id, file_id) in outputs {
+        let Some(file_id) = file_id else { continue };
+        if let Err(e) = discard_file(conn, library_root, &task_id, &file_id) {
+            warn!("Could not discard take {}: {}", task_id, e);
+        }
+    }
+}
+
+/// Sweep what a run abandoned at a hold point made.
+///
+/// The difference from what [`cancel_run`] does alone is deliberate, and is the
+/// reason this is a second step rather than a flag on that one. Cancelling a
+/// *running* run leaves its intermediates alone, because a cancelled task goes
+/// back in the queue on retry and reads the one before it. A run abandoned at a
+/// hold has nothing to resume — every one of its tasks completed — so its
+/// intermediates are exactly the disk somebody asked to be rid of.
+pub(crate) fn sweep_abandoned(conn: &mut SqliteConnection, library_root: &Path, run_id: &str) {
+    let run: Option<(Option<String>, i32)> = runs::table
+        .filter(runs::id.eq(run_id))
+        .select((runs::line_id, runs::stage_count))
+        .first(conn)
+        .optional()
+        .unwrap_or(None);
+    if let Some((line_id, stage_count)) = run {
+        discard_intermediates(
+            conn,
+            library_root,
+            run_id,
+            line_id.as_deref(),
+            stage_count,
+            Sweep::Abandoned,
+        );
     }
 }
 
@@ -510,6 +767,11 @@ pub(crate) fn retry_run(conn: &mut SqliteConnection, run_id: &str) -> QueryResul
         enhancement_tasks::settle_until.eq(None::<String>),
         enhancement_tasks::next_attempt_at.eq(None::<String>),
         enhancement_tasks::comfyui_prompt_id.eq(None::<String>),
+        // Somebody pressed Retry on one run and is watching the board. That is
+        // the definition of interactive, whoever opened the run originally —
+        // and the stages after it inherit it, because they are the rest of what
+        // that person asked to see.
+        enhancement_tasks::priority.eq(crate::comfyui::queue::Priority::Interactive.as_str()),
     ))
     .execute(conn)?;
 
@@ -550,19 +812,22 @@ pub(crate) fn cancel_run(conn: &mut SqliteConnection, run_id: &str) -> QueryResu
     ))
     .execute(conn)?;
 
-    // Only a run still in flight can be cancelled. A cancel that arrives after
-    // the run settled — or races the worker past its last landing — must not
-    // overwrite a terminal verdict with `cancelled`.
+    // Only a run still in flight — running or parked at a hold — can be
+    // cancelled. A cancel that arrives after the run settled, or races the
+    // worker past its last landing, must not overwrite a terminal verdict.
     diesel::update(
         runs::table.filter(
-            runs::id
-                .eq(run_id)
-                .and(runs::status.eq(RunState::Running.as_str())),
+            runs::id.eq(run_id).and(
+                runs::status.eq_any([RunState::Running.as_str(), RunState::Held.as_str()]),
+            ),
         ),
     )
     .set((
         runs::status.eq(RunState::Cancelled.as_str()),
         runs::finished_at.eq(&now),
+        // A cancelled run is holding nothing: the takes are still there to
+        // look at, but there is no verdict left to give about them.
+        runs::held_at_stage.eq(None::<i32>),
     ))
     .execute(conn)?;
     Ok(stopped)
@@ -649,7 +914,13 @@ mod tests {
         }
 
         fn start(&mut self) -> crate::comfyui::runs::RunStart {
-            crate::comfyui::runs::start_line_run(&mut self.conn, "line-1", "shot-1").unwrap()
+            crate::comfyui::runs::start_line_run(
+                &mut self.conn,
+                "line-1",
+                "shot-1",
+                &Default::default(),
+            )
+            .unwrap()
         }
 
         fn advance(&mut self) {
@@ -731,6 +1002,90 @@ mod tests {
                 .select((runs::status, runs::error_message))
                 .first(&mut self.conn)
                 .unwrap()
+        }
+
+        /// Mark a stage of the line as one that parks the run and asks.
+        fn hold_at(&mut self, stage_idx: usize) {
+            self.sql(&format!(
+                "UPDATE line_stages SET hold_for_review = 1 WHERE stage_idx = {};",
+                stage_idx
+            ));
+        }
+
+        /// Sweep four seeds at one stage — the fan-out a hold point exists for.
+        fn four_seeds_at(&mut self, stage_idx: usize) {
+            self.sql(&format!(
+                r#"UPDATE line_stages
+                   SET parameters = '{{"3.seed":1000}}',
+                       vary = '{{"3.seed":{{"count":4,"mode":"increment"}}}}'
+                   WHERE stage_idx = {};"#,
+                stage_idx
+            ));
+        }
+
+        /// What a run is holding, if anything.
+        fn hold(&mut self, run_id: &str) -> Option<crate::comfyui::holds::Hold> {
+            crate::comfyui::holds::read_hold(&mut self.conn, run_id).unwrap()
+        }
+
+        /// A verdict, given the way the endpoint gives it.
+        fn verdict(
+            &mut self,
+            run_id: &str,
+            verdict: crate::comfyui::Verdict,
+            keep: &[String],
+        ) -> crate::comfyui::holds::Outcome {
+            let root = self.dir.path().to_path_buf();
+            crate::comfyui::holds::give_verdict(&mut self.conn, &root, run_id, verdict, keep, None)
+                .unwrap()
+        }
+
+        /// Every task of the run at one stage, with its seed and its parent.
+        fn takes_at(&mut self, stage_idx: i32) -> Vec<(String, i64, Option<String>, String)> {
+            enhancement_tasks::table
+                .filter(enhancement_tasks::stage_idx.eq(stage_idx))
+                .order(enhancement_tasks::id.asc())
+                .select((
+                    enhancement_tasks::id,
+                    enhancement_tasks::parameters,
+                    enhancement_tasks::parent_task_id,
+                    enhancement_tasks::status,
+                ))
+                .load::<(String, Option<String>, Option<String>, String)>(&mut self.conn)
+                .unwrap()
+                .into_iter()
+                .map(|(id, params, parent, status)| {
+                    let seed =
+                        serde_json::from_str::<serde_json::Value>(&params.unwrap_or_default())
+                            .ok()
+                            .and_then(|p| p["3.seed"].as_i64())
+                            .unwrap_or(-1);
+                    (id, seed, parent, status)
+                })
+                .collect()
+        }
+
+        fn verdict_rows(&mut self) -> Vec<(String, i32, Vec<String>, Vec<String>)> {
+            crate::schema::run_holds::table
+                .order(crate::schema::run_holds::id.asc())
+                .select((
+                    crate::schema::run_holds::verdict,
+                    crate::schema::run_holds::stage_idx,
+                    crate::schema::run_holds::reviewed_task_ids,
+                    crate::schema::run_holds::kept_task_ids,
+                ))
+                .load::<(String, i32, String, String)>(&mut self.conn)
+                .unwrap()
+                .into_iter()
+                .map(|(v, idx, r, k)| {
+                    (
+                        v,
+                        idx,
+                        serde_json::from_str(&r).unwrap_or_default(),
+                        serde_json::from_str(&k).unwrap_or_default(),
+                    )
+                })
+                .collect()
         }
 
         fn file_exists(&mut self, file_id: &str) -> bool {
@@ -1322,6 +1677,737 @@ mod tests {
         assert_eq!(
             lib.overrides_of(&stage2[0])["6.text"],
             "A woman sits on a jetty at dusk."
+        );
+    }
+
+    // === FR5c — hold points ==================================================
+
+    use crate::comfyui::Verdict;
+
+    /// The line the whole feature exists for: make four candidates cheaply,
+    /// stop, and only spend the expensive stage on what somebody kept.
+    fn extend_then_upscale() -> (Library, crate::comfyui::runs::RunStart) {
+        let mut lib = Library::with_workflows(3);
+        lib.line(3, &[]);
+        lib.four_seeds_at(1);
+        lib.hold_at(1);
+        let run = lib.start();
+        (lib, run)
+    }
+
+    /// Get a held run all the way to its hold: stage 1 lands, four takes land.
+    fn park(lib: &mut Library, run: &crate::comfyui::runs::RunStart) -> Vec<String> {
+        lib.land(&run.task_ids[0]);
+        lib.advance();
+        let takes = lib.pending_at(1);
+        for take in &takes {
+            lib.land(take);
+        }
+        lib.advance();
+        takes
+    }
+
+    #[test]
+    fn four_takes_at_a_hold_point_park_the_run_instead_of_upscaling_all_four() {
+        let (mut lib, run) = extend_then_upscale();
+
+        lib.land(&run.task_ids[0]);
+        lib.advance();
+        let takes = lib.pending_at(1);
+        assert_eq!(takes.len(), 4, "one request, four candidates");
+
+        // Three landed, one still rendering: nothing to review yet, and
+        // certainly nothing to park on — a person shown one of four takes is
+        // not the feature.
+        for take in &takes[..3] {
+            lib.land(take);
+        }
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "running");
+        assert!(lib.hold(&run.run_id).is_none());
+
+        // The fourth lands. Now the run parks.
+        lib.land(&takes[3]);
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "held");
+        assert_eq!(
+            lib.pending_at(2),
+            Vec::<String>::new(),
+            "and not one second of upscaling was spent"
+        );
+
+        let hold = lib.hold(&run.run_id).expect("the run is holding");
+        assert_eq!(hold.stage_idx, 1);
+        assert_eq!(hold.takes.len(), 4);
+        assert_eq!(
+            hold.fanouts,
+            vec![1],
+            "one upscale per take, which is what continuing costs"
+        );
+        assert_eq!(
+            runs::table
+                .filter(runs::id.eq(&run.run_id))
+                .select(runs::held_at_stage)
+                .first::<Option<i32>>(&mut lib.conn)
+                .unwrap(),
+            Some(1)
+        );
+
+        // A hold with no verdict stays held, tick after tick, for as long as it
+        // takes. Nothing here expires.
+        lib.advance();
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "held");
+        assert_eq!(lib.hold(&run.run_id).unwrap().takes.len(), 4);
+    }
+
+    #[test]
+    fn continuing_with_two_of_four_upscales_exactly_those_two() {
+        let (mut lib, run) = extend_then_upscale();
+        let _takes = park(&mut lib, &run);
+        let hold = lib.hold(&run.run_id).unwrap();
+        let offered: Vec<String> = hold.takes.iter().map(|t| t.task_id.clone()).collect();
+
+        // Keep the first and the third.
+        let keep = vec![offered[0].clone(), offered[2].clone()];
+        let outcome = lib.verdict(&run.run_id, Verdict::Continue, &keep);
+        assert_eq!(outcome.kept, keep);
+        assert_eq!(
+            outcome.reviewed.len(),
+            4,
+            "the verdict was given over all four, not only over the two it kept"
+        );
+        assert_eq!(lib.run_status(&run.run_id).0, "running");
+
+        // The worker queues the continuations, through the same code every
+        // other continuation goes through.
+        lib.advance();
+        let upscales = lib.pending_at(2);
+        assert_eq!(upscales.len(), 2, "two takes, two upscales");
+        let mut parents: Vec<String> = enhancement_tasks::table
+            .filter(enhancement_tasks::stage_idx.eq(2))
+            .select(enhancement_tasks::parent_task_id.assume_not_null())
+            .load(&mut lib.conn)
+            .unwrap();
+        parents.sort();
+        let mut expected = keep.clone();
+        expected.sort();
+        assert_eq!(parents, expected, "and each reads the take it was kept for");
+
+        // The two nobody chose have no children, and never get any.
+        for passed in [&offered[1], &offered[3]] {
+            assert_eq!(
+                enhancement_tasks::table
+                    .filter(enhancement_tasks::parent_task_id.eq(passed))
+                    .count()
+                    .get_result::<i64>(&mut lib.conn)
+                    .unwrap(),
+                0,
+                "a passed-over take does not run the rest of the line"
+            );
+        }
+
+        // And the run does not park again on them: they were reviewed.
+        lib.advance();
+        assert_eq!(lib.pending_at(2).len(), 2, "still two, not four");
+        assert_eq!(lib.run_status(&run.run_id).0, "running");
+
+        // It walks to the end like any other run.
+        for task in &upscales {
+            lib.land(task);
+        }
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "completed");
+    }
+
+    #[test]
+    fn one_verdict_keeping_three_takes_queues_each_child_exactly_once() {
+        // The idempotence property, under the case that could break it: one
+        // verdict, several continuations. `parent_task_id` is still the only
+        // marker, and every extra tick has to be a no-op.
+        let (mut lib, run) = extend_then_upscale();
+        park(&mut lib, &run);
+        let offered: Vec<String> = lib
+            .hold(&run.run_id)
+            .unwrap()
+            .takes
+            .iter()
+            .map(|t| t.task_id.clone())
+            .collect();
+
+        lib.verdict(&run.run_id, Verdict::Continue, &offered[..3]);
+        for _ in 0..5 {
+            lib.advance();
+        }
+        let children = lib.takes_at(2);
+        assert_eq!(children.len(), 3, "three takes, three children, five ticks");
+        let mut parents: Vec<String> = children.iter().filter_map(|c| c.2.clone()).collect();
+        parents.sort();
+        parents.dedup();
+        assert_eq!(parents.len(), 3, "one child each, and no child twice");
+    }
+
+    #[test]
+    fn regenerating_gives_fresh_seeds_changes_nothing_else_and_holds_again() {
+        let (mut lib, run) = extend_then_upscale();
+        let first = park(&mut lib, &run);
+        let before = lib.takes_at(1);
+        let mut seeds: Vec<i64> = before.iter().map(|t| t.1).collect();
+        seeds.sort();
+        assert_eq!(seeds, [1000, 1001, 1002, 1003]);
+        let parent = before[0].2.clone();
+        let source: Option<String> = enhancement_tasks::table
+            .filter(enhancement_tasks::id.eq(&first[0]))
+            .select(enhancement_tasks::source_file_id)
+            .first(&mut lib.conn)
+            .unwrap();
+
+        let outcome = lib.verdict(&run.run_id, Verdict::Regenerate, &[]);
+        assert_eq!(
+            outcome.queued.len(),
+            4,
+            "another four takes, queued at once"
+        );
+        assert!(outcome.kept.is_empty());
+
+        // Fresh seeds, and the sweep kept the shape somebody asked for.
+        let after = lib.takes_at(1);
+        assert_eq!(after.len(), 8, "the old generation is still on the row");
+        let mut fresh: Vec<i64> = after
+            .iter()
+            .filter(|t| outcome.queued.contains(&t.0))
+            .map(|t| t.1)
+            .collect();
+        fresh.sort();
+        assert_eq!(fresh, [1004, 1005, 1006, 1007]);
+
+        // Nothing else moved. Said as strongly as it can be said: take one of
+        // the old rows and one of the new, drop the seed from each, and the two
+        // must be the same map. Same workflow, same source, same parent.
+        let without_seed = |lib: &mut Library, id: &str| -> serde_json::Value {
+            let raw: Option<String> = enhancement_tasks::table
+                .filter(enhancement_tasks::id.eq(id))
+                .select(enhancement_tasks::parameters)
+                .first(&mut lib.conn)
+                .unwrap();
+            let mut params: serde_json::Value =
+                serde_json::from_str(&raw.unwrap_or_default()).unwrap();
+            params.as_object_mut().unwrap().remove("3.seed");
+            params
+        };
+        let was = without_seed(&mut lib, &first[0]);
+        for (id, _, new_parent, _) in after
+            .iter()
+            .filter(|t| outcome.queued.contains(&t.0))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            assert_eq!(new_parent, parent, "read by the same stage-1 output");
+            let (wf, src): (String, Option<String>) = enhancement_tasks::table
+                .filter(enhancement_tasks::id.eq(&id))
+                .select((
+                    enhancement_tasks::workflow_id,
+                    enhancement_tasks::source_file_id,
+                ))
+                .first(&mut lib.conn)
+                .unwrap();
+            assert_eq!(wf, "wf-1");
+            assert_eq!(src, source);
+            assert_eq!(without_seed(&mut lib, &id), was, "only the seed moved");
+        }
+
+        // The run is alive again, and holds on the *new* takes only — a verdict
+        // was already given over the old ones.
+        assert_eq!(lib.run_status(&run.run_id).0, "running");
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "running", "still rendering");
+        for id in &outcome.queued {
+            lib.land(id);
+        }
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "held");
+        let hold = lib.hold(&run.run_id).unwrap();
+        assert_eq!(hold.takes.len(), 4, "the new generation, not eight");
+        let offered: Vec<&String> = hold.takes.iter().map(|t| &t.task_id).collect();
+        for old in &first {
+            assert!(!offered.contains(&old), "a decided take is not re-offered");
+        }
+
+        // And every verdict is on the record, in the order they were given.
+        let rows = lib.verdict_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "regenerate");
+        assert_eq!(rows[0].1, 1);
+        assert_eq!(rows[0].2.len(), 4, "given over the four it replaced");
+        assert!(rows[0].3.is_empty(), "and kept none of them");
+    }
+
+    #[test]
+    fn regenerating_discards_the_takes_it_replaced_unless_the_stage_keeps_them() {
+        let (mut lib, run) = extend_then_upscale();
+        park(&mut lib, &run);
+        let outputs: Vec<String> = enhancement_tasks::table
+            .filter(enhancement_tasks::stage_idx.eq(1))
+            .select(enhancement_tasks::output_file_id.assume_not_null())
+            .load(&mut lib.conn)
+            .unwrap();
+        lib.verdict(&run.run_id, Verdict::Regenerate, &[]);
+        for file_id in &outputs {
+            assert!(
+                !lib.file_exists(file_id),
+                "a generation somebody replaced is not worth the disk"
+            );
+        }
+
+        // With `keep` on the held stage, every generation stays.
+        let mut lib = Library::with_workflows(3);
+        lib.line(3, &[1]);
+        lib.four_seeds_at(1);
+        lib.hold_at(1);
+        let run = lib.start();
+        park(&mut lib, &run);
+        let outputs: Vec<String> = enhancement_tasks::table
+            .filter(enhancement_tasks::stage_idx.eq(1))
+            .select(enhancement_tasks::output_file_id.assume_not_null())
+            .load(&mut lib.conn)
+            .unwrap();
+        lib.verdict(&run.run_id, Verdict::Regenerate, &[]);
+        for file_id in &outputs {
+            assert!(lib.file_exists(file_id), "the stage asked to keep them");
+        }
+    }
+
+    #[test]
+    fn cancelling_a_hold_abandons_the_run_and_removes_what_no_stage_keeps() {
+        // Stage 1's output is worth keeping; the takes are not.
+        let mut lib = Library::with_workflows(3);
+        lib.line(3, &[0]);
+        lib.four_seeds_at(1);
+        lib.hold_at(1);
+        let run = lib.start();
+        let stage1_out: String = enhancement_tasks::table
+            .filter(enhancement_tasks::id.eq(&run.task_ids[0]))
+            .select(enhancement_tasks::id)
+            .first(&mut lib.conn)
+            .unwrap();
+        let _ = stage1_out;
+        lib.land(&run.task_ids[0]);
+        lib.advance();
+        let kept_output: String = enhancement_tasks::table
+            .filter(enhancement_tasks::id.eq(&run.task_ids[0]))
+            .select(enhancement_tasks::output_file_id.assume_not_null())
+            .first(&mut lib.conn)
+            .unwrap();
+        for take in lib.pending_at(1) {
+            lib.land(&take);
+        }
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "held");
+        let take_outputs: Vec<String> = enhancement_tasks::table
+            .filter(enhancement_tasks::stage_idx.eq(1))
+            .select(enhancement_tasks::output_file_id.assume_not_null())
+            .load(&mut lib.conn)
+            .unwrap();
+
+        let outcome = lib.verdict(&run.run_id, Verdict::Cancel, &[]);
+        assert_eq!(outcome.reviewed.len(), 4);
+        assert_eq!(lib.run_status(&run.run_id).0, "cancelled");
+
+        for file_id in &take_outputs {
+            assert!(
+                !lib.file_exists(file_id),
+                "nobody is going to choose one of these now"
+            );
+            assert!(!lib.root().join(format!("{}.png", file_id)).exists());
+        }
+        assert!(
+            lib.file_exists(&kept_output),
+            "the stage that said keep still means it"
+        );
+        // And there is nothing left to resume: every task of the run completed.
+        assert_eq!(
+            crate::comfyui::retry_run(&mut lib.conn, &run.run_id).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_run_that_lands_keeps_the_takes_it_was_picked_out_of() {
+        let (mut lib, run) = extend_then_upscale();
+        park(&mut lib, &run);
+        let offered: Vec<String> = lib
+            .hold(&run.run_id)
+            .unwrap()
+            .takes
+            .iter()
+            .map(|t| t.task_id.clone())
+            .collect();
+        let take_outputs: Vec<String> = enhancement_tasks::table
+            .filter(enhancement_tasks::stage_idx.eq(1))
+            .select(enhancement_tasks::output_file_id.assume_not_null())
+            .load(&mut lib.conn)
+            .unwrap();
+        let stage1_out: String = enhancement_tasks::table
+            .filter(enhancement_tasks::id.eq(&run.task_ids[0]))
+            .select(enhancement_tasks::output_file_id.assume_not_null())
+            .first(&mut lib.conn)
+            .unwrap();
+
+        lib.verdict(&run.run_id, Verdict::Continue, &[offered[0].clone()]);
+        lib.advance();
+        let upscale = lib.pending_at(2)[0].clone();
+        lib.land(&upscale);
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "completed");
+
+        assert!(
+            !lib.file_exists(&stage1_out),
+            "an ordinary intermediate is swept as it always was"
+        );
+        for file_id in &take_outputs {
+            assert!(
+                lib.file_exists(file_id),
+                "but the takes are what somebody chose between, and they stay"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_run_survives_a_restart_and_is_never_swept_or_settled() {
+        let (mut lib, run) = extend_then_upscale();
+        park(&mut lib, &run);
+        assert_eq!(lib.run_status(&run.run_id).0, "held");
+
+        // The data-loss bug the pass's order exists to prevent, in the shape a
+        // hold gives it. Every task of this run has completed, so a settle that
+        // did not know about the hold would call it *finished* — and the sweep
+        // that follows a finished run would delete the stage-1 clip that the
+        // upscale a person is about to ask for reads. It is still there.
+        let feeds_the_takes: String = enhancement_tasks::table
+            .filter(enhancement_tasks::id.eq(&run.task_ids[0]))
+            .select(enhancement_tasks::output_file_id.assume_not_null())
+            .first(&mut lib.conn)
+            .unwrap();
+        assert!(
+            lib.file_exists(&feeds_the_takes),
+            "a held run is not settled, so nothing sweeps what its next stage will read"
+        );
+
+        // The process comes back. Recovery touches tasks by status, and a held
+        // run's are all completed, so it has nothing to say about them.
+        super::super::recover_interrupted_tasks(&mut lib.conn);
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "held");
+        assert_eq!(lib.hold(&run.run_id).unwrap().takes.len(), 4);
+
+        // Nor is it settled: `finished_at` is what a run that is over has, and
+        // a run waiting on a person has not finished.
+        assert_eq!(
+            runs::table
+                .filter(runs::id.eq(&run.run_id))
+                .select(runs::finished_at)
+                .first::<Option<String>>(&mut lib.conn)
+                .unwrap(),
+            None
+        );
+
+        // And the five-minute sweep leaves its takes alone, however long the
+        // person takes to look: the tasks are the takes.
+        lib.sql("UPDATE enhancement_tasks SET completed_at = '2020-01-01 00:00:00';");
+        super::super::cleanup_completed_tasks(&mut lib.conn);
+        assert_eq!(lib.tasks().len(), 5, "one stage-1 task and four takes");
+        assert_eq!(lib.hold(&run.run_id).unwrap().takes.len(), 4);
+    }
+
+    #[test]
+    fn a_held_run_does_not_stop_the_queue_moving() {
+        // The deadlock this feature could obviously cause, and does not: a held
+        // run is out of the advance pass entirely, so everything else keeps
+        // going. FR7's cap on outstanding holds is the other half, and belongs
+        // where batches are fed rather than here.
+        let (mut lib, held) = extend_then_upscale();
+        park(&mut lib, &held);
+        assert_eq!(lib.run_status(&held.run_id).0, "held");
+
+        let other = lib.start();
+        lib.land(&other.task_ids[0]);
+        lib.advance();
+        assert_eq!(
+            enhancement_tasks::table
+                .filter(
+                    enhancement_tasks::run_id
+                        .eq(&other.run_id)
+                        .and(enhancement_tasks::stage_idx.eq(1))
+                )
+                .count()
+                .get_result::<i64>(&mut lib.conn)
+                .unwrap(),
+            4,
+            "the second run walked straight past the first one's hold"
+        );
+        assert_eq!(
+            lib.run_status(&held.run_id).0,
+            "held",
+            "and it is still held"
+        );
+    }
+
+    #[test]
+    fn a_take_that_broke_fails_the_run_and_the_hold_is_what_the_retry_arrives_at() {
+        let (mut lib, run) = extend_then_upscale();
+        lib.land(&run.task_ids[0]);
+        lib.advance();
+        let takes = lib.pending_at(1);
+        lib.break_task(&takes[0], "CUDA out of memory");
+        for take in &takes[1..] {
+            lib.land(take);
+        }
+        lib.advance();
+
+        // A failure outranks a hold: showing three of four takes and calling it
+        // a choice would be the wrong answer to a broken GPU.
+        let (status, error) = lib.run_status(&run.run_id);
+        assert_eq!(status, "failed");
+        assert_eq!(error.as_deref(), Some("CUDA out of memory"));
+        assert!(lib.hold(&run.run_id).is_none());
+
+        // Retry, and it lands where it was always going to.
+        crate::comfyui::retry_run(&mut lib.conn, &run.run_id).unwrap();
+        lib.land(&takes[0]);
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "held");
+        assert_eq!(lib.hold(&run.run_id).unwrap().takes.len(), 4);
+    }
+
+    #[test]
+    fn a_verdict_is_refused_when_there_is_nothing_to_give_one_on() {
+        let (mut lib, run) = extend_then_upscale();
+        let root = lib.dir.path().to_path_buf();
+
+        // Not held yet.
+        let err = crate::comfyui::holds::give_verdict(
+            &mut lib.conn,
+            &root,
+            &run.run_id,
+            Verdict::Continue,
+            &["whatever".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::comfyui::holds::HoldError::NotHeld),
+            "{}",
+            err
+        );
+
+        // No such run.
+        let err = crate::comfyui::holds::give_verdict(
+            &mut lib.conn,
+            &root,
+            "nobody",
+            Verdict::Cancel,
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::comfyui::holds::HoldError::NotFound),
+            "{}",
+            err
+        );
+
+        // Held, but the verdict names a take from somewhere else.
+        park(&mut lib, &run);
+        let err = crate::comfyui::holds::give_verdict(
+            &mut lib.conn,
+            &root,
+            &run.run_id,
+            Verdict::Continue,
+            &["a-take-from-another-run".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not one of the takes"), "{}", err);
+        assert_eq!(
+            lib.run_status(&run.run_id).0,
+            "held",
+            "and a refused verdict changes nothing"
+        );
+        assert!(lib.verdict_rows().is_empty());
+    }
+
+    #[test]
+    fn a_held_run_with_nothing_left_to_look_at_can_still_be_abandoned() {
+        // The verdict's writes are one transaction precisely so this state
+        // cannot arise from a crash — but a take deleted by hand can still
+        // produce it, and a run nothing can clear is worse than a run that
+        // stopped. Abandoning is the verdict that is never refused.
+        let (mut lib, run) = extend_then_upscale();
+        park(&mut lib, &run);
+        lib.sql("DELETE FROM enhancement_tasks WHERE stage_idx = 1;");
+        assert_eq!(lib.hold(&run.run_id).unwrap().takes.len(), 0);
+
+        let root = lib.dir.path().to_path_buf();
+        assert!(crate::comfyui::holds::give_verdict(
+            &mut lib.conn,
+            &root,
+            &run.run_id,
+            Verdict::Regenerate,
+            &[],
+            None,
+        )
+        .is_err());
+
+        lib.verdict(&run.run_id, Verdict::Cancel, &[]);
+        assert_eq!(lib.run_status(&run.run_id).0, "cancelled");
+    }
+
+    #[test]
+    fn a_held_row_with_no_stage_on_it_is_still_stoppable() {
+        // The fall-through in the API's cancel handler, at the level the
+        // handler decides on. Cancelling a held run goes through the hold's own
+        // Cancel verdict, so an abandoned hold is recorded like every other;
+        // but if the run turns out not to be holding anything the handler must
+        // go on to the ordinary cancel rather than refusing, because stopping a
+        // run is the one thing that has to work in every state.
+        //
+        // Nothing writes this row: `park_run` and `release` set the status and
+        // the stage together, and the verdict's writes are one transaction. A
+        // hand on the database can, which is the whole reason the branch exists.
+        let (mut lib, run) = extend_then_upscale();
+        park(&mut lib, &run);
+        lib.sql("UPDATE runs SET held_at_stage = NULL;");
+
+        // Still `held`, so the handler tries the verdict — and gets back the
+        // one error that means "go on", rather than a refusal to report.
+        assert_eq!(lib.run_status(&run.run_id).0, "held");
+        assert!(
+            lib.hold(&run.run_id).is_none(),
+            "a held row with no stage is holding nothing, and says so"
+        );
+        let root = lib.dir.path().to_path_buf();
+        let err = crate::comfyui::holds::give_verdict(
+            &mut lib.conn,
+            &root,
+            &run.run_id,
+            Verdict::Cancel,
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::comfyui::holds::HoldError::NotHeld),
+            "{}",
+            err
+        );
+        assert!(
+            lib.verdict_rows().is_empty(),
+            "and it recorded no verdict on the way out"
+        );
+
+        // The ordinary cancel finishes the job, and takes the stale marker with
+        // it: a cancelled run is holding nothing.
+        crate::comfyui::cancel_run(&mut lib.conn, &run.run_id).unwrap();
+        assert_eq!(lib.run_status(&run.run_id).0, "cancelled");
+        assert_eq!(
+            runs::table
+                .filter(runs::id.eq(&run.run_id))
+                .select(runs::held_at_stage)
+                .first::<Option<i32>>(&mut lib.conn)
+                .unwrap(),
+            None
+        );
+
+        // And it stays stopped: the advance pass reads running runs only, so
+        // nothing re-parks it and nothing upscales its takes.
+        lib.advance();
+        assert_eq!(lib.run_status(&run.run_id).0, "cancelled");
+        assert_eq!(lib.pending_at(2), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_hold_under_a_fan_out_reviews_every_branch_together() {
+        // Two takes at stage 1, four seeds each at stage 2, holding at stage 2:
+        // eight takes in two groups, one verdict over all of them, and a
+        // regenerate that re-runs both groups.
+        let mut lib = Library::with_workflows(3);
+        lib.line(3, &[]);
+        lib.sql(
+            r#"UPDATE line_stages
+               SET parameters = '{"3.seed":1}', vary = '{"3.seed":{"count":2,"mode":"increment"}}'
+               WHERE stage_idx = 0;"#,
+        );
+        lib.four_seeds_at(1);
+        lib.hold_at(1);
+        let run = lib.start();
+        assert_eq!(run.task_ids.len(), 2);
+        for task in &run.task_ids {
+            lib.land(task);
+        }
+        lib.advance();
+        let takes = lib.pending_at(1);
+        assert_eq!(takes.len(), 8, "two branches, four takes each");
+        for take in &takes {
+            lib.land(take);
+        }
+        lib.advance();
+
+        let hold = lib.hold(&run.run_id).unwrap();
+        assert_eq!(hold.takes.len(), 8, "one verdict over both branches");
+
+        let outcome = lib.verdict(&run.run_id, Verdict::Regenerate, &[]);
+        assert_eq!(outcome.queued.len(), 8, "and both branches run again");
+        let parents: std::collections::HashSet<Option<String>> = lib
+            .takes_at(1)
+            .into_iter()
+            .filter(|t| outcome.queued.contains(&t.0))
+            .map(|t| t.2)
+            .collect();
+        assert_eq!(parents.len(), 2, "each fresh take reads its own branch");
+    }
+
+    #[test]
+    fn a_describe_stage_can_hold_because_a_take_is_a_task() {
+        // A hold does not need a picture. Four sentences are four takes, and
+        // naming them by task id rather than by file id is what makes that fall
+        // out rather than needing a case.
+        let mut lib = Library::describe_then_generate("{}");
+        lib.sql(
+            r#"UPDATE line_stages SET hold_for_review = 1, vary = '{"2.x":{"values":[1,2]}}'
+               WHERE stage_idx = 0;"#,
+        );
+        let run = lib.start();
+        assert_eq!(run.task_ids.len(), 2);
+        lib.describe(&run.task_ids[0], "A woman sits on a jetty at dusk.");
+        lib.describe(&run.task_ids[1], "A jetty at dusk, empty.");
+        lib.advance();
+
+        assert_eq!(lib.run_status(&run.run_id).0, "held");
+        let hold = lib.hold(&run.run_id).unwrap();
+        assert_eq!(hold.takes.len(), 2);
+        let second = hold
+            .takes
+            .iter()
+            .find(|t| t.task_id == run.task_ids[1])
+            .expect("both sentences are on offer");
+        assert_eq!(
+            second.text_output.as_deref(),
+            Some("A jetty at dusk, empty.")
+        );
+        assert!(second.output_file_id.is_none(), "no file anywhere");
+
+        lib.verdict(
+            &run.run_id,
+            Verdict::Continue,
+            std::slice::from_ref(&second.task_id),
+        );
+        lib.advance();
+        let stage2 = lib.pending_at(1);
+        assert_eq!(stage2.len(), 1);
+        assert_eq!(
+            lib.overrides_of(&stage2[0])["6.text"],
+            "A jetty at dusk, empty.",
+            "the sentence that was chosen is the one that was compiled"
         );
     }
 

@@ -296,7 +296,69 @@ async function fetchLines() {
 function selectLine(id) {
   selectedLineId.value = selectedLineId.value === id ? null : id
   submitError.value = ''
+  // An asked key may still carry the value it had back when it was pinned, and
+  // the worker falls back to that value when no answer arrives. Start the
+  // controls from it, so what the dialog shows is what an untouched field runs
+  // — the workflow's own default here would be a value the run never uses.
+  const seeded = {}
+  for (const stage of selectedLine.value?.stages || []) {
+    for (const key of stage.exposed || []) {
+      const params = stage.parameters || {}
+      const texts = stage.text_overrides || {}
+      if (!(key in params) && !(key in texts)) continue
+      const slot = (seeded[String(stage.stage_idx)] ||= { text_overrides: {}, parameters: {} })
+      if (key in params) slot.parameters[key] = params[key]
+      else slot.text_overrides[key] = texts[key]
+    }
+  }
+  stageValues.value = seeded
 }
+
+// --- What the line left open ----------------------------------------------
+//
+// A stage can pin a setting, sweep it, or leave it to whoever sends the line.
+// The third is what this is: the line published its craft and left its subject
+// open, so those are the only fields asked for here — and the only ones the
+// backend will accept.
+const stageValues = ref({})
+
+/** The stages of the picked line that ask for anything, with their controls. */
+const askedStages = computed(() => {
+  const line = selectedLine.value
+  if (!line) return []
+  return line.stages
+    .filter((stage) => (stage.exposed || []).length)
+    .map((stage) => {
+      const workflow = workflows.value.find((w) => w.id === stage.workflow_id)
+      const keys = new Set(stage.exposed)
+      return {
+        key: String(stage.stage_idx),
+        stage_idx: stage.stage_idx,
+        name: stage.workflow_name,
+        inputs: (workflow?.inputs || []).filter((i) => keys.has(inputKey(i))),
+        loaderNodeIds: (workflow?.loaders || []).map((l) => l.node_id),
+      }
+    })
+    .filter((s) => s.inputs.length)
+})
+
+/** One stage's two override maps, created the first time it is written to. */
+function valuesFor(key) {
+  if (!stageValues.value[key]) {
+    stageValues.value = { ...stageValues.value, [key]: { text_overrides: {}, parameters: {} } }
+  }
+  return stageValues.value[key]
+}
+
+/** Only the stages somebody actually answered for. */
+const answeredStages = computed(() =>
+  Object.fromEntries(
+    Object.entries(stageValues.value).filter(
+      ([, v]) =>
+        Object.keys(v.text_overrides || {}).length || Object.keys(v.parameters || {}).length,
+    ),
+  ),
+)
 
 async function fetchPresets(workflowId) {
   try {
@@ -497,7 +559,13 @@ async function startLineRun() {
   const res = await fetch('/api/comfyui/runs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ line_id: selectedLineId.value, shot_id: props.shotId }),
+    body: JSON.stringify({
+      line_id: selectedLineId.value,
+      shot_id: props.shotId,
+      ...(Object.keys(answeredStages.value).length
+        ? { stage_values: answeredStages.value }
+        : {}),
+    }),
   })
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))
@@ -614,6 +682,24 @@ async function enhance() {
               <template v-for="(st, i) in selectedLine.stages" :key="st.stage_idx">
                 <span v-if="i">&nbsp;→&nbsp;</span>{{ st.workflow_name }}
               </template>
+            </div>
+          </div>
+
+          <!-- What the line left open. Everything else it already decided, and
+               a value sent for one of those is refused by name. -->
+          <div v-if="askedStages.length" class="flex flex-col gap-2">
+            <div class="label">This line asks for</div>
+            <div v-for="asked in askedStages" :key="asked.key" class="flex flex-col gap-1.5">
+              <div class="flex items-baseline gap-2">
+                <span class="label">St {{ asked.stage_idx + 1 }}</span>
+                <span class="font-mono text-[11px] text-ink-secondary truncate">{{ asked.name }}</span>
+              </div>
+              <WorkflowInputControls
+                v-model:text-overrides="valuesFor(asked.key).text_overrides"
+                v-model:parameters="valuesFor(asked.key).parameters"
+                :inputs="asked.inputs"
+                :loader-node-ids="asked.loaderNodeIds"
+              />
             </div>
           </div>
 
