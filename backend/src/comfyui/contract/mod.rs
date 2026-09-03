@@ -193,6 +193,16 @@ impl ParamName {
         }
     }
 
+    /// Does a field with this name carry this setting?
+    ///
+    /// The same alias table the derivation matches on, asked directly — for the
+    /// callers that have a graph in front of them and no catalogue to type it
+    /// with.
+    pub fn names_field(self, field: &str) -> bool {
+        let field = field.trim().to_ascii_lowercase();
+        self.aliases().contains(&field.as_str())
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         const ALL: &[ParamName] = &[
             ParamName::Seed,

@@ -1,21 +1,29 @@
 <script setup>
 /**
- * Review Desk — one screen, three lanes.
+ * Review Desk — one screen, four lanes.
  *
  * Shots, duplicates and face clusters used to be separate destinations. They are
  * the same job (decide, route, move on), so the design puts them on one desk and
  * lets the lane tabs carry the counts.
+ *
+ * Takes is the fourth and the same job again, over generated output: a run
+ * parked at a hold point has made four candidates and is waiting to be told
+ * which are worth the stages below. It is deliberately last, because it is the
+ * only lane that is empty on a library nobody generates into — and deliberately
+ * here rather than on its own route, because a person clearing a backlog should
+ * not have to know which kind of backlog it is.
  */
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ReviewQueue from '@/components/ReviewQueue.vue'
 import VariationsQueue from '@/components/VariationsQueue.vue'
 import PersonNamer from '@/components/PersonNamer.vue'
+import TakesQueue from '@/components/TakesQueue.vue'
 
 const route = useRoute()
 const router = useRouter()
 
-const LANES = ['shots', 'duplicates', 'faces']
+const LANES = ['shots', 'duplicates', 'faces', 'takes']
 const lane = ref(LANES.includes(route.query.lane) ? route.query.lane : 'shots')
 
 watch(() => route.query.lane, (v) => {
@@ -29,6 +37,7 @@ function goLane(l) {
 
 const stats = ref({ pending_review: 0, unnamed_people: 0, confirmed: 0, total_shots: 0 })
 const dupeCount = ref(0)
+const takeCount = ref(0)
 
 async function loadData() {
   try {
@@ -39,12 +48,19 @@ async function loadData() {
     const res = await fetch('/api/shots/similar-groups?offset=0&limit=1')
     if (res.ok) dupeCount.value = (await res.json()).total || 0
   } catch { dupeCount.value = 0 }
+  try {
+    // Takes counts *takes*, not runs: it is how much looking is left, and a
+    // four-seed fan-out is four decisions rather than one.
+    const res = await fetch('/api/comfyui/takes?limit=100')
+    takeCount.value = res.ok ? (await res.json()).takes_waiting || 0 : 0
+  } catch { takeCount.value = 0 }
 }
 
 const lanes = computed(() => [
   { id: 'shots', label: 'Shots', count: stats.value.pending_review || 0 },
   { id: 'duplicates', label: 'Duplicates', count: dupeCount.value || 0 },
   { id: 'faces', label: 'Faces', count: stats.value.unnamed_people || 0 },
+  { id: 'takes', label: 'Takes', count: takeCount.value || 0 },
 ])
 
 const progress = computed(() => {
@@ -82,6 +98,7 @@ defineExpose({ loadData })
 
     <ReviewQueue v-if="lane === 'shots'" class="flex-1 min-h-0" @changed="loadData" />
     <VariationsQueue v-else-if="lane === 'duplicates'" class="flex-1 min-h-0" @changed="loadData" />
+    <TakesQueue v-else-if="lane === 'takes'" class="flex-1 min-h-0" @changed="loadData" />
     <PersonNamer v-else inline class="flex-1 min-h-0" @changed="loadData" />
   </div>
 </template>

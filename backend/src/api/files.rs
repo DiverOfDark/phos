@@ -106,9 +106,7 @@ pub(super) async fn upload_file_raw(
         (status = 200, description = "Ingest queue status", body = crate::ingest::IngestStatus),
     )
 )]
-pub(super) async fn import_status(
-    UState(state): UState,
-) -> Json<crate::ingest::IngestStatus> {
+pub(super) async fn import_status(UState(state): UState) -> Json<crate::ingest::IngestStatus> {
     Json(state.ingest.status(&state.library_root))
 }
 
@@ -192,7 +190,10 @@ pub(super) async fn get_file(
     UState(state): UState,
 ) -> Result<impl IntoResponse, StatusCode> {
     let (file_path, mime_type) = {
-        let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut conn = state
+            .pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         files::table
             .filter(files::id.eq(&id))
             .select((files::path, files::mime_type))
@@ -260,7 +261,10 @@ pub(super) async fn get_file_thumbnail(
     UState(state): UState,
 ) -> Result<impl IntoResponse, StatusCode> {
     let (file_path, mime_type) = {
-        let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut conn = state
+            .pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         files::table
             .filter(files::id.eq(&id))
             .select((files::path, files::mime_type))
@@ -370,43 +374,58 @@ pub(super) async fn set_file_original(
     Path(id): Path<String>,
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Get the shot_id for this file
+    let shot_id = set_main_file(&mut conn, &id).map_err(|e| match e {
+        diesel::result::Error::NotFound => StatusCode::NOT_FOUND,
+        e => {
+            tracing::error!("Failed to promote {} to main file: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
+
+    Ok(Json(
+        serde_json::json!({"status": "ok", "shot_id": shot_id}),
+    ))
+}
+
+/// Make this file its shot's main one, demoting whichever was.
+///
+/// A free function rather than handler body because it is what the Takes lane's
+/// `P` key does — *this take is the picture now* — and a keystroke that ends in
+/// a shot pointing somewhere else is worth a test that does not need an HTTP
+/// server to run.
+///
+/// The two halves are kept in step deliberately: `files.is_original` is what the
+/// gallery reads and `shots.main_file_id` is what the queries join on, and a
+/// library where they disagree draws one picture and opens another. Returns the
+/// shot that now points here.
+pub(crate) fn set_main_file(
+    conn: &mut diesel::sqlite::SqliteConnection,
+    file_id: &str,
+) -> Result<String, diesel::result::Error> {
     let shot_id: String = files::table
-        .filter(files::id.eq(&id))
+        .filter(files::id.eq(file_id))
         .select(files::shot_id)
-        .first::<String>(&mut conn)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .first::<String>(conn)?;
 
-    // Set all files in this shot to is_original = false
-    diesel::update(files::table.filter(files::shot_id.eq(&shot_id)))
-        .set(files::is_original.eq(false))
-        .execute(&mut conn)
-        .map_err(|e| {
-            tracing::error!("Failed to clear is_original on shot files: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    conn.transaction(|conn| {
+        diesel::update(files::table.filter(files::shot_id.eq(&shot_id)))
+            .set(files::is_original.eq(false))
+            .execute(conn)?;
+        diesel::update(files::table.filter(files::id.eq(file_id)))
+            .set(files::is_original.eq(true))
+            .execute(conn)?;
+        diesel::update(shots::table.filter(shots::id.eq(&shot_id)))
+            .set(shots::main_file_id.eq(file_id))
+            .execute(conn)?;
+        Ok::<_, diesel::result::Error>(())
+    })?;
 
-    // Set this file as original
-    diesel::update(files::table.filter(files::id.eq(&id)))
-        .set(files::is_original.eq(true))
-        .execute(&mut conn)
-        .map_err(|e| {
-            tracing::error!("Failed to set is_original on file: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Update shots.main_file_id
-    diesel::update(shots::table.filter(shots::id.eq(&shot_id)))
-        .set(shots::main_file_id.eq(&id))
-        .execute(&mut conn)
-        .map_err(|e| {
-            tracing::error!("Failed to update shots.main_file_id: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(Json(serde_json::json!({"status": "ok"})))
+    Ok(shot_id)
 }
 
 /// DELETE /api/files/:id - delete a non-original file from a shot.
@@ -429,7 +448,10 @@ pub(super) async fn delete_file(
     Path(id): Path<String>,
     UState(state): UState,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Get file info
     let (shot_id, file_path, is_original): (String, String, Option<bool>) = files::table
