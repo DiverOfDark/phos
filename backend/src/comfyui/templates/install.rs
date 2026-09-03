@@ -223,6 +223,9 @@ pub fn install(
                     vary: Some(&vary),
                     source_mode: stage.source_mode.as_deref(),
                     keep_output: stage.keep_output,
+                    // The template format predates the exposed disposition;
+                    // a seeded stage asks for nothing until somebody edits it.
+                    exposed: None,
                 })
                 .execute(conn)?;
         }
