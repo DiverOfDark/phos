@@ -5,7 +5,7 @@ import WorkflowGraph from '@/components/WorkflowGraph.vue'
 import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
 import WorkflowContract from '@/components/WorkflowContract.vue'
 import LineEditor from '@/components/LineEditor.vue'
-import { controlKind, isParameterInput, isTextInput, inputKey, parameterValue, formatDuration, stageOf, readinessColor, installedLabel } from '@/lib/utils'
+import { controlKind, isParameterInput, isTextInput, inputKey, parameterValue, formatDuration, stageOf } from '@/lib/utils'
 import { typeTrack, continuationCost, heldLabel, takeSeed } from '@/lib/lines'
 
 // --- Connection health ---
@@ -473,7 +473,7 @@ async function giveVerdict(runId, verdict) {
 
 // ===== LINES TAB =====
 //
-// Three ways to get a line, and blank is the last of them. Fork a template and
+// Three ways to get a line, and blank is the last of them. Fork a line and
 // change a stage; promote a sequence Phos has watched somebody run by hand;
 // or, failing both, compose one. `LineEditor.vue` is the screen; everything
 // here is what it is shown and where its answers go.
@@ -802,57 +802,10 @@ function formatDate(dateStr) {
 }
 
 // ===== TEMPLATES TAB =====
-//
-// The five lines that ship with Phos. Seeding happens at startup, so this tab
-// is mostly a *report*: what came with the build, what this library has of it,
-// and — the part that earns the screen — whether this ComfyUI can actually run
-// it. A template that cannot run names exactly what to install, here, rather
-// than failing at dispatch some minutes into a run.
-const templates = ref([])
-const loadingTemplates = ref(false)
-const catalogAvailable = ref(true)
-const installingKey = ref(null)
-const templateError = ref('')
-const openTemplateKey = ref(null)
-
-async function fetchTemplates() {
-  loadingTemplates.value = true
-  try {
-    const res = await fetch('/api/comfyui/templates')
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const data = await res.json()
-    templates.value = data.items
-    catalogAvailable.value = data.catalog_available
-  } catch (e) {
-    console.error('Failed to fetch templates', e)
-  } finally {
-    loadingTemplates.value = false
-  }
-}
-
-async function installTemplate(key) {
-  installingKey.value = key
-  templateError.value = ''
-  try {
-    const res = await fetch(`/api/comfyui/templates/${key}/install`, { method: 'POST' })
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}))
-      throw new Error(data.error || `HTTP ${res.status}`)
-    }
-    // The template wrote workflows and a line, so both lists are now stale.
-    await Promise.all([fetchTemplates(), fetchWorkflows(), fetchLines()])
-  } catch (e) {
-    console.error('Failed to install template', e)
-    templateError.value = e.message
-  } finally {
-    installingKey.value = null
-  }
-}
-
 // --- Active tab tracking (synced with URL) ---
 const route = useRoute()
 const router = useRouter()
-const TABS = ['templates', 'workflows', 'lines', 'queue']
+const TABS = ['workflows', 'lines', 'queue']
 const activeTab = computed(() => TABS.includes(route.query.tab) ? route.query.tab : 'workflows')
 
 function onTabChange(val) {
@@ -866,7 +819,6 @@ function onTabChange(val) {
       fetchLines()
       fetchSuggestions()
     }
-    if (val === 'templates') fetchTemplates()
   }
 }
 
@@ -876,7 +828,6 @@ onMounted(() => {
   fetchWorkflows()
   fetchLines()
   fetchSuggestions()
-  if (activeTab.value === 'templates') fetchTemplates()
   if (activeTab.value === 'queue') {
     fetchRuns()
     startTaskPolling()
@@ -913,7 +864,6 @@ defineExpose({ loadData: fetchWorkflows })
     <div class="flex items-center gap-1 border-b border-line">
       <button
         v-for="t in [
-          { id: 'templates', label: 'Templates', count: templates.length },
           { id: 'workflows', label: 'Workflows', count: workflows.length },
           { id: 'lines', label: 'Lines', count: lines.length },
           { id: 'queue', label: 'Queue', count: runs.length },
@@ -1157,108 +1107,6 @@ defineExpose({ loadData: fetchWorkflows })
       :workflow-id="selectedWorkflow.id"
       :editable-node-ids="editableNodeIds"
     />
-
-    <!-- Templates tab — the five lines that ship with Phos.
-         The status pill is the point of the screen: a template that cannot run
-         on this ComfyUI says exactly what is missing here, rather than failing
-         at dispatch some minutes into a run. `unknown` is its own answer — the
-         catalogue could not be read, which is not evidence of a problem. -->
-    <div v-else-if="activeTab === 'templates'" class="flex flex-col gap-3">
-      <div class="text-[13px] font-light text-ink-secondary max-w-[620px]">
-        Five ready-made lines. Installing one adds its workflows and its line to this
-        library, where they are as editable as anything you imported yourself — and
-        Phos stops updating one the moment you change it.
-      </div>
-
-      <div
-        v-if="!catalogAvailable"
-        class="card-ab px-4 py-3 font-mono text-[11px] tracking-[0.08em] uppercase"
-        :style="{ color: readinessColor('unknown') }"
-      >
-        ComfyUI could not be asked what it has installed — readiness is unknown, not missing
-      </div>
-
-      <div v-if="templateError" class="font-mono text-xs text-error">{{ templateError }}</div>
-
-      <div class="card-ab overflow-hidden">
-        <div
-          v-for="t in templates"
-          :key="t.key"
-          class="px-4 py-3 border-b border-line last:border-b-0 flex flex-col gap-2"
-        >
-          <div class="flex items-start gap-3">
-            <span class="min-w-0 flex-1">
-              <span class="block text-[13px] text-ink">{{ t.name }}</span>
-              <span class="block font-mono text-[11px] tracking-[0.08em] uppercase text-ink-tertiary">
-                {{ t.accepts }} → {{ t.produces }} ·
-                {{ t.stage_count }} {{ t.stage_count === 1 ? 'stage' : 'stages' }} ·
-                v{{ t.version }}<template v-if="t.confidence === 'unverified'"> · unverified</template>
-              </span>
-              <span class="block text-[13px] font-light text-ink-secondary mt-1">{{ t.summary }}</span>
-            </span>
-
-            <span
-              class="flex items-center gap-1.5 font-mono text-[11px] tracking-[0.08em] uppercase whitespace-nowrap"
-              :style="{ color: readinessColor(t.readiness.state) }"
-            >
-              <span
-                class="signal-dot"
-                style="width:6px;height:6px"
-                :style="{ background: readinessColor(t.readiness.state) }"
-              ></span>
-              {{ t.readiness.label }}
-            </span>
-
-            <button
-              class="border border-line-strong rounded px-3 py-1.5 text-[13px] text-ink-secondary hover:text-signal transition-colors whitespace-nowrap disabled:opacity-50"
-              :disabled="installingKey === t.key"
-              @click="installTemplate(t.key)"
-            >{{ installingKey === t.key ? 'Installing…' : t.installed ? 'Install again' : 'Install' }}</button>
-          </div>
-
-          <div class="flex items-center gap-3">
-            <span class="font-mono text-[11px] tracking-[0.08em] uppercase text-ink-tertiary">
-              {{ installedLabel(t) }}
-            </span>
-            <span class="flex-1"></span>
-            <button
-              class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
-              @click="openTemplateKey = openTemplateKey === t.key ? null : t.key"
-            >{{ openTemplateKey === t.key ? 'hide' : 'what it needs' }}</button>
-          </div>
-
-          <!-- What to install, and what to know before running it. -->
-          <div v-if="openTemplateKey === t.key" class="flex flex-col gap-2 pt-1">
-            <div
-              class="text-[13px] font-light"
-              :style="{ color: t.readiness.state === 'ready' ? undefined : readinessColor(t.readiness.state) }"
-            >{{ t.readiness.detail }}</div>
-            <div v-if="t.notes" class="text-[13px] font-light text-ink-secondary">{{ t.notes }}</div>
-            <div class="flex flex-col gap-1">
-              <span class="label">Nodes</span>
-              <span class="font-mono text-[11px] text-ink-tertiary break-words">
-                {{ t.requirements.node_classes.join(' · ') }}
-              </span>
-            </div>
-            <div v-if="t.requirements.models.length" class="flex flex-col gap-1">
-              <span class="label">Models</span>
-              <span
-                v-for="m in t.requirements.models"
-                :key="m.class_type + m.field + m.name"
-                class="font-mono text-[11px] text-ink-tertiary break-words"
-              >{{ m.name }} → {{ m.class_type }}.{{ m.field }}</span>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="loadingTemplates && templates.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
-          loading templates…
-        </div>
-        <div v-else-if="templates.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
-          no templates in this build
-        </div>
-      </div>
-    </div>
 
     <!-- Lines tab — a chain of workflows run as one thing.
          Three ways in, and blank is the last of them: fork one, promote a

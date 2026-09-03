@@ -67,8 +67,7 @@ use super::UState;
     summary = "Export a production line",
     description = "The line, its stages, the workflow graph behind every stage, and a manifest \
                    of the node classes and model files it needs — as one JSON document that can \
-                   be imported into another library or another Phos install. This is the same \
-                   format bundled templates ship in.",
+                   be imported into another library or another Phos install.",
     params(("id" = String, Path, description = "Line ID")),
     responses(
         (status = 200, description = "The line as a portable bundle", body = LineBundle),
@@ -210,8 +209,7 @@ impl From<diesel::result::Error> for ImportFailure {
     path = "/api/comfyui/lines/import",
     tag = "comfyui",
     summary = "Import a production line",
-    description = "Read a line out of an exported bundle — the same format bundled templates \
-                   ship in. Its workflows are created, or reused where an identical graph is \
+    description = "Read a line out of an exported bundle. Its workflows are created, or reused where an identical graph is \
                    already here, and its requirements are checked against what this ComfyUI has \
                    installed. A line whose nodes or models are missing is still imported; the \
                    response says what is missing. A name already in use is suffixed, never \
@@ -386,7 +384,7 @@ pub(super) async fn import_line(
     })))
 }
 
-/// The corrections a bundle's workflow travels with. A hand-written template
+/// The corrections a bundle's workflow travels with. A hand-written bundle
 /// carries none.
 fn bundle_corrections(wf: &BundleWorkflow) -> ContractCorrections {
     wf.contract

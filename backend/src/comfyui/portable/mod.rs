@@ -14,17 +14,6 @@
 //! dispatch. The graphs go in the file, and the importer either finds them
 //! already present or creates them.
 //!
-//! # This is also the template format
-//!
-//! FR6 ships bundled templates. A template is a line somebody else drew, which
-//! is exactly what this file is, so there is one format rather than two: a
-//! bundled template is an exported line, seeded through the same importer, and
-//! gets the same requirements report. Everything a template needs beyond a
-//! hand-written export is optional here — `contract` is re-derived when absent,
-//! `requirements` is recomputed rather than trusted, and workflow keys are
-//! arbitrary strings so a template can say `"upscale"` where an export says a
-//! uuid.
-//!
 //! # Nothing in this module touches a database or a network
 //!
 //! Parsing, canonicalising, deriving requirements, checking them against a
@@ -132,16 +121,6 @@ pub struct LineBundle {
     /// When it left, for a human reading the file. Never read by the importer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exported_at: Option<String>,
-    /// Present on a **bundled template**, absent on somebody's export.
-    ///
-    /// The one block FR6 adds to this format, and the reason it is declared
-    /// there rather than here: it says nothing about the line, only about
-    /// Phos's claim on it — the key an upgrade matches and the version it
-    /// compares. Carried on the document type all the same, so a template
-    /// pasted into the import box round-trips as the file it is instead of
-    /// quietly losing its identity on the way through.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template: Option<super::templates::bundle::Template>,
     pub line: BundleLine,
     /// Every workflow the stages name, keyed by whatever they name it.
     #[serde(default)]
@@ -156,21 +135,6 @@ pub struct LineBundle {
 }
 
 impl LineBundle {
-    /// The template block, on a document that has one.
-    pub fn template(&self) -> Option<&super::templates::bundle::Template> {
-        self.template.as_ref()
-    }
-
-    /// The key an upgrade matches on. Empty for an ordinary export, which is
-    /// nothing a template sync ever looks at.
-    pub fn key(&self) -> &str {
-        self.template.as_ref().map_or("", |t| t.key.as_str())
-    }
-
-    pub fn version(&self) -> u32 {
-        self.template.as_ref().map_or(0, |t| t.version)
-    }
-
     pub fn workflow(&self, key: &str) -> Option<&BundleWorkflow> {
         self.workflows.get(key)
     }
@@ -278,7 +242,6 @@ impl LineBundle {
             format_version: BUNDLE_VERSION,
             exported_at: None,
             // A line somebody exports is theirs, not one Phos tracks.
-            template: None,
             line,
             workflows,
             requirements,

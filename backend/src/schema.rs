@@ -1,17 +1,6 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
-    bundled_templates (template_key) {
-        template_key -> Text,
-        template_version -> Integer,
-        line_id -> Nullable<Text>,
-        workflow_ids -> Text,
-        installed_at -> Nullable<Timestamp>,
-        updated_at -> Nullable<Timestamp>,
-    }
-}
-
-diesel::table! {
     comfyui_workflows (id) {
         id -> Text,
         name -> Text,
@@ -208,7 +197,6 @@ diesel::table! {
     }
 }
 
-diesel::joinable!(bundled_templates -> production_lines (line_id));
 diesel::joinable!(enhancement_tasks -> comfyui_workflows (workflow_id));
 diesel::joinable!(enhancement_tasks -> runs (run_id));
 diesel::joinable!(enhancement_tasks -> shots (shot_id));
@@ -225,7 +213,6 @@ diesel::joinable!(video_keyframes -> files (video_file_id));
 diesel::joinable!(workflow_presets -> comfyui_workflows (workflow_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
-    bundled_templates,
     comfyui_workflows,
     enhancement_tasks,
     faces,

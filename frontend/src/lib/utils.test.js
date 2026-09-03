@@ -21,8 +21,6 @@ import {
   slotKey,
   applyCompiledPrompt,
   mergeConstraints,
-  readinessColor,
-  installedLabel,
   MAX_SAFE_SEED,
 } from "./utils.js";
 
@@ -260,31 +258,4 @@ test("a workflow with no negative slot still takes the prompt", () => {
   const wf = { contract: { slots: [{ name: "positive", node_id: "6", field: "text" }] } };
   const after = applyCompiledPrompt(wf, {}, { positive: "a cat.", negative: "change face" });
   assert.deepEqual(after, { "6.text": "a cat." });
-});
-
-test("a template's readiness is painted from the status palette", () => {
-  assert.equal(readinessColor("ready"), "var(--status-ready)");
-  assert.equal(readinessColor("missing"), "var(--status-error)");
-  assert.equal(readinessColor("degraded"), "var(--status-degraded)");
-  // Not knowing is neutral, not red: the catalogue could not be read, which is
-  // not evidence that anything is wrong.
-  assert.equal(readinessColor("unchecked"), "var(--status-stopped)");
-  assert.equal(readinessColor(undefined), "var(--status-stopped)");
-});
-
-test("a template says whether it is installed, and whether it is still ours to update", () => {
-  assert.equal(installedLabel({ version: 1 }), "NOT INSTALLED");
-  assert.equal(
-    installedLabel({ version: 2, installed: { version: 2, line_exists: true, customised: false } }),
-    "INSTALLED v2",
-  );
-  // The one that matters: an edited template is the user's, for good.
-  assert.equal(
-    installedLabel({ version: 2, installed: { version: 1, line_exists: true, customised: true } }),
-    "EDITED \u00b7 NOT UPDATED",
-  );
-  assert.equal(
-    installedLabel({ version: 1, installed: { version: 1, line_exists: false, customised: false } }),
-    "LINE DELETED",
-  );
 });
