@@ -207,18 +207,20 @@ impl Handoff {
 ///   what FR2's source modes are for, and what `bind_targets` then puts in the
 ///   loader of the matching kind.
 ///
-/// `takes_video` comes from the caller rather than off `downstream.roles`,
-/// because that is where the dispatcher gets it: straight from the graph, with
-/// [`super::loaders::takes_video`]. A contract stored before loaders were
+/// `takes_video` and `takes_image` come from the caller rather than off
+/// `downstream.roles`, because that is where the dispatcher gets them: straight
+/// from the graph, with [`super::loaders::takes_video`] and
+/// [`super::loaders::takes_image`]. A contract stored before loaders were
 /// recorded carries none, and a connector reading the contract alone would then
-/// promise a frame where the run is going to send the whole clip.
+/// promise a frame where the run is going to send the whole clip — or present a
+/// mixed image/video graph as video-only and hide the frame-vs-clip choice.
 pub fn handoff(
     carries: MediaType,
     downstream: &StageContract,
     takes_video: bool,
+    takes_image: bool,
     stored: Option<&str>,
 ) -> Handoff {
-    let takes_image = downstream.roles.iter().any(|r| r.kind == LoaderKind::Image);
     let carries_video = carries == MediaType::Video;
 
     // The same call the dispatcher makes, so what the editor shows is what the
@@ -439,8 +441,14 @@ mod tests {
         let line = drawn(&["Photo to 5s Clip", "Upscale 4K"]);
         assert_eq!(
             offered(&stage_options(&library(), &line, 0, Placement::Replace)),
-            ["Photo to 5s Clip", "Interpolate 60fps", "Upscale 4K"],
-            "everything that hands the upscaler a clip"
+            [
+                "Photo to 5s Clip",
+                "Interpolate 60fps",
+                "Upscale 4K",
+                "Describe"
+            ],
+            "everything that hands the upscaler a clip — or, since FR9, is \
+             transparent and lets the shot itself reach it"
         );
     }
 
@@ -452,15 +460,15 @@ mod tests {
         let line = drawn(&["Restore Portrait", "Restore Portrait", "Photo to 5s Clip"]);
         assert_eq!(
             offered(&stage_options(&library(), &line, 1, Placement::Insert)),
-            ["Restore Portrait"]
+            ["Restore Portrait", "Describe"]
         );
         // …and on a shorter line they come apart, which is the whole reason
         // the two are different questions. image → image, at index 1:
         let two = drawn(&["Restore Portrait", "Restore Portrait"]);
         assert_eq!(
             offered(&stage_options(&library(), &two, 1, Placement::Insert)),
-            ["Restore Portrait"],
-            "inserted above a still stage, it has to hand on a still"
+            ["Restore Portrait", "Describe"],
+            "inserted above a still stage, it has to hand on a still — or none"
         );
         assert_eq!(
             offered(&stage_options(&library(), &two, 1, Placement::Replace)),
@@ -469,13 +477,12 @@ mod tests {
         );
     }
 
-    /// The one case FR9 changes, pinned here so the change is visible.
+    /// The one case FR9 changed, pinned here so the change stays visible.
     ///
-    /// A describe stage reads a photograph and produces a sentence. Today
-    /// `validate_chain` refuses anything after it that wants a file, and the
-    /// picker refuses it too — which is the point: they agree. FR9 makes a
-    /// text-producing stage transparent to the media flow, and when it does,
-    /// this test is the one that says so, without a line of the picker moving.
+    /// A describe stage reads a photograph and produces a sentence. FR9 makes
+    /// a text-producing stage transparent to the media flow, and the picker
+    /// learned that without a line of it moving — the loop below is the proof:
+    /// it agrees with `validate_chain` on every candidate.
     #[test]
     fn what_may_follow_a_describe_stage_is_whatever_validation_says_may() {
         let line = drawn(&["Describe"]);
@@ -489,9 +496,21 @@ mod tests {
                 option.candidate.name
             );
         }
-        // Pre-FR9 that means nothing follows it at all, because nothing in this
-        // library eats text.
-        assert!(offered(&options).is_empty());
+
+        // FR9 landed: a describe stage is transparent to the media flow, so
+        // the stage after it reads the same shot the describe stage did and
+        // everything that could open a line may follow one. Only "Text to
+        // Image" stays refused — Accepts::None can only be the first stage.
+        assert_eq!(
+            offered(&options),
+            [
+                "Photo to 5s Clip",
+                "Interpolate 60fps",
+                "Upscale 4K",
+                "Restore Portrait",
+                "Describe"
+            ]
+        );
     }
 
     #[test]
@@ -572,7 +591,7 @@ mod tests {
             MediaType::Image,
             vec![slot("4", LoaderKind::Image, SourceRole::Start)],
         );
-        let h = handoff(MediaType::Image, &down, false, None);
+        let h = handoff(MediaType::Image, &down, false, true, None);
         assert_eq!(h.resolved, "first_frame");
         assert!(h.modes.is_empty(), "there is no frame two of a JPEG");
         assert!(!h.is_a_question());
@@ -585,7 +604,7 @@ mod tests {
             MediaType::Video,
             vec![slot("7", LoaderKind::Video, SourceRole::Start)],
         );
-        let h = handoff(MediaType::Video, &down, true, None);
+        let h = handoff(MediaType::Video, &down, true, false, None);
         assert_eq!(h.resolved, "whole_video");
         assert!(h.modes.is_empty());
         assert!(!h.is_a_question());
@@ -604,14 +623,14 @@ mod tests {
                 slot("9", LoaderKind::Image, SourceRole::Reference),
             ],
         );
-        let h = handoff(MediaType::Video, &down, true, None);
+        let h = handoff(MediaType::Video, &down, true, true, None);
         assert_eq!(h.resolved, "whole_video", "the dispatcher's own default");
         assert_eq!(h.modes, [WHOLE_VIDEO, FIRST_FRAME, LAST_FRAME, AT_TIME]);
         assert!(h.is_a_question());
         // Choosing a frame moves the upload into the image loader, so the slot
         // it could fill changes with it.
         assert_eq!(h.roles, [SourceRole::Start], "the video loader's slot");
-        let framed = handoff(MediaType::Video, &down, true, Some("last_frame"));
+        let framed = handoff(MediaType::Video, &down, true, true, Some("last_frame"));
         assert_eq!(framed.resolved, "last_frame");
         assert_eq!(framed.roles, [SourceRole::Reference]);
     }
@@ -628,7 +647,7 @@ mod tests {
                 slot("5", LoaderKind::Image, SourceRole::End),
             ],
         );
-        let h = handoff(MediaType::Image, &down, false, None);
+        let h = handoff(MediaType::Image, &down, false, true, None);
         assert!(h.modes.is_empty(), "a still is a still");
         assert_eq!(h.roles, [SourceRole::Start, SourceRole::End]);
         assert!(h.is_a_question(), "which slot is a real choice");
@@ -643,21 +662,27 @@ mod tests {
         // run is never going to send.
         let bare = contract(Accepts::Video, MediaType::Video, Vec::new());
         assert_eq!(
-            handoff(MediaType::Video, &bare, true, None).resolved,
+            handoff(MediaType::Video, &bare, true, false, None).resolved,
             "whole_video"
         );
         // And with no video loader anywhere, the same contract resolves to the
         // frame the dispatcher would actually extract.
         assert_eq!(
-            handoff(MediaType::Video, &bare, false, None).resolved,
+            handoff(MediaType::Video, &bare, false, true, None).resolved,
             "first_frame"
         );
+        // The mirror image: the roles are empty but the graph loads both a
+        // clip and a still, so the frame-vs-whole-clip choice the dispatcher
+        // honours must be offered — not hidden behind a role-less contract.
+        let both = handoff(MediaType::Video, &bare, true, true, None);
+        assert_eq!(both.modes, [WHOLE_VIDEO, FIRST_FRAME, LAST_FRAME, AT_TIME]);
+        assert!(both.is_a_question());
     }
 
     #[test]
     fn a_graph_with_no_loader_at_all_still_answers() {
         let down = contract(Accepts::None, MediaType::Image, Vec::new());
-        let h = handoff(MediaType::Image, &down, false, None);
+        let h = handoff(MediaType::Image, &down, false, false, None);
         assert!(h.roles.is_empty());
         assert!(!h.is_a_question());
     }
@@ -691,7 +716,7 @@ mod tests {
                 slot("9", LoaderKind::Image, SourceRole::Start),
             ],
         );
-        for mode in handoff(MediaType::Video, &down, true, None).modes {
+        for mode in handoff(MediaType::Video, &down, true, true, None).modes {
             // `at_time` is the one the editor completes with a number.
             let spelling = if mode == AT_TIME {
                 "at_time:1500".to_string()

@@ -256,7 +256,9 @@ fn continue_one(conn: &mut SqliteConnection, c: &Continuation) -> Result<(), Str
             // the map it binds into, so the directive has to ride down with the
             // description. The downstream stage's own say still wins.
             if !plan.text_overrides.contains_key(prompt::SLOT_KEY) {
-                if let Some(slot) = upstream.get(prompt::SLOT_KEY).filter(|s| !s.trim().is_empty())
+                if let Some(slot) = upstream
+                    .get(prompt::SLOT_KEY)
+                    .filter(|s| !s.trim().is_empty())
                 {
                     plan.text_overrides
                         .insert(prompt::SLOT_KEY.to_string(), slot.clone());

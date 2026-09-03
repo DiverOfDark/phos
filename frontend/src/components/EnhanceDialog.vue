@@ -296,7 +296,22 @@ async function fetchLines() {
 function selectLine(id) {
   selectedLineId.value = selectedLineId.value === id ? null : id
   submitError.value = ''
-  stageValues.value = {}
+  // An asked key may still carry the value it had back when it was pinned, and
+  // the worker falls back to that value when no answer arrives. Start the
+  // controls from it, so what the dialog shows is what an untouched field runs
+  // — the workflow's own default here would be a value the run never uses.
+  const seeded = {}
+  for (const stage of selectedLine.value?.stages || []) {
+    for (const key of stage.exposed || []) {
+      const params = stage.parameters || {}
+      const texts = stage.text_overrides || {}
+      if (!(key in params) && !(key in texts)) continue
+      const slot = (seeded[String(stage.stage_idx)] ||= { text_overrides: {}, parameters: {} })
+      if (key in params) slot.parameters[key] = params[key]
+      else slot.text_overrides[key] = texts[key]
+    }
+  }
+  stageValues.value = seeded
 }
 
 // --- What the line left open ----------------------------------------------

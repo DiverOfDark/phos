@@ -67,6 +67,9 @@ pub(crate) struct StageRow {
     /// the way the dispatcher takes it. The contract's roles usually say the
     /// same thing, but one stored before loaders were recorded says nothing.
     pub takes_video: bool,
+    /// And whether it has one that reads a still — off the graph for the same
+    /// reason, so a role-less contract cannot hide the frame-vs-clip choice.
+    pub takes_image: bool,
     pub contract: StageContract,
 }
 
@@ -225,6 +228,9 @@ pub(crate) fn stages_of_line(
             exposed: serde_json::from_str(&r.8).unwrap_or_default(),
             takes_video: serde_json::from_str::<serde_json::Value>(&r.10)
                 .map(|g| super::loaders::takes_video(&g))
+                .unwrap_or(false),
+            takes_image: serde_json::from_str::<serde_json::Value>(&r.10)
+                .map(|g| super::loaders::takes_image(&g))
                 .unwrap_or(false),
             contract: contract_of(r.9.as_deref(), &r.10),
         })

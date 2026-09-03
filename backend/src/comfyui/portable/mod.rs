@@ -78,6 +78,11 @@ pub struct BundleStage {
     pub source_mode: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_output: bool,
+    /// Keys this stage leaves to whoever sends the line — the *exposed*
+    /// disposition. Optional, like everything else a hand-written template
+    /// would rather not say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exposed: Vec<String>,
 }
 
 /// The line itself. Stage order is array order — there is no `stage_idx`,
@@ -468,6 +473,7 @@ mod tests {
                     vary: VaryMap::new(),
                     source_mode: None,
                     keep_output: false,
+                    exposed: Vec::new(),
                 }],
             },
             workflows,

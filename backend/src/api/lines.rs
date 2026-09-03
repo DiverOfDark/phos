@@ -184,8 +184,15 @@ pub(super) fn draft_stages_json(
         };
         let contract = contract_of(contract_json.as_deref(), &workflow_json);
         let takes_video = graph_takes_video(&workflow_json);
+        let takes_image = graph_takes_image(&workflow_json);
         let handoff = crate::comfyui::editor::carried_into(&above).map(|carries| {
-            let h = crate::comfyui::editor::handoff(carries, &contract, takes_video, *source_mode);
+            let h = crate::comfyui::editor::handoff(
+                carries,
+                &contract,
+                takes_video,
+                takes_image,
+                *source_mode,
+            );
             serde_json::json!({
                 "carries": h.carries,
                 "resolved": h.resolved,
@@ -253,12 +260,14 @@ pub(super) fn stage_json(
     stage: &StageRow,
     upstream: Option<MediaType>,
     takes_video: bool,
+    takes_image: bool,
 ) -> serde_json::Value {
     let handoff = upstream.map(|carries| {
         let h = crate::comfyui::editor::handoff(
             carries,
             &stage.contract,
             takes_video,
+            takes_image,
             stage.source_mode.as_deref(),
         );
         serde_json::json!({
@@ -305,6 +314,7 @@ pub(super) fn stages_json(stages: &[StageRow]) -> Vec<serde_json::Value> {
                 s,
                 crate::comfyui::editor::carried_into(&above),
                 s.takes_video,
+                s.takes_image,
             )
         })
         .collect()
@@ -317,11 +327,15 @@ pub(super) fn stages_json(stages: &[StageRow]) -> Vec<serde_json::Value> {
 pub(super) fn graph_takes_video(workflow_json: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(workflow_json)
         .ok()
-        .map(|graph| {
-            crate::comfyui::detect_loaders(&graph)
-                .iter()
-                .any(|l| l.kind == crate::comfyui::LoaderKind::Video)
-        })
+        .map(|graph| crate::comfyui::takes_video(&graph))
+        .unwrap_or(false)
+}
+
+/// Its still-reading half, asked the same way for the same reason.
+pub(super) fn graph_takes_image(workflow_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(workflow_json)
+        .ok()
+        .map(|graph| crate::comfyui::takes_image(&graph))
         .unwrap_or(false)
 }
 

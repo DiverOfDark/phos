@@ -192,19 +192,27 @@ pub fn suggest(tasks: &[TaskRow], limits: Limits) -> Vec<Suggestion> {
 
     let mut out: Vec<Suggestion> = kept
         .into_iter()
-        .map(|r| Suggestion {
-            stages: r
-                .workflow_ids
-                .iter()
-                .enumerate()
-                .map(|(position, workflow_id)| {
-                    evidence(
-                        workflow_id,
-                        r.occurrences.iter().map(|o| &tasks[o[position]]),
-                    )
-                })
-                .collect(),
-            shots: r.shots,
+        .filter_map(|r| {
+            let mut stages = Vec::with_capacity(r.workflow_ids.len());
+            for (position, workflow_id) in r.workflow_ids.iter().enumerate() {
+                let (stage, mode_disagrees) = evidence(
+                    workflow_id,
+                    r.occurrences.iter().map(|o| &tasks[o[position]]),
+                );
+                // Occurrences that disagreed on how this stage reads its input
+                // were runs of two habits, not one. Offering the chain with the
+                // mode silently dropped would save a line whose joins mean
+                // something none of the observed runs meant, so it is not
+                // offered at all.
+                if mode_disagrees {
+                    return None;
+                }
+                stages.push(stage);
+            }
+            Some(Suggestion {
+                stages,
+                shots: r.shots,
+            })
         })
         .collect();
 
@@ -274,11 +282,13 @@ fn contains_window(haystack: &[String], needle: &[String]) -> bool {
 }
 
 /// What one position was run with, folded across every occurrence: what never
-/// moved, and what did.
+/// moved, and what did. The second answer says whether the occurrences
+/// disagreed on the stage's `source_mode` — a disagreement the caller cannot
+/// fold away, because there is no "asked at send time" for a join.
 fn evidence<'a>(
     workflow_id: &str,
     occurrences: impl Iterator<Item = &'a TaskRow>,
-) -> StageEvidence {
+) -> (StageEvidence, bool) {
     let mut first_params: Option<ParameterMap> = None;
     let mut first_text: Option<BTreeMap<String, String>> = None;
     let mut first_mode: Option<Option<String>> = None;
@@ -323,17 +333,16 @@ fn evidence<'a>(
         pinned_text.remove(key);
     }
 
-    StageEvidence {
-        workflow_id: workflow_id.to_string(),
-        pinned,
-        pinned_text,
-        exposed: moved.into_iter().collect(),
-        source_mode: if mode_moved {
-            None
-        } else {
-            first_mode.flatten()
+    (
+        StageEvidence {
+            workflow_id: workflow_id.to_string(),
+            pinned,
+            pinned_text,
+            exposed: moved.into_iter().collect(),
+            source_mode: first_mode.flatten(),
         },
-    }
+        mode_moved,
+    )
 }
 
 /// Every key either map holds — a value that appeared in one run and not in
@@ -579,15 +588,17 @@ mod tests {
         );
         assert_eq!(found[0].stages[0].source_mode, None);
 
-        // One that varied is nobody's default, so the line does not claim one.
+        // One that varied is nobody's default — the twelve runs were two
+        // habits, not one, and saving the chain with the mode dropped would
+        // change what its joins mean. No suggestion is honest here.
         for t in tasks.iter_mut() {
             if t.workflow_id == "wf-interp" && t.shot_id == "s2" {
                 t.source_mode = Some("last_frame".to_string());
             }
         }
-        assert_eq!(
-            suggest(&tasks, Limits::default())[0].stages[2].source_mode,
-            None
+        assert!(
+            suggest(&tasks, Limits::default()).is_empty(),
+            "a chain whose occurrences fed a stage differently is not offered"
         );
     }
 

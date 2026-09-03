@@ -195,6 +195,16 @@ pub fn takes_video(workflow: &Value) -> bool {
         .any(|l| l.kind == LoaderKind::Video)
 }
 
+/// Does this graph have a loader that reads a still? The other half of the
+/// question [`takes_video`] answers, and read off the graph for the same
+/// reason: a contract stored before loader roles were recorded carries none,
+/// and an answer read off it alone would hide a choice the dispatcher honours.
+pub fn takes_image(workflow: &Value) -> bool {
+    detect_loaders(workflow)
+        .iter()
+        .any(|l| l.kind == LoaderKind::Image)
+}
+
 /// Can Phos feed this graph anything at all? The import gate.
 ///
 /// It used to be "does it have a `LoadImage`", which 400'd every video workflow
