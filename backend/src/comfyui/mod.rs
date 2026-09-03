@@ -108,6 +108,7 @@ pub mod promote;
 pub mod prompt;
 pub mod runs;
 mod source;
+pub mod templates;
 mod timestamp;
 mod worker;
 mod workflow;

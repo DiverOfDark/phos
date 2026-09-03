@@ -302,3 +302,21 @@ pub struct Setting {
     pub key: String,
     pub value: String,
 }
+
+// ── Bundled Templates ──
+
+/// This library's claim on one bundled template key.
+///
+/// The row says *that* a template was seeded and which rows it wrote. Whether
+/// any of those rows may still be updated is the `_phos` marker's business, in
+/// the workflow's own JSON — see `comfyui::templates::marker`.
+#[derive(Insertable)]
+#[diesel(table_name = bundled_templates)]
+pub struct NewBundledTemplate<'a> {
+    pub template_key: &'a str,
+    pub template_version: i32,
+    /// The line that was created. `None` once the user deletes it.
+    pub line_id: Option<&'a str>,
+    /// `{"<workflow key>": "<comfyui_workflows.id>"}`.
+    pub workflow_ids: &'a str,
+}
