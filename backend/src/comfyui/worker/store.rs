@@ -227,13 +227,25 @@ fn build_manifest(
     out: &OutputRef,
 ) -> ProvenanceManifest {
     // The source file is on the task row, not on `ActiveTask` — reading it here
-    // keeps the polling query the shape the completion path wants.
-    let source_file_id: Option<String> = enhancement_tasks::table
+    // keeps the polling query the shape the completion path wants. `started_at`
+    // rides along for the same reason, and because this is the last moment it
+    // can be read: the task row is swept five minutes after its run settles, so
+    // the manifest is the only durable record of what this workflow costs.
+    let row: Option<(Option<String>, Option<String>)> = enhancement_tasks::table
         .filter(enhancement_tasks::id.eq(&task.id))
-        .select(enhancement_tasks::source_file_id)
-        .first::<Option<String>>(conn)
-        .ok()
-        .flatten();
+        .select((
+            enhancement_tasks::source_file_id,
+            enhancement_tasks::started_at,
+        ))
+        .first(conn)
+        .ok();
+    let (source_file_id, started_at) = row.unwrap_or((None, None));
+
+    let now = chrono::Utc::now().naive_utc();
+    let duration_seconds = started_at
+        .as_deref()
+        .and_then(super::super::timestamp::parse_ts)
+        .map(|started| (now - started).num_milliseconds() as f64 / 1000.0);
 
     ProvenanceManifest::for_comfyui_run(&ComfyuiRun {
         task_id: &task.id,
@@ -245,7 +257,8 @@ fn build_manifest(
         comfyui_prompt_id: Some(&task.prompt_id),
         source_file_id: source_file_id.as_deref(),
         output_filename: Some(&out.filename),
-        generated_at: &format_ts(chrono::Utc::now().naive_utc()),
+        generated_at: &format_ts(now),
+        duration_seconds,
     })
 }
 

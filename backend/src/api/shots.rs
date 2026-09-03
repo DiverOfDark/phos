@@ -45,13 +45,114 @@ pub(super) struct SimilarShotsGrouped {
     shots: Vec<SimilarShotItem>,
 }
 
-#[derive(Deserialize, utoipa::IntoParams)]
-pub(super) struct ShotsQuery {
-    q: Option<String>,
-    person_id: Option<String>,
-    status: Option<String>,
-    from: Option<String>,
-    to: Option<String>,
+/// What a person means by "these shots".
+///
+/// This is the *only* filter language in Phos, and FR7's batches reuse it
+/// wholesale rather than growing a second one: a batch is this query plus a
+/// line plus a cursor. Every field is optional and they are ANDed, so an empty
+/// query is the whole library — which is why the batch endpoints make you
+/// confirm a count before anything is queued.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, utoipa::IntoParams, ToSchema)]
+pub struct ShotsQuery {
+    /// Free text: matches a file's path or the shot's description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    /// Exact match on the shot's primary person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_id: Option<String>,
+    /// Review status, or the magic value `unsorted` for "belongs to nobody".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Inclusive lower bound on the shot's timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Inclusive upper bound on the shot's timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+}
+
+/// Turn a query into `WHERE` fragments over `shots s`, appending each one's
+/// binds in the order the `?N` placeholders name them.
+///
+/// Split out of [`get_shots`] so that the batch selector can add its own
+/// conditions (a cursor, an already-generated filter) to the same list rather
+/// than reimplementing the filter language. The caller owns `conditions` and
+/// `binds`, so it decides what else is ANDed in and in what order — the only
+/// contract is that a fragment's `?N` refers to `binds[N-1]`.
+pub(crate) fn shot_conditions(
+    params: &ShotsQuery,
+    conditions: &mut Vec<String>,
+    binds: &mut Vec<String>,
+) {
+    if let Some(ref person_id) = params.person_id {
+        binds.push(person_id.clone());
+        conditions.push(format!("s.primary_person_id = ?{}", binds.len()));
+    }
+
+    if let Some(ref status) = params.status {
+        if status == "unsorted" {
+            // A shot pointing at a person row that is gone is owned by nobody:
+            // it shows in no person's list, so it has to show in this one. Same
+            // rule as `people::browse_graph` and the organize stats.
+            conditions.push(
+                "(s.primary_person_id IS NULL OR NOT EXISTS \
+                 (SELECT 1 FROM people pu WHERE pu.id = s.primary_person_id)) \
+                 AND EXISTS (SELECT 1 FROM files fu WHERE fu.shot_id = s.id)"
+                    .to_string(),
+            );
+        } else {
+            binds.push(status.clone());
+            conditions.push(format!("s.review_status = ?{}", binds.len()));
+        }
+    }
+
+    if let Some(ref q) = params.q {
+        let pattern = format!("%{}%", q);
+        binds.push(pattern.clone());
+        let idx1 = binds.len();
+        binds.push(pattern);
+        let idx2 = binds.len();
+        conditions.push(format!(
+            "(EXISTS (SELECT 1 FROM files fq WHERE fq.shot_id = s.id AND fq.path LIKE ?{}) OR s.description LIKE ?{})",
+            idx1, idx2
+        ));
+    }
+
+    // `CAST(... AS TEXT)` rather than a bare column reference, and it is not
+    // decoration. `shots.timestamp` is declared `TIMESTAMP`, which gives it
+    // SQLite's NUMERIC affinity, and comparing it to a bound that happens to
+    // parse as a number converts the *bound* to an integer — after which every
+    // stored value, being text, sorts above it and the filter matches nothing.
+    // A bare year is exactly such a bound, so `to=1990` silently returned an
+    // empty gallery. The cast pins both sides to text, which is the comparison
+    // these ISO-ish strings were always meant to get.
+    if let Some(ref from) = params.from {
+        binds.push(from.clone());
+        conditions.push(format!("CAST(s.timestamp AS TEXT) >= ?{}", binds.len()));
+    }
+
+    if let Some(ref to) = params.to {
+        binds.push(to.clone());
+        conditions.push(format!("CAST(s.timestamp AS TEXT) <= ?{}", binds.len()));
+    }
+}
+
+/// Bind an arbitrary number of text parameters onto a raw query.
+///
+/// `sql_query(..).bind(..)` changes its own static type on every call, so a
+/// loop needs the boxed form. This used to be a `match` on the bind count with
+/// one arm per arity and a `_` arm that silently dropped anything past the
+/// sixth — a ceiling FR7's extra conditions would have walked straight into.
+pub(crate) fn bind_text_all(
+    sql: &str,
+    binds: Vec<String>,
+) -> diesel::query_builder::BoxedSqlQuery<'static, diesel::sqlite::Sqlite, diesel::query_builder::SqlQuery>
+{
+    let mut query = diesel::sql_query(sql.to_string()).into_boxed();
+    for value in binds {
+        query = query.bind::<diesel::sql_types::Text, _>(value);
+    }
+    query
 }
 
 /// GET /api/shots - list shots with query params: person_id, status, q, from, to
@@ -88,50 +189,7 @@ pub(super) async fn get_shots(
     );
     let mut conditions: Vec<String> = Vec::new();
     let mut bind_values: Vec<String> = Vec::new();
-
-    if let Some(ref person_id) = params.person_id {
-        bind_values.push(person_id.clone());
-        conditions.push(format!("s.primary_person_id = ?{}", bind_values.len()));
-    }
-
-    if let Some(ref status) = params.status {
-        if status == "unsorted" {
-            // A shot pointing at a person row that is gone is owned by nobody:
-            // it shows in no person's list, so it has to show in this one. Same
-            // rule as `people::browse_graph` and the organize stats.
-            conditions.push(
-                "(s.primary_person_id IS NULL OR NOT EXISTS \
-                 (SELECT 1 FROM people pu WHERE pu.id = s.primary_person_id)) \
-                 AND EXISTS (SELECT 1 FROM files fu WHERE fu.shot_id = s.id)"
-                    .to_string(),
-            );
-        } else {
-            bind_values.push(status.clone());
-            conditions.push(format!("s.review_status = ?{}", bind_values.len()));
-        }
-    }
-
-    if let Some(ref q) = params.q {
-        let pattern = format!("%{}%", q);
-        bind_values.push(pattern.clone());
-        let idx1 = bind_values.len();
-        bind_values.push(pattern);
-        let idx2 = bind_values.len();
-        conditions.push(format!(
-            "(EXISTS (SELECT 1 FROM files fq WHERE fq.shot_id = s.id AND fq.path LIKE ?{}) OR s.description LIKE ?{})",
-            idx1, idx2
-        ));
-    }
-
-    if let Some(ref from) = params.from {
-        bind_values.push(from.clone());
-        conditions.push(format!("s.timestamp >= ?{}", bind_values.len()));
-    }
-
-    if let Some(ref to) = params.to {
-        bind_values.push(to.clone());
-        conditions.push(format!("s.timestamp <= ?{}", bind_values.len()));
-    }
+    shot_conditions(&params, &mut conditions, &mut bind_values);
 
     if !conditions.is_empty() {
         sql.push_str(" WHERE ");
@@ -164,54 +222,7 @@ pub(super) async fn get_shots(
         synthetic: bool,
     }
 
-    // Build the sql_query and bind parameters dynamically
-    let query = diesel::sql_query(&sql);
-
-    // We need to bind each parameter. Since diesel::sql_query().bind() returns a
-    // different type each time, we need to handle this with a macro-like approach.
-    // Instead, we'll use the boxed approach with raw SQL parameter embedding.
-    // Actually, diesel::sql_query uses positional params (?1, ?2, etc.) for SQLite.
-    // We need to bind them in order.
-
-    // Unfortunately, diesel's sql_query chaining changes the type with each bind,
-    // making dynamic binding difficult. We'll handle up to the maximum number of
-    // parameters we can have (max 5: person_id, status, q_pattern1, q_pattern2, from, to = 6 max).
-    let rows: Result<Vec<ShotRow>, _> = match bind_values.len() {
-        0 => query.load::<ShotRow>(&mut conn),
-        1 => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .load::<ShotRow>(&mut conn),
-        2 => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
-            .load::<ShotRow>(&mut conn),
-        3 => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
-            .load::<ShotRow>(&mut conn),
-        4 => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[3])
-            .load::<ShotRow>(&mut conn),
-        5 => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[3])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[4])
-            .load::<ShotRow>(&mut conn),
-        _ => query
-            .bind::<diesel::sql_types::Text, _>(&bind_values[0])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[1])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[2])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[3])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[4])
-            .bind::<diesel::sql_types::Text, _>(&bind_values[5])
-            .load::<ShotRow>(&mut conn),
-    };
+    let rows: Result<Vec<ShotRow>, _> = bind_text_all(&sql, bind_values).load::<ShotRow>(&mut conn);
 
     let shots = match rows {
         Ok(rows) => rows
@@ -1606,4 +1617,118 @@ pub(super) async fn get_similar_shot_groups(
         offset,
         limit,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::connection::SimpleConnection;
+
+    fn library() -> (tempfile::TempDir, SqliteConnection) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".phos.db");
+        crate::db::init_and_migrate(&db_path).unwrap();
+        let mut conn = crate::db::open_diesel_connection(&db_path).unwrap();
+        conn.batch_execute(
+            "INSERT INTO people (id, name) VALUES ('p-1', 'Grandma');
+             INSERT INTO shots (id, timestamp, primary_person_id) VALUES
+               ('s-1', '1950-01-01 00:00:00', 'p-1'),
+               ('s-2', '1975-06-01 00:00:00', 'p-1'),
+               ('s-3', '2005-06-01 00:00:00', 'p-1'),
+               ('s-4', '2020-06-01 00:00:00', NULL);",
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn matching(conn: &mut SqliteConnection, query: &ShotsQuery) -> Vec<String> {
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            id: String,
+        }
+        let mut conditions = Vec::new();
+        let mut binds = Vec::new();
+        shot_conditions(query, &mut conditions, &mut binds);
+        let sql = if conditions.is_empty() {
+            "SELECT s.id AS id FROM shots s ORDER BY s.id".to_string()
+        } else {
+            format!(
+                "SELECT s.id AS id FROM shots s WHERE {} ORDER BY s.id",
+                conditions.join(" AND ")
+            )
+        };
+        bind_text_all(&sql, binds)
+            .load::<Row>(conn)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect()
+    }
+
+    #[test]
+    fn a_bare_year_bound_actually_filters() {
+        // `shots.timestamp` is declared TIMESTAMP, so it carries SQLite's
+        // NUMERIC affinity: comparing it to a bound that parses as a number
+        // converts the *bound* to an integer, and every stored value — text —
+        // then sorts above it. `to=1990` used to match nothing at all, which is
+        // "everything of Grandma before 1990" returning an empty gallery.
+        let (_dir, mut conn) = library();
+        let before_1990 = ShotsQuery {
+            to: Some("1990".into()),
+            ..Default::default()
+        };
+        assert_eq!(matching(&mut conn, &before_1990), vec!["s-1", "s-2"]);
+
+        let since_2000 = ShotsQuery {
+            from: Some("2000".into()),
+            ..Default::default()
+        };
+        assert_eq!(matching(&mut conn, &since_2000), vec!["s-3", "s-4"]);
+    }
+
+    #[test]
+    fn a_full_date_bound_still_works() {
+        let (_dir, mut conn) = library();
+        let query = ShotsQuery {
+            from: Some("1960-01-01".into()),
+            to: Some("2010-12-31".into()),
+            ..Default::default()
+        };
+        assert_eq!(matching(&mut conn, &query), vec!["s-2", "s-3"]);
+    }
+
+    #[test]
+    fn the_filters_are_anded_and_their_binds_stay_in_step() {
+        let (_dir, mut conn) = library();
+        let query = ShotsQuery {
+            person_id: Some("p-1".into()),
+            to: Some("1990".into()),
+            ..Default::default()
+        };
+        assert_eq!(matching(&mut conn, &query), vec!["s-1", "s-2"]);
+    }
+
+    #[test]
+    fn more_than_six_binds_no_longer_falls_off_the_end() {
+        // The old hand-written bind ladder had one arm per arity and a `_` arm
+        // that bound exactly six, so a seventh condition would have been
+        // dropped — or panicked on an index it never reached. The boxed query
+        // binds however many there are.
+        let (_dir, mut conn) = library();
+        let query = ShotsQuery {
+            person_id: Some("p-1".into()),
+            status: Some("kept".into()),
+            q: Some("nothing".into()),
+            from: Some("1900".into()),
+            to: Some("2100".into()),
+        };
+        // Six binds (q contributes two) and no panic; nothing matches because
+        // no shot is `kept`.
+        let mut conditions = Vec::new();
+        let mut binds = Vec::new();
+        shot_conditions(&query, &mut conditions, &mut binds);
+        assert_eq!(binds.len(), 6);
+        assert!(matching(&mut conn, &query).is_empty());
+    }
 }

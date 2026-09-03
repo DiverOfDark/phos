@@ -204,6 +204,12 @@ pub struct NewLineStage<'a> {
     pub source_mode: Option<&'a str>,
     /// Whether this stage's intermediate survives the run.
     pub keep_output: bool,
+    /// Keys this stage deliberately does not pin, as a JSON array — the ones
+    /// starting a run may supply, and the only ones it may.
+    pub exposed: Option<&'a str>,
+    /// Whether this stage parks its run and asks a person which of its takes
+    /// go on. FR5c's hold point.
+    pub hold_for_review: bool,
 }
 
 // ── Runs ──
@@ -220,6 +226,89 @@ pub struct NewRun<'a> {
     /// correctly after the line is renamed or deleted.
     pub label: &'a str,
     pub stage_count: i32,
+    /// What the sender answered for the stages that asked — a JSON object
+    /// keyed by stage index, snapshotted here because the worker queues the
+    /// later stages long after the request that carried the answers is gone.
+    pub stage_values: Option<&'a str>,
+    /// The batch that opened this run, if a batch did. `None` for every run
+    /// started one shot at a time.
+    pub batch_id: Option<&'a str>,
+}
+
+// ── Batches ──
+
+/// A query, a line, and a cursor: FR7's whole batch.
+///
+/// The runs it will open are not rows yet and mostly never will be at once —
+/// the feeder pulls the next handful each tick from `cursor_key`/`cursor_shot_id`
+/// onward. See the `batches` migration for why that is the shape.
+#[derive(Insertable)]
+#[diesel(table_name = batches)]
+pub struct NewBatch<'a> {
+    pub id: &'a str,
+    pub line_id: &'a str,
+    pub label: &'a str,
+    /// `{"kind":"ids",...}` or `{"kind":"query",...}` — see `batch::Selection`.
+    pub selection_json: &'a str,
+    pub stage_values: Option<&'a str>,
+    pub skip_if_generated: bool,
+    pub matched_total: Option<i32>,
+    pub skipped_total: Option<i32>,
+    pub est_tasks: Option<i32>,
+    pub est_gpu_seconds: Option<i32>,
+    pub est_disk_bytes: Option<i64>,
+    pub daily_task_cap: Option<i32>,
+    pub window_start_minute: Option<i32>,
+    pub window_end_minute: Option<i32>,
+    pub disk_floor_bytes: Option<i64>,
+    pub max_outstanding_holds: Option<i32>,
+}
+
+/// What the feeder writes back after a tick.
+///
+/// `paused_reason` is `Option<Option<..>>` on purpose: the outer `None` leaves
+/// the column alone, the inner `None` clears it. A batch that resumes has to be
+/// able to say "no reason any more".
+#[derive(AsChangeset, Default)]
+#[diesel(table_name = batches)]
+pub struct BatchChangeset<'a> {
+    pub status: Option<&'a str>,
+    pub paused_reason: Option<Option<&'a str>>,
+    pub cursor_key: Option<Option<&'a str>>,
+    pub cursor_shot_id: Option<Option<&'a str>>,
+    pub finished_at: Option<Option<&'a str>>,
+}
+
+/// A query plus the line you usually send it to. It never fires on its own.
+#[derive(Insertable)]
+#[diesel(table_name = saved_selections)]
+pub struct NewSavedSelection<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub line_id: Option<&'a str>,
+    pub selection_json: &'a str,
+    pub caps_json: Option<&'a str>,
+    pub skip_if_generated: bool,
+}
+
+/// One verdict on one hold, appended and never rewritten.
+///
+/// `reviewed_task_ids` is every take the verdict was given over and
+/// `kept_task_ids` the subset that continues — both JSON arrays of task ids.
+/// The first is what tells the advance pass a take was *passed over* rather
+/// than not yet looked at, which is the difference between a run that goes on
+/// and a run that parks again forever.
+#[derive(Insertable)]
+#[diesel(table_name = run_holds)]
+pub struct NewRunHold<'a> {
+    pub id: &'a str,
+    pub run_id: &'a str,
+    pub stage_idx: i32,
+    /// `continue`, `regenerate` or `cancel`.
+    pub verdict: &'a str,
+    pub reviewed_task_ids: &'a str,
+    pub kept_task_ids: &'a str,
+    pub note: Option<&'a str>,
 }
 
 #[derive(AsChangeset, Default)]

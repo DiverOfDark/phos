@@ -305,6 +305,71 @@ fn random_in(min: i64, max: i64) -> i64 {
     (min as i128 + (raw as i128 % span)) as i64
 }
 
+// ===== Another take of the same stage =======================================
+
+/// Move every seed on, and nothing else.
+///
+/// What *regenerate* means at a hold point: the same stage, the same prompt,
+/// the same source, the same everything a person set — run again, differently.
+/// The only thing that may move is the noise, so this touches exactly the keys
+/// the workflow's contract calls a seed and leaves the rest of the map alone.
+///
+/// Three cases, because a stage says one of three things about a seed:
+///
+/// * **Swept by count.** `Random` needs nothing: [`expand`] draws afresh every
+///   time it is called. `Increment` is advanced by the width of the sweep, so
+///   1000–1003 becomes 1004–1007 — fresh seeds that keep the character of the
+///   sweep somebody asked for, rather than being quietly turned into random
+///   ones.
+/// * **Swept by an explicit list.** Left alone. A person who typed the seeds
+///   asked for those seeds, and silently running different ones is the one
+///   thing regenerate must not do.
+/// * **Pinned, or not set at all.** A fresh draw. Not setting it is the case
+///   worth being careful about: the stage would otherwise run the graph's own
+///   literal seed again and produce the identical clip, which makes the button
+///   look broken. Writing a seed the line did not have is the smallest possible
+///   change that makes "again, differently" true.
+pub fn reseed(seed_keys: &[String], base: &mut ParameterMap, vary: &mut VaryMap) {
+    reseed_with(seed_keys, base, vary, &mut random_in)
+}
+
+/// [`reseed`], with the randomness handed in — tests pass a counter.
+pub fn reseed_with(
+    seed_keys: &[String],
+    base: &mut ParameterMap,
+    vary: &mut VaryMap,
+    draw: &mut impl FnMut(i64, i64) -> i64,
+) {
+    for key in seed_keys {
+        let Some(variation) = vary.get(key) else {
+            base.insert(
+                key.clone(),
+                Value::Number(Number::from(draw(0, MAX_RANDOM_SEED))),
+            );
+            continue;
+        };
+        let spec = variation.spec();
+        if !spec.values.is_empty() {
+            continue;
+        }
+        let Some(count) = spec.count.filter(|c| *c > 0) else {
+            continue;
+        };
+        if spec.mode != VaryMode::Increment {
+            continue;
+        }
+        let min = spec.min.unwrap_or(0);
+        let max = spec.max.unwrap_or(MAX_RANDOM_SEED).max(min);
+        let span = (max as i128 - min as i128) + 1;
+        let start = base.get(key).and_then(Value::as_i64).unwrap_or(min);
+        let moved = (start as i128 - min as i128 + count as i128).rem_euclid(span);
+        base.insert(
+            key.clone(),
+            Value::Number(Number::from((min as i128 + moved) as i64)),
+        );
+    }
+}
+
 // ===== Substitution =========================================================
 
 /// Write this run's typed parameters over one node's literal inputs.
@@ -759,5 +824,91 @@ mod tests {
     fn an_empty_parameter_map_changes_nothing() {
         let before = json!({ "steps": 20, "cfg": 8.0, "model": ["1", 0] });
         assert_eq!(applied(before.clone(), &[]), before);
+    }
+
+    // === Regenerating: fresh seeds and nothing else ==========================
+
+    #[test]
+    fn regenerating_moves_the_seed_and_leaves_everything_else_alone() {
+        let mut base = params(&[
+            ("3.seed", json!(42)),
+            ("3.steps", json!(20)),
+            ("6.text", json!("a lighthouse")),
+        ]);
+        let mut vary = VaryMap::new();
+        reseed_with(
+            &["3.seed".to_string()],
+            &mut base,
+            &mut vary,
+            &mut counting_draw(),
+        );
+        assert_eq!(base["3.seed"], json!(0), "a fresh draw");
+        assert_eq!(base["3.steps"], json!(20), "the craft is untouched");
+        assert_eq!(base["6.text"], json!("a lighthouse"));
+        assert!(vary.is_empty(), "and it did not become a sweep");
+    }
+
+    #[test]
+    fn a_stage_that_never_pinned_a_seed_still_gets_a_new_one() {
+        // Otherwise regenerate re-runs the graph's own literal seed and hands
+        // back the identical clip, which reads as a broken button.
+        let mut base = ParameterMap::new();
+        let mut vary = VaryMap::new();
+        reseed_with(
+            &["3.seed".to_string()],
+            &mut base,
+            &mut vary,
+            &mut counting_draw(),
+        );
+        assert_eq!(base["3.seed"], json!(0));
+    }
+
+    #[test]
+    fn an_incrementing_sweep_moves_on_by_its_own_width() {
+        // 1000–1003 was generation one; generation two is 1004–1007, which is
+        // four fresh seeds that are still the sweep somebody asked for.
+        let mut base = params(&[("3.seed", json!(1000))]);
+        let mut vary = vary(json!({ "3.seed": { "count": 4, "mode": "increment" } }));
+        reseed_with(
+            &["3.seed".to_string()],
+            &mut base,
+            &mut vary,
+            &mut counting_draw(),
+        );
+        assert_eq!(base["3.seed"], json!(1004));
+        let seeds: Vec<i64> = expand_with(&base, &vary, &mut counting_draw())
+            .unwrap()
+            .iter()
+            .map(|t| t["3.seed"].as_i64().unwrap())
+            .collect();
+        assert_eq!(seeds, [1004, 1005, 1006, 1007]);
+    }
+
+    #[test]
+    fn a_random_sweep_needs_no_help_and_an_explicit_list_gets_none() {
+        // Random redraws on every expansion, so the base is left as it is…
+        let mut base = params(&[("3.seed", json!(42))]);
+        let mut swept = vary(json!({ "3.seed": 4 }));
+        reseed_with(
+            &["3.seed".to_string()],
+            &mut base,
+            &mut swept,
+            &mut counting_draw(),
+        );
+        assert_eq!(base["3.seed"], json!(42));
+
+        // …and a list of exact seeds is what somebody typed, so it stands.
+        let mut listed = vary(json!({ "3.seed": [11, 22, 33] }));
+        reseed_with(
+            &["3.seed".to_string()],
+            &mut base,
+            &mut listed,
+            &mut counting_draw(),
+        );
+        assert_eq!(base["3.seed"], json!(42));
+        assert_eq!(
+            listed["3.seed"].spec().values,
+            vec![json!(11), json!(22), json!(33)]
+        );
     }
 }
