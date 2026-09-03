@@ -67,11 +67,7 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 ### Frontend Structure (`frontend/src/`)
 - **`App.vue`** — App shell only: sidebar nav (topbar + lane tabs on mobile), import dialog, `<router-view>`
 - **`components/ReviewDesk.vue`** — One screen, three lanes (`?lane=` → shots / duplicates / faces); `/variations` redirects into it
-<<<<<<< HEAD
-- **`components/WorkflowsPage.vue`** — Three tabs: workflows, lines, and a queue that is a schedule
-=======
-- **`components/WorkflowsPage.vue`** — Five tabs: templates, workflows, lines, batches, and a queue that is a schedule
->>>>>>> a85dd12 (docs: say what a batch is, and which of its guardrails are load-bearing)
+- **`components/WorkflowsPage.vue`** — Four tabs: workflows, lines, batches, and a queue that is a schedule
   board of **runs** — one row per run saying `STAGE 2/4 · UPSCALE · 00:03:12`, with the tasks
   underneath one click away. A four-stage run as four unrelated rows is what it replaced. A run
   parked at a hold point reads `HELD · 4 TAKES` and opens a review strip: its takes, tick the ones
