@@ -340,7 +340,13 @@ fn continue_one(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("stage {} is no longer part of the line", next_idx + 1))?;
 
-    let mut plan = stage.plan_for(conn, &c.shot_id);
+    // The answers this run was started with. A stage that asked for a value at
+    // send time gets it here, whichever hour of the run it is queued in — and
+    // `plan_for` folds them in before it compiles anything out of them.
+    let supplied = crate::comfyui::runs::supplied_for(c.stage_values.as_deref(), next_idx);
+    let mut plan = stage
+        .plan_for(conn, &c.shot_id, &supplied)
+        .map_err(|e| e.message)?;
     let source_file_id = match &handoff {
         Handoff::File(file_id) => Some(file_id.as_str()),
         Handoff::Description {
@@ -376,12 +382,6 @@ fn continue_one(
         }
     };
 
-    // The answers this run was started with. A stage that asked for a value at
-    // send time gets it here, whichever hour of the run it is queued in. Applied
-    // after the description binds, so an explicit answer from the sender wins.
-    let supplied = crate::comfyui::runs::supplied_for(c.stage_values.as_deref(), next_idx);
-    plan.accept(&stage.exposed, &supplied)
-        .map_err(|e| e.message)?;
     let queued = queue_stage(
         conn,
         &c.run_id,

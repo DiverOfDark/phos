@@ -381,7 +381,7 @@
             "description": "Enhancement task(s) queued"
           },
           "400": {
-            "description": "Unrecognised source_mode, or an unusable sweep"
+            "description": "Unrecognised source_mode, one this workflow cannot take, or an unusable sweep"
           },
           "404": {
             "description": "Shot or workflow not found"
@@ -401,7 +401,7 @@
           "comfyui"
         ],
         "summary": "Get shot generation history",
-        "description": "Returns the workflow and text overrides used to generate each non-original file for a shot.",
+        "description": "Returns the workflow, text overrides and typed parameters used to generate each non-original file for a shot.",
         "operationId": "comfyui_shot_generations",
         "parameters": [
           {
@@ -812,7 +812,7 @@
           "comfyui"
         ],
         "summary": "Get ComfyUI node definitions",
-        "description": "What ComfyUI says its installed node classes take: every input's name, type, default and range, and for an enum its contents — the checkpoints, samplers, schedulers and LoRAs installed on that server. Cached in memory and re-read when ComfyUI comes back after being down. Always 200: a server that is unreachable or too old to have /object_info answers `available: false`, and the console falls back to plain text boxes.",
+        "description": "What ComfyUI says its installed node classes take: every input's name, type, default and range, and for an enum its contents — the checkpoints, samplers, schedulers and LoRAs installed on that server. Cached in memory for five minutes and re-read when ComfyUI comes back after being down; `refresh=true` re-reads it now. Always 200: a server that is unreachable or too old to have /object_info answers `available: false`, and the console falls back to plain text boxes.",
         "operationId": "comfyui_nodes",
         "parameters": [
           {
@@ -825,6 +825,15 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          {
+            "name": "refresh",
+            "in": "query",
+            "description": "Read `/object_info` from ComfyUI now instead of serving the cached\ncopy. For after installing a model or a node pack.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -874,7 +883,7 @@
           {
             "name": "cursor",
             "in": "query",
-            "description": "Cursor: `created_at` of the last run from the previous page",
+            "description": "Cursor: `next_cursor` from the previous page — `created_at|id` of its\nlast run. The id is the tie-breaker: a migrated backlog can put dozens\nof runs on the same second, and a timestamp alone would skip the rest\nof them.",
             "required": false,
             "schema": {
               "type": [
@@ -1447,6 +1456,9 @@
           "404": {
             "description": "Workflow not found"
           },
+          "409": {
+            "description": "A production line still uses this workflow"
+          },
           "500": {
             "description": "Internal server error"
           },
@@ -1811,6 +1823,9 @@
           "404": {
             "description": "Face or target person not found"
           },
+          "409": {
+            "description": "Face is on a machine-generated file and cannot join the person model"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -2000,6 +2015,9 @@
           },
           "404": {
             "description": "File not found"
+          },
+          "409": {
+            "description": "File is machine-generated; faces on it are not accepted"
           },
           "500": {
             "description": "Internal server error"
@@ -3326,7 +3344,8 @@
         "required": [
           "id",
           "is_original",
-          "thumbnail_url"
+          "thumbnail_url",
+          "synthetic"
         ],
         "properties": {
           "file_size": {
@@ -3347,6 +3366,10 @@
               "string",
               "null"
             ]
+          },
+          "synthetic": {
+            "type": "boolean",
+            "description": "A workflow made this file, not a camera. The client says so."
           },
           "thumbnail_url": {
             "type": "string"
@@ -3420,7 +3443,7 @@
             "items": {
               "type": "string"
             },
-            "description": "The keys this stage deliberately left open — FR5b's *exposed*\ndisposition. Travels with the stage for the same reason `parameters`\ndoes: a line that asks the sender for a seed is not the same line once\nit has been carried somewhere that pins one."
+            "description": "Keys this stage leaves to whoever sends the line — the *exposed*\ndisposition. Optional, like everything else a hand-written template\nwould rather not say."
           },
           "hold_for_review": {
             "type": "boolean",
@@ -5440,10 +5463,8 @@
           },
           "values": {
             "type": "array",
-            "items": {
-              "type": "object"
-            },
-            "description": "Run exactly these values, in this order."
+            "items": {},
+            "description": "Run exactly these values, in this order.\n\nAny scalar JSON value: `[4.0, 6.0, 8.0]` for a cfg,\n`[\"sd15.safetensors\", \"sdxl.safetensors\"]` for a checkpoint. Declared\nas unconstrained values, not objects — `Vec<Object>` would make a\ngenerated client refuse every valid list."
           }
         }
       },

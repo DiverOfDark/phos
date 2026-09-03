@@ -92,17 +92,31 @@ impl StageRow {
         }
     }
 
-    /// The stage as something queueable, with everything only Phos can supply
-    /// already written into its override map.
+    /// The stage as something queueable, in the order the answers layer:
     ///
-    /// Today that is one thing: a **describe** stage is handed the instruction
-    /// compiled from what the library knows about this shot — the person names
-    /// clustering found, the EXIF date and place, the caption — which is the
-    /// whole point of FR9 and is a single `text_overrides` entry.
-    pub fn plan_for(&self, conn: &mut SqliteConnection, shot_id: &str) -> StagePlan<'_> {
+    /// 1. what the line pinned ([`StageRow::plan`]);
+    /// 2. what the sender answered for the keys this stage left **exposed**
+    ///    ([`StagePlan::accept`]) — refused by name if they answered one it
+    ///    pinned;
+    /// 3. what only Phos can supply. Today that is one thing: a **describe**
+    ///    stage is handed the instruction compiled from what the library knows
+    ///    about this shot — the person names clustering found, the EXIF date
+    ///    and place, the caption — as a single `text_overrides` entry.
+    ///
+    /// Third rather than second because a describe stage may leave
+    /// `phos:intent` exposed, and the instruction has to be compiled out of the
+    /// intent that ended up on the stage rather than the one the line was drawn
+    /// with.
+    pub fn plan_for(
+        &self,
+        conn: &mut SqliteConnection,
+        shot_id: &str,
+        supplied: &SuppliedValues,
+    ) -> Result<StagePlan<'_>, LineError> {
         let mut plan = self.plan();
+        plan.accept(&self.exposed, supplied)?;
         compile_describe_instruction(conn, shot_id, &self.contract, &mut plan.text_overrides);
-        plan
+        Ok(plan)
     }
 
     /// The stage as something queueable: its stored JSON parsed, and the
@@ -580,12 +594,12 @@ pub(crate) fn start_line_run(
             stage_count,
             stage_values.as_deref(),
         )?;
-        let mut plan = stages[0].plan_for(conn, shot_id);
-        // Already checked above, so this cannot refuse; applied again because
-        // the plan is rebuilt inside the transaction.
-        if let Some(supplied) = answers.get("0") {
-            let _ = plan.accept(&stages[0].exposed, supplied);
-        }
+        // Already checked above, so the `accept` inside this cannot refuse;
+        // applied again because the plan is rebuilt inside the transaction.
+        let first = answers.get("0").cloned().unwrap_or_default();
+        let plan = stages[0]
+            .plan_for(conn, shot_id, &first)
+            .map_err(|e| diesel::result::Error::QueryBuilderError(e.message.into()))?;
         let task_ids = queue_stage(conn, &run_id, shot_id, &plan, None, None)
             .map_err(|e| diesel::result::Error::QueryBuilderError(e.into()))?;
         Ok(RunStart {
