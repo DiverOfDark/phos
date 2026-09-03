@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/comfyui-batch-by-query"
+    "version": "feat/comfyui-stage-ordered-drain"
   },
   "paths": {
     "/api/auth/callback": {
@@ -1201,7 +1201,7 @@
           "comfyui"
         ],
         "summary": "Give a verdict on a held run",
-        "description": "`continue` proceeds with the takes named — more than one is ordinary, and each walks the rest of the line for itself. `regenerate` runs the held stage again with fresh seeds and nothing else changed, and the run holds again on the new takes. `cancel` abandons the run and removes its intermediates except where a stage says keep.",
+        "description": "`continue` proceeds with the takes named — more than one is ordinary, and each walks the rest of the line for itself. `regenerate` runs the held stage again with fresh seeds and nothing else changed, and the run holds again on the new takes. `cancel` abandons the run and removes its intermediates except where a stage says keep. Takes named in `reject` have their files removed from the library outright — that is the curation lane's `X`, and it is how a farm's disk stays habitable. `scope: batch` applies the same verdict to the rest of the batch; a rejection never travels with it.",
         "operationId": "post_verdict",
         "parameters": [
           {
@@ -1229,7 +1229,7 @@
             "description": "Verdict recorded"
           },
           "400": {
-            "description": "The verdict names no takes, or a take this hold is not offering"
+            "description": "The verdict names no takes, names a take this hold is not offering, or is not a verdict"
           },
           "404": {
             "description": "Run not found"
@@ -1355,6 +1355,51 @@
           },
           "404": {
             "description": "No such selection"
+          }
+        }
+      }
+    },
+    "/api/comfyui/takes": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Every run waiting on a verdict",
+        "description": "The curation lane: one page of held runs, oldest first, each with the takes it is holding, the file those takes were made from, the shot's current main file, and what continuing with one take will cost. Oldest first because this is a backlog somebody is draining, not a feed they are browsing.",
+        "operationId": "list_takes",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Held runs per page. Default 24, capped at 100 — each row prices its own\ncontinuation, so a page is real work.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Cursor: `created_at` of the last run from the previous page.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of held runs"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
           }
         }
       }
@@ -2242,6 +2287,48 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "File not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/files/{id}/rating": {
+      "put": {
+        "tags": [
+          "files"
+        ],
+        "summary": "Rate a file",
+        "description": "The Takes lane's `1`–`5` keys. `null` clears the rating, which is a different answer from zero and is drawn differently. Any file may be rated, not only a generated one.",
+        "operationId": "put_rating",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "File ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RatingPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The rating as stored"
           },
           "404": {
             "description": "File not found"
@@ -5119,6 +5206,19 @@
           "description": "Anything a newer Phos wrote that this one has no field for. Kept so a\nround trip through an older binary does not quietly drop provenance.\n\nFlattened, so it has no name of its own in the JSON and nothing to\npublish in the schema — a client generated from an older spec simply\ndoes not see the newer keys, which is the point."
         }
       },
+      "RatingPayload": {
+        "type": "object",
+        "properties": {
+          "rating": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "One to five, or `null` to clear it. Out of range is clamped, not\nrefused: the lane cannot produce a six, so one is a caller's bug and\nlosing somebody's keystroke over it helps nobody."
+          }
+        }
+      },
       "ReassignFacePayload": {
         "type": "object",
         "description": "Reassign a face to a different person",
@@ -6001,6 +6101,20 @@
               "null"
             ],
             "description": "Why, in the reviewer's own words. Kept with the verdict."
+          },
+          "reject": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The takes whose **bytes go**, by task id — the curation lane's `X`.\n\nDeleting, not passing over: a take nobody named is disposed of by its\nstage's `keep_output` policy, which is the line author's decision, while\na rejected one goes regardless, which is the reviewer's. Generated video\nis enormous and a farm fills a disk in days, so this is the key that\nkeeps the library habitable.\n\nNever carried to another run by `scope`, whatever it says. Deleting\nbytes is something you do to pictures you have looked at."
+          },
+          "scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How far this verdict reaches: `run` (the default) or `batch`.\n\n`batch` applies the same verdict to every other run of the same FR7\nbatch held at the same stage of the same line. `continue` resolves there\nto *all* of that run's waiting takes, because task ids are per run and\nthe selection made here does not exist there."
           },
           "verdict": {
             "type": "string",
