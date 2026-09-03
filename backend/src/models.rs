@@ -204,6 +204,12 @@ pub struct NewLineStage<'a> {
     pub source_mode: Option<&'a str>,
     /// Whether this stage's intermediate survives the run.
     pub keep_output: bool,
+    /// Keys this stage deliberately does not pin, as a JSON array — the ones
+    /// starting a run may supply, and the only ones it may.
+    pub exposed: Option<&'a str>,
+    /// Whether this stage parks its run and asks a person which of its takes
+    /// go on. FR5c's hold point.
+    pub hold_for_review: bool,
 }
 
 // ── Runs ──
@@ -220,6 +226,30 @@ pub struct NewRun<'a> {
     /// correctly after the line is renamed or deleted.
     pub label: &'a str,
     pub stage_count: i32,
+    /// What the sender answered for the stages that asked — a JSON object
+    /// keyed by stage index, snapshotted here because the worker queues the
+    /// later stages long after the request that carried the answers is gone.
+    pub stage_values: Option<&'a str>,
+}
+
+/// One verdict on one hold, appended and never rewritten.
+///
+/// `reviewed_task_ids` is every take the verdict was given over and
+/// `kept_task_ids` the subset that continues — both JSON arrays of task ids.
+/// The first is what tells the advance pass a take was *passed over* rather
+/// than not yet looked at, which is the difference between a run that goes on
+/// and a run that parks again forever.
+#[derive(Insertable)]
+#[diesel(table_name = run_holds)]
+pub struct NewRunHold<'a> {
+    pub id: &'a str,
+    pub run_id: &'a str,
+    pub stage_idx: i32,
+    /// `continue`, `regenerate` or `cancel`.
+    pub verdict: &'a str,
+    pub reviewed_task_ids: &'a str,
+    pub kept_task_ids: &'a str,
+    pub note: Option<&'a str>,
 }
 
 #[derive(AsChangeset, Default)]

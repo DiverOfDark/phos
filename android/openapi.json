@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "feat/comfyui-prompt-compiler"
+    "version": "feat/comfyui-hold-points"
   },
   "paths": {
     "/api/auth/callback": {
@@ -504,7 +504,7 @@
           "comfyui"
         ],
         "summary": "Import a production line",
-        "description": "Read a line out of an exported bundle — the same format bundled templates ship in. Its workflows are created, or reused where an identical graph is already here, and its requirements are checked against what this ComfyUI has installed. A line whose nodes or models are missing is still imported; the response says what is missing. A name already in use is suffixed, never overwritten. Pass `dry_run=true` for the report alone.",
+        "description": "Read a line out of an exported bundle. Its workflows are created, or reused where an identical graph is already here, and its requirements are checked against what this ComfyUI has installed. A line whose nodes or models are missing is still imported; the response says what is missing. A name already in use is suffixed, never overwritten. Pass `dry_run=true` for the report alone.",
         "operationId": "import_line",
         "parameters": [
           {
@@ -545,6 +545,80 @@
           },
           "400": {
             "description": "The file is not a readable line export, or its chain does not fit together here"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/stage-options": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Which workflows may go in one slot of a line",
+        "description": "Send the line as it stands and the position being filled; every workflow comes back marked offered or refused. The verdict is `validate_chain` run over the line that each candidate would make, so a stage this offers can never be one that saving then refuses — and the refused ones come back too, each with the reason, so the editor can say what it is not offering and why.",
+        "operationId": "list_stage_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StageOptionsPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The workflows, offered or refused"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/suggestions": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Lines somebody has already been running by hand",
+        "description": "Sequences of workflows a person ran one at a time, over and over, on enough different shots to be a habit rather than an afternoon. Each comes back as a line ready to POST, with the settings that never changed pinned and the ones that did marked as asked-for.",
+        "operationId": "list_suggestions",
+        "responses": {
+          "200": {
+            "description": "The sequences worth offering"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/lines/validate": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Check a line without saving it",
+        "description": "The same check POST and PUT make, with nothing written. What the editor asks after a reorder, so a chain that no longer fits says so where it was dragged rather than after Save.",
+        "operationId": "validate_line",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Whether it holds together, and why not"
           },
           "503": {
             "description": "ComfyUI not configured"
@@ -661,13 +735,45 @@
         }
       }
     },
+    "/api/comfyui/lines/{id}/duplicate": {
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Fork a production line",
+        "description": "Copy a line and everything its stages carry — workflows, prompts, parameters, sweeps, source modes, keep flags and exposed keys — under a new name. The default way to get a line, and the way to change one that a run is currently walking.",
+        "operationId": "duplicate_line",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Line ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The fork"
+          },
+          "404": {
+            "description": "Line not found"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
     "/api/comfyui/lines/{id}/export": {
       "get": {
         "tags": [
           "comfyui"
         ],
         "summary": "Export a production line",
-        "description": "The line, its stages, the workflow graph behind every stage, and a manifest of the node classes and model files it needs — as one JSON document that can be imported into another library or another Phos install. This is the same format bundled templates ship in.",
+        "description": "The line, its stages, the workflow graph behind every stage, and a manifest of the node classes and model files it needs — as one JSON document that can be imported into another library or another Phos install.",
         "operationId": "export_line",
         "parameters": [
           {
@@ -889,6 +995,84 @@
           },
           "404": {
             "description": "Run not found"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      }
+    },
+    "/api/comfyui/runs/{id}/hold": {
+      "get": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "The takes a held run is waiting on",
+        "description": "Every take of the stage this run is parked at, with what continuing from one of them will cost in tasks. Answers `null` for a run that is not holding anything.",
+        "operationId": "get_hold",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Run ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The hold, or null"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "503": {
+            "description": "ComfyUI not configured"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "comfyui"
+        ],
+        "summary": "Give a verdict on a held run",
+        "description": "`continue` proceeds with the takes named — more than one is ordinary, and each walks the rest of the line for itself. `regenerate` runs the held stage again with fresh seeds and nothing else changed, and the run holds again on the new takes. `cancel` abandons the run and removes its intermediates except where a stage says keep.",
+        "operationId": "post_verdict",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Run ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerdictPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Verdict recorded"
+          },
+          "400": {
+            "description": "The verdict names no takes, or a take this hold is not offering"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "This run is not holding anything for review"
           },
           "503": {
             "description": "ComfyUI not configured"
@@ -3198,6 +3382,17 @@
           "workflow"
         ],
         "properties": {
+          "exposed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Keys this stage leaves to whoever sends the line — the *exposed*\ndisposition. Optional, like everything else a hand-written template\nwould rather not say."
+          },
+          "hold_for_review": {
+            "type": "boolean",
+            "description": "Whether this stage parks its run and asks which of its takes go on —\nFR5c's hold point. Travels for the same reason again: a `×4 → hold →\nupscale` line carried somewhere without the hold is a line that spends\nfour hours where the original spent one."
+          },
           "keep_output": {
             "type": "boolean"
           },
@@ -3942,9 +4137,20 @@
           "workflow_id"
         ],
         "properties": {
+          "exposed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Keys this stage deliberately leaves open — the *exposed* disposition.\nStarting a run may supply values for exactly these, and only these."
+          },
+          "hold_for_review": {
+            "type": "boolean",
+            "description": "Park the run after this stage and ask which of its takes go on. Refused\non the last stage, whose output is the product."
+          },
           "keep_output": {
             "type": "boolean",
-            "description": "Keep this stage's output once the run completes. The last stage's output\nis the product and is kept regardless."
+            "description": "Keep this stage's output once the run completes. The last stage's output\nis the product and is kept regardless, and so are the takes of a stage\nthat holds for review."
           },
           "parameters": {
             "type": "object",
@@ -4835,6 +5041,31 @@
           }
         }
       },
+      "StageOptionsPayload": {
+        "type": "object",
+        "description": "The draft being edited, and where in it a stage is going.\n\nThe whole draft rather than the two types either side of the slot, because\nwhether a stage fits is a question about the *line*: a stage that makes no\nfile is transparent to what flows past it, so the join above position 3 is\nnot necessarily what stage 2 produced. Sending the line and letting\n`validate_chain` answer is the only shape that cannot fall behind that rule.",
+        "properties": {
+          "at": {
+            "type": "integer",
+            "description": "The position being filled, 0-based.",
+            "minimum": 0
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`insert` (the default) pushes whatever is at `at` down; `replace` puts\nthe candidate in its place."
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The workflow ids of the line as it stands, in order. Empty for a line\nwith no stages yet."
+          }
+        }
+      },
       "StartRunPayload": {
         "type": "object",
         "description": "What starts a run.\n\nFR7 adds a query in place of `shot_id` and a cursor beside it; the handler\nis already written around \"which shots does this ask for\", so that is a new\nfield rather than a new endpoint.",
@@ -4848,6 +5079,10 @@
           },
           "shot_id": {
             "type": "string"
+          },
+          "stage_values": {
+            "type": "object",
+            "description": "Values for the keys each stage left open, keyed by stage index as a\nstring. A key a stage did not expose is refused by name rather than\nignored."
           }
         }
       },
@@ -4965,6 +5200,33 @@
             "type": "array",
             "items": {},
             "description": "Run exactly these values, in this order.\n\nAny scalar JSON value: `[4.0, 6.0, 8.0]` for a cfg,\n`[\"sd15.safetensors\", \"sdxl.safetensors\"]` for a checkpoint. Declared\nas unconstrained values, not objects — `Vec<Object>` would make a\ngenerated client refuse every valid list."
+          }
+        }
+      },
+      "VerdictPayload": {
+        "type": "object",
+        "description": "What a person said about a held run.",
+        "required": [
+          "verdict"
+        ],
+        "properties": {
+          "keep": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The takes that go on, by task id. Required for `continue` and ignored by\nthe other two, which are about the hold rather than about a selection."
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why, in the reviewer's own words. Kept with the verdict."
+          },
+          "verdict": {
+            "type": "string",
+            "description": "`continue`, `regenerate` or `cancel`."
           }
         }
       },

@@ -4,7 +4,9 @@ import { useRoute, useRouter } from 'vue-router'
 import WorkflowGraph from '@/components/WorkflowGraph.vue'
 import WorkflowInputControls from '@/components/WorkflowInputControls.vue'
 import WorkflowContract from '@/components/WorkflowContract.vue'
+import LineEditor from '@/components/LineEditor.vue'
 import { controlKind, isParameterInput, isTextInput, inputKey, parameterValue, formatDuration, stageOf } from '@/lib/utils'
+import { typeTrack, continuationCost, heldLabel, takeSeed } from '@/lib/lines'
 
 // --- Connection health ---
 const comfyuiHealthy = ref(false)
@@ -405,18 +407,85 @@ async function cancelTask(taskId) {
   }
 }
 
+// ===== HOLD POINTS — the verdict, from the board =====
+//
+// Enough surface for a person to actually give a verdict, and no more: the
+// takes of one run, tick the ones worth the stages below, and the three
+// buttons. The curation lane — every held run at once, keyboard-driven, big
+// pictures — is FR10b, and it reads these same two endpoints.
+const openHoldId = ref(null)
+const hold = ref(null)
+const keptTakes = ref([])
+const holdBusy = ref(false)
+const holdError = ref('')
+
+/** How many tasks continuing with what is ticked will queue. */
+const holdCost = computed(() => continuationCost(keptTakes.value.length, hold.value?.tasks_per_take))
+
+async function toggleHold(runId) {
+  if (openHoldId.value === runId) {
+    openHoldId.value = null
+    hold.value = null
+    return
+  }
+  openHoldId.value = runId
+  hold.value = null
+  keptTakes.value = []
+  holdError.value = ''
+  try {
+    const res = await fetch(`/api/comfyui/runs/${runId}/hold`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    hold.value = await res.json()
+  } catch (e) {
+    console.error('Failed to fetch hold', e)
+    holdError.value = 'Could not read what this run is holding.'
+  }
+}
+
+function toggleTake(taskId) {
+  keptTakes.value = keptTakes.value.includes(taskId)
+    ? keptTakes.value.filter(id => id !== taskId)
+    : [...keptTakes.value, taskId]
+}
+
+async function giveVerdict(runId, verdict) {
+  if (holdBusy.value) return
+  holdBusy.value = true
+  holdError.value = ''
+  try {
+    const res = await fetch(`/api/comfyui/runs/${runId}/hold`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ verdict, keep: verdict === 'continue' ? keptTakes.value : [] }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+    openHoldId.value = null
+    hold.value = null
+    keptTakes.value = []
+    await fetchRuns()
+  } catch (e) {
+    holdError.value = String(e.message || e)
+  } finally {
+    holdBusy.value = false
+  }
+}
+
 // ===== LINES TAB =====
 //
-// Enough to make a line and see whether it holds together. The editor proper —
-// reordering, per-stage prompts and parameters, hold points — is FR5b; this is
-// the affordance that makes the runtime reachable without one.
+// Three ways to get a line, and blank is the last of them. Fork a line and
+// change a stage; promote a sequence Phos has watched somebody run by hand;
+// or, failing both, compose one. `LineEditor.vue` is the screen; everything
+// here is what it is shown and where its answers go.
 const lines = ref([])
 const loadingLines = ref(false)
-const showLineForm = ref(false)
-const newLineName = ref('')
-const newLineStages = ref([])
+const selectedLineId = ref(null)
+const composing = ref(false)
 const lineError = ref('')
-const savingLine = ref(false)
+
+const selectedLine = computed(() =>
+  lines.value.find((l) => l.id === selectedLineId.value) || null,
+)
 
 async function fetchLines() {
   loadingLines.value = true
@@ -431,57 +500,47 @@ async function fetchLines() {
   }
 }
 
-function startLineForm() {
-  showLineForm.value = true
-  newLineName.value = ''
-  newLineStages.value = [{ workflow_id: workflows.value[0]?.id || '', keep_output: false }]
+function selectLine(id) {
+  composing.value = false
+  selectedLineId.value = id
+}
+
+function startBlankLine() {
+  selectedLineId.value = null
+  composing.value = true
   lineError.value = ''
 }
 
-function addLineStage() {
-  newLineStages.value.push({ workflow_id: workflows.value[0]?.id || '', keep_output: false })
+async function onLineSaved(saved) {
+  composing.value = false
+  await fetchLines()
+  if (saved?.id) selectedLineId.value = saved.id
 }
 
-function removeLineStage(idx) {
-  newLineStages.value.splice(idx, 1)
-}
-
-const lineReady = computed(() =>
-  newLineName.value.trim() !== '' &&
-  newLineStages.value.length > 0 &&
-  newLineStages.value.every(s => s.workflow_id)
-)
-
-async function createLine() {
-  savingLine.value = true
+/** Fork: the default way to get a line, and the way to change a locked one. */
+async function duplicateLine(id) {
   lineError.value = ''
   try {
-    const res = await fetch('/api/comfyui/lines', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newLineName.value.trim(), stages: newLineStages.value }),
-    })
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}))
-      throw new Error(data.error || `HTTP ${res.status}`)
-    }
-    showLineForm.value = false
+    const res = await fetch(`/api/comfyui/lines/${id}/duplicate`, { method: 'POST' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const fork = await res.json()
     await fetchLines()
+    selectedLineId.value = fork.id
+    composing.value = true
   } catch (e) {
-    // The refusal names the stage that does not fit; show it verbatim.
-    lineError.value = e.message || 'Failed to create line'
-  } finally {
-    savingLine.value = false
+    lineError.value = e.message || 'Could not duplicate the line'
   }
 }
 
 async function deleteLine(id) {
+  if (!confirm('Delete this line?')) return
   try {
     const res = await fetch(`/api/comfyui/lines/${id}`, { method: 'DELETE' })
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
       throw new Error(data.error || `HTTP ${res.status}`)
     }
+    if (selectedLineId.value === id) selectedLineId.value = null
     await fetchLines()
   } catch (e) {
     lineError.value = e.message || 'Failed to delete line'
@@ -591,6 +650,70 @@ function reportColor(status) {
   }
 }
 
+
+// --- Promote from history -------------------------------------------------
+// Nobody sits down to design a four-stage chain; they run three workflows in a
+// row on twelve shots. Phos already recorded which file each run read, so the
+// sequence is written down and the only thing missing is somebody noticing.
+const suggestions = ref([])
+const dismissed = ref(new Set())
+
+async function fetchSuggestions() {
+  try {
+    const res = await fetch('/api/comfyui/lines/suggestions')
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    suggestions.value = (await res.json()).items
+  } catch (e) {
+    // Nothing to say: a suggestion nobody asked for that cannot be made is
+    // not worth a message.
+    console.warn('Could not read line suggestions', e)
+    suggestions.value = []
+  }
+}
+
+const liveSuggestions = computed(() =>
+  suggestions.value.filter((s) => !dismissed.value.has(s.name)),
+)
+
+function dismissSuggestion(name) {
+  dismissed.value = new Set([...dismissed.value, name])
+}
+
+async function acceptSuggestion(suggestion) {
+  lineError.value = ''
+  try {
+    const res = await fetch('/api/comfyui/lines', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: suggestion.name,
+        description: 'Promoted from what you have been running by hand.',
+        stages: suggestion.stages.map((s) => ({
+          workflow_id: s.workflow_id,
+          text_overrides: s.text_overrides || {},
+          parameters: s.parameters || {},
+          vary: {},
+          source_mode: s.source_mode ?? null,
+          keep_output: false,
+          exposed: s.exposed || [],
+        })),
+      }),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || `HTTP ${res.status}`)
+    }
+    const saved = await res.json()
+    dismissSuggestion(suggestion.name)
+    await Promise.all([fetchLines(), fetchSuggestions()])
+    selectedLineId.value = saved.id
+    composing.value = false
+  } catch (e) {
+    lineError.value = e.message || 'Could not save that line'
+  }
+}
+
+
 /**
  * The statuses the backend actually writes: pending → uploading → queued →
  * processing → downloading → completed, with awaiting_output when ComfyUI says
@@ -620,14 +743,20 @@ function isInFlight(status) {
 }
 
 /**
- * A run has four states, not nine: it is walking its line, or it is however it
- * ended. The nine belong to the tasks underneath.
+ * A run has five states, not nine: it is walking its line, it is parked at a
+ * hold waiting for a person, or it is however it ended. The nine belong to the
+ * tasks underneath.
+ *
+ * `held` gets the degraded amber — the colour this system already uses for
+ * "this needs somebody", which is exactly what a hold is. It is not an error
+ * and it is not progress.
  */
 function runStatusColor(status) {
   switch (status) {
     case 'completed': return 'var(--status-ready)'
     case 'failed': return 'var(--status-error)'
     case 'cancelled': return 'var(--status-stopped)'
+    case 'held': return 'var(--status-degraded)'
     default: return 'var(--status-building)'
   }
 }
@@ -672,6 +801,7 @@ function formatDate(dateStr) {
   return new Date(dateStr).toLocaleDateString()
 }
 
+// ===== TEMPLATES TAB =====
 // --- Active tab tracking (synced with URL) ---
 const route = useRoute()
 const router = useRouter()
@@ -685,7 +815,10 @@ function onTabChange(val) {
     startTaskPolling()
   } else {
     stopTaskPolling()
-    if (val === 'lines') fetchLines()
+    if (val === 'lines') {
+      fetchLines()
+      fetchSuggestions()
+    }
   }
 }
 
@@ -694,6 +827,7 @@ onMounted(() => {
   checkHealth()
   fetchWorkflows()
   fetchLines()
+  fetchSuggestions()
   if (activeTab.value === 'queue') {
     fetchRuns()
     startTaskPolling()
@@ -975,10 +1109,10 @@ defineExpose({ loadData: fetchWorkflows })
     />
 
     <!-- Lines tab — a chain of workflows run as one thing.
-         Enough to draw one and see whether it holds together; the editor
-         proper is FR5b. -->
-    <div v-else-if="activeTab === 'lines'" class="flex flex-col gap-3">
-      <div class="flex items-baseline gap-4">
+         Three ways in, and blank is the last of them: fork one, promote a
+         sequence you have already been running by hand, or compose. -->
+    <div v-else-if="activeTab === 'lines'" class="flex flex-col gap-4">
+      <div class="flex flex-wrap items-baseline gap-4">
         <div class="text-[13px] font-light text-ink-secondary max-w-[560px]">
           A line runs its workflows in order, each stage reading what the one before it made.
           Start one from a shot's <span class="font-normal text-ink">Enhance</span> dialog.
@@ -990,10 +1124,9 @@ defineExpose({ loadData: fetchWorkflows })
           @click="openLineImport"
         >Import line</button>
         <button
-          v-if="!showLineForm"
-          class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors whitespace-nowrap"
+          class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors whitespace-nowrap disabled:opacity-50"
           :disabled="workflows.length === 0"
-          @click="startLineForm"
+          @click="startBlankLine"
         >New line</button>
       </div>
 
@@ -1098,106 +1231,101 @@ defineExpose({ loadData: fetchWorkflows })
         </div>
       </div>
 
-      <!-- Draw a line: name it, then pick a workflow per stage. -->
-      <div v-if="showLineForm" class="card-ab p-4 flex flex-col gap-3">
-        <input
-          v-model="newLineName"
-          placeholder="4K Restore"
-          class="bg-base border border-line rounded-sm px-3 py-2 text-[13px] text-ink"
-        />
-        <div
-          v-for="(stage, i) in newLineStages"
-          :key="i"
-          class="flex items-center gap-3"
-        >
-          <span class="label w-16 flex-none">St {{ i + 1 }}</span>
-          <select
-            v-model="stage.workflow_id"
-            class="flex-1 min-w-0 bg-base border border-line rounded-sm px-3 py-1.5 font-mono text-xs text-ink"
-          >
-            <option v-for="wf in workflows" :key="wf.id" :value="wf.id">{{ wf.name }}</option>
-          </select>
-          <label
-            class="flex items-center gap-1.5 font-mono text-[11px] text-ink-tertiary whitespace-nowrap"
-            title="Keep this stage's output once the run completes. The last stage's is kept regardless."
-          >
-            <input v-model="stage.keep_output" type="checkbox" class="accent-[var(--accent)]" />
-            keep
-          </label>
-          <button
-            class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
-            :disabled="newLineStages.length === 1"
-            @click="removeLineStage(i)"
-          >remove</button>
-        </div>
-        <div v-if="lineError" class="font-mono text-xs" style="color: var(--status-error)">{{ lineError }}</div>
-        <div class="flex items-center gap-3">
-          <button
-            class="bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors disabled:opacity-50"
-            :disabled="!lineReady || savingLine"
-            @click="createLine"
-          >{{ savingLine ? 'Saving…' : 'Save line' }}</button>
-          <button
-            class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
-            @click="addLineStage"
-          >add stage</button>
+      <!-- Promoted from history: the sequence somebody has already been
+           running one workflow at a time, offered as the line it is. -->
+      <div
+        v-for="s in liveSuggestions"
+        :key="s.name"
+        class="card-ab p-4 flex flex-col gap-2"
+        style="border-color: var(--accent-muted)"
+      >
+        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <span class="signal-dot" style="width:6px;height:6px;background:var(--accent)"></span>
+          <span class="label">Noticed</span>
+          <span class="text-[13px] text-ink">
+            You ran
+            <span class="font-mono">{{ s.stages.map(st => st.workflow_name || st.workflow_id).join(' → ') }}</span>
+            on {{ s.shot_count }} shots.
+          </span>
           <span class="flex-1"></span>
           <button
+            class="font-mono text-[11px] text-signal hover:underline underline-offset-2"
+            @click="acceptSuggestion(s)"
+          >save as a line</button>
+          <button
             class="font-mono text-[11px] text-ink-tertiary hover:text-ink transition-colors"
-            @click="showLineForm = false"
-          >cancel</button>
+            @click="dismissSuggestion(s.name)"
+          >dismiss</button>
+        </div>
+        <div
+          v-if="s.stages.some(st => (st.exposed || []).length)"
+          class="font-mono text-[11px] text-ink-tertiary"
+        >
+          The settings you changed every time will be asked for when the line is sent; the ones
+          you never changed are part of it.
         </div>
       </div>
 
-      <!-- Export and delete fail from the list, not the form, so their errors
-           have to show here too — a download that silently does not happen
-           reads as a dead button. -->
-      <div
-        v-if="lineError && !showLineForm"
-        class="font-mono text-xs"
-        style="color: var(--status-error)"
-      >{{ lineError }}</div>
+      <div v-if="lineError" class="font-mono text-xs" style="color: var(--status-error)">{{ lineError }}</div>
 
-      <div class="card-ab overflow-hidden">
-        <div
-          v-for="ln in lines"
-          :key="ln.id"
-          class="flex items-center gap-3 px-4 py-3 border-b border-line last:border-b-0"
-        >
-          <span class="min-w-0 flex-1">
-            <span class="block text-[13px] text-ink truncate">{{ ln.name }}</span>
-            <span class="block font-mono text-[11px] text-ink-tertiary truncate">
-              <template v-for="(st, i) in ln.stages" :key="st.stage_idx">
-                <span v-if="i">&nbsp;→&nbsp;</span>{{ st.workflow_name }}<span
-                  v-if="st.keep_output && i < ln.stages.length - 1"
-                  class="text-signal"
-                >&nbsp;·keep</span>
-              </template>
+      <div class="grid gap-6 items-start lg:grid-cols-[280px_minmax(0,1fr)]">
+        <!-- The lines this library holds. -->
+        <div class="flex flex-col gap-2">
+          <button
+            v-for="ln in lines"
+            :key="ln.id"
+            class="flex flex-col gap-1 p-3 border rounded text-left transition-colors"
+            :class="selectedLineId === ln.id ? 'border-signal bg-surface' : 'border-line hover:bg-raised'"
+            @click="selectLine(ln.id)"
+          >
+            <span class="flex items-baseline gap-2 min-w-0">
+              <span class="font-mono text-[13px] font-medium text-ink truncate">{{ ln.name }}</span>
+              <span class="flex-1"></span>
+              <span
+                v-if="!ln.valid"
+                class="signal-dot"
+                style="width:6px;height:6px;background:var(--status-error)"
+                title="This chain no longer fits together"
+              ></span>
+              <span
+                v-else-if="ln.live_runs"
+                class="signal-dot signal-pulse"
+                style="width:6px;height:6px;background:var(--status-building)"
+                title="A run is walking this line"
+              ></span>
             </span>
-            <span
-              v-if="!ln.valid"
-              class="block font-mono text-[11px]"
-              style="color: var(--status-error)"
-            >{{ ln.error }}</span>
-          </span>
-          <span class="font-mono text-[11px] tracking-[0.08em] uppercase text-ink-tertiary whitespace-nowrap">
-            {{ ln.stage_count }} {{ ln.stage_count === 1 ? 'stage' : 'stages' }}
-          </span>
-          <button
-            class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
-            title="Download this line, its stages and every workflow behind them as one file."
-            @click="exportLine(ln)"
-          >export</button>
-          <button
-            class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
-            @click="deleteLine(ln.id)"
-          >delete</button>
+            <span class="font-mono text-[11px] text-ink-tertiary truncate">
+              {{ ln.stages.map(st => st.workflow_name).join(' → ') }}
+            </span>
+            <span class="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-tertiary">
+              {{ ln.stage_count }} {{ ln.stage_count === 1 ? 'stage' : 'stages' }} · {{ typeTrack(ln) }}
+            </span>
+          </button>
+
+          <div v-if="loadingLines && lines.length === 0" class="font-mono text-xs text-ink-tertiary px-1">
+            loading lines…
+          </div>
+          <div v-else-if="lines.length === 0" class="font-mono text-xs text-ink-tertiary px-1">
+            no lines yet
+          </div>
         </div>
-        <div v-if="loadingLines && lines.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
-          loading lines…
-        </div>
-        <div v-else-if="lines.length === 0" class="px-4 py-6 font-mono text-xs text-ink-tertiary">
-          no lines yet
+
+        <!-- The editor. Read-only it draws as a route board; under edit it is a
+             list, and Add stage only offers what fits where it is going. -->
+        <LineEditor
+          v-if="selectedLine || composing"
+          :key="`${selectedLineId || 'new'}-${composing}`"
+          :line="selectedLine"
+          :workflows="workflows"
+          :start-editing="composing"
+          @saved="onLineSaved"
+          @cancelled="composing = false"
+          @duplicate="duplicateLine(selectedLineId)"
+          @export="exportLine(selectedLine)"
+          @delete="deleteLine(selectedLineId)"
+        />
+        <div v-else class="card-ab p-6 font-mono text-xs text-ink-tertiary">
+          select a line, or start one
         </div>
       </div>
     </div>
@@ -1205,7 +1333,7 @@ defineExpose({ loadData: fetchWorkflows })
     <!-- Queue tab — a schedule of runs.
          A four-stage run is one row that says which stage it is on, not four
          unrelated ones. The tasks underneath open on click. -->
-    <div v-else class="flex flex-col gap-2">
+    <div v-else-if="activeTab === 'queue'" class="flex flex-col gap-2">
       <div class="card-ab overflow-hidden overflow-x-auto" ref="taskListRef" @scroll="onTaskListScroll">
         <div
           class="grid gap-3 px-4 py-2 border-b min-w-[860px]"
@@ -1276,6 +1404,8 @@ defineExpose({ loadData: fetchWorkflows })
 
             <span class="font-mono text-xs text-ink-tertiary tabular-nums">{{ formatDuration(run.elapsed_seconds) }}</span>
 
+            <!-- A held run says what it is waiting on, because the number is
+                 the whole decision: HELD · 4 TAKES. -->
             <span
               class="flex items-center gap-1.5 font-mono text-[11px] tracking-[0.08em] uppercase"
               :style="{ color: runStatusColor(run.status) }"
@@ -1286,12 +1416,19 @@ defineExpose({ loadData: fetchWorkflows })
                 style="width:6px;height:6px"
                 :style="{ background: runStatusColor(run.status) }"
               ></span>
-              {{ run.status }}
+              {{ run.status === 'held' ? heldLabel(run) : run.status }}
             </span>
 
             <span class="flex gap-3 justify-end">
               <button
-                v-if="run.status === 'running'"
+                v-if="run.status === 'held'"
+                class="font-mono text-[11px] transition-colors"
+                :style="{ color: 'var(--status-degraded)' }"
+                title="Look at this run's takes and say which of them are worth the stages below."
+                @click="toggleHold(run.id)"
+              >{{ openHoldId === run.id ? 'close' : 'review' }}</button>
+              <button
+                v-else-if="run.status === 'running'"
                 class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
                 @click="cancelRun(run.id)"
               >cancel</button>
@@ -1306,6 +1443,91 @@ defineExpose({ loadData: fetchWorkflows })
                 @click="toggleRun(run.id)"
               >{{ openRunId === run.id ? 'hide' : 'stages' }}</button>
             </span>
+          </div>
+
+          <!-- The takes, and the three things a person can say about them.
+               Curation as a step inside the pipeline rather than a bin at the
+               end of it. -->
+          <div
+            v-if="openHoldId === run.id"
+            class="px-4 py-3 border-b bg-base min-w-[860px] flex flex-col gap-3"
+            style="border-color: var(--status-degraded)"
+          >
+            <div class="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+              <span class="label" style="color: var(--status-degraded)">
+                Held at stage {{ (hold?.stage_idx ?? 0) + 1 }} / {{ hold?.stage_count ?? run.stage_count }}
+              </span>
+              <span class="font-mono text-[11px] text-ink-secondary">{{ hold?.stage_label || run.stage_label || '' }}</span>
+              <span class="font-mono text-[11px] text-ink-tertiary">
+                {{ (hold?.takes || []).length }} take(s) waiting · nothing below this stage has run
+              </span>
+            </div>
+
+            <div v-if="holdError" class="font-mono text-[11px]" style="color: var(--status-error)">{{ holdError }}</div>
+            <div v-if="!hold && !holdError" class="font-mono text-[11px] text-ink-tertiary">loading takes…</div>
+
+            <div v-if="hold" class="flex flex-wrap gap-2">
+              <button
+                v-for="take in hold.takes"
+                :key="take.task_id"
+                class="w-[132px] text-left border rounded-sm overflow-hidden bg-surface transition-colors"
+                :style="{ borderColor: keptTakes.includes(take.task_id) ? 'var(--accent)' : 'var(--border)' }"
+                @click="toggleTake(take.task_id)"
+              >
+                <span class="block w-full h-[88px] bg-raised">
+                  <img
+                    v-if="take.thumbnail_url"
+                    :src="take.thumbnail_url"
+                    class="w-full h-full object-cover"
+                    loading="lazy"
+                  />
+                  <!-- A describe stage's take is a sentence, and there is
+                       nothing to photograph. -->
+                  <span
+                    v-else
+                    class="block w-full h-full p-2 font-mono text-[10px] leading-tight text-ink-secondary overflow-hidden"
+                  >{{ take.text_output || '—' }}</span>
+                </span>
+                <span class="flex items-center justify-between gap-1 px-2 py-1 border-t border-line">
+                  <span class="font-mono text-[10px] uppercase tracking-[0.08em] text-ink-tertiary truncate">
+                    <template v-if="takeSeed(take) !== null">seed {{ takeSeed(take) }}</template>
+                    <template v-else>{{ shortId(take.task_id) }}</template>
+                  </span>
+                  <span
+                    class="signal-dot flex-none"
+                    style="width:6px;height:6px"
+                    :style="{ background: keptTakes.includes(take.task_id) ? 'var(--accent)' : 'var(--border-strong)' }"
+                  ></span>
+                </span>
+              </button>
+            </div>
+
+            <div v-if="hold" class="flex flex-wrap items-center gap-4">
+              <button
+                class="border rounded-sm px-4 py-1.5 font-mono text-[11px] uppercase tracking-[0.08em] transition-colors disabled:opacity-40"
+                style="border-color: var(--accent); color: var(--accent)"
+                :disabled="holdBusy || !keptTakes.length"
+                @click="giveVerdict(run.id, 'continue')"
+              >continue</button>
+              <!-- The cost moves as boxes are ticked. That is the reason to
+                   stop here at all. -->
+              <span class="font-mono text-[11px] text-ink-tertiary">
+                {{ keptTakes.length }} kept → {{ holdCost }} task(s) below
+              </span>
+              <span class="flex-1"></span>
+              <button
+                class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors disabled:opacity-40"
+                :disabled="holdBusy"
+                title="Run this stage again with fresh seeds. Same prompt, same parameters, same source."
+                @click="giveVerdict(run.id, 'regenerate')"
+              >regenerate</button>
+              <button
+                class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors disabled:opacity-40"
+                :disabled="holdBusy"
+                title="Abandon the run. Intermediates go, except where a stage says keep."
+                @click="giveVerdict(run.id, 'cancel')"
+              >abandon</button>
+            </div>
           </div>
 
           <!-- The tasks underneath: reachable, but not the top-level unit. -->

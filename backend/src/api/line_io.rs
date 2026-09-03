@@ -67,8 +67,7 @@ use super::UState;
     summary = "Export a production line",
     description = "The line, its stages, the workflow graph behind every stage, and a manifest \
                    of the node classes and model files it needs — as one JSON document that can \
-                   be imported into another library or another Phos install. This is the same \
-                   format bundled templates ship in.",
+                   be imported into another library or another Phos install.",
     params(("id" = String, Path, description = "Line ID")),
     responses(
         (status = 200, description = "The line as a portable bundle", body = LineBundle),
@@ -155,6 +154,8 @@ pub(super) async fn export_line(
                 vary: serde_json::from_str(&s.vary).unwrap_or_default(),
                 source_mode: s.source_mode.clone(),
                 keep_output: s.keep_output,
+                exposed: s.exposed.clone(),
+                hold_for_review: s.hold_for_review,
             })
             .collect(),
     };
@@ -208,8 +209,7 @@ impl From<diesel::result::Error> for ImportFailure {
     path = "/api/comfyui/lines/import",
     tag = "comfyui",
     summary = "Import a production line",
-    description = "Read a line out of an exported bundle — the same format bundled templates \
-                   ship in. Its workflows are created, or reused where an identical graph is \
+    description = "Read a line out of an exported bundle. Its workflows are created, or reused where an identical graph is \
                    already here, and its requirements are checked against what this ComfyUI has \
                    installed. A line whose nodes or models are missing is still imported; the \
                    response says what is missing. A name already in use is suffixed, never \
@@ -314,6 +314,8 @@ pub(super) async fn import_line(
                         vary: s.vary.clone(),
                         source_mode: s.source_mode.clone(),
                         keep_output: s.keep_output,
+                        exposed: s.exposed.clone(),
+                        hold_for_review: s.hold_for_review,
                     })
                     .collect(),
             };
@@ -370,6 +372,7 @@ pub(super) async fn import_line(
             None,
             None,
             &stages,
+            0,
         ),
         "renamed_from": renamed_from,
         "workflows_created": created,
@@ -381,7 +384,7 @@ pub(super) async fn import_line(
     })))
 }
 
-/// The corrections a bundle's workflow travels with. A hand-written template
+/// The corrections a bundle's workflow travels with. A hand-written bundle
 /// carries none.
 fn bundle_corrections(wf: &BundleWorkflow) -> ContractCorrections {
     wf.contract
@@ -533,12 +536,12 @@ mod tests {
              VALUES ('line-1', '4K Restore', 'photo to 4K');
              INSERT INTO line_stages \
                (id, line_id, stage_idx, workflow_id, text_overrides, parameters, vary, \
-                source_mode, keep_output) \
+                source_mode, keep_output, hold_for_review) \
              VALUES \
                ('st-1', 'line-1', 0, 'wf-1', '{{\"6.text\":\"a golden retriever\"}}', \
                 '{{\"3.seed\":1000}}', '{{\"3.seed\":{{\"count\":3,\"mode\":\"increment\"}}}}', \
-                'first_frame', 1), \
-               ('st-2', 'line-1', 1, 'wf-2', '{{}}', '{{\"3.cfg\":7.5}}', '{{}}', NULL, 0);",
+                'first_frame', 1, 1), \
+               ('st-2', 'line-1', 1, 'wf-2', '{{}}', '{{\"3.cfg\":7.5}}', '{{}}', NULL, 0, 0);",
             a = image_graph().to_string().replace('\'', "''"),
             b = second.to_string().replace('\'', "''"),
         ))
@@ -599,6 +602,8 @@ mod tests {
                         vary: serde_json::from_str(&s.vary).unwrap_or_default(),
                         source_mode: s.source_mode.clone(),
                         keep_output: s.keep_output,
+                        exposed: s.exposed.clone(),
+                        hold_for_review: s.hold_for_review,
                     })
                     .collect(),
             },
@@ -634,6 +639,8 @@ mod tests {
                         vary: s.vary.clone(),
                         source_mode: s.source_mode.clone(),
                         keep_output: s.keep_output,
+                        exposed: s.exposed.clone(),
+                        hold_for_review: s.hold_for_review,
                     })
                     .collect(),
             };
@@ -764,11 +771,17 @@ mod tests {
         );
         assert_eq!(first_stage.source_mode.as_deref(), Some("first_frame"));
         assert!(first_stage.keep_output);
+        assert!(
+            first_stage.hold_for_review,
+            "a line carried without its hold point is a line that spends four \
+             hours where the original spent one"
+        );
 
         let second_stage = &second.line.stages[1];
         assert_eq!(second_stage.parameters["3.cfg"], json!(7.5));
         assert!(second_stage.text_overrides.is_empty());
         assert!(!second_stage.keep_output);
+        assert!(!second_stage.hold_for_review);
         assert_eq!(second_stage.source_mode, None);
     }
 
@@ -933,6 +946,8 @@ mod tests {
                         vary: Default::default(),
                         source_mode: None,
                         keep_output: false,
+                        exposed: Vec::new(),
+                        hold_for_review: false,
                     })
                     .collect(),
             },
@@ -1010,6 +1025,8 @@ mod tests {
                     vary: Default::default(),
                     source_mode: None,
                     keep_output: false,
+                    exposed: Vec::new(),
+                    hold_for_review: false,
                 }],
             },
             workflows,
@@ -1106,6 +1123,8 @@ mod tests {
                         vary: Default::default(),
                         source_mode: None,
                         keep_output: false,
+                        exposed: Vec::new(),
+                        hold_for_review: false,
                     })
                     .collect(),
             },
