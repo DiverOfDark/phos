@@ -180,11 +180,6 @@ pub fn init_db<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
                 diesel::sql_query("DELETE FROM video_keyframes WHERE video_file_id = ?1")
                     .bind::<diesel::sql_types::Text, _>(file_id)
                     .execute(&mut conn)?;
-                diesel::sql_query(
-                    "UPDATE enhancement_tasks SET output_file_id = NULL WHERE output_file_id = ?1",
-                )
-                .bind::<diesel::sql_types::Text, _>(file_id)
-                .execute(&mut conn)?;
                 diesel::delete(files::table.filter(files::id.eq(file_id))).execute(&mut conn)?;
             }
             diesel::sql_query(

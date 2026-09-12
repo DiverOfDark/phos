@@ -77,10 +77,6 @@ spec:
               value: {{ include "phos.oidcRedirectUri" . | quote }}
             - name: PHOS_OIDC_SCOPES
               value: {{ .Values.oidc.scopes | quote }}
-            {{- if .Values.phos.comfyuiUrl }}
-            - name: PHOS_COMFYUI_URL
-              value: {{ .Values.phos.comfyuiUrl | quote }}
-            {{- end }}
             - name: PHOS_JWT_TTL
               value: {{ .Values.phos.jwtTtl | quote }}
             - name: RUST_LOG

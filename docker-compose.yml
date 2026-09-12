@@ -26,7 +26,4 @@ services:
       #- PHOS_JWT_SECRET=your-random-secret
       #- PHOS_JWT_TTL=1209600  # session JWT lifetime in seconds, default 14 days
       #- PHOS_OIDC_SCOPES=openid profile email
-      - PHOS_COMFYUI_URL=http://host.docker.internal:8188
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped

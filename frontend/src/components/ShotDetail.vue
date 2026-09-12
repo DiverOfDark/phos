@@ -1,7 +1,6 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import EnhanceDialog from '@/components/EnhanceDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -47,12 +46,6 @@ const mergeTargetShot = ref(null)
 const mergeTargetPersonId = ref(null)
 const merging = ref(false)
 
-// --- ComfyUI enhance ---
-const comfyuiAvailable = ref(false)
-const showEnhanceDialog = ref(false)
-const shotTasks = ref([])
-let taskPollInterval = null
-
 // Reset video playback state when switching files
 watch(selectedFileIndex, () => { videoPlaying.value = false; confirmDeleteFile.value = false })
 
@@ -83,13 +76,6 @@ const isVideo = computed(() => {
   return mime.startsWith('video/')
 })
 
-// The file an enhancement run reads: the original, since the dialog does not
-// pin a source file. Its type is what decides whether the source picker appears.
-const originalFile = computed(() => {
-  const files = shot.value?.files || []
-  return files.find(f => f.is_original) || files[0] || null
-})
-
 const selectedFilename = computed(() => {
   if (!selectedFile.value) return ''
   return selectedFile.value.path.split('/').pop()
@@ -98,49 +84,6 @@ const selectedFilename = computed(() => {
 const facesForSelectedFile = computed(() => {
   if (!shot.value?.faces?.length || !selectedFile.value) return []
   return shot.value.faces.filter(f => f.file_id === selectedFile.value.id)
-})
-
-// --- Provenance ---
-// A generated picture looks exactly like a photograph. The badge says which it
-// is; this says how it was made, for the day nobody remembers.
-const provenance = ref(null)
-
-watch(selectedFile, async (file) => {
-  provenance.value = null
-  if (!file?.synthetic) return
-  const id = file.id
-  try {
-    const res = await fetch(`/api/files/${id}/manifest`)
-    if (!res.ok) return
-    const body = await res.json()
-    // The selection may have moved on while this was in flight.
-    if (selectedFile.value?.id === id) provenance.value = body.manifest || null
-  } catch {
-    // Same guard on failure: a stale request rejecting must not wipe out
-    // what a newer request already loaded.
-    if (selectedFile.value?.id === id) provenance.value = null
-  }
-}, { immediate: true })
-
-/** The manifest, as rows in the same register as the metadata block. */
-const provenanceRows = computed(() => {
-  const m = provenance.value
-  if (!m) return []
-  const rows = [['made', m.generated_at || '—'], ['workflow', m.workflow_id]]
-  if (m.seed != null) rows.push(['seed', String(m.seed)])
-  if (m.output_filename) rows.push(['output', m.output_filename])
-  rows.push(['task', String(m.task_id || '').slice(0, 8)])
-  for (const [node, text] of Object.entries(m.text_overrides || {})) {
-    rows.push([`prompt/${node}`, text])
-  }
-  // The typed values this take ran with. The seed already has its own row
-  // above, so it is not repeated here.
-  for (const [key, value] of Object.entries(m.parameters || {})) {
-    const field = key.split('.').pop()
-    if (field === 'seed' || field === 'noise_seed') continue
-    rows.push([`set/${key}`, String(value)])
-  }
-  return rows
 })
 
 const peopleMap = computed(() => {
@@ -543,88 +486,6 @@ async function deleteShot() {
   }
 }
 
-// --- ComfyUI functions ---
-async function checkComfyuiHealth() {
-  try {
-    const res = await fetch('/api/comfyui/health')
-    if (!res.ok) throw new Error()
-    const data = await res.json()
-    comfyuiAvailable.value = data.status === 'ok'
-  } catch {
-    comfyuiAvailable.value = false
-  }
-}
-
-async function fetchShotTasks() {
-  if (!shotId.value) return
-  try {
-    const res = await fetch(`/api/comfyui/tasks?shot_id=${shotId.value}`)
-    if (!res.ok) return
-    const data = await res.json()
-    shotTasks.value = data.items
-  } catch {
-    // ignore
-  }
-}
-
-function startTaskPolling() {
-  stopTaskPolling()
-  taskPollInterval = setInterval(async () => {
-    await fetchShotTasks()
-    // Check if any task just completed - refetch shot for new files
-    const hasActive = shotTasks.value.some(t => t.status === 'pending' || t.status === 'running')
-    if (!hasActive) {
-      stopTaskPolling()
-      // Refetch shot data in case new files appeared
-      await fetchShot()
-    }
-  }, 3000)
-}
-
-function stopTaskPolling() {
-  if (taskPollInterval) {
-    clearInterval(taskPollInterval)
-    taskPollInterval = null
-  }
-}
-
-function onTaskCreated(task) {
-  fetchShotTasks()
-  startTaskPolling()
-}
-
-/** Clear a finished or failed run off the shot. The output file, if any, stays. */
-async function deleteTask(taskId) {
-  try {
-    const res = await fetch(`/api/comfyui/tasks/${taskId}`, { method: 'DELETE' })
-    if (!res.ok) throw new Error()
-    await fetchShotTasks()
-  } catch (e) {
-    console.error('Failed to delete task', e)
-  }
-}
-
-async function retryTask(taskId) {
-  try {
-    const res = await fetch(`/api/comfyui/tasks/${taskId}/retry`, { method: 'POST' })
-    if (!res.ok) throw new Error()
-    await fetchShotTasks()
-    startTaskPolling()
-  } catch (e) {
-    console.error('Failed to retry task', e)
-  }
-}
-
-function taskStatusColor(status) {
-  switch (status) {
-    case 'completed': return 'var(--status-ready)'
-    case 'failed': return 'var(--status-error)'
-    case 'running': return 'var(--status-building)'
-    case 'cancelled': return 'var(--status-stopped)'
-    default: return 'var(--status-degraded)'
-  }
-}
-
 // --- Navigation ---
 function goBack() {
   router.back()
@@ -667,8 +528,6 @@ onMounted(() => {
   fetchShot()
   fetchPeople()
   fetchSimilarShots()
-  checkComfyuiHealth()
-  fetchShotTasks()
   window.addEventListener('keydown', onKeydown)
   document.addEventListener('click', onDocumentClick)
 })
@@ -676,7 +535,6 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
   document.removeEventListener('click', onDocumentClick)
-  stopTaskPolling()
 })
 
 defineExpose({ loadData: fetchShot, fetchShots: fetchShot, fetchPeople })
@@ -686,7 +544,6 @@ watch(() => route.params.id, () => {
   if (route.params.id) {
     fetchShot()
     fetchSimilarShots()
-    fetchShotTasks()
   }
 })
 </script>
@@ -784,12 +641,6 @@ watch(() => route.params.id, () => {
           @click="enterSplitMode"
         >Split</button>
 
-        <button
-          v-if="comfyuiAvailable"
-          class="bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors whitespace-nowrap"
-          @click="showEnhanceDialog = true"
-        >Enhance…</button>
-
         <template v-if="showDeleteDialog">
           <button
             class="rounded px-4 py-2 text-[13px] font-medium text-ink whitespace-nowrap"
@@ -839,7 +690,6 @@ watch(() => route.params.id, () => {
           <img :src="`/api/files/${file.id}/thumbnail`" class="w-full h-full object-cover" loading="lazy" />
           <span v-if="file.is_original" class="absolute top-1 left-1 w-1.5 h-1.5 rounded-full bg-signal"></span>
           <span v-if="file.mime_type?.startsWith('video/')" class="absolute bottom-0.5 right-1 font-mono text-[9px] text-building">VID</span>
-          <span v-if="file.synthetic" class="absolute bottom-0.5 left-1 font-mono text-[9px] tracking-[0.08em] text-ink-tertiary">GEN</span>
           <span v-if="splitMode && splitSelection.has(file.id)" class="absolute top-1 right-1 font-mono text-[11px] text-signal">✓</span>
         </button>
       </div>
@@ -904,12 +754,6 @@ watch(() => route.params.id, () => {
                 class="font-mono text-[10px] tracking-[0.08em] text-signal border rounded-sm px-1"
                 style="border-color: var(--accent-muted)"
               >MASTER</span>
-              <!-- An attribute of the file, not a status: the label register, no colour. -->
-              <span
-                v-if="selectedFile?.synthetic"
-                class="font-mono text-[10px] tracking-[0.08em] text-ink-tertiary border border-line rounded-sm px-1"
-                title="Made by a workflow, not a camera. Kept out of face recognition."
-              >GENERATED</span>
               <span class="flex-1"></span>
               <template v-if="selectedFile && !selectedFile.is_original">
                 <button
@@ -1011,60 +855,6 @@ watch(() => route.params.id, () => {
               <div v-if="shot.description" class="text-xs font-light text-ink-secondary">"{{ shot.description }}"</div>
             </div>
 
-            <!-- Provenance: what made this picture, for the day nobody remembers. -->
-            <div v-if="selectedFile?.synthetic" class="flex flex-col gap-2">
-              <div class="label">Provenance</div>
-              <div class="grid font-mono text-xs" style="grid-template-columns: auto 1fr; gap: 4px 16px">
-                <template v-for="row in provenanceRows" :key="row[0]">
-                  <span class="text-ink-tertiary">{{ row[0] }}</span>
-                  <span class="text-ink-secondary break-all">{{ row[1] }}</span>
-                </template>
-              </div>
-              <div v-if="!provenanceRows.length" class="font-mono text-[11px] text-ink-tertiary">
-                generated before provenance was recorded
-              </div>
-            </div>
-
-            <!-- AI enhancements -->
-            <div v-if="shotTasks.length" class="flex flex-col gap-2">
-              <div class="label">AI enhancements</div>
-              <div class="card-ab overflow-hidden">
-                <div
-                  v-for="task in shotTasks"
-                  :key="task.id"
-                  class="px-3 py-2 border-b border-line"
-                >
-                  <div class="flex items-center gap-2">
-                    <span
-                      class="signal-dot"
-                      :class="{ 'signal-pulse': task.status === 'running' || task.status === 'pending' }"
-                      :style="{ background: taskStatusColor(task.status), width: '6px', height: '6px' }"
-                    ></span>
-                    <span class="flex-1 font-mono text-xs text-ink truncate">{{ task.workflow_name || task.workflow_id }}</span>
-                    <span
-                      class="font-mono text-[11px] tracking-[0.08em] uppercase"
-                      :style="{ color: taskStatusColor(task.status) }"
-                    >{{ task.status }}</span>
-                    <template v-if="task.status === 'failed'">
-                      <button
-                        class="font-mono text-[11px] text-ink-tertiary hover:text-signal transition-colors"
-                        @click="retryTask(task.id)"
-                      >retry</button>
-                      <button
-                        class="font-mono text-[11px] text-ink-tertiary hover:text-error transition-colors"
-                        @click="deleteTask(task.id)"
-                      >delete</button>
-                    </template>
-                  </div>
-                  <!-- A run that failed without saying why is just a red dot. -->
-                  <div
-                    v-if="task.error_message"
-                    class="font-mono text-[11px] mt-1 break-all"
-                    style="color: var(--status-error)"
-                  >{{ task.error_message }}</div>
-                </div>
-              </div>
-            </div>
           </div>
         </div>
       </div>
@@ -1127,13 +917,5 @@ watch(() => route.params.id, () => {
         </div>
       </div>
     </div>
-
-    <EnhanceDialog
-      v-model:open="showEnhanceDialog"
-      :shot-id="shotId"
-      :shot-label="shotIdLabel"
-      :source-mime="originalFile?.mime_type || ''"
-      @task-created="onTaskCreated"
-    />
   </div>
 </template>

@@ -53,7 +53,6 @@ class BrowseRepository @Inject constructor(
                             isOriginal = file.isOriginal ?: false,
                             fileSize = file.fileSize,
                             thumbnailUrl = file.thumbnailUrl,
-                            synthetic = file.synthetic == true,
                         )
                     },
                 )

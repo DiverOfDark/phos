@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -180,15 +180,6 @@ impl Scanner {
                     video_keyframes::table.filter(video_keyframes::video_file_id.eq(file_id)),
                 )
                 .execute(&mut conn);
-                let _ = diesel::update(
-                    crate::schema::enhancement_tasks::table
-                        .filter(crate::schema::enhancement_tasks::output_file_id.eq(file_id)),
-                )
-                .set(
-                    crate::schema::enhancement_tasks::output_file_id
-                        .eq(None::<String>),
-                )
-                .execute(&mut conn);
                 let _ = diesel::delete(files::table.filter(files::id.eq(file_id)))
                     .execute(&mut conn);
                 removed += 1;
@@ -304,11 +295,6 @@ impl Scanner {
         // After all files are processed, run face clustering
         let mut conn = self.open_db()?;
 
-        // Generated files hold no faces. Anything the library picked up before
-        // that was a rule — or before the row said what the file was — goes
-        // now, while there is still only one library to re-cluster.
-        self.purge_synthetic_faces(&mut conn)?;
-
         // Remove overlapping duplicate detections (e.g. the same face across many
         // video keyframes) from not-yet-reviewed shots before clustering, so
         // duplicates don't spawn phantom people or skew person centroids.
@@ -369,16 +355,6 @@ impl Scanner {
         .execute(conn)?;
         debug!("Deleted video keyframes for file {}", file_id);
 
-        // Clear enhancement_tasks referencing this file
-        diesel::update(
-            crate::schema::enhancement_tasks::table
-                .filter(crate::schema::enhancement_tasks::output_file_id.eq(&file_id)),
-        )
-        .set(
-            crate::schema::enhancement_tasks::output_file_id.eq(None::<String>),
-        )
-        .execute(conn)?;
-
         // Delete the file record
         diesel::delete(files::table.filter(files::id.eq(&file_id))).execute(conn)?;
         info!("Removed file record {} for {:?}", file_id, path);
@@ -422,18 +398,10 @@ impl Scanner {
     /// This is O(n x k) where k = number of people, instead of the previous O(n^2) pairwise approach.
     pub fn cluster_faces(&self, conn: &mut SqliteConnection) -> anyhow::Result<()> {
         // Load unassigned faces with embeddings.
-        //
-        // Never a face on a generated file. [`Self::purge_synthetic_faces`] has
-        // normally already deleted those, but this filter is the rule and that
-        // is the sweep: a generated face admitted here is averaged into an
-        // ArcFace centroid, and taking it back out again means re-clustering
-        // the whole library.
         let unassigned_rows: Vec<(String, Vec<u8>)> = faces::table
-            .inner_join(files::table.on(faces::file_id.eq(files::id)))
             .select((faces::id, faces::embedding.assume_not_null()))
             .filter(faces::embedding.is_not_null())
             .filter(faces::person_id.is_null())
-            .filter(files::synthetic.eq(false))
             .load::<(String, Vec<u8>)>(conn)?;
 
         let unassigned: Vec<(String, Vec<f32>)> = unassigned_rows
@@ -703,8 +671,7 @@ impl Scanner {
         conn: &mut SqliteConnection,
         dry_run: bool,
     ) -> anyhow::Result<usize> {
-        // Files belonging to not-yet-reviewed shots. Generated files are not
-        // among them: they hold no faces to sweep, by rule.
+        // Files belonging to not-yet-reviewed shots.
         let file_ids: Vec<String> = files::table
             .inner_join(shots::table.on(files::shot_id.eq(shots::id)))
             .filter(
@@ -712,7 +679,6 @@ impl Scanner {
                     .ne("confirmed")
                     .or(shots::review_status.is_null()),
             )
-            .filter(files::synthetic.eq(false))
             .select(files::id)
             .load::<String>(conn)?;
 
@@ -815,23 +781,6 @@ impl Scanner {
         Ok(total_removed)
     }
 
-    /// Delete every face box drawn on a generated file, and repair whatever
-    /// those boxes had already influenced.
-    ///
-    /// A generated face should never have been detected in the first place —
-    /// [`Self::process_file`] refuses to look at a file the database says is
-    /// synthetic. But "should never" is not the same as "cannot": a file can be
-    /// indexed by the watcher in the moment between the bytes landing on disk
-    /// and the generator claiming the row, and libraries carry rows written
-    /// before any of this existed. So the sweep runs anyway, and puts back what
-    /// a wrong box had already moved: the person's centroid, the shot's owner,
-    /// and any person who turns out to have been made of nothing else.
-    ///
-    /// Returns the number of face rows removed.
-    pub fn purge_synthetic_faces(&self, conn: &mut SqliteConnection) -> anyhow::Result<usize> {
-        purge_faces_on_synthetic_files(conn)
-    }
-
     /// Returns `true` if the file was newly indexed, `false` if it was
     /// already known (same path or duplicate content).
     pub fn process_file(
@@ -850,25 +799,12 @@ impl Scanner {
             // `.optional()?`, never `.ok()`: a query error here (say, a schema
             // this build doesn't match) must abort, because "not found" is what
             // licenses the duplicate branch below to delete files from disk.
-            let existing: Option<(String, bool)> = files::table
-                .select((files::id, files::synthetic))
+            let existing: Option<String> = files::table
+                .select(files::id)
                 .filter(files::path.eq(&relative_path))
-                .first::<(String, bool)>(conn)
+                .first::<String>(conn)
                 .optional()?;
-            if let Some((existing_id, synthetic)) = existing {
-                if synthetic {
-                    // Nothing a machine drew goes near the person model. This
-                    // is the rule the rest of the pipeline leans on, so state
-                    // it here rather than let the early return imply it — and
-                    // clear any boxes that got in before the row said so.
-                    let removed = purge_faces_on_file(conn, &existing_id)?;
-                    if removed > 0 {
-                        warn!(
-                            "Dropped {} face box(es) found on generated file {:?}",
-                            removed, path
-                        );
-                    }
-                }
+            if existing.is_some() {
                 debug!("File already indexed at path {:?}, skipping", path);
                 return Ok(false);
             }
@@ -1038,12 +974,6 @@ impl Scanner {
                     file_size: Some(file_size as i32),
                     is_original: Some(is_original),
                     visual_embedding: None,
-                    source_workflow_id: None,
-                    source_text_overrides: None,
-                    // A file found on disk is a photograph until a generator
-                    // says otherwise; only the generators set this.
-                    synthetic: None,
-                    manifest_json: None,
                 })
                 .execute(conn)?;
 
@@ -1215,147 +1145,6 @@ impl Scanner {
     }
 }
 
-// ── The synthetic-media rule ─────────────────────────────────────────────────
-//
-// Generated faces never enter the person model. A file whose `synthetic` flag
-// is set is skipped by detection, excluded from clustering, excluded from the
-// overlap sweep, and cannot decide a shot's primary person. What follows is the
-// repair path for boxes that got in anyway.
-
-/// Delete the face boxes on one file, leaving nothing pointing at them.
-///
-/// Returns the number of rows removed.
-pub fn purge_faces_on_file(conn: &mut SqliteConnection, file_id: &str) -> anyhow::Result<usize> {
-    let doomed: Vec<String> = faces::table
-        .filter(faces::file_id.eq(file_id))
-        .select(faces::id)
-        .load::<String>(conn)?;
-    if doomed.is_empty() {
-        return Ok(0);
-    }
-
-    // A person whose portrait is one of these boxes needs a different one.
-    // Picked here, not left for clustering: cluster_faces returns before its
-    // thumbnail-refresh loop when every remaining face is already assigned, so
-    // in a settled library "cleared" would mean "blank forever".
-    let widowed: Vec<String> = people::table
-        .filter(people::thumbnail_face_id.eq_any(&doomed))
-        .select(people::id)
-        .load::<String>(conn)?;
-
-    let removed = diesel::delete(faces::table.filter(faces::id.eq_any(&doomed))).execute(conn)?;
-
-    for person_id in &widowed {
-        let replacement: Option<String> = faces::table
-            .inner_join(files::table.on(faces::file_id.eq(files::id)))
-            .filter(faces::person_id.eq(person_id))
-            .filter(files::synthetic.eq(false))
-            .select(faces::id)
-            .order(faces::score.desc())
-            .first::<String>(conn)
-            .optional()?;
-        diesel::update(people::table.filter(people::id.eq(person_id)))
-            .set(people::thumbnail_face_id.eq(replacement))
-            .execute(conn)?;
-    }
-
-    Ok(removed)
-}
-
-/// Sweep every face box drawn on a generated file out of the library, and undo
-/// what those boxes had already influenced.
-///
-/// See [`Scanner::purge_synthetic_faces`] for why this exists at all.
-pub fn purge_faces_on_synthetic_files(conn: &mut SqliteConnection) -> anyhow::Result<usize> {
-    let offending_files: Vec<String> = files::table
-        .filter(files::synthetic.eq(true))
-        .filter(diesel::dsl::exists(
-            faces::table.filter(faces::file_id.eq(files::id)),
-        ))
-        .select(files::id)
-        .load::<String>(conn)?;
-    if offending_files.is_empty() {
-        return Ok(0);
-    }
-
-    // Whose average these boxes were pulling on, before they go.
-    let contaminated: Vec<String> = faces::table
-        .filter(faces::file_id.eq_any(&offending_files))
-        .filter(faces::person_id.is_not_null())
-        .select(faces::person_id.assume_not_null())
-        .distinct()
-        .load::<String>(conn)?;
-
-    let mut removed = 0usize;
-    for file_id in &offending_files {
-        removed += purge_faces_on_file(conn, file_id)?;
-    }
-    if removed == 0 {
-        return Ok(0);
-    }
-
-    // Deleting the box is not enough: the embedding is already averaged into
-    // the person's centroid, and the next face compared against it would be
-    // compared against a person partly made of something that never existed.
-    for pid in &contaminated {
-        recompute_representative_embedding(conn, pid)?;
-    }
-
-    // A generated face may have been the largest one in its shot, and so the
-    // reason the shot belongs to whoever it belongs to.
-    assign_primary_persons(conn)?;
-    // And a person who was only ever that face is now nobody.
-    crate::db::cleanup_orphaned_people(conn)?;
-
-    warn!(
-        "Removed {} face box(es) detected on {} generated file(s); recomputed {} person centroid(s)",
-        removed,
-        offending_files.len(),
-        contaminated.len()
-    );
-    Ok(removed)
-}
-
-/// Recompute a person's representative embedding from the faces they still
-/// have. A person left with none keeps whatever they had — the orphan cleanup
-/// decides whether they still exist at all.
-fn recompute_representative_embedding(
-    conn: &mut SqliteConnection,
-    person_id: &str,
-) -> anyhow::Result<()> {
-    let blobs: Vec<Vec<u8>> = faces::table
-        .select(faces::embedding.assume_not_null())
-        .filter(faces::person_id.eq(person_id))
-        .filter(faces::embedding.is_not_null())
-        .load::<Vec<u8>>(conn)?;
-
-    let embeddings: Vec<Vec<f32>> = blobs
-        .into_iter()
-        .filter_map(|b| crate::embedding::decode_embedding(&b).filter(|e| !e.is_empty()))
-        .collect();
-    if embeddings.is_empty() {
-        return Ok(());
-    }
-
-    let dim = embeddings[0].len();
-    let mut sum = vec![0.0f32; dim];
-    for emb in &embeddings {
-        for (i, v) in emb.iter().enumerate() {
-            sum[i] += v;
-        }
-    }
-    let mean: Vec<f32> = sum.iter().map(|v| v / embeddings.len() as f32).collect();
-    let norm: f32 = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        let normalized: Vec<f32> = mean.iter().map(|v| v / norm).collect();
-        let blob = crate::embedding::encode_embedding(&normalized);
-        diesel::update(people::table.filter(people::id.eq(person_id)))
-            .set(people::representative_embedding.eq(&blob))
-            .execute(conn)?;
-    }
-    Ok(())
-}
-
 /// Assign `primary_person_id` for each shot based on the largest face with a person_id.
 ///
 /// For each shot where `review_status != 'confirmed'`, finds the face with the
@@ -1386,8 +1175,6 @@ pub fn assign_primary_persons(conn: &mut SqliteConnection) -> anyhow::Result<()>
             .select(faces::person_id.assume_not_null())
             .filter(files::shot_id.eq(shot_id))
             .filter(faces::person_id.is_not_null())
-            // A generated variant does not get to decide whose shot this is.
-            .filter(files::synthetic.eq(false))
             .order(
                 diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::Float>>(
                     "(faces.box_x2 - faces.box_x1) * (faces.box_y2 - faces.box_y1)",
@@ -1892,68 +1679,14 @@ where
     Ok(count)
 }
 
-/// Which frame of a video to pull out.
-///
-/// [`FrameTarget::Last`] is the one that makes extending a clip possible, and
-/// the one that needs care: the trailing frames of a stream sit in the
-/// decoder's reorder buffer until it is flushed, so a loop that stops when the
-/// packets run out stops one or more frames short of the end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameTarget {
-    /// The first decodable frame.
-    First,
-    /// The final decodable frame.
-    Last,
-    /// The first frame at or after this position, clamped to the final frame
-    /// when the video is shorter than that.
-    AtMs(i64),
-}
-
-/// How far before the end to land before decoding forward for [`FrameTarget::Last`].
-///
-/// A backward seek lands on a keyframe, so this only has to be longer than one
-/// group of pictures; decoding a couple of seconds beats decoding an hour.
-const LAST_FRAME_LOOKBACK_US: i64 = 5_000_000;
-
 /// Extract the first frame from a video file and return it as a DynamicImage.
 pub fn extract_first_video_frame(path: &Path) -> anyhow::Result<DynamicImage> {
-    extract_video_frame(path, FrameTarget::First)
+    decode_first_frame(path)?
+        .ok_or_else(|| anyhow::anyhow!("Could not extract any frame from {:?}", path))
 }
 
-/// Extract one frame from a video file and return it as a DynamicImage.
-///
-/// Seeking is treated as an optimisation, never as a correctness requirement:
-/// containers lie about their duration and some are not seekable at all, so a
-/// seek that yields no frame falls back to decoding from the start.
-pub fn extract_video_frame(path: &Path, target: FrameTarget) -> anyhow::Result<DynamicImage> {
-    if matches!(target, FrameTarget::Last | FrameTarget::AtMs(_)) {
-        match decode_target(path, target, true) {
-            Ok(Some(img)) => return Ok(img),
-            Ok(None) => debug!(
-                "Seek-assisted decode of {:?} for {:?} found no frame; decoding from the start",
-                path, target
-            ),
-            Err(e) => debug!(
-                "Seek-assisted decode of {:?} for {:?} failed ({}); decoding from the start",
-                path, target, e
-            ),
-        }
-    }
-    decode_target(path, target, false)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Could not extract any frame from {:?} for {:?}",
-            path,
-            target
-        )
-    })
-}
-
-/// Decode `path` until `target` is satisfied, optionally seeking there first.
-fn decode_target(
-    path: &Path,
-    target: FrameTarget,
-    allow_seek: bool,
-) -> anyhow::Result<Option<DynamicImage>> {
+/// Decode `path` until its first decodable frame comes out.
+fn decode_first_frame(path: &Path) -> anyhow::Result<Option<DynamicImage>> {
     let mut ictx = ffmpeg::format::input(&path)?;
 
     let stream = ictx
@@ -1961,7 +1694,6 @@ fn decode_target(
         .best(ffmpeg::media::Type::Video)
         .ok_or_else(|| anyhow::anyhow!("No video stream found in {:?}", path))?;
     let video_stream_index = stream.index();
-    let time_base = stream.time_base();
 
     let context_decoder = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
     let mut decoder = context_decoder.decoder().video()?;
@@ -1988,62 +1720,24 @@ fn decode_target(
         ffmpeg::software::scaling::Flags::BILINEAR,
     )?;
 
-    if allow_seek {
-        // `duration()` is in AV_TIME_BASE units (microseconds), and is 0 or
-        // negative when the container does not know.
-        let seek_us = match target {
-            FrameTarget::First => None,
-            FrameTarget::Last => {
-                let duration = ictx.duration();
-                (duration > LAST_FRAME_LOOKBACK_US).then(|| duration - LAST_FRAME_LOOKBACK_US)
-            }
-            FrameTarget::AtMs(ms) => (ms > 0).then(|| ms.saturating_mul(1000)),
-        };
-        // Nothing worth seeking to — say so rather than repeating the unseeked
-        // pass the caller is about to run anyway.
-        let Some(seek_us) = seek_us else {
-            return Ok(None);
-        };
-        // Land on the keyframe at or before the mark, then decode forward.
-        if ictx.seek(seek_us, ..seek_us).is_err() {
-            return Ok(None);
-        }
-        decoder.flush();
-    }
-
     let mut best: Option<DynamicImage> = None;
-    let mut satisfied = false;
 
     let collect = |decoder: &mut ffmpeg::decoder::Video,
                    scaler: &mut ffmpeg::software::scaling::Context,
-                   best: &mut Option<DynamicImage>,
-                   satisfied: &mut bool| {
+                   best: &mut Option<DynamicImage>| {
         let mut decoded = ffmpeg::frame::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
-            if *satisfied {
+            if best.is_some() {
                 // Keep draining so the decoder stays in a sane state, but the
                 // answer is already decided.
                 continue;
             }
-            let pts = decoded.timestamp().unwrap_or(0);
-            let timestamp_ms = (pts as f64 * f64::from(time_base) * 1000.0) as i64;
-
             let mut rgb_frame = ffmpeg::frame::Video::empty();
             if scaler.run(&decoded, &mut rgb_frame).is_err() {
                 continue;
             }
-            let Some(img) = rgb_frame_to_image(&rgb_frame) else {
-                continue;
-            };
-
-            // Every target keeps the newest frame and they differ only in when
-            // that frame is good enough to stop on. `Last` never stops, which
-            // is why the EOF drain below matters.
-            *best = Some(img);
-            match target {
-                FrameTarget::First => *satisfied = true,
-                FrameTarget::Last => {}
-                FrameTarget::AtMs(ms) => *satisfied = timestamp_ms >= ms,
+            if let Some(img) = rgb_frame_to_image(&rgb_frame) {
+                *best = Some(img);
             }
         }
     };
@@ -2051,17 +1745,16 @@ fn decode_target(
     for (stream, packet) in ictx.packets() {
         if stream.index() == video_stream_index {
             decoder.send_packet(&packet)?;
-            collect(&mut decoder, &mut scaler, &mut best, &mut satisfied);
-            if satisfied {
+            collect(&mut decoder, &mut scaler, &mut best);
+            if best.is_some() {
                 return Ok(best);
             }
         }
     }
-    // Flush: the frames still inside the decoder are exactly the ones a loop
-    // that stops at the last packet loses, and for `Last` one of them is the
-    // answer.
+    // Flush the reorder buffer: a short stream can end before the decoder has
+    // emitted anything.
     decoder.send_eof()?;
-    collect(&mut decoder, &mut scaler, &mut best, &mut satisfied);
+    collect(&mut decoder, &mut scaler, &mut best);
 
     Ok(best)
 }
@@ -2548,397 +2241,6 @@ mod tests {
         assert_eq!(hash, [0u8; 8]);
     }
 
-    // ── The synthetic-media rule ────────────────────────────────────────────
-
-    /// A library with one photograph, scanned: one file, one face, one person.
-    /// The pipeline runs in dummy mode, which finds exactly one face per image —
-    /// so every file in these tests has a detectable face, including the ones
-    /// that must not be allowed to keep it.
-    fn scanned_library_with_one_photograph() -> (tempfile::TempDir, PathBuf, Scanner) {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let db_path = root.join(".phos.db");
-        crate::db::init_and_migrate(&db_path).unwrap();
-
-        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(200, 200, |x, y| {
-            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
-        }));
-        img.save(root.join("orig.png")).unwrap();
-
-        let scanner = Scanner::new(db_path.clone(), Some(AiPipeline::dummy()));
-        scanner.scan(&root).unwrap();
-        (dir, root, scanner)
-    }
-
-    /// Write a picture a machine made, and register it the way the ComfyUI
-    /// worker does.
-    fn register_generated_file(
-        conn: &mut SqliteConnection,
-        root: &Path,
-        name: &str,
-        file_id: &str,
-        tint: u8,
-    ) -> PathBuf {
-        let gen = DynamicImage::ImageRgb8(RgbImage::from_fn(200, 200, |x, y| {
-            image::Rgb([255 - (x % 256) as u8, (y % 256) as u8, tint])
-        }));
-        let path = root.join(name);
-        gen.save(&path).unwrap();
-
-        let shot_id: String = shots::table.select(shots::id).first(conn).unwrap();
-        let rel = db::make_relative(root, &path);
-        diesel::insert_into(files::table)
-            .values(NewFile {
-                id: file_id,
-                shot_id: &shot_id,
-                path: &rel,
-                hash: file_id,
-                mime_type: Some("image/png"),
-                file_size: Some(1),
-                is_original: Some(false),
-                visual_embedding: None,
-                source_workflow_id: Some("wf-1"),
-                source_text_overrides: Some("{}"),
-                synthetic: Some(true),
-                manifest_json: Some(r#"{"version":1,"generator":"comfyui"}"#),
-            })
-            .execute(conn)
-            .unwrap();
-        path
-    }
-
-    fn centroid_of_the_only_person(conn: &mut SqliteConnection) -> Vec<u8> {
-        people::table
-            .select(people::representative_embedding.assume_not_null())
-            .first::<Vec<u8>>(conn)
-            .unwrap()
-    }
-
-    fn add_face(
-        conn: &mut SqliteConnection,
-        id: &str,
-        file_id: &str,
-        person_id: Option<&str>,
-        box_to: f32,
-        embedding: &[u8],
-    ) {
-        diesel::insert_into(faces::table)
-            .values(NewFace {
-                id,
-                file_id,
-                person_id,
-                box_x1: Some(0.0),
-                box_y1: Some(0.0),
-                box_x2: Some(box_to),
-                box_y2: Some(box_to),
-                embedding: Some(embedding),
-                score: Some(0.99),
-            })
-            .execute(conn)
-            .unwrap();
-    }
-
-    /// The rule, end to end: a generated file with a perfectly detectable face
-    /// comes out of a rescan with no face rows and leaves the person model
-    /// exactly as it found it.
-    #[test]
-    fn a_rescan_never_takes_a_face_off_a_generated_file() {
-        let (_dir, root, scanner) = scanned_library_with_one_photograph();
-        let mut conn = scanner.open_db().unwrap();
-
-        assert_eq!(
-            1i64,
-            faces::table.count().get_result::<i64>(&mut conn).unwrap(),
-            "the photograph's own face"
-        );
-        let centroid_before = centroid_of_the_only_person(&mut conn);
-
-        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
-        scanner.scan(&root).unwrap();
-
-        let on_generated: i64 = faces::table
-            .filter(faces::file_id.eq("gen-file"))
-            .count()
-            .get_result(&mut conn)
-            .unwrap();
-        assert_eq!(0, on_generated, "a generated file carries no faces");
-        assert_eq!(
-            2i64,
-            files::table.count().get_result::<i64>(&mut conn).unwrap(),
-            "the generated file is still in the library, just not in the face index"
-        );
-        assert_eq!(
-            1i64,
-            people::table.count().get_result::<i64>(&mut conn).unwrap(),
-            "no person invented from a face nobody has"
-        );
-        assert_eq!(
-            centroid_before,
-            centroid_of_the_only_person(&mut conn),
-            "the person model must be bit-for-bit what it was"
-        );
-    }
-
-    /// The same file arriving before its row does — the watcher race, and every
-    /// library that generated a variant before this rule existed. The boxes are
-    /// swept out, and what they had already moved is put back.
-    #[test]
-    fn faces_that_got_onto_a_generated_file_are_swept_back_out() {
-        let (_dir, root, scanner) = scanned_library_with_one_photograph();
-        let mut conn = scanner.open_db().unwrap();
-        let centroid_before = centroid_of_the_only_person(&mut conn);
-        let shot_id: String = shots::table.select(shots::id).first(&mut conn).unwrap();
-
-        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
-
-        // A face nobody should have detected, clustered into a person who has
-        // never existed, holding the shot.
-        let invented = crate::embedding::encode_embedding(&vec![0.9f32; 512]);
-        diesel::insert_into(people::table)
-            .values(NewPerson {
-                id: "phantom",
-                name: None,
-                thumbnail_face_id: Some("face-generated"),
-                representative_embedding: Some(&invented),
-                folder_name: None,
-            })
-            .execute(&mut conn)
-            .unwrap();
-        add_face(
-            &mut conn,
-            "face-generated",
-            "gen-file",
-            Some("phantom"),
-            190.0,
-            &invented,
-        );
-        diesel::update(shots::table.filter(shots::id.eq(&shot_id)))
-            .set(shots::primary_person_id.eq("phantom"))
-            .execute(&mut conn)
-            .unwrap();
-
-        let removed = scanner.purge_synthetic_faces(&mut conn).unwrap();
-
-        assert_eq!(1, removed);
-        assert_eq!(
-            0i64,
-            faces::table
-                .filter(faces::id.eq("face-generated"))
-                .count()
-                .get_result::<i64>(&mut conn)
-                .unwrap(),
-        );
-        assert_eq!(
-            0i64,
-            people::table
-                .filter(people::id.eq("phantom"))
-                .count()
-                .get_result::<i64>(&mut conn)
-                .unwrap(),
-            "a person made only of a generated face is nobody",
-        );
-        let owner: Option<String> = shots::table
-            .select(shots::primary_person_id)
-            .filter(shots::id.eq(&shot_id))
-            .first(&mut conn)
-            .unwrap();
-        assert_ne!(
-            Some("phantom".to_string()),
-            owner,
-            "the shot goes back to whoever its real face says it belongs to",
-        );
-        assert_eq!(
-            centroid_before,
-            centroid_of_the_only_person(&mut conn),
-            "the surviving person's centroid is untouched",
-        );
-    }
-
-    /// The centroid repair, on its own: a real person whose average was pulled
-    /// by a generated face gets that face's contribution taken back out.
-    #[test]
-    fn a_centroid_a_generated_face_pulled_on_is_recomputed_without_it() {
-        let (_dir, root, scanner) = scanned_library_with_one_photograph();
-        let mut conn = scanner.open_db().unwrap();
-        let person_id: String = people::table.select(people::id).first(&mut conn).unwrap();
-        let centroid_before = centroid_of_the_only_person(&mut conn);
-
-        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
-
-        // A generated face assigned to a person who really exists, and a
-        // centroid already averaged with it.
-        let drifted = crate::embedding::encode_embedding(&vec![0.5f32; 512]);
-        add_face(
-            &mut conn,
-            "face-generated",
-            "gen-file",
-            Some(&person_id),
-            50.0,
-            &drifted,
-        );
-        diesel::update(people::table.filter(people::id.eq(&person_id)))
-            .set(people::representative_embedding.eq(&drifted))
-            .execute(&mut conn)
-            .unwrap();
-        assert_ne!(centroid_before, centroid_of_the_only_person(&mut conn));
-
-        scanner.purge_synthetic_faces(&mut conn).unwrap();
-
-        assert_eq!(
-            centroid_before,
-            centroid_of_the_only_person(&mut conn),
-            "the centroid is rebuilt from the faces that are really theirs",
-        );
-    }
-
-    /// Belt and braces: even handed a generated face directly, clustering will
-    /// not take it. This is the filter that holds when the sweep has not run.
-    #[test]
-    fn clustering_will_not_take_a_generated_face_even_when_offered_one() {
-        let (_dir, root, scanner) = scanned_library_with_one_photograph();
-        let mut conn = scanner.open_db().unwrap();
-        let people_before: i64 = people::table.count().get_result(&mut conn).unwrap();
-
-        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
-        let invented = crate::embedding::encode_embedding(&vec![0.9f32; 512]);
-        add_face(
-            &mut conn,
-            "face-generated",
-            "gen-file",
-            None,
-            100.0,
-            &invented,
-        );
-
-        scanner.cluster_faces(&mut conn).unwrap();
-
-        let assigned: Option<String> = faces::table
-            .select(faces::person_id)
-            .filter(faces::id.eq("face-generated"))
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(None, assigned, "it belongs to nobody, because it is nobody");
-        assert_eq!(
-            people_before,
-            people::table.count().get_result::<i64>(&mut conn).unwrap(),
-            "and it invents nobody",
-        );
-    }
-
-    /// A generated variant can be the biggest face in the shot and still not
-    /// get to say whose shot it is.
-    #[test]
-    fn a_generated_variant_does_not_decide_whose_shot_it_is() {
-        let (_dir, root, scanner) = scanned_library_with_one_photograph();
-        let mut conn = scanner.open_db().unwrap();
-        let real_person: String = people::table.select(people::id).first(&mut conn).unwrap();
-        let shot_id: String = shots::table.select(shots::id).first(&mut conn).unwrap();
-
-        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
-        let invented = crate::embedding::encode_embedding(&vec![0.9f32; 512]);
-        diesel::insert_into(people::table)
-            .values(NewPerson {
-                id: "someone-else",
-                name: Some("Someone Else"),
-                thumbnail_face_id: None,
-                representative_embedding: Some(&invented),
-                folder_name: None,
-            })
-            .execute(&mut conn)
-            .unwrap();
-        // Bigger than the photograph's own 100x100 box, so on area alone it wins.
-        add_face(
-            &mut conn,
-            "face-generated",
-            "gen-file",
-            Some("someone-else"),
-            199.0,
-            &invented,
-        );
-
-        assign_primary_persons(&mut conn).unwrap();
-
-        let owner: Option<String> = shots::table
-            .select(shots::primary_person_id)
-            .filter(shots::id.eq(&shot_id))
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(Some(real_person), owner);
-    }
-
-    /// The gate in `process_file` itself: walking past a file the database
-    /// already knows is generated drops any box hanging off it, rather than
-    /// leaving the skip to imply the rule.
-    #[test]
-    fn walking_past_a_generated_file_drops_any_box_hanging_off_it() {
-        let (_dir, root, scanner) = scanned_library_with_one_photograph();
-        let mut conn = scanner.open_db().unwrap();
-
-        let gen_path =
-            register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
-        let invented = crate::embedding::encode_embedding(&vec![0.9f32; 512]);
-        add_face(
-            &mut conn,
-            "face-generated",
-            "gen-file",
-            None,
-            100.0,
-            &invented,
-        );
-
-        let cache = std::sync::Mutex::new(Vec::<DHashCacheEntry>::new());
-        let indexed = scanner.process_file(&mut conn, &gen_path, &cache).unwrap();
-
-        assert!(!indexed, "already known, so nothing new is indexed");
-        assert_eq!(
-            0i64,
-            faces::table
-                .filter(faces::file_id.eq("gen-file"))
-                .count()
-                .get_result::<i64>(&mut conn)
-                .unwrap(),
-        );
-    }
-
-    /// A surviving person whose portrait happened to be a generated face gets
-    /// a replacement from their real faces during the purge itself — not
-    /// "eventually", because clustering returns early in a settled library
-    /// and would leave the blank forever.
-    #[test]
-    fn purging_a_persons_thumbnail_face_picks_a_real_replacement() {
-        let (_dir, root, scanner) = scanned_library_with_one_photograph();
-        let mut conn = scanner.open_db().unwrap();
-        let person_id: String = people::table.select(people::id).first(&mut conn).unwrap();
-        let real_face: String = faces::table.select(faces::id).first(&mut conn).unwrap();
-
-        register_generated_file(&mut conn, &root, "orig_enhanced_1.png", "gen-file", 3);
-        let invented = crate::embedding::encode_embedding(&vec![0.9f32; 512]);
-        add_face(
-            &mut conn,
-            "face-generated",
-            "gen-file",
-            Some(&person_id),
-            100.0,
-            &invented,
-        );
-        diesel::update(people::table.filter(people::id.eq(&person_id)))
-            .set(people::thumbnail_face_id.eq("face-generated"))
-            .execute(&mut conn)
-            .unwrap();
-
-        scanner.purge_synthetic_faces(&mut conn).unwrap();
-
-        let thumbnail: Option<String> = people::table
-            .select(people::thumbnail_face_id)
-            .filter(people::id.eq(&person_id))
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(
-            Some(real_face),
-            thumbnail,
-            "the portrait falls back to a face that really is theirs",
-        );
-    }
 }
 
 /// A real, encoded video whose every frame says which frame it is.
@@ -3101,9 +2403,7 @@ mod frame_target_tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// 96 frames at 12fps — eight seconds, comfortably longer than the
-    /// five-second lookback, so `Last` really does exercise the seek path.
-    const FRAMES: u8 = 96;
+    const FRAMES: u8 = 24;
     const FPS: i32 = 12;
 
     struct Clip {
@@ -3125,11 +2425,11 @@ mod frame_target_tests {
     }
 
     #[test]
-    fn the_fixture_round_trips_its_own_frame_numbers() {
-        // If this fails nothing below means anything: the assertion is that a
-        // frame survives encode → decode still naming itself.
+    fn the_first_frame_comes_out_as_itself() {
+        // The fixture asserts its own premise too: a frame survives
+        // encode → decode still naming itself.
         let clip = clip();
-        let first = extract_video_frame(&clip.path, FrameTarget::First).unwrap();
+        let first = extract_first_video_frame(&clip.path).unwrap();
         assert_eq!(fixture::index_of(&first), clip.frames[0]);
         assert_eq!(
             (first.width(), first.height()),
@@ -3138,67 +2438,10 @@ mod frame_target_tests {
     }
 
     #[test]
-    fn first_frame_is_unchanged_by_the_rewrite() {
-        let clip = clip();
-        assert_eq!(
-            fixture::index_of(&extract_first_video_frame(&clip.path).unwrap()),
-            0
-        );
-    }
-
-    /// The one the whole feature turns on: extending a clip needs its *last*
-    /// frame, and the naive loop returns the last frame the decoder happened to
-    /// have emitted, which with B-frames is not the last frame of the video.
-    #[test]
-    fn last_frame_is_the_last_frame_not_the_one_before_the_flush() {
-        let clip = clip();
-        let last = extract_video_frame(&clip.path, FrameTarget::Last).unwrap();
-        assert_eq!(
-            fixture::index_of(&last),
-            *clip.frames.last().unwrap(),
-            "last frame extraction stopped short of the end"
-        );
-    }
-
-    #[test]
-    fn at_time_lands_on_the_frame_that_covers_that_moment() {
-        let clip = clip();
-        // Frame n is shown at n/FPS seconds. Ask for 4s into an 8s clip.
-        let ms = 4_000;
-        let img = extract_video_frame(&clip.path, FrameTarget::AtMs(ms)).unwrap();
-        let got = fixture::index_of(&img);
-        let want = (ms as f64 / 1000.0 * FPS as f64).round() as u8;
-        assert!(
-            got.abs_diff(want) <= 1,
-            "asked for {}ms (frame {}), got frame {}",
-            ms,
-            want,
-            got
-        );
-    }
-
-    #[test]
-    fn at_time_zero_is_the_first_frame() {
-        let clip = clip();
-        let img = extract_video_frame(&clip.path, FrameTarget::AtMs(0)).unwrap();
-        assert_eq!(fixture::index_of(&img), 0);
-    }
-
-    /// A timestamp past the end is a user typo, not an error: give them the
-    /// closest thing that exists rather than failing the whole task.
-    #[test]
-    fn at_time_past_the_end_clamps_to_the_last_frame() {
-        let clip = clip();
-        let img = extract_video_frame(&clip.path, FrameTarget::AtMs(999_000)).unwrap();
-        assert_eq!(fixture::index_of(&img), *clip.frames.last().unwrap());
-    }
-
-    #[test]
     fn a_file_that_is_not_a_video_is_an_error_not_a_panic() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("notes.txt");
         std::fs::write(&path, b"not a video").unwrap();
-        assert!(extract_video_frame(&path, FrameTarget::Last).is_err());
-        assert!(extract_video_frame(&path, FrameTarget::AtMs(10)).is_err());
+        assert!(extract_first_video_frame(&path).is_err());
     }
 }

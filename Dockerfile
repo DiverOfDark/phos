@@ -51,9 +51,9 @@ COPY backend/src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 2c: Build deps + release binary. Tests are not run here: CI runs them
-# (unit, integration and the ComfyUI contract test) in its own job and only
-# builds this image once they pass, so a test stage in the image would run the
-# same tests a second time on every build.
+# (unit and integration) in its own job and only builds this image once they
+# pass, so a test stage in the image would run the same tests a second time on
+# every build.
 FROM chef AS backend-builder
 COPY --from=planner /app/backend/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
