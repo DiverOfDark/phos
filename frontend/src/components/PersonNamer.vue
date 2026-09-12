@@ -4,7 +4,7 @@
  * has a name. Renders inline inside the Review Desk; the dialog form is kept for
  * callers that still open it as a modal.
  */
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -61,7 +61,14 @@ watch(dialogOpen, async (isOpen) => {
 })
 
 onMounted(() => {
-  if (props.inline) start()
+  if (props.inline) {
+    start()
+    window.addEventListener('keydown', onKeydown)
+  }
+})
+
+onUnmounted(() => {
+  if (props.inline) window.removeEventListener('keydown', onKeydown)
 })
 
 async function fetchPeople() {
@@ -145,6 +152,41 @@ async function skip() {
   await advance()
 }
 
+const deletingCluster = ref(false)
+
+/** Remove the whole cluster: deletes its face records, the files stay. No confirmation by design. */
+async function deleteCluster() {
+  if (!currentPerson.value || deletingCluster.value) return
+  deletingCluster.value = true
+  try {
+    const res = await fetch(`/api/people/${currentPerson.value.id}`, { method: 'DELETE' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+
+    unnamedPeople.value.splice(currentIndex.value, 1)
+    handled.value++
+    emit('changed')
+
+    // The splice already moved the next cluster into this index.
+    if (currentIndex.value >= unnamedPeople.value.length) {
+      done.value = true
+    } else {
+      await fetchFaces(unnamedPeople.value[currentIndex.value].id)
+    }
+  } catch (e) {
+    console.error('Failed to delete cluster', e)
+  } finally {
+    deletingCluster.value = false
+  }
+}
+
+function onKeydown(e) {
+  if (e.key !== 'Delete' || e.ctrlKey || e.metaKey || e.altKey) return
+  // Forward-delete inside the name/search inputs must keep editing text.
+  if (['INPUT', 'TEXTAREA'].includes(e.target?.tagName)) return
+  e.preventDefault()
+  deleteCluster()
+}
+
 async function advance() {
   const nextIdx = currentIndex.value + 1
   if (nextIdx >= unnamedPeople.value.length) {
@@ -214,6 +256,12 @@ defineExpose({ loadData: start })
           class="border border-line-strong rounded px-4 py-2.5 text-[13px] text-ink-secondary hover:text-signal transition-colors"
           @click="skip"
         >Skip</button>
+        <button
+          class="border border-line-strong rounded px-4 py-2.5 text-[13px] text-error transition-colors disabled:opacity-40"
+          title="Delete this cluster — removes its face detections, files are untouched (Del)"
+          :disabled="deletingCluster"
+          @click="deleteCluster"
+        >Delete <span class="font-mono text-[10px] text-ink-tertiary">DEL</span></button>
       </div>
 
       <div v-if="namedPeople.length > 0" class="flex flex-col gap-2">

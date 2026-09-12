@@ -13,6 +13,7 @@ const error = ref('')
 // --- Selected file in filmstrip ---
 const selectedFileIndex = ref(0)
 const videoPlaying = ref(false)
+const fullscreen = ref(false)
 
 // --- People list for reassign dropdowns ---
 const people = ref([])
@@ -493,6 +494,11 @@ function goBack() {
 
 // --- Keyboard shortcuts ---
 function onKeydown(e) {
+  if (fullscreen.value) {
+    if (e.key === 'Escape' || e.key === 'f' || e.key === 'F') fullscreen.value = false
+    return
+  }
+
   if (reassignFaceId.value || showReassignDropdown.value || showDeleteDialog.value || showMergeConfirm.value) {
     if (e.key === 'Escape') {
       closeReassign()
@@ -500,6 +506,12 @@ function onKeydown(e) {
       showDeleteDialog.value = false
       showMergeConfirm.value = false
     }
+    return
+  }
+
+  if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey && !e.altKey
+      && !['INPUT', 'TEXTAREA'].includes(e.target?.tagName)) {
+    fullscreen.value = true
     return
   }
 
@@ -698,14 +710,14 @@ watch(() => route.params.id, () => {
       <div class="grid gap-6 items-start" style="grid-template-columns: minmax(0, 1fr)">
         <div class="grid gap-6 items-start" :class="'lg:grid-cols-[minmax(0,1fr)_320px]'">
           <div class="flex flex-col gap-2 min-w-0">
-            <div class="relative bg-surface border border-line rounded overflow-hidden flex items-center justify-center" style="aspect-ratio: 3/2">
+            <div class="relative bg-surface border border-line rounded flex items-center justify-center" style="min-height: 240px">
               <template v-if="selectedFile">
-                <div class="relative max-w-full max-h-full">
+                <div class="relative max-w-full">
                   <img
                     :src="isVideo ? `${selectedFileThumbnailUrl}?w=1280` : selectedFileUrl"
                     :alt="selectedFilename"
-                    class="max-w-full max-h-full block object-contain"
-                    style="max-height: 60vh"
+                    class="max-w-full block"
+                    style="max-height: 70vh"
                     @load="onImageLoad"
                   />
                   <button
@@ -735,11 +747,18 @@ watch(() => route.params.id, () => {
                   >stop</button>
                 </div>
 
-                <div v-if="isVideo && !videoPlaying" class="absolute top-2 right-2">
+                <div class="absolute top-2 right-2 flex gap-1">
                   <button
+                    v-if="isVideo && !videoPlaying"
                     class="bg-base border border-line-strong rounded-sm px-2 py-0.5 font-mono text-[11px] text-ink-secondary hover:text-signal transition-colors"
                     @click="videoPlaying = true"
                   >▶ play</button>
+                  <button
+                    v-if="!videoPlaying"
+                    class="bg-base border border-line-strong rounded-sm px-2 py-0.5 font-mono text-[11px] text-ink-secondary hover:text-signal transition-colors"
+                    title="View full screen (F)"
+                    @click="fullscreen = true"
+                  >⛶ full</button>
                 </div>
               </template>
             </div>
@@ -885,6 +904,34 @@ watch(() => route.params.id, () => {
         </div>
       </div>
     </template>
+
+    <!-- Fullscreen viewer -->
+    <div
+      v-if="fullscreen"
+      class="fixed inset-0 z-50 bg-base flex items-center justify-center"
+      @click="fullscreen = false"
+    >
+      <video
+        v-if="isVideo"
+        :src="selectedFileUrl"
+        class="max-w-full max-h-full"
+        controls
+        autoplay
+        @click.stop
+      ></video>
+      <img
+        v-else
+        :src="selectedFileUrl"
+        :alt="selectedFilename"
+        class="max-w-full max-h-full object-contain"
+        @click.stop
+      />
+      <button
+        class="absolute top-3 right-3 bg-base border border-line-strong rounded-sm px-2 py-0.5 font-mono text-[11px] text-ink-secondary hover:text-signal"
+        @click.stop="fullscreen = false"
+      >✕ close</button>
+      <span class="absolute bottom-3 left-3 font-mono text-[11px] text-ink-tertiary">{{ selectedFilename }}</span>
+    </div>
 
     <!-- Merge confirmation -->
     <div
