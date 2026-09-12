@@ -7,7 +7,6 @@ Phos is a self-hosted AI-powered media manager that automatically indexes your p
 - **AI Face Detection & Recognition** — SCRFD detection + ArcFace embeddings, automatic clustering by person
 - **Recursive Media Scanning** — SHA256 hashing, duplicate detection, automatic file organization
 - **Video Support** — Keyframe extraction and face analysis on video files
-- **ComfyUI Integration** — Optional image enhancement via ComfyUI workflows
 - **Multi-User Mode** — OIDC/SSO authentication with per-user isolated libraries
 - **Web UI** — Modern Vue 3 gallery with people browser, import dialog, and settings
 - **WebDAV Server** — Read-only network drive access to your library; mount from any file manager, Nextcloud, or rclone
@@ -85,13 +84,7 @@ Setting `PHOS_OIDC_ISSUER` enables multi-user mode — each authenticated user g
 | `PHOS_S3_PORT` | *(unset)* | Also serve the S3 API on a separate port at `/` (e.g. `9000`). There `ListBuckets` works too, which the main port cannot offer |
 | `PHOS_S3_PUBLIC_URL` | *(unset)* | External S3 endpoint URL shown in the settings UI (for reverse-proxy setups) |
 
-### ComfyUI Integration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PHOS_COMFYUI_URL` | *(unset)* | ComfyUI server URL (e.g. `http://localhost:8188`). Enables background image enhancement |
-
-### Docker Compose with SSO, ComfyUI, and WebDAV
+### Docker Compose with SSO and WebDAV
 
 ```yaml
 services:
@@ -111,9 +104,6 @@ services:
       - PHOS_OIDC_CLIENT_ID=phos
       - PHOS_OIDC_CLIENT_SECRET=your-client-secret
       - PHOS_OIDC_REDIRECT_URI=https://phos.example.com/api/auth/callback
-      - PHOS_COMFYUI_URL=http://host.docker.internal:8188
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 ```
 

@@ -270,7 +270,6 @@ fun BrowserScreen(
                 fileIndex = currentFileIndex,
                 fileCount = currentShot?.files?.size ?: 0,
                 isOriginal = currentShot?.files?.getOrNull(currentFileIndex)?.isOriginal ?: true,
-                isSynthetic = currentShot?.files?.getOrNull(currentFileIndex)?.synthetic ?: false,
                 timestamp = currentShot?.shot?.timestamp,
                 onBack = onBack,
                 onDeleteVariant = { showDeleteConfirm = true },
@@ -721,7 +720,6 @@ private fun MediaOverlay(
     fileIndex: Int,
     fileCount: Int,
     isOriginal: Boolean,
-    isSynthetic: Boolean,
     timestamp: String?,
     onBack: () -> Unit,
     onDeleteVariant: () -> Unit,
@@ -758,11 +756,6 @@ private fun MediaOverlay(
                             append(fileIndex + 1)
                             append(" / ")
                             append(fileCount)
-                        }
-                        // An attribute of the file, not a status — same
-                        // register as the rest of this line, no colour.
-                        if (isSynthetic) {
-                            append(" · GENERATED")
                         }
                     },
                     style = MonoSmall,

@@ -2,7 +2,7 @@ use crate::ai::{cosine_similarity, AiPipeline, MAX_FACE_DISTANCE};
 use crate::db;
 use crate::models::NewPerson;
 use crate::scanner::{self, Scanner};
-use crate::schema::{faces, files, people, shots, enhancement_tasks, video_keyframes};
+use crate::schema::{faces, files, people, shots, video_keyframes};
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use image::DynamicImage;
@@ -964,12 +964,6 @@ pub fn run_reorganize(library: &Path, dry_run: bool) -> anyhow::Result<()> {
                     video_keyframes::table
                         .filter(video_keyframes::video_file_id.eq(&file_row.file_id)),
                 )
-                .execute(&mut conn);
-                let _ = diesel::update(
-                    enhancement_tasks::table
-                        .filter(enhancement_tasks::output_file_id.eq(&file_row.file_id)),
-                )
-                .set(enhancement_tasks::output_file_id.eq(None::<String>))
                 .execute(&mut conn);
                 let _ = diesel::delete(files::table.filter(files::id.eq(&file_row.file_id)))
                     .execute(&mut conn);

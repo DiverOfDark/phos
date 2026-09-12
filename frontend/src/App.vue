@@ -37,7 +37,6 @@ const navItems = computed(() => [
   { view: 'overview', label: 'Overview', to: '/' },
   { view: 'review', label: 'Review Desk', to: '/review', badge: pendingCount.value || null },
   { view: 'people', label: 'People', to: '/people' },
-  { view: 'workflows', label: 'Workflows', to: '/workflows' },
   { view: 'settings', label: 'Settings', to: '/settings' },
 ])
 

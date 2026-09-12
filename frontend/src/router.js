@@ -5,7 +5,6 @@ import ShotDetail from './components/ShotDetail.vue'
 import PersonDetail from './components/PersonDetail.vue'
 import PeopleList from './components/PeopleList.vue'
 import LoginPage from './components/LoginPage.vue'
-import WorkflowsPage from './components/WorkflowsPage.vue'
 import ReviewDesk from './components/ReviewDesk.vue'
 import SettingsPage from './components/SettingsPage.vue'
 
@@ -51,12 +50,6 @@ const routes = [
     name: 'people',
     component: PeopleList,
     meta: { view: 'people' },
-  },
-  {
-    path: '/workflows',
-    name: 'workflows',
-    component: WorkflowsPage,
-    meta: { view: 'workflows' },
   },
   {
     path: '/settings',

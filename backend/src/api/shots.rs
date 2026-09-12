@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::UState;
-use crate::schema::{
-    enhancement_tasks, faces, files, ignored_merges, people, runs, shots, video_keyframes,
-};
+use crate::schema::{faces, files, ignored_merges, people, shots, video_keyframes};
 
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ShotBrief {
@@ -23,9 +21,6 @@ pub(crate) struct ShotBrief {
     pub review_status: Option<String>,
     pub folder_number: Option<i64>,
     pub description: Option<String>,
-    /// The shot's main file was made by a machine. The card says so, because
-    /// the picture itself cannot.
-    pub synthetic: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -80,8 +75,7 @@ pub(super) async fn get_shots(
         "SELECT DISTINCT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number,
                 f.id AS main_file_id, p.name AS person_name,
                 (SELECT COUNT(*) FROM files WHERE shot_id = s.id) AS file_count,
-                s.description,
-                COALESCE(f.synthetic, 0) AS synthetic
+                s.description
          FROM shots s
          LEFT JOIN files f ON s.main_file_id = f.id
          LEFT JOIN people p ON s.primary_person_id = p.id",
@@ -160,8 +154,6 @@ pub(super) async fn get_shots(
         file_count: i64,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         description: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        synthetic: bool,
     }
 
     // Build the sql_query and bind parameters dynamically
@@ -229,7 +221,6 @@ pub(super) async fn get_shots(
                 review_status: row.review_status,
                 folder_number: row.folder_number.map(|v| v as i64),
                 description: row.description,
-                synthetic: row.synthetic,
             })
             .collect(),
         Err(e) => {
@@ -270,9 +261,6 @@ pub(super) struct FileDetail {
     height: Option<i64>,
     duration_ms: Option<i64>,
     thumbnail_url: String,
-    /// Made by a machine rather than a camera. `GET /api/files/{id}/manifest`
-    /// says how.
-    synthetic: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -338,10 +326,10 @@ pub(super) async fn get_shot_detail(
     let shot_height = shot_height_i32.map(|v| v as i64);
 
     // Get files for this shot
-    type FileRow = (String, String, Option<String>, Option<bool>, Option<i32>, bool);
+    type FileRow = (String, String, Option<String>, Option<bool>, Option<i32>);
     let file_rows: Vec<FileRow> = files::table
         .filter(files::shot_id.eq(&id))
-        .select((files::id, files::path, files::mime_type, files::is_original, files::file_size, files::synthetic))
+        .select((files::id, files::path, files::mime_type, files::is_original, files::file_size))
         .order((files::is_original.desc(), files::path.asc()))
         .load(&mut conn)
         .map_err(|e| {
@@ -351,7 +339,7 @@ pub(super) async fn get_shot_detail(
 
     let detail_files: Vec<FileDetail> = file_rows
         .into_iter()
-        .map(|(file_id, path, mime_type, is_original, file_size, synthetic)| FileDetail {
+        .map(|(file_id, path, mime_type, is_original, file_size)| FileDetail {
             thumbnail_url: format!("/api/files/{}/thumbnail", file_id),
             id: file_id,
             path,
@@ -361,7 +349,6 @@ pub(super) async fn get_shot_detail(
             width: shot_width,
             height: shot_height,
             duration_ms: None,
-            synthetic,
         })
         .collect();
 
@@ -529,33 +516,6 @@ pub(super) async fn delete_shot(
         .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to delete video_keyframes: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Clear enhancement_tasks referencing these files
-    diesel::update(enhancement_tasks::table.filter(enhancement_tasks::output_file_id.eq_any(&file_ids)))
-        .set(enhancement_tasks::output_file_id.eq(None::<String>))
-        .execute(&mut conn)
-        .map_err(|e| {
-            tracing::error!("Failed to clear enhancement_tasks: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Delete enhancement_tasks for this shot
-    diesel::delete(enhancement_tasks::table.filter(enhancement_tasks::shot_id.eq(&id)))
-        .execute(&mut conn)
-        .map_err(|e| {
-            tracing::error!("Failed to delete enhancement_tasks: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // And the runs those tasks belonged to. Left behind, a finished run is a
-    // permanent board row pointing at a shot that is gone, and a live one
-    // stays "running" forever — settlement skips a run with no tasks.
-    diesel::delete(runs::table.filter(runs::shot_id.eq(&id)))
-        .execute(&mut conn)
-        .map_err(|e| {
-            tracing::error!("Failed to delete runs: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -1177,23 +1137,6 @@ pub(super) async fn merge_shots(
         .execute(&mut conn)
         .map_err(|e| {
             tracing::error!("Failed to move files during shot merge: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // The source's runs and tasks move with its files: their outputs now hang
-    // off the target shot, so the board rows that explain them must follow.
-    diesel::update(runs::table.filter(runs::shot_id.eq(&payload.source_id)))
-        .set(runs::shot_id.eq(&payload.target_id))
-        .execute(&mut conn)
-        .map_err(|e| {
-            tracing::error!("Failed to move runs during shot merge: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    diesel::update(enhancement_tasks::table.filter(enhancement_tasks::shot_id.eq(&payload.source_id)))
-        .set(enhancement_tasks::shot_id.eq(&payload.target_id))
-        .execute(&mut conn)
-        .map_err(|e| {
-            tracing::error!("Failed to move enhancement tasks during shot merge: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 

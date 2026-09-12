@@ -94,9 +94,9 @@ openApiGenerate {
         //
         // Filtered to the tags this app actually calls, capitalised — the filter
         // matches the generated *class* prefix, not the lowercase tag in the spec,
-        // and an unmatched name silently generates nothing. ComfyUI, WebDAV/S3
-        // settings and import are web-only; generating them would compile dead
-        // code and let an unrelated backend endpoint break the Android build.
+        // and an unmatched name silently generates nothing. WebDAV/S3 settings
+        // and import are web-only; generating them would compile dead code and
+        // let an unrelated backend endpoint break the Android build.
         "apis" to "Shots,People,Files,Faces,Client,Auth,System",
         // The generated interfaces `import ...CollectionFormats.*`, so that one
         // supporting file has to come along. Naming it explicitly rather than

@@ -6,7 +6,6 @@ mod ai;
 mod api;
 mod auth;
 mod cli_auth;
-mod comfyui;
 mod db;
 mod embedding;
 mod import;
@@ -171,11 +170,6 @@ async fn run_server() {
     let ai = ai::AiPipeline::new().expect("Failed to load AI models");
     let scanner = Arc::new(scanner::Scanner::new(db_path.to_path_buf(), Some(ai)));
 
-    let comfyui_url = std::env::var("PHOS_COMFYUI_URL").ok();
-    if let Some(ref url) = comfyui_url {
-        info!("ComfyUI integration enabled (url: {})", url);
-    }
-
     let pool = db::establish_pool(&db_path).expect("Failed to create connection pool");
     db::run_migrations(&pool).expect("Failed to run Diesel migrations");
 
@@ -194,7 +188,6 @@ async fn run_server() {
     let state = api::AppState {
         pool,
         scanner: scanner.clone(),
-        comfyui_url: comfyui_url.clone(),
         library_root: root_path.to_path_buf(),
         multi_user,
         user_pools: Arc::new(RwLock::new(HashMap::new())),
@@ -209,8 +202,6 @@ async fn run_server() {
         // Multi-user mode: scan all existing user subdirectories at startup
         let root = root_path.to_path_buf();
         let scanner_ref = scanner.clone();
-        let comfyui_url_bg = comfyui_url.clone();
-        let comfyui_shutdown = shutdown_flag.clone();
         let bg_organizer = organizer.clone();
         let bg_ingest = ingest.clone();
         tokio::task::spawn_blocking(move || {
@@ -309,16 +300,6 @@ async fn run_server() {
                         tracing::error!("Failed to start watcher for user {}: {}", user_name, e)
                     }
                 }
-
-                // Spawn a ComfyUI worker for each existing user
-                if let Some(ref url) = comfyui_url_bg {
-                    info!("Spawning ComfyUI worker for user {}", user_name);
-                    comfyui::spawn_enhancement_worker(
-                        user_db_path,
-                        url.clone(),
-                        comfyui_shutdown.clone(),
-                    );
-                }
             }
             info!(
                 "Multi-user startup scan complete ({} user libraries)",
@@ -405,24 +386,6 @@ async fn run_server() {
                 }
             }
         })
-    };
-
-    // Spawn ComfyUI enhancement worker for single-user mode.
-    // In multi-user mode, workers are spawned per user in the background scan
-    // and dynamically when new users are created.
-    let _comfyui_handle = if !multi_user {
-        if let Some(ref url) = comfyui_url {
-            let comfyui_shutdown = shutdown_flag.clone();
-            Some(comfyui::spawn_enhancement_worker(
-                db_path.to_path_buf(),
-                url.clone(),
-                comfyui_shutdown,
-            ))
-        } else {
-            None
-        }
-    } else {
-        None
     };
 
     let api_router = api::create_router(state);

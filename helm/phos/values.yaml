@@ -68,8 +68,6 @@ phos:
   libraryPath: /app/data
   jwtTtl: "86400"
   rustLog: info
-  # ComfyUI endpoint for AI image processing; empty disables the env var.
-  comfyuiUrl: ""
 
 oidc:
   issuer: "https://auth.example.com"

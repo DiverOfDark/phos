@@ -1,10 +1,6 @@
 pub mod client;
-mod comfyui;
-mod describe;
 mod faces;
 mod files;
-mod line_io;
-mod lines;
 mod people;
 pub mod settings;
 mod shots;
@@ -74,7 +70,6 @@ use utoipa::OpenApi;
         files::get_file,
         files::delete_file,
         files::get_file_thumbnail,
-        files::get_file_manifest,
         files::set_file_original,
         files::upload_file_raw,
         files::finalize_import,
@@ -86,40 +81,6 @@ use utoipa::OpenApi;
         stats::trigger_scan,
         stats::get_version,
         client::client_version,
-        // ComfyUI
-        comfyui::comfyui_health,
-        comfyui::comfyui_nodes,
-        comfyui::comfyui_list_workflows,
-        comfyui::comfyui_import_workflow,
-        comfyui::comfyui_delete_workflow,
-        comfyui::comfyui_workflow_graph,
-        comfyui::comfyui_correct_contract,
-        comfyui::comfyui_enhance,
-        comfyui::comfyui_list_tasks,
-        comfyui::comfyui_get_task,
-        comfyui::comfyui_retry_task,
-        comfyui::comfyui_cancel_task,
-        comfyui::comfyui_delete_task,
-        comfyui::comfyui_shot_generations,
-        comfyui::comfyui_list_presets,
-        comfyui::comfyui_create_preset,
-        comfyui::comfyui_update_preset,
-        comfyui::comfyui_delete_preset,
-        // Production lines and runs
-        lines::list_lines,
-        lines::get_line,
-        lines::create_line,
-        lines::update_line,
-        lines::delete_line,
-        lines::start_run,
-        lines::list_runs,
-        lines::get_run,
-        lines::retry_run,
-        lines::cancel_run,
-        line_io::export_line,
-        line_io::import_line,
-        describe::describe_shot,
-        describe::get_description,
         // Settings
         settings::get_webdav_settings,
         settings::set_webdav_settings,
@@ -167,9 +128,6 @@ use utoipa::OpenApi;
             faces::DedupeFacesResponse,
             faces::ReassignFacePayload,
             faces::AddManualFacePayload,
-            // Files
-            files::FileManifestResponse,
-            crate::comfyui::ProvenanceManifest,
             // Import
             crate::ingest::IngestStatus,
             // Stats
@@ -178,35 +136,6 @@ use utoipa::OpenApi;
             stats::ScanParams,
             // Android client
             client::ClientVersionResponse,
-            // ComfyUI
-            comfyui::ImportWorkflowPayload,
-            comfyui::EnhancePayload,
-            comfyui::PresetPayload,
-            crate::comfyui::VarySpec,
-            crate::comfyui::VaryMode,
-            crate::comfyui::ContractCorrections,
-            crate::comfyui::Accepts,
-            crate::comfyui::MediaType,
-            crate::comfyui::ParamName,
-            crate::comfyui::SourceRole,
-            lines::LinePayload,
-            lines::LineStagePayload,
-            lines::StartRunPayload,
-            // A line as a file — also the format bundled templates ship in.
-            crate::comfyui::LineBundle,
-            crate::comfyui::BundleLine,
-            crate::comfyui::BundleStage,
-            crate::comfyui::BundleWorkflow,
-            crate::comfyui::Requirements,
-            crate::comfyui::RequirementsReport,
-            crate::comfyui::ModelRef,
-            describe::DescribePayload,
-            describe::DescribeResponse,
-            describe::DescribeState,
-            crate::comfyui::Analysis,
-            crate::comfyui::CompiledPrompt,
-            crate::comfyui::Intent,
-            crate::comfyui::ShotFacts,
             // Settings
             settings::WebDavSettings,
             settings::WebDavCredentials,
@@ -242,7 +171,6 @@ impl utoipa::Modify for SecurityAddon {
 pub struct AppState {
     pub pool: DbPool,
     pub scanner: Arc<crate::scanner::Scanner>,
-    pub comfyui_url: Option<String>,
     pub library_root: PathBuf,
     pub multi_user: bool,
     pub user_pools: Arc<RwLock<HashMap<String, DbPool>>>,
@@ -296,7 +224,6 @@ pub async fn resolve_user_db(
             AppState {
                 pool: user_pool,
                 scanner: user_scanner,
-                comfyui_url: state.comfyui_url.clone(),
                 library_root: user_library,
                 multi_user: state.multi_user,
                 user_pools: state.user_pools.clone(),
@@ -347,15 +274,6 @@ async fn get_or_create_user_pool(
     // is only attached at startup, so live watching begins after a restart.)
     state.organizer.watch(&user_dir);
 
-    // Spawn a ComfyUI enhancement worker for the new user
-    if let Some(ref url) = state.comfyui_url {
-        tracing::info!("Spawning ComfyUI worker for user {}", user_sub);
-        crate::comfyui::spawn_enhancement_worker(
-            db_path,
-            url.clone(),
-            state.shutdown_flag.clone(),
-        );
-    }
     Ok(pool)
 }
 
@@ -388,9 +306,6 @@ pub(crate) fn recalculate_primary_person(conn: &mut diesel::SqliteConnection, sh
         .select(faces::person_id.assume_not_null())
         .filter(files::shot_id.eq(shot_id))
         .filter(faces::person_id.is_not_null())
-        // A generated variant does not get to decide whose shot this is —
-        // same rule as the scanner's assign_primary_persons.
-        .filter(files::synthetic.eq(false))
         .order(
             diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::Float>>(
                 "(faces.box_x2 - faces.box_x1) * (faces.box_y2 - faces.box_y1)",
@@ -517,7 +432,6 @@ pub fn create_router(state: AppState) -> Router {
             get(files::get_file).delete(files::delete_file),
         )
         .route("/api/files/{id}/thumbnail", get(files::get_file_thumbnail))
-        .route("/api/files/{id}/manifest", get(files::get_file_manifest))
         .route("/api/files/{id}/set-original", put(files::set_file_original))
         .route("/api/files/{id}/faces", post(faces::add_manual_face))
         // Stats + organize
@@ -532,86 +446,6 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/import/finalize", post(files::finalize_import))
         .route("/api/import/status", get(files::import_status))
-        // ComfyUI integration
-        .route("/api/comfyui/health", get(comfyui::comfyui_health))
-        .route("/api/comfyui/nodes", get(comfyui::comfyui_nodes))
-        .route(
-            "/api/comfyui/workflows",
-            get(comfyui::comfyui_list_workflows).post(comfyui::comfyui_import_workflow),
-        )
-        .route(
-            "/api/comfyui/workflows/{id}",
-            delete(comfyui::comfyui_delete_workflow),
-        )
-        .route(
-            "/api/comfyui/workflows/{id}/graph",
-            get(comfyui::comfyui_workflow_graph),
-        )
-        .route(
-            "/api/comfyui/workflows/{id}/contract",
-            put(comfyui::comfyui_correct_contract),
-        )
-        .route(
-            "/api/comfyui/workflows/{id}/presets",
-            get(comfyui::comfyui_list_presets).post(comfyui::comfyui_create_preset),
-        )
-        .route(
-            "/api/comfyui/workflows/{workflow_id}/presets/{preset_id}",
-            put(comfyui::comfyui_update_preset).delete(comfyui::comfyui_delete_preset),
-        )
-        .route(
-            "/api/comfyui/generations/{shot_id}",
-            get(comfyui::comfyui_shot_generations),
-        )
-        .route("/api/comfyui/enhance", post(comfyui::comfyui_enhance))
-        .route("/api/comfyui/tasks", get(comfyui::comfyui_list_tasks))
-        .route(
-            "/api/comfyui/tasks/{id}",
-            get(comfyui::comfyui_get_task).delete(comfyui::comfyui_delete_task),
-        )
-        .route(
-            "/api/comfyui/tasks/{id}/retry",
-            post(comfyui::comfyui_retry_task),
-        )
-        .route(
-            "/api/comfyui/tasks/{id}/cancel",
-            post(comfyui::comfyui_cancel_task),
-        )
-        // Production lines: a chain of workflows, and the runs that walk one.
-        .route(
-            "/api/comfyui/lines",
-            get(lines::list_lines).post(lines::create_line),
-        )
-        // Before `/lines/{id}`: a literal segment and a path parameter both
-        // match `/lines/import`, and axum takes the literal only if it is
-        // there to take.
-        .route(
-            "/api/comfyui/lines/import",
-            // A bundle carries every stage's whole graph, so a line of
-            // workflows that each fit axum's 2 MiB default can add up to a
-            // file that does not.
-            post(line_io::import_line).layer(DefaultBodyLimit::max(64 * 1024 * 1024)), // 64 MB
-        )
-        .route(
-            "/api/comfyui/lines/{id}",
-            get(lines::get_line)
-                .put(lines::update_line)
-                .delete(lines::delete_line),
-        )
-        .route("/api/comfyui/lines/{id}/export", get(line_io::export_line))
-        .route(
-            "/api/comfyui/runs",
-            get(lines::list_runs).post(lines::start_run),
-        )
-        .route("/api/comfyui/runs/{id}", get(lines::get_run))
-        .route("/api/comfyui/runs/{id}/retry", post(lines::retry_run))
-        .route("/api/comfyui/runs/{id}/cancel", post(lines::cancel_run))
-        // The prompt a shot's own contents compile to.
-        .route("/api/comfyui/describe", post(describe::describe_shot))
-        .route(
-            "/api/comfyui/describe/{shot_id}",
-            get(describe::get_description),
-        )
         .route("/api/version", get(stats::get_version))
         // Settings
         .route(
