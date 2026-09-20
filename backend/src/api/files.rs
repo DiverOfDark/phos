@@ -259,6 +259,20 @@ pub(super) async fn get_file_thumbnail(
     Query(query): Query<ThumbnailQuery>,
     UState(state): UState,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let bytes = thumbnail_bytes(&state, &id, query.w.unwrap_or(320)).await?;
+    Ok(([(header::CONTENT_TYPE, "image/jpeg".to_string())], bytes))
+}
+
+/// Render (and cache) a file's thumbnail as JPEG bytes.
+///
+/// The body of [`get_file_thumbnail`] with the extractors and the response
+/// headers peeled off, so the MCP server can hand the same JPEG to a model as
+/// an image content block without going back out through HTTP.
+pub(crate) async fn thumbnail_bytes(
+    state: &super::AppState,
+    id: &str,
+    width: u32,
+) -> Result<Vec<u8>, StatusCode> {
     let (file_path, mime_type) = {
         let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         files::table
@@ -281,7 +295,7 @@ pub(super) async fn get_file_thumbnail(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let target_width = query.w.unwrap_or(320).clamp(64, 1920);
+    let target_width = width.clamp(64, 1920);
     let cache_suffix = if target_width == 320 {
         format!("{}.jpg", id)
     } else {
@@ -294,7 +308,7 @@ pub(super) async fn get_file_thumbnail(
         let bytes = tokio::fs::read(&thumb_path)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        return Ok(([(header::CONTENT_TYPE, "image/jpeg".to_string())], bytes));
+        return Ok(bytes);
     }
 
     // Generate thumbnail
@@ -348,7 +362,7 @@ pub(super) async fn get_file_thumbnail(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(([(header::CONTENT_TYPE, "image/jpeg".to_string())], result))
+    Ok(result)
 }
 
 /// PUT /api/files/:id/set-original - set is_original=true on this file,

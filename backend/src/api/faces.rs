@@ -136,7 +136,7 @@ pub(super) async fn get_face_suggestions(
 
 /// Reassign a face to a different person
 #[derive(Deserialize, ToSchema)]
-pub(super) struct ReassignFacePayload {
+pub(crate) struct ReassignFacePayload {
     person_id: String,
 }
 
@@ -156,7 +156,7 @@ pub(super) struct ReassignFacePayload {
         (status = 500, description = "Internal server error")
     )
 )]
-pub(super) async fn reassign_face(
+pub(crate) async fn reassign_face(
     Path(id): Path<String>,
     UState(state): UState,
     Json(payload): Json<ReassignFacePayload>,

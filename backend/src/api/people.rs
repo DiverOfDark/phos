@@ -13,7 +13,7 @@ use super::shots::ShotBrief;
 use crate::schema::{faces, files, people, shots};
 
 #[derive(Serialize, ToSchema)]
-pub(super) struct PersonBrief {
+pub(crate) struct PersonBrief {
     id: String,
     name: Option<String>,
     face_count: i64,
@@ -55,7 +55,7 @@ struct PersonBriefRow {
         (status = 500, description = "Internal server error")
     )
 )]
-pub(super) async fn get_people(UState(state): UState) -> Result<Json<Vec<PersonBrief>>, StatusCode> {
+pub(crate) async fn get_people(UState(state): UState) -> Result<Json<Vec<PersonBrief>>, StatusCode> {
     let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let rows: Vec<PersonBriefRow> = diesel::sql_query(
@@ -166,7 +166,7 @@ pub(super) async fn create_person(
         (status = 500, description = "Internal server error")
     )
 )]
-pub(super) async fn get_person_shots(
+pub(crate) async fn get_person_shots(
     Path(id): Path<String>,
     UState(state): UState,
 ) -> Result<Json<Vec<ShotBrief>>, StatusCode> {
@@ -279,7 +279,7 @@ pub(super) async fn get_person_faces(
 
 /// Rename a person
 #[derive(Deserialize, ToSchema)]
-pub(super) struct RenamePersonPayload {
+pub(crate) struct RenamePersonPayload {
     name: String,
 }
 
@@ -298,7 +298,7 @@ pub(super) struct RenamePersonPayload {
         (status = 500, description = "Internal server error")
     )
 )]
-pub(super) async fn rename_person(
+pub(crate) async fn rename_person(
     Path(id): Path<String>,
     UState(state): UState,
     Json(payload): Json<RenamePersonPayload>,
@@ -315,7 +315,7 @@ pub(super) async fn rename_person(
 
 /// Merge two people: move all faces from source to target, then delete source
 #[derive(Deserialize, ToSchema)]
-pub(super) struct MergePeoplePayload {
+pub(crate) struct MergePeoplePayload {
     source_id: String,
     target_id: String,
 }
@@ -333,7 +333,7 @@ pub(super) struct MergePeoplePayload {
         (status = 500, description = "Internal server error")
     )
 )]
-pub(super) async fn merge_people(
+pub(crate) async fn merge_people(
     UState(state): UState,
     Json(payload): Json<MergePeoplePayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -406,7 +406,7 @@ pub(super) struct BrowseShotDetail {
 }
 
 #[derive(Serialize, ToSchema)]
-pub(super) struct PersonBrowseResponse {
+pub(crate) struct PersonBrowseResponse {
     person: PersonMeta,
     pub(super) shots: Vec<BrowseShotDetail>,
 }
@@ -426,7 +426,7 @@ pub(super) struct PersonBrowseResponse {
         (status = 500, description = "Internal server error")
     )
 )]
-pub(super) async fn get_person_browse(
+pub(crate) async fn get_person_browse(
     Path(id): Path<String>,
     UState(state): UState,
 ) -> Result<Json<PersonBrowseResponse>, StatusCode> {

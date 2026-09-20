@@ -422,18 +422,37 @@ function removeCurrentAndAdvance() {
 
 const reassigningShot = ref(false)
 
+/**
+ * Route the shot to someone else — and stay on it.
+ *
+ * `PUT /api/shots/:id` with a person deliberately leaves `review_status` alone:
+ * picking the right person is not the same as saying "I have reviewed this".
+ * So this is not a verdict, and advancing here moved the reviewer off a shot
+ * that was still pending — the correction they just made left the screen before
+ * they could confirm it, and the shot came back in the next queue load.
+ *
+ * Confirm is what settles a shot. This only changes what Confirm will say.
+ */
 async function reassignShot(personId) {
   if (!currentShot.value || reassigningShot.value) return
+  const shotId = currentShot.value.id
   reassigningShot.value = true
   try {
-    const res = await fetch(`/api/shots/${currentShot.value.id}`, {
+    const res = await fetch(`/api/shots/${shotId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ primary_person_id: personId }),
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     routeSearch.value = ''
-    removeCurrentAndAdvance()
+    await fetchShotDetail(shotId)
+    // The queue row carries the person too, and the counts elsewhere read it.
+    const row = shots.value.find(s => s.id === shotId)
+    if (row && detail.value) {
+      row.primary_person_id = detail.value.primary_person_id
+      row.primary_person_name = detail.value.primary_person_name
+    }
+    emit('changed')
   } catch (e) {
     console.error('Failed to reassign shot:', e)
   } finally {

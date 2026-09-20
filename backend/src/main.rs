@@ -10,6 +10,7 @@ mod db;
 mod embedding;
 mod import;
 mod ingest;
+mod mcp;
 mod models;
 mod organizer;
 mod s3;
@@ -65,6 +66,15 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Serve the MCP (Model Context Protocol) server over stdio
+    Mcp {
+        /// Library directory containing .phos.db (defaults to PHOS_LIBRARY_PATH)
+        library: Option<PathBuf>,
+        /// Also expose the tools that change the library (rename, merge,
+        /// assign, confirm, scan). Off by default.
+        #[arg(long)]
+        allow_write: bool,
+    },
     /// Export OpenAPI spec as JSON
     #[command(name = "openapi")]
     OpenApi {
@@ -88,6 +98,22 @@ async fn main() {
             eprintln!("OpenAPI spec written to {}", path.display());
         } else {
             println!("{}", spec);
+        }
+        return;
+    }
+
+    // Before the tracing subscriber: it logs to stdout, and stdout is the MCP
+    // protocol stream. A single INFO line there is a parse error on the client.
+    if let Some(Commands::Mcp { library, allow_write }) = cli.command {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_max_level(Level::WARN)
+            .init();
+        ffmpeg_next::init().expect("Failed to initialize ffmpeg");
+        ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Error);
+        if let Err(e) = mcp::stdio::run(library, allow_write).await {
+            eprintln!("MCP server failed: {e:#}");
+            std::process::exit(1);
         }
         return;
     }
@@ -138,7 +164,9 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::OpenApi { .. }) => unreachable!("handled above"),
+        Some(Commands::OpenApi { .. }) | Some(Commands::Mcp { .. }) => {
+            unreachable!("handled above")
+        }
         Some(Commands::Serve) | None => {
             run_server().await;
         }
@@ -388,7 +416,16 @@ async fn run_server() {
         })
     };
 
-    let api_router = api::create_router(state);
+    let api_router = api::create_router(state.clone());
+
+    // MCP is merged beside the API rather than inside it: its authentication is
+    // a bearer token of its own, in both single- and multi-user mode, so it
+    // must not inherit either the API's open door or its session requirement.
+    let mcp_write = mcp::http::writes_enabled();
+    if mcp_write {
+        info!("MCP write tools enabled (PHOS_MCP_WRITE)");
+    }
+    let mcp_router = mcp::http::create_router(state, mcp_write);
     let static_dir = std::env::var("PHOS_STATIC_DIR").unwrap_or_else(|_| "static".to_string());
     let index_path = format!("{}/index.html", static_dir);
     let serve_static = ServeDir::new(&static_dir).not_found_service(ServeFile::new(index_path));
@@ -469,6 +506,7 @@ async fn run_server() {
             // would break in-app updates exactly when someone is logged out.
             .merge(public_api)
             .merge(protected_api)
+            .merge(mcp_router)
             .nest_service("/webdav", webdav_service.clone())
             .route_service(&format!("/{}", s3::BUCKET_NAME), s3_service.clone())
             .route_service(&format!("/{}/", s3::BUCKET_NAME), s3_service.clone())
@@ -486,6 +524,7 @@ async fn run_server() {
         Router::new()
             .merge(api_router)
             .merge(public_api)
+            .merge(mcp_router)
             .nest_service("/webdav", webdav_service.clone())
             .route_service(&format!("/{}", s3::BUCKET_NAME), s3_service.clone())
             .route_service(&format!("/{}/", s3::BUCKET_NAME), s3_service.clone())

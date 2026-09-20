@@ -15,6 +15,8 @@ cd backend && cargo build --release # Release build
 cd backend && cargo run             # Run dev server (port 33000)
 cd backend && cargo test            # Run all tests
 cd backend && cargo test scanner    # Run scanner tests only
+cd backend && cargo test --test mcp_test   # MCP protocol tests (no models needed)
+cd backend && cargo run -- mcp ./library   # Serve one library over stdio
 ```
 
 ### Frontend (Vue 3, in `frontend/`)
@@ -43,6 +45,8 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 | `PHOS_S3_PUBLIC_URL` | unset | External S3 endpoint URL shown in the settings UI |
 | `PHOS_STATIC_DIR` | `static` | Path to built frontend files |
 | `PHOS_DUMMY_AI` | unset | Set to `1` to skip ONNX model loading (for testing without models) |
+| `PHOS_MCP_WRITE` | unset | Set to `1` to expose the MCP tools that change the library |
+| `PHOS_PUBLIC_URL` | unset | External base URL, shown as the `/mcp` endpoint in the settings UI |
 | `RUST_LOG` | unset | Tracing log level (e.g. `info`, `debug`) |
 
 ## Architecture
@@ -57,6 +61,7 @@ docker compose up --build    # Full stack (dummy AI mode by default)
 - **`api.rs`** — Axum REST routes under `/api/` (photos, people, scan trigger). State is `Arc<Mutex<Connection>>`
 - **`db.rs`** — SQLite schema (tables: people, photos, files, faces, video_keyframes) and query functions
 - **`ai.rs`** — ONNX face detection (SCRFD det_10g) and recognition (ArcFace w600k_r50) pipeline. Supports dummy mode via env var
+- **`mcp/`** — The MCP server. `tools.rs` and `resources.rs` are shims over the same handlers the REST routes call, so the two can never drift; `mod.rs` holds the handler and the instructions the model is given; `auth.rs` is the bearer token in front of the HTTP transport; `http.rs` mounts `/mcp`; `stdio.rs` is the `phos mcp` subcommand
 - **`scanner.rs`** — Recursive directory walker: hashes files (SHA256), processes images/videos, runs face detection, stores results in SQLite
 
 ### Frontend Structure (`frontend/src/`)
@@ -91,6 +96,31 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - Android versioning feeds the in-app updater: `versionName` comes from `PHOS_VERSION` (a `v1.2.3` tag is stripped to `1.2.3`; otherwise `<branch>+<short-sha>`), and `versionCode` from the `PHOS_VERSION_CODE` build arg, which CI sets to `git rev-list --count HEAD` (monotonic on master; CI must check out with `fetch-depth: 0`). Both are passed to Gradle on **every** build — a fixed `versionCode` makes the updater compare 1 against 1 and answer "up to date" forever
 - The `android-builder` stage writes `static/phos.apk.json` beside the APK (`version_name`, `version_code`, `sha256`, `size_bytes`) from the same values it gave Gradle, cross-checked with `aapt2 dump badging`. `GET /api/client/version` serves it — unauthenticated, like the APK download it describes, and always `200` (a build with no APK answers `available: false`). The app installs only a **strictly greater** `version_code`, after verifying the download's sha256 and that its signing certificate matches the running app's
 
+- **The MCP server is a shape, not a second API.** Every tool in `mcp/tools.rs` calls the
+  handler behind the matching REST route — payloads are built with `serde_json::from_value` so
+  the REST payload types keep their private fields and a new required field is a compile error,
+  not a silent default. What the MCP layer owns is what a *model* should be asked for and given:
+  six read tools instead of forty endpoints, `resource_link`s instead of inlined records, and an
+  image content block so the assistant can actually look at a photo. It also owns the limits a
+  model needs and a browser does not: a person's timeline is capped at 200 shots (the
+  `phos://person/{id}` resource applies the same cap, so following a link is not a way around it),
+  and `trigger_scan`'s path is canonicalized and confined to the library root — a token names one
+  library, and the scanner writes absolute paths and deletes duplicate files, so an unconfined
+  path would be a read *and* a write outside it
+- **MCP auth is a static bearer token, in the header.** Generated in Settings (`POST
+  /api/settings/mcp`), stored only as a SHA-256, compared in constant time. Never in the URL: a
+  secret in a path lands in every access and proxy log and cannot be rotated independently of the
+  endpoint. In multi-user mode the token is `phos_mcp_<base64url(sub)>.<secret>`, because
+  `require_mcp_token` runs *before* `resolve_user_db` and has no session to read the owner from;
+  an unknown `sub` is rejected without creating a library. The spec's answer for a hosted server
+  is OAuth protected-resource metadata — not implemented, and the `WWW-Authenticate` header is
+  the hook it will hang from
+- **`/mcp` is merged beside the API, not inside it.** Its own middleware stack (token, then
+  `resolve_user_db`) means it behaves identically whether OIDC is on or off, rather than
+  inheriting the REST API's open door in single-user mode and its session requirement in
+  multi-user mode. `StreamableHttpService` cannot see the request when its factory runs, so
+  `http.rs` caches one service per library root and dispatches into it
+
 ### REST API Endpoints
 - `GET /api/photos` — List all photos
 - `GET /api/photos/:id` — Photo details with faces and files
@@ -101,6 +131,8 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
 - `GET /api/import/status` — Ingest queue depth for the caller's library, polled by the import UI
 - `POST /api/faces/dedupe?dry_run=` — Collapse overlapping boxes drawn on one face (never merges two boxes assigned to different people; skips reviewed shots). Also runs at startup and after each upload batch is analyzed
 - `GET /api/client/version` — Bundled Android APK metadata for the in-app updater (no auth)
+- `GET/POST/DELETE /api/settings/mcp` — Read, mint (shown once) or revoke the MCP bearer token
+- `POST /mcp` — Streamable HTTP MCP endpoint; bearer token only, outside the session auth
 
 ## AI Models
 

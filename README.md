@@ -10,7 +10,8 @@ Phos is a self-hosted AI-powered media manager that automatically indexes your p
 - **Multi-User Mode** — OIDC/SSO authentication with per-user isolated libraries
 - **Web UI** — Modern Vue 3 gallery with people browser, import dialog, and settings
 - **WebDAV Server** — Read-only network drive access to your library; mount from any file manager, Nextcloud, or rclone
-- **CLI Tools** — `import` (local/remote) and `reorganize` subcommands
+- **MCP Server** — Point Claude (or any MCP client) at your library: it can search, read shots and people, and look at the photos themselves
+- **CLI Tools** — `import` (local/remote), `reorganize` and `mcp` subcommands
 
 ## Quick Start with Docker
 
@@ -83,6 +84,13 @@ Setting `PHOS_OIDC_ISSUER` enables multi-user mode — each authenticated user g
 |----------|---------|-------------|
 | `PHOS_S3_PORT` | *(unset)* | Also serve the S3 API on a separate port at `/` (e.g. `9000`). There `ListBuckets` works too, which the main port cannot offer |
 | `PHOS_S3_PUBLIC_URL` | *(unset)* | External S3 endpoint URL shown in the settings UI (for reverse-proxy setups) |
+
+### MCP
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PHOS_MCP_WRITE` | *(unset)* | Set to `1` to also expose the MCP tools that change the library (rename, merge, assign, confirm, scan). Read-only otherwise |
+| `PHOS_PUBLIC_URL` | *(unset)* | External base URL, used to show the right `/mcp` endpoint in the settings UI (for reverse-proxy setups) |
 
 ### Docker Compose with SSO and WebDAV
 
@@ -192,6 +200,43 @@ aws configure set default.s3.addressing_style path
 AWS_ACCESS_KEY_ID=phos AWS_SECRET_ACCESS_KEY=SECRET \
   aws s3 ls s3://phos/ --endpoint-url http://localhost:33000 --region us-east-1
 ```
+
+## MCP (Model Context Protocol)
+
+Phos speaks MCP, so an AI assistant can work with the library directly — find the shots you mean, read what is in them, and actually look at the photos.
+
+### Hosted server
+
+1. Open **Settings** in the web UI and scroll to **MCP Access**
+2. Click **Generate token** — the token is shown **once**, because only its SHA-256 is stored
+3. Copy the `claude mcp add …` line the card gives you, or wire the endpoint into any MCP client by hand:
+
+```bash
+claude mcp add --transport http phos https://phos.example.com/mcp \
+  --header "Authorization: Bearer phos_mcp_..."
+```
+
+The token travels in the `Authorization` header, never in the URL — a secret in a path is written to every access log and proxy log the request passes through, and cannot be rotated without reconfiguring every client. Rotate anytime from the same card; the old token stops working immediately.
+
+In multi-user (OIDC) mode each user generates their own token, and it carries their identity, so a token only ever opens the library it was minted for.
+
+### Local library
+
+No server, no token — point the client at the binary:
+
+```bash
+claude mcp add phos -- phos mcp /path/to/library
+```
+
+Add `--allow-write` to enable the tools that change things. A read-only session never loads the ONNX models, so it starts immediately.
+
+### What it exposes
+
+Six read tools — `search_shots`, `get_shot`, `list_people`, `person_timeline`, `get_image`, `library_stats` — and, when writes are enabled, five more: `rename_person`, `merge_people`, `assign_face`, `confirm_shots`, `trigger_scan`. There is deliberately no delete tool.
+
+Shots, people and files are also MCP **resources** (`phos://shot/{id}`, `phos://person/{id}`, `phos://file/{id}`), and searches answer with links to them rather than inlining every record. `resources/list` returns only the 100 most recent shots: a real library is far too large to enumerate into a context window.
+
+Free-text search matches the AI-written caption and the file path, not the image contents.
 
 ## Architecture
 

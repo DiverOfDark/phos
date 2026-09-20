@@ -26,9 +26,9 @@ import java.io.IOException
  * How the queue moves.
  *
  * The rule that matters is which actions *settle* a shot and which do not. A verdict
- * takes it out of the queue and moves on; skip leaves it pending; a face edit leaves
- * the reviewer on the same picture, because fixing one face in a group photo is
- * usually the first of several.
+ * takes it out of the queue and moves on; skip leaves it pending; reassigning, a face
+ * edit and a split all leave the reviewer on the same picture, because the shot is
+ * still unreviewed afterwards and they are usually not finished with it.
  */
 class ReviewQueueTest {
 
@@ -163,16 +163,53 @@ class ReviewQueueTest {
         }
 
     @Test
-    fun `moving to a person settles the shot too`() = runTest(dispatcher) {
-        coEvery { shotRepository.moveToPerson("s1", "person-9") } returns Unit
+    fun `moving to a person stays on the shot so it can still be confirmed`() =
+        runTest(dispatcher) {
+            coEvery { shotRepository.moveToPerson("s1", "person-9") } returns Unit
+            val vm = viewModel()
+            runCurrent()
+
+            vm.moveToPerson("person-9", "Bob")
+            runCurrent()
+
+            coVerify { shotRepository.moveToPerson("s1", "person-9") }
+            // Reassigning leaves `review_status` pending on purpose, so advancing
+            // here would take the correction off screen before it was confirmed —
+            // and the shot would be back in the next queue load.
+            assertEquals(3, vm.uiState.value.remaining)
+            assertEquals("s1", vm.uiState.value.current?.id)
+            assertEquals("Moved to Bob — confirm to file it", vm.uiState.value.message)
+        }
+
+    @Test
+    fun `confirming after a reassign is what finally settles the shot`() =
+        runTest(dispatcher) {
+            coEvery { shotRepository.moveToPerson("s1", "person-9") } returns Unit
+            coEvery { shotRepository.confirm("s1") } returns Unit
+            val vm = viewModel()
+            runCurrent()
+
+            vm.moveToPerson("person-9", "Bob")
+            runCurrent()
+            vm.confirm()
+            runCurrent()
+
+            assertEquals(2, vm.uiState.value.remaining)
+            assertEquals("s2", vm.uiState.value.current?.id)
+        }
+
+    @Test
+    fun `creating a person to move to also stays on the shot`() = runTest(dispatcher) {
+        coEvery { shotRepository.createPerson("Carol") } returns "person-new"
+        coEvery { shotRepository.moveToPerson("s1", "person-new") } returns Unit
         val vm = viewModel()
         runCurrent()
 
-        vm.moveToPerson("person-9", "Bob")
+        vm.createPersonAndMove("Carol")
         runCurrent()
 
-        assertEquals(2, vm.uiState.value.remaining)
-        assertEquals("Moved to Bob", vm.uiState.value.message)
+        assertEquals(3, vm.uiState.value.remaining)
+        assertEquals("s1", vm.uiState.value.current?.id)
     }
 
     @Test

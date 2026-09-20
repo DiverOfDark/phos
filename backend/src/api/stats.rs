@@ -22,7 +22,7 @@ pub(super) async fn get_version() -> Json<serde_json::Value> {
 
 /// Return aggregate stats about the library
 #[derive(Serialize, ToSchema)]
-pub(super) struct StatsResponse {
+pub(crate) struct StatsResponse {
     total_shots: i64,
     total_people: i64,
     total_files: i64,
@@ -39,7 +39,7 @@ pub(super) struct StatsResponse {
         (status = 500, description = "Internal server error")
     )
 )]
-pub(super) async fn get_stats(UState(state): UState) -> Json<StatsResponse> {
+pub(crate) async fn get_stats(UState(state): UState) -> Json<StatsResponse> {
     let mut conn = state.pool.get().unwrap();
 
     let total_shots: i64 = shots::table.count().get_result(&mut conn).unwrap_or(0);
@@ -159,7 +159,7 @@ pub(super) async fn trigger_reorganize(UState(state): UState) -> Json<serde_json
 }
 
 #[derive(Deserialize, ToSchema)]
-pub(super) struct ScanParams {
+pub(crate) struct ScanParams {
     path: String,
 }
 
@@ -175,7 +175,7 @@ pub(super) struct ScanParams {
         (status = 500, description = "Internal server error")
     )
 )]
-pub(super) async fn trigger_scan(
+pub(crate) async fn trigger_scan(
     UState(state): UState,
     Json(payload): Json<ScanParams>,
 ) -> Json<serde_json::Value> {
