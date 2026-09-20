@@ -115,7 +115,8 @@ pub struct ConfirmShotsParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScanParams {
-    /// Directory to scan. Defaults to the whole library.
+    /// Directory to scan. Must be inside this library; defaults to the whole
+    /// library.
     pub path: Option<String>,
 }
 
@@ -246,11 +247,14 @@ impl PhosMcp {
         Ok(CallToolResult::success(content))
     }
 
-    /// Everything one person appears in.
+    /// The shots filed under one person.
     #[rmcp::tool(
         name = "person_timeline",
-        description = "Every shot one person appears in, oldest first, with each shot's files. \
-                       Pass the reserved id `unsorted` for the shots that belong to nobody yet.",
+        description = "The shots filed under one person — the ones where they are the primary \
+                       (largest) face — newest first, with each shot's files. A group photo \
+                       where they are not the primary face is not listed here; use \
+                       search_shots to look wider. Pass the reserved id `unsorted` for the \
+                       shots that belong to nobody yet.",
         annotations(title = "Person timeline", read_only_hint = true)
     )]
     pub async fn person_timeline(
@@ -267,24 +271,7 @@ impl PhosMcp {
         let mut value = serde_json::to_value(&browse.0)
             .map_err(|e| McpError::internal_error(format!("failed to serialize: {e}"), None))?;
 
-        // A prolific person's whole graph is far more than a model needs in one
-        // answer, so it is truncated here rather than at the handler, which the
-        // offline-first Android client relies on returning everything.
-        let mut truncated = 0usize;
-        if let Some(shots) = value.get_mut("shots").and_then(|s| s.as_array_mut()) {
-            if shots.len() > TIMELINE_LIMIT {
-                truncated = shots.len() - TIMELINE_LIMIT;
-                shots.truncate(TIMELINE_LIMIT);
-            }
-        }
-        if truncated > 0 {
-            value["truncated_shots"] = json!(truncated);
-            value["truncation_note"] = json!(format!(
-                "{truncated} further shot(s) omitted; narrow with search_shots person_id={} plus \
-                 a date range.",
-                params.0.person_id
-            ));
-        }
+        truncate_timeline(&mut value, &params.0.person_id);
 
         json_result(&value)
     }
@@ -395,8 +382,10 @@ impl PhosMcp {
 
     #[rmcp::tool(
         name = "assign_face",
-        description = "Assign one detected face to a person. Updates the shot's primary person \
-                       if that face is now the largest one on it.",
+        description = "Assign one detected face to a person. On a shot that has not been \
+                       confirmed yet, this also updates the shot's primary person when that \
+                       face is the largest one on it; a confirmed shot keeps the primary \
+                       person it was confirmed with.",
         annotations(title = "Assign face", read_only_hint = false, destructive_hint = true)
     )]
     pub async fn assign_face(
@@ -452,10 +441,10 @@ impl PhosMcp {
         &self,
         params: rmcp::handler::server::wrapper::Parameters<ScanParams>,
     ) -> Result<CallToolResult, McpError> {
-        let path = params
-            .0
-            .path
-            .unwrap_or_else(|| self.state.library_root.to_string_lossy().to_string());
+        let path = match params.0.path {
+            Some(path) => confine_to_library(&self.state.library_root, &path)?,
+            None => self.state.library_root.to_string_lossy().to_string(),
+        };
         let payload: crate::api::stats::ScanParams = from_json(json!({ "path": path }))?;
         let result =
             crate::api::stats::trigger_scan(UState(self.state.clone()), Json(payload)).await;
@@ -466,6 +455,62 @@ impl PhosMcp {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Cap a person browse graph at [`TIMELINE_LIMIT`] shots, in place.
+///
+/// A prolific person's whole graph is far more than a model needs in one
+/// answer, so it is truncated here rather than at the handler, which the
+/// offline-first Android client relies on returning everything. The kept shots
+/// are the newest ones, which is the order the handler returns them in and the
+/// order the tool advertises. The `phos://person/{id}` resource applies the
+/// same cap, so following the link cannot smuggle the whole graph back in.
+pub(super) fn truncate_timeline(value: &mut serde_json::Value, person_id: &str) {
+    let mut truncated = 0usize;
+    if let Some(shots) = value.get_mut("shots").and_then(|s| s.as_array_mut()) {
+        if shots.len() > TIMELINE_LIMIT {
+            truncated = shots.len() - TIMELINE_LIMIT;
+            shots.truncate(TIMELINE_LIMIT);
+        }
+    }
+    if truncated > 0 {
+        value["truncated_shots"] = json!(truncated);
+        value["truncation_note"] = json!(format!(
+            "{truncated} older shot(s) omitted; narrow with search_shots person_id={person_id} \
+             plus a date range."
+        ));
+    }
+}
+
+/// Resolve a caller-supplied scan path against the library it is allowed to
+/// touch, rejecting anything outside it.
+///
+/// A token names one library, so a scan has to stay inside that library's root.
+/// Without this, a token holder could point the scanner at any directory the
+/// server can see — another user's library, or the filesystem at large — and
+/// `Scanner` would index those files into *this* database (as absolute paths,
+/// which `get_image` then happily serves) and may delete an outside file it
+/// decides is a duplicate of one it already holds. Both components are
+/// canonicalized first so `..` and symlinks cannot walk out of the root.
+fn confine_to_library(root: &std::path::Path, requested: &str) -> Result<String, McpError> {
+    let outside = || {
+        McpError::invalid_params(
+            "path must be inside this library; omit it to scan the whole library",
+            None,
+        )
+    };
+
+    let root = root
+        .canonicalize()
+        .map_err(|e| McpError::internal_error(format!("library root is unreadable: {e}"), None))?;
+    let path = std::path::Path::new(requested)
+        .canonicalize()
+        .map_err(|_| outside())?;
+
+    if !path.starts_with(&root) {
+        return Err(outside());
+    }
+    Ok(path.to_string_lossy().to_string())
+}
 
 /// Build a REST payload from JSON, so payload structs keep their private fields.
 fn from_json<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T, McpError> {

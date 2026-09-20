@@ -94,12 +94,17 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 /// Read the token a request presents, if any.
+///
+/// RFC 7235 makes the auth scheme case-insensitive, and clients do send
+/// `bearer`, so the scheme is split off and compared without regard to case
+/// rather than matched as a literal prefix.
 fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim_start())
+        .filter(|token| !token.is_empty())
 }
 
 fn unauthorized(detail: &str) -> Response {
@@ -235,6 +240,26 @@ mod tests {
         headers.insert(header::AUTHORIZATION, "Bearer phos_mcp_x".parse().unwrap());
         assert_eq!(bearer(&headers), Some("phos_mcp_x"));
         headers.insert(header::AUTHORIZATION, "Basic phos_mcp_x".parse().unwrap());
+        assert_eq!(bearer(&headers), None);
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive() {
+        // RFC 7235: the scheme is a case-insensitive token, and clients do send
+        // `bearer`. Rejecting those is a login failure with no explanation.
+        for header_value in [
+            "bearer phos_mcp_x",
+            "BEARER phos_mcp_x",
+            "BeArEr phos_mcp_x",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, header_value.parse().unwrap());
+            assert_eq!(bearer(&headers), Some("phos_mcp_x"), "{header_value}");
+        }
+
+        // A scheme with nothing after it is not a token.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer  ".parse().unwrap());
         assert_eq!(bearer(&headers), None);
     }
 }

@@ -276,3 +276,59 @@ async fn the_three_resource_templates_are_advertised() {
 
     client.cancel().await.ok();
 }
+
+#[tokio::test]
+async fn trigger_scan_refuses_a_path_outside_the_library() {
+    let (_dir, state) = fixture_library();
+    let library_root = state.library_root.clone();
+    let client = connect(state, true).await;
+
+    // A directory the server can see but this token's library does not contain.
+    // Indexing it would write absolute paths into this database, which
+    // `get_image` would then serve, and the scanner may delete a file out there
+    // that hashes the same as one already indexed.
+    let outsider = tempfile::tempdir().expect("tempdir");
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("trigger_scan")
+                .with_arguments(args(json!({ "path": outsider.path().to_string_lossy() }))),
+        )
+        .await;
+
+    let rejected = match &result {
+        Err(e) => format!("{e}").contains("inside this library"),
+        Ok(result) => result.is_error == Some(true),
+    };
+    assert!(
+        rejected,
+        "an out-of-library scan must be refused: {result:?}"
+    );
+
+    // A `..` walk back out is the same request wearing a disguise.
+    let escaped = library_root.join("..").to_string_lossy().to_string();
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("trigger_scan")
+                .with_arguments(args(json!({ "path": escaped }))),
+        )
+        .await;
+    let rejected = match &result {
+        Err(e) => format!("{e}").contains("inside this library"),
+        Ok(result) => result.is_error == Some(true),
+    };
+    assert!(
+        rejected,
+        "`..` must not escape the library root: {result:?}"
+    );
+
+    // The library itself still scans.
+    client
+        .call_tool(
+            CallToolRequestParams::new("trigger_scan")
+                .with_arguments(args(json!({ "path": library_root.to_string_lossy() }))),
+        )
+        .await
+        .expect("scanning the library root must still work");
+
+    client.cancel().await.ok();
+}

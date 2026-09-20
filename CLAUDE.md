@@ -101,7 +101,12 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   the REST payload types keep their private fields and a new required field is a compile error,
   not a silent default. What the MCP layer owns is what a *model* should be asked for and given:
   six read tools instead of forty endpoints, `resource_link`s instead of inlined records, and an
-  image content block so the assistant can actually look at a photo
+  image content block so the assistant can actually look at a photo. It also owns the limits a
+  model needs and a browser does not: a person's timeline is capped at 200 shots (the
+  `phos://person/{id}` resource applies the same cap, so following a link is not a way around it),
+  and `trigger_scan`'s path is canonicalized and confined to the library root — a token names one
+  library, and the scanner writes absolute paths and deletes duplicate files, so an unconfined
+  path would be a read *and* a write outside it
 - **MCP auth is a static bearer token, in the header.** Generated in Settings (`POST
   /api/settings/mcp`), stored only as a SHA-256, compared in constant time. Never in the URL: a
   secret in a path lands in every access and proxy log and cannot be rotated independently of the
