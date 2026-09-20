@@ -220,3 +220,109 @@ pub async fn delete_s3_settings(UState(state): UState) -> Result<StatusCode, Sta
 
     Ok(StatusCode::OK)
 }
+
+// ---------------------------------------------------------------------------
+// MCP — the Model Context Protocol endpoint's bearer token
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, ToSchema)]
+pub struct McpSettings {
+    /// True once a token has been generated; `/mcp` rejects everything until then.
+    pub enabled: bool,
+    /// The endpoint an MCP client should be pointed at, if the server knows its
+    /// own external URL (`PHOS_PUBLIC_URL`).
+    pub endpoint: Option<String>,
+    /// Whether the tools that change the library are exposed (`PHOS_MCP_WRITE`).
+    pub writes_enabled: bool,
+    /// The token in the clear. Returned **only** by the call that generates it:
+    /// the database keeps a SHA-256, so a token nobody wrote down is a token
+    /// that has to be regenerated.
+    pub token: Option<String>,
+}
+
+fn mcp_settings_response(enabled: bool, token: Option<String>) -> McpSettings {
+    McpSettings {
+        enabled,
+        endpoint: std::env::var("PHOS_PUBLIC_URL")
+            .ok()
+            .map(|base| format!("{}/mcp", base.trim_end_matches('/'))),
+        writes_enabled: crate::mcp::http::writes_enabled(),
+        token,
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/settings/mcp",
+    responses(
+        (status = 200, body = McpSettings)
+    ),
+    tag = "Settings"
+)]
+pub async fn get_mcp_settings(UState(state): UState) -> Result<Json<McpSettings>, StatusCode> {
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let enabled: bool = settings::table
+        .filter(settings::key.eq(crate::mcp::auth::TOKEN_HASH_SETTING))
+        .select(settings::value)
+        .first::<String>(&mut conn)
+        .is_ok();
+
+    Ok(Json(mcp_settings_response(enabled, None)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/settings/mcp",
+    responses(
+        (status = 200, description = "Token generated; shown once", body = McpSettings)
+    ),
+    tag = "Settings"
+)]
+pub async fn generate_mcp_settings(
+    UState(state): UState,
+    request: axum::extract::Request,
+) -> Result<Json<McpSettings>, StatusCode> {
+    let (parts, _) = request.into_parts();
+    // In multi-user mode the token has to name its owner, because the middleware
+    // that checks it runs before there is any session to read the owner from.
+    let owner = if state.multi_user {
+        Some(share_username(&state, &parts))
+    } else {
+        None
+    };
+    let token = crate::mcp::auth::generate_token(owner.as_deref());
+    let hash = crate::mcp::auth::hash_token(&token);
+
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    diesel::insert_into(settings::table)
+        .values((
+            settings::key.eq(crate::mcp::auth::TOKEN_HASH_SETTING),
+            settings::value.eq(&hash),
+        ))
+        .on_conflict(settings::key)
+        .do_update()
+        .set(settings::value.eq(&hash))
+        .execute(&mut conn)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(mcp_settings_response(true, Some(token))))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/settings/mcp",
+    responses(
+        (status = 200, description = "MCP access disabled")
+    ),
+    tag = "Settings"
+)]
+pub async fn delete_mcp_settings(UState(state): UState) -> Result<StatusCode, StatusCode> {
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    diesel::delete(
+        settings::table.filter(settings::key.eq(crate::mcp::auth::TOKEN_HASH_SETTING)),
+    )
+    .execute(&mut conn)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(StatusCode::OK)
+}

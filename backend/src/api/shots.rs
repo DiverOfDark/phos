@@ -41,7 +41,7 @@ pub(super) struct SimilarShotsGrouped {
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
-pub(super) struct ShotsQuery {
+pub(crate) struct ShotsQuery {
     q: Option<String>,
     person_id: Option<String>,
     status: Option<String>,
@@ -61,7 +61,7 @@ pub(super) struct ShotsQuery {
         (status = 200, description = "List of shots", body = Vec<ShotBrief>)
     )
 )]
-pub(super) async fn get_shots(
+pub(crate) async fn get_shots(
     UState(state): UState,
     Query(params): Query<ShotsQuery>,
 ) -> Json<Vec<ShotBrief>> {
@@ -233,7 +233,7 @@ pub(super) async fn get_shots(
 }
 
 #[derive(Serialize, ToSchema)]
-pub(super) struct ShotDetailResponse {
+pub(crate) struct ShotDetailResponse {
     id: String,
     timestamp: Option<String>,
     primary_person_id: Option<String>,
@@ -294,7 +294,7 @@ pub(super) struct AlsoContainsPerson {
         (status = 404, description = "Shot not found")
     )
 )]
-pub(super) async fn get_shot_detail(
+pub(crate) async fn get_shot_detail(
     Path(id): Path<String>,
     UState(state): UState,
 ) -> Result<Json<ShotDetailResponse>, StatusCode> {
@@ -1174,7 +1174,7 @@ pub(super) async fn merge_shots(
 
 /// POST /api/shots/batch/confirm - batch set review_status = 'confirmed'
 #[derive(Deserialize, ToSchema)]
-pub(super) struct BatchConfirmPayload {
+pub(crate) struct BatchConfirmPayload {
     shot_ids: Vec<String>,
 }
 
@@ -1191,7 +1191,7 @@ pub(super) struct BatchConfirmPayload {
         (status = 500, description = "Internal server error")
     )
 )]
-pub(super) async fn batch_confirm(
+pub(crate) async fn batch_confirm(
     UState(state): UState,
     Json(payload): Json<BatchConfirmPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1222,7 +1222,7 @@ pub(super) async fn batch_confirm(
 
 /// POST /api/shots/batch/reassign - batch set primary_person_id, assign new folder numbers, set confirmed.
 #[derive(Deserialize, ToSchema)]
-pub(super) struct BatchReassignPayload {
+pub(crate) struct BatchReassignPayload {
     shot_ids: Vec<String>,
     person_id: String,
 }
@@ -1240,7 +1240,7 @@ pub(super) struct BatchReassignPayload {
         (status = 500, description = "Internal server error")
     )
 )]
-pub(super) async fn batch_reassign(
+pub(crate) async fn batch_reassign(
     UState(state): UState,
     Json(payload): Json<BatchReassignPayload>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {

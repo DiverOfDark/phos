@@ -160,6 +160,78 @@ function copyS3Secret() {
   setTimeout(() => { s3SecretCopied.value = false }, 2000)
 }
 
+// --- MCP ---
+//
+// The token is shown once, because the server only keeps its SHA-256. Losing it
+// means rotating, not recovering — so the card leads with the whole
+// `claude mcp add` line rather than the bare secret: a copied command is a
+// configured client, and that is the only moment the token exists in the clear.
+const mcpEnabled = ref(false)
+const mcpEndpoint = ref('')
+const mcpWrites = ref(false)
+const mcpToken = ref('')
+const mcpGenerating = ref(false)
+const mcpMessage = ref('')
+const mcpError = ref('')
+const mcpRevealed = ref(false)
+const mcpCommandCopied = ref(false)
+
+const mcpUrl = computed(() => mcpEndpoint.value || `${window.location.protocol}//${window.location.host}/mcp`)
+const mcpCommand = computed(() =>
+  `claude mcp add --transport http phos ${mcpUrl.value} --header "Authorization: Bearer ${mcpToken.value || '<token>'}"`
+)
+
+async function fetchMcpSettings() {
+  try {
+    const res = await fetch('/api/settings/mcp')
+    if (!res.ok) return
+    const data = await res.json()
+    mcpEnabled.value = data.enabled
+    mcpEndpoint.value = data.endpoint || ''
+    mcpWrites.value = data.writes_enabled
+  } catch { /* the card just shows DISABLED */ }
+}
+
+async function generateMcpToken() {
+  mcpGenerating.value = true
+  mcpMessage.value = ''
+  mcpError.value = ''
+  try {
+    const res = await fetch('/api/settings/mcp', { method: 'POST' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    mcpEnabled.value = data.enabled
+    mcpToken.value = data.token || ''
+    mcpRevealed.value = true
+    mcpMessage.value = 'token generated — copy it now, it is not shown again'
+  } catch (e) {
+    mcpError.value = e.message || 'failed to generate a token'
+  } finally {
+    mcpGenerating.value = false
+  }
+}
+
+async function disableMcp() {
+  mcpMessage.value = ''
+  mcpError.value = ''
+  try {
+    const res = await fetch('/api/settings/mcp', { method: 'DELETE' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    mcpEnabled.value = false
+    mcpToken.value = ''
+    mcpMessage.value = 'mcp access disabled'
+    setTimeout(() => { mcpMessage.value = '' }, 3000)
+  } catch (e) {
+    mcpError.value = e.message || 'failed to disable mcp access'
+  }
+}
+
+function copyMcpCommand() {
+  navigator.clipboard.writeText(mcpCommand.value)
+  mcpCommandCopied.value = true
+  setTimeout(() => { mcpCommandCopied.value = false }, 2000)
+}
+
 // --- Maintenance: duplicate face boxes ---
 //
 // Two-step on purpose: deleting a face cannot be undone, so the first click only
@@ -208,6 +280,7 @@ async function checkApkAvailable() {
 onMounted(() => {
   fetchWebdavSettings()
   fetchS3Settings()
+  fetchMcpSettings()
   checkApkAvailable()
 })
 </script>
@@ -342,6 +415,69 @@ onMounted(() => {
 
       <div v-if="s3Message" class="font-mono text-xs text-ready">{{ s3Message }}</div>
       <div v-if="s3Error" class="font-mono text-xs text-error">{{ s3Error }}</div>
+    </div>
+
+    <!-- MCP -->
+    <div class="card-ab p-6 flex flex-col gap-4">
+      <div class="flex items-center justify-between">
+        <div class="label">MCP access</div>
+        <span class="tag" :style="{ color: mcpEnabled ? 'var(--status-ready)' : 'var(--status-stopped)' }">
+          {{ mcpEnabled ? 'Enabled' : 'Disabled' }}
+        </span>
+      </div>
+      <div class="text-[13px] font-light text-ink-secondary">
+        Let an AI assistant search the library, read shots and people, and look at the photos
+        themselves. Shots are also exposed as <span class="font-mono text-ink">phos://shot/&#123;id&#125;</span>
+        resources.
+        <span v-if="mcpWrites">Write tools (rename, merge, assign, confirm, scan) are on.</span>
+        <span v-else>Read-only; set <span class="font-mono text-ink">PHOS_MCP_WRITE=1</span> to allow changes.</span>
+      </div>
+
+      <div
+        v-if="mcpEnabled"
+        class="grid gap-x-4 gap-y-1 items-center bg-base border border-line rounded-sm p-3 font-mono text-xs"
+        style="grid-template-columns: auto 1fr auto"
+      >
+        <span class="text-ink-tertiary">endpoint</span>
+        <span class="text-ink-secondary truncate">{{ mcpUrl }}</span>
+        <span></span>
+        <span class="text-ink-tertiary">token</span>
+        <span class="text-ink-secondary truncate">
+          {{ mcpToken ? (mcpRevealed ? mcpToken : '••••••••••••••••') : 'not shown — rotate to see a new one' }}
+        </span>
+        <span class="flex gap-2">
+          <button
+            v-if="mcpToken"
+            class="text-[11px] text-ink-tertiary hover:text-signal transition-colors"
+            @click="mcpRevealed = !mcpRevealed"
+          >{{ mcpRevealed ? 'hide' : 'reveal' }}</button>
+        </span>
+        <span class="text-ink-tertiary">command</span>
+        <span class="text-ink-secondary truncate">{{ mcpCommand }}</span>
+        <button class="text-[11px] text-ink-tertiary hover:text-signal transition-colors" @click="copyMcpCommand">
+          {{ mcpCommandCopied ? 'copied' : 'copy' }}
+        </button>
+      </div>
+      <div v-if="mcpEnabled" class="text-xs font-light text-ink-secondary">
+        Only a hash of the token is stored, so it is shown once. The header carries it — never
+        the URL, which would end up in every access log. Rotate anytime.
+      </div>
+
+      <div class="flex gap-2">
+        <button
+          class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors disabled:opacity-50"
+          :disabled="mcpGenerating"
+          @click="generateMcpToken"
+        >{{ mcpEnabled ? 'Rotate token' : 'Generate token' }}</button>
+        <button
+          v-if="mcpEnabled"
+          class="border border-line-strong rounded px-4 py-2 text-[13px] text-error transition-colors"
+          @click="disableMcp"
+        >Disable</button>
+      </div>
+
+      <div v-if="mcpMessage" class="font-mono text-xs text-ready">{{ mcpMessage }}</div>
+      <div v-if="mcpError" class="font-mono text-xs text-error">{{ mcpError }}</div>
     </div>
 
     <!-- Maintenance -->

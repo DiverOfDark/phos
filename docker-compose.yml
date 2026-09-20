@@ -26,4 +26,7 @@ services:
       #- PHOS_JWT_SECRET=your-random-secret
       #- PHOS_JWT_TTL=1209600  # session JWT lifetime in seconds, default 14 days
       #- PHOS_OIDC_SCOPES=openid profile email
+      # MCP — generate the bearer token in Settings once the server is up
+      #- PHOS_MCP_WRITE=1               # also expose the tools that change the library
+      #- PHOS_PUBLIC_URL=https://phos.example.com  # shown as the /mcp endpoint in Settings
     restart: unless-stopped

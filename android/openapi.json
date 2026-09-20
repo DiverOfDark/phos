@@ -6,7 +6,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "remove-comfyui"
+    "version": "dev"
   },
   "paths": {
     "/api/auth/callback": {
@@ -1071,6 +1071,55 @@
         }
       }
     },
+    "/api/settings/mcp": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "operationId": "get_mcp_settings",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpSettings"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "operationId": "generate_mcp_settings",
+        "responses": {
+          "200": {
+            "description": "Token generated; shown once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpSettings"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Settings"
+        ],
+        "operationId": "delete_mcp_settings",
+        "responses": {
+          "200": {
+            "description": "MCP access disabled"
+          }
+        }
+      }
+    },
     "/api/settings/s3": {
       "get": {
         "tags": [
@@ -2111,6 +2160,37 @@
             "type": "integer",
             "description": "Files waiting for the worker.",
             "minimum": 0
+          }
+        }
+      },
+      "McpSettings": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "writes_enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "True once a token has been generated; `/mcp` rejects everything until then."
+          },
+          "endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The endpoint an MCP client should be pointed at, if the server knows its\nown external URL (`PHOS_PUBLIC_URL`)."
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The token in the clear. Returned **only** by the call that generates it:\nthe database keeps a SHA-256, so a token nobody wrote down is a token\nthat has to be regenerated."
+          },
+          "writes_enabled": {
+            "type": "boolean",
+            "description": "Whether the tools that change the library are exposed (`PHOS_MCP_WRITE`)."
           }
         }
       },

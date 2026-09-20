@@ -1,10 +1,10 @@
 pub mod client;
-mod faces;
-mod files;
-mod people;
+pub(crate) mod faces;
+pub(crate) mod files;
+pub(crate) mod people;
 pub mod settings;
-mod shots;
-mod stats;
+pub(crate) mod shots;
+pub(crate) mod stats;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -88,6 +88,9 @@ use utoipa::OpenApi;
         settings::get_s3_settings,
         settings::generate_s3_settings,
         settings::delete_s3_settings,
+        settings::get_mcp_settings,
+        settings::generate_mcp_settings,
+        settings::delete_mcp_settings,
     ),
     components(
         schemas(
@@ -140,6 +143,7 @@ use utoipa::OpenApi;
             settings::WebDavSettings,
             settings::WebDavCredentials,
             settings::S3Settings,
+            settings::McpSettings,
         )
     ),
     modifiers(&SecurityAddon),
@@ -241,7 +245,7 @@ pub async fn resolve_user_db(
     next.run(request).await
 }
 
-async fn get_or_create_user_pool(
+pub(crate) async fn get_or_create_user_pool(
     state: &AppState,
     user_sub: &str,
 ) -> Result<DbPool, StatusCode> {
@@ -459,6 +463,12 @@ pub fn create_router(state: AppState) -> Router {
             get(settings::get_s3_settings)
                 .post(settings::generate_s3_settings)
                 .delete(settings::delete_s3_settings),
+        )
+        .route(
+            "/api/settings/mcp",
+            get(settings::get_mcp_settings)
+                .post(settings::generate_mcp_settings)
+                .delete(settings::delete_mcp_settings),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

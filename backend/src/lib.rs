@@ -7,6 +7,7 @@ pub mod models;
 pub mod schema;
 pub mod import;
 pub mod ingest;
+pub mod mcp;
 pub mod organizer;
 pub mod scanner;
 pub mod watcher;

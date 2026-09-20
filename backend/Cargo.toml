@@ -51,6 +51,8 @@ s3s = "0.14"
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 mime_guess = "2"
+rmcp = { version = "3.4.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "client"] }
+schemars = "1"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
