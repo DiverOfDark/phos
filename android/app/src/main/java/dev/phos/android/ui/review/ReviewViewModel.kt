@@ -43,13 +43,15 @@ data class ReviewUiState(
 /**
  * The review queue: pending shots, one at a time, with the fastest path to a verdict.
  *
- * Every verdict — confirm, reassign, unsort, delete — removes the shot from the queue
- * and moves to the next one, because the queue *is* the progress bar. Skip is the one
- * action that leaves the shot in place: it means "not now", not "fine".
+ * A verdict — confirm, unsort, delete — removes the shot from the queue and moves to
+ * the next one, because the queue *is* the progress bar. Skip is the one way past a
+ * shot without one: it means "not now", not "fine".
  *
- * Face edits are the exception. They do not advance, because correcting one face in a
- * group photo is usually the first of several, and the reviewer is still working on
- * the same picture.
+ * Routing a shot to a person is **not** a verdict, and neither are face edits or a
+ * split. They change the shot and leave it where it is, because the shot is still
+ * pending afterwards and the reviewer is still working on it. Advancing on a reassign
+ * took the correction off screen before it could be confirmed, and the shot came
+ * straight back in the next queue load.
  */
 @HiltViewModel
 class ReviewViewModel @Inject constructor(
@@ -138,17 +140,28 @@ class ReviewViewModel @Inject constructor(
         verdict("Confirmed") { shotRepository.confirm(shot.id) }
     }
 
+    /**
+     * Route the shot to someone else — and stay on it.
+     *
+     * Reassigning is not a verdict. [ShotRepository.moveToPerson] deliberately leaves
+     * `review_status` alone, so advancing here moved the reviewer off a shot that was
+     * still pending: the correction they had just made left the screen before they
+     * could confirm it, and the shot reappeared in the next queue load. Confirm is
+     * what settles a shot; this only changes what Confirm will say.
+     */
     fun moveToPerson(personId: String, personName: String?) {
         val shot = _uiState.value.current ?: return
-        verdict("Moved to ${personName ?: "another person"}") {
+        act("Moved to ${personName ?: "another person"} — confirm to file it") {
             shotRepository.moveToPerson(shot.id, personId)
+            loadDetail()
         }
     }
 
     fun createPersonAndMove(name: String) {
         val shot = _uiState.value.current ?: return
-        verdict("Moved to $name") {
+        act("Moved to $name — confirm to file it") {
             shotRepository.moveToPerson(shot.id, shotRepository.createPerson(name))
+            loadDetail()
         }
     }
 
