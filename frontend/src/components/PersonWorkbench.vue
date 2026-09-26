@@ -66,9 +66,7 @@ async function request(url, options) {
   try {
     const res = await fetch(url, options)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const data = await res.json().catch(() => ({}))
-    await Promise.all([reload(), loadPeople()])
-    return data
+    return await res.json().catch(() => ({}))
   } catch (e) {
     notice.value = `Operation failed · ${e.message}`
     throw e
@@ -77,21 +75,79 @@ async function request(url, options) {
   }
 }
 
+function shotCopy(shotId) {
+  for (const pane of panes) {
+    const shot = pane.shots.find(candidate => candidate.id === shotId)
+    if (shot) return shot
+  }
+  return null
+}
+
+function removeShot(shotId) {
+  for (const pane of panes) {
+    const index = pane.shots.findIndex(shot => shot.id === shotId)
+    if (index !== -1) pane.shots.splice(index, 1)
+  }
+}
+
+function addShotToPerson(shot, personId) {
+  if (!shot) return
+  for (const pane of panes) {
+    if (pane.id !== personId || pane.shots.some(candidate => candidate.id === shot.id)) continue
+    pane.shots.push({ ...shot, files: shot.files.map(file => ({ ...file })), is_primary: false })
+    pane.shots.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''))
+  }
+}
+
+function updatePersonCounts(fromId, toId) {
+  if (fromId === toId) return
+  const from = people.value.find(person => person.id === fromId)
+  const to = people.value.find(person => person.id === toId)
+  if (from) from.shot_count = Math.max(0, (from.shot_count || 0) - 1)
+  if (to) to.shot_count = (to.shot_count || 0) + 1
+}
+
 async function dropOnShot(event, targetShot) {
   event.stopPropagation()
   const item = dragged(event)
   if (!item || busy.value || item.shotId === targetShot.id) return
   if (item.type === 'shot') {
+    const source = shotCopy(item.shotId)
     await request('/api/shots/merge', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source_id: item.shotId, target_id: targetShot.id }),
     })
+    for (const pane of panes) {
+      const target = pane.shots.find(shot => shot.id === targetShot.id)
+      if (!target || !source) continue
+      target.files.push(...source.files.map(file => ({ ...file, is_original: false })))
+      target.is_primary = target.is_primary || source.is_primary
+    }
+    removeShot(item.shotId)
     notice.value = 'Shots merged'
   } else if (item.type === 'file') {
+    const source = shotCopy(item.shotId)
+    const movedFile = source?.files.find(file => file.id === item.fileId)
+    const sourceFileCount = source?.files.length || 0
+    const sourceWasPrimary = Boolean(source?.is_primary)
     await request('/api/shots/move-file', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ file_id: item.fileId, source_shot_id: item.shotId, target_shot_id: targetShot.id }),
     })
+    for (const pane of panes) {
+      const sourceInPane = pane.shots.find(shot => shot.id === item.shotId)
+      const targetInPane = pane.shots.find(shot => shot.id === targetShot.id)
+      if (sourceInPane) {
+        const movedWasOriginal = sourceInPane.files.some(file => file.id === item.fileId && file.is_original)
+        sourceInPane.files = sourceInPane.files.filter(file => file.id !== item.fileId)
+        if (movedWasOriginal && sourceInPane.files.length) sourceInPane.files[0].is_original = true
+      }
+      if (targetInPane && movedFile && !targetInPane.files.some(file => file.id === item.fileId)) {
+        targetInPane.files.push({ ...movedFile, is_original: false })
+        if (sourceFileCount === 1 && sourceWasPrimary) targetInPane.is_primary = true
+      }
+    }
+    if (sourceFileCount === 1) removeShot(item.shotId)
     notice.value = 'Photo moved'
   }
 }
@@ -103,20 +159,45 @@ async function dropOnPane(event, pane) {
     if (item.personId === pane.id) return
     await reassign(item.shotId, pane.id)
   } else if (item.type === 'file') {
+    const source = shotCopy(item.shotId)
+    const splitFile = source?.files.find(file => file.id === item.fileId)
     const data = await request(`/api/shots/${item.shotId}/split`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ file_ids: [item.fileId] }),
     })
-    if (pane.id !== item.personId && data.new_shot_id) await reassign(data.new_shot_id, pane.id)
+    for (const visiblePane of panes) {
+      const sourceInPane = visiblePane.shots.find(shot => shot.id === item.shotId)
+      if (sourceInPane) sourceInPane.files = sourceInPane.files.filter(file => file.id !== item.fileId)
+    }
+    const newShot = data.new_shot_id && splitFile ? {
+      ...source,
+      id: data.new_shot_id,
+      review_status: 'pending',
+      is_primary: false,
+      files: [{ ...splitFile, is_original: true }],
+    } : null
+    if (pane.id !== item.personId && data.new_shot_id) {
+      await request(`/api/shots/${data.new_shot_id}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ primary_person_id: pane.id === 'unsorted' ? '' : pane.id }),
+      })
+      updatePersonCounts(item.personId, pane.id)
+    }
+    addShotToPerson(newShot, pane.id)
     notice.value = 'Photo split into a new shot'
   }
 }
 
 async function reassign(shotId, personId) {
+  const shot = shotCopy(shotId)
+  const oldPersonId = panes.find(pane => pane.shots.some(candidate => candidate.id === shotId))?.id
   await request(`/api/shots/${shotId}`, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ primary_person_id: personId === 'unsorted' ? '' : personId }),
   })
+  removeShot(shotId)
+  addShotToPerson(shot, personId)
+  updatePersonCounts(oldPersonId, personId)
   notice.value = personId === 'unsorted' ? 'Shot moved to Unsorted' : 'Shot reassigned'
 }
 
@@ -125,6 +206,12 @@ async function makePrimary(pane, shot) {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ shot_id: shot.id }),
   })
+  for (const visiblePane of panes) {
+    if (visiblePane.id !== pane.id) continue
+    for (const candidate of visiblePane.shots) candidate.is_primary = candidate.id === shot.id
+  }
+  const person = people.value.find(candidate => candidate.id === pane.id)
+  if (person) person.primary_shot_id = shot.id
   notice.value = 'Primary shot updated'
 }
 
