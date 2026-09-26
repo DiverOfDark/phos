@@ -73,10 +73,16 @@ pub(crate) async fn get_people(UState(state): UState) -> Result<Json<Vec<PersonB
                 COUNT(DISTINCT CASE WHEN s_primary.id IS NOT NULL THEN s_primary.id END) as shot_count,
                 COUNT(DISTINCT CASE WHEN s_primary.id IS NOT NULL AND s_primary.review_status = 'pending' THEN s_primary.id END) as pending_count,
                 p.updated_at, p.primary_shot_id,
-                (SELECT f_cover.id FROM shots s_cover
-                 JOIN files f_cover ON s_cover.main_file_id = f_cover.id
-                 WHERE s_cover.primary_person_id = p.id
-                 ORDER BY (s_cover.id = p.primary_shot_id) DESC, s_cover.timestamp DESC LIMIT 1) as cover_file_id
+                COALESCE(
+                    (SELECT s_explicit.main_file_id FROM shots s_explicit
+                     WHERE s_explicit.id = p.primary_shot_id
+                       AND s_explicit.primary_person_id = p.id
+                     LIMIT 1),
+                    (SELECT f_cover.id FROM shots s_cover
+                     JOIN files f_cover ON s_cover.main_file_id = f_cover.id
+                     WHERE s_cover.primary_person_id = p.id
+                     ORDER BY s_cover.timestamp DESC LIMIT 1)
+                ) as cover_file_id
          FROM people p
          LEFT JOIN faces fa ON fa.person_id = p.id
          LEFT JOIN shots s_primary ON s_primary.primary_person_id = p.id
