@@ -48,7 +48,28 @@ pub fn run_migrations(
     let mut conn = pool
         .get()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    conn.run_pending_migrations(MIGRATIONS).map(|_| ())
+    conn.run_pending_migrations(MIGRATIONS)?;
+    ensure_primary_shot_column(&mut conn)?;
+    Ok(())
+}
+
+/// Repair databases whose migration ledger and physical schema got out of
+/// sync. This guard is intentionally idempotent: some deployment paths reuse a
+/// compiled migration set, and serving the new API against that database must
+/// not leave every `/api/people` request failing until another image rebuild.
+fn ensure_primary_shot_column(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
+    let has_column = diesel::sql_query(
+        "SELECT COUNT(*) AS cnt FROM pragma_table_info('people') WHERE name = 'primary_shot_id'",
+    )
+    .get_result::<CountResult>(conn)?
+    .cnt
+        > 0;
+
+    if !has_column {
+        tracing::warn!("Repairing people table: adding missing primary_shot_id column");
+        diesel::sql_query("ALTER TABLE people ADD COLUMN primary_shot_id TEXT").execute(conn)?;
+    }
+    Ok(())
 }
 
 /// Open a Diesel SQLite connection with WAL mode and busy timeout enabled.
@@ -403,6 +424,27 @@ mod tests {
         // Second startup: same call, now against the schema Diesel just created.
         // This is the path every subsequent boot takes, and it has to stay quiet.
         init_db(&db_path).expect("data migrations on a migrated database must not fail");
+    }
+
+    #[test]
+    fn repairs_a_missing_primary_shot_column() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db_path = tmp.path().join(".phos.db");
+        let mut conn = open_diesel_connection(&db_path).expect("connection");
+        diesel::sql_query("CREATE TABLE people (id TEXT PRIMARY KEY NOT NULL)")
+            .execute(&mut conn)
+            .expect("legacy people table");
+
+        ensure_primary_shot_column(&mut conn).expect("schema repair");
+        ensure_primary_shot_column(&mut conn).expect("idempotent repair");
+
+        let count = diesel::sql_query(
+            "SELECT COUNT(*) AS cnt FROM pragma_table_info('people') WHERE name = 'primary_shot_id'",
+        )
+        .get_result::<CountResult>(&mut conn)
+        .expect("column query")
+        .cnt;
+        assert_eq!(count, 1);
     }
 
     /// The guard keys off the schema, not off the file existing: an empty
