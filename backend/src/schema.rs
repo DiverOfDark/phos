@@ -43,6 +43,7 @@ diesel::table! {
         id -> Text,
         name -> Nullable<Text>,
         thumbnail_face_id -> Nullable<Text>,
+        primary_shot_id -> Nullable<Text>,
         representative_embedding -> Nullable<Binary>,
         folder_name -> Nullable<Text>,
         created_at -> Nullable<Timestamp>,

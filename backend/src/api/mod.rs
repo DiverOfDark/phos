@@ -109,6 +109,7 @@ use utoipa::OpenApi;
             shots::AlsoContainsPerson,
             shots::UpdateShotPayload,
             shots::SplitShotPayload,
+            shots::MoveFilePayload,
             shots::MergeShotsPayload,
             shots::BatchConfirmPayload,
             shots::BatchReassignPayload,
@@ -122,6 +123,7 @@ use utoipa::OpenApi;
             people::CreatedPerson,
             people::RenamePersonPayload,
             people::MergePeoplePayload,
+            people::PrimaryShotPayload,
             people::PersonMeta,
             people::BrowseFileDetail,
             people::BrowseShotDetail,
@@ -405,6 +407,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/shots/merge/ignore", post(shots::ignore_merge))
         .route("/api/shots/{id}/similar", get(shots::get_similar_shots))
         .route("/api/shots/{id}/split", post(shots::split_shot))
+        .route("/api/shots/move-file", post(shots::move_file))
         .route("/api/shots/batch/confirm", post(shots::batch_confirm))
         .route("/api/shots/batch/reassign", post(shots::batch_reassign))
         // People
@@ -420,6 +423,7 @@ pub fn create_router(state: AppState) -> Router {
                 .delete(people::delete_person),
         )
         .route("/api/people/{id}/browse", get(people::get_person_browse))
+        .route("/api/people/{id}/primary-shot", put(people::set_primary_shot))
         .route("/api/people/{id}/faces", get(people::get_person_faces))
         // Faces
         .route("/api/faces/{id}/thumbnail", get(faces::get_face_thumbnail))

@@ -113,7 +113,7 @@ function cropUrl(person) {
   if (hovered.value === person.id && crops && crops.length > 1) {
     return crops[cycle.value % crops.length]
   }
-  return person.thumbnail_url || person.cover_shot_thumbnail_url || null
+  return (person.primary_shot_id && person.cover_shot_thumbnail_url) || person.thumbnail_url || person.cover_shot_thumbnail_url || null
 }
 
 onMounted(fetchPeople)

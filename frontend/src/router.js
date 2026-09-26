@@ -7,6 +7,7 @@ import PeopleList from './components/PeopleList.vue'
 import LoginPage from './components/LoginPage.vue'
 import ReviewDesk from './components/ReviewDesk.vue'
 import SettingsPage from './components/SettingsPage.vue'
+import PersonWorkbench from './components/PersonWorkbench.vue'
 
 const routes = [
   {
@@ -43,6 +44,12 @@ const routes = [
     path: '/person/:id',
     name: 'person-detail',
     component: PersonDetail,
+    meta: { view: 'people' },
+  },
+  {
+    path: '/person/:id/workbench',
+    name: 'person-workbench',
+    component: PersonWorkbench,
     meta: { view: 'people' },
   },
   {

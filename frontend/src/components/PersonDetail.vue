@@ -189,7 +189,7 @@ defineExpose({ loadData, fetchPeople: fetchPerson, fetchShots })
 
       <div class="flex flex-wrap items-center gap-4">
         <div class="w-16 h-16 rounded bg-raised border border-line overflow-hidden flex items-center justify-center font-mono text-[22px] text-ink-tertiary shrink-0">
-          <img v-if="person?.thumbnail_url" :src="person.thumbnail_url" class="w-full h-full object-cover" />
+          <img v-if="person?.thumbnail_url || person?.cover_shot_thumbnail_url" :src="person.primary_shot_id ? person.cover_shot_thumbnail_url : (person.thumbnail_url || person.cover_shot_thumbnail_url)" class="w-full h-full object-cover" />
           <template v-else>{{ displayName[0] }}</template>
         </div>
 
@@ -217,6 +217,10 @@ defineExpose({ loadData, fetchPeople: fetchPerson, fetchShots })
         </div>
 
         <div class="flex flex-wrap gap-2 items-center">
+          <button
+            class="bg-signal text-signal-fg rounded px-4 py-2 text-[13px] font-medium hover:bg-signal-hover transition-colors"
+            @click="router.push({ name: 'person-workbench', params: { id: personId } })"
+          >Organize</button>
           <button
             class="border border-line-strong rounded px-4 py-2 text-[13px] text-ink-secondary hover:text-signal transition-colors"
             @click="startEditName"

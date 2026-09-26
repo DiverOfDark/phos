@@ -527,6 +527,12 @@ pub(super) async fn delete_shot(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // An explicit cover cannot point at a shot that no longer exists.
+    diesel::update(people::table.filter(people::primary_shot_id.eq(&id)))
+        .set(people::primary_shot_id.eq(None::<String>))
+        .execute(&mut conn)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     // Delete the shot record
     let deleted = diesel::delete(shots::table.filter(shots::id.eq(&id)))
         .execute(&mut conn)
@@ -601,7 +607,20 @@ pub(super) async fn update_shot(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    let previous_person_id: Option<String> = shots::table
+        .filter(shots::id.eq(&id))
+        .select(shots::primary_person_id)
+        .first::<Option<String>>(&mut conn)
+        .ok()
+        .flatten();
+
     if let Some(ref person_id) = payload.primary_person_id {
+        if previous_person_id.as_deref() != Some(person_id.as_str()) {
+            diesel::update(people::table.filter(people::primary_shot_id.eq(&id)))
+                .set(people::primary_shot_id.eq(None::<String>))
+                .execute(&mut conn)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
         if person_id.is_empty() {
             // Set to unsorted (NULL primary_person_id)
             let max_folder: i64 = shots::table
@@ -1127,6 +1146,18 @@ pub(super) async fn merge_shots(
         }
     }
 
+    let source_was_primary: bool = people::table
+        .filter(people::primary_shot_id.eq(&payload.source_id))
+        .count()
+        .get_result::<i64>(&mut conn)
+        .unwrap_or(0) > 0;
+    let target_person_id: Option<String> = shots::table
+        .filter(shots::id.eq(&payload.target_id))
+        .select(shots::primary_person_id)
+        .first::<Option<String>>(&mut conn)
+        .ok()
+        .flatten();
+
     // Move all files from source to target
     // Set is_original = false on moved files (target keeps its original)
     diesel::update(files::table.filter(files::shot_id.eq(&payload.source_id)))
@@ -1141,6 +1172,18 @@ pub(super) async fn merge_shots(
         })?;
 
     // Delete the source shot
+    diesel::update(people::table.filter(people::primary_shot_id.eq(&payload.source_id)))
+        .set(people::primary_shot_id.eq(None::<String>))
+        .execute(&mut conn)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if source_was_primary {
+        if let Some(ref target_person_id) = target_person_id {
+            diesel::update(people::table.filter(people::id.eq(target_person_id)))
+                .set(people::primary_shot_id.eq(&payload.target_id))
+                .execute(&mut conn)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+    }
     diesel::delete(shots::table.filter(shots::id.eq(&payload.source_id)))
         .execute(&mut conn)
         .map_err(|e| {
@@ -1169,6 +1212,54 @@ pub(super) async fn merge_shots(
 
     state.organizer.signal(&state.library_root);
 
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct MoveFilePayload {
+    file_id: String,
+    source_shot_id: String,
+    target_shot_id: String,
+}
+
+/// Move one file between existing shots while keeping both shots valid.
+pub(crate) async fn move_file(
+    UState(state): UState,
+    Json(payload): Json<MoveFilePayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if payload.source_shot_id == payload.target_shot_id {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let belongs: i64 = files::table
+        .filter(files::id.eq(&payload.file_id))
+        .filter(files::shot_id.eq(&payload.source_shot_id))
+        .count().get_result(&mut conn).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let source_count: i64 = files::table.filter(files::shot_id.eq(&payload.source_shot_id))
+        .count().get_result(&mut conn).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let target_exists: i64 = shots::table.filter(shots::id.eq(&payload.target_shot_id))
+        .count().get_result(&mut conn).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if belongs == 0 || source_count <= 1 || target_exists == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        diesel::update(files::table.filter(files::id.eq(&payload.file_id)))
+            .set((files::shot_id.eq(&payload.target_shot_id), files::is_original.eq(false)))
+            .execute(conn)?;
+        let source_main = files::table.filter(files::shot_id.eq(&payload.source_shot_id))
+            .order(files::is_original.desc()).select(files::id).first::<String>(conn)?;
+        diesel::update(shots::table.filter(shots::id.eq(&payload.source_shot_id)))
+            .set(shots::main_file_id.eq(source_main)).execute(conn)?;
+        Ok(())
+    }).map_err(|e| {
+        tracing::error!("Failed to move file between shots: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    super::recalculate_primary_person(&mut conn, &payload.source_shot_id)?;
+    super::recalculate_primary_person(&mut conn, &payload.target_shot_id)?;
+    state.organizer.signal(&state.library_root);
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 

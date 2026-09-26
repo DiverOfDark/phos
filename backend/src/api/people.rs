@@ -22,6 +22,7 @@ pub(crate) struct PersonBrief {
     pending_count: i64,
     updated_at: Option<String>,
     cover_shot_thumbnail_url: Option<String>,
+    primary_shot_id: Option<String>,
 }
 
 #[derive(QueryableByName)]
@@ -42,6 +43,8 @@ struct PersonBriefRow {
     updated_at: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     cover_file_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    primary_shot_id: Option<String>,
 }
 
 #[utoipa::path(
@@ -62,11 +65,11 @@ pub(crate) async fn get_people(UState(state): UState) -> Result<Json<Vec<PersonB
         "SELECT p.id, p.name, COUNT(DISTINCT fa.id) as face_count, p.thumbnail_face_id,
                 COUNT(DISTINCT CASE WHEN s_primary.id IS NOT NULL THEN s_primary.id END) as shot_count,
                 COUNT(DISTINCT CASE WHEN s_primary.id IS NOT NULL AND s_primary.review_status = 'pending' THEN s_primary.id END) as pending_count,
-                p.updated_at,
+                p.updated_at, p.primary_shot_id,
                 (SELECT f_cover.id FROM shots s_cover
                  JOIN files f_cover ON s_cover.main_file_id = f_cover.id
                  WHERE s_cover.primary_person_id = p.id
-                 ORDER BY s_cover.timestamp DESC LIMIT 1) as cover_file_id
+                 ORDER BY (s_cover.id = p.primary_shot_id) DESC, s_cover.timestamp DESC LIMIT 1) as cover_file_id
          FROM people p
          LEFT JOIN faces fa ON fa.person_id = p.id
          LEFT JOIN shots s_primary ON s_primary.primary_person_id = p.id
@@ -90,6 +93,7 @@ pub(crate) async fn get_people(UState(state): UState) -> Result<Json<Vec<PersonB
             pending_count: row.pending_count as i64,
             updated_at: row.updated_at,
             cover_shot_thumbnail_url: row.cover_file_id.map(|fid| format!("/api/files/{}/thumbnail", fid)),
+            primary_shot_id: row.primary_shot_id,
         })
         .collect();
 
@@ -372,6 +376,38 @@ pub(crate) async fn merge_people(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct PrimaryShotPayload {
+    shot_id: String,
+}
+
+/// Choose the shot used as a person's explicit cover.
+pub(crate) async fn set_primary_shot(
+    Path(id): Path<String>,
+    UState(state): UState,
+    Json(payload): Json<PrimaryShotPayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let belongs: i64 = shots::table
+        .filter(shots::id.eq(&payload.shot_id))
+        .filter(shots::primary_person_id.eq(&id))
+        .count()
+        .get_result(&mut conn)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if belongs == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let updated = diesel::update(people::table.filter(people::id.eq(&id)))
+        .set(people::primary_shot_id.eq(&payload.shot_id))
+        .execute(&mut conn)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if updated == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
 /// The id a client passes to browse the shots nobody owns yet.
 ///
 /// Person ids are UUIDs, so this cannot collide with a real one. Routing the
@@ -403,6 +439,9 @@ pub(super) struct BrowseShotDetail {
     timestamp: Option<String>,
     review_status: Option<String>,
     files: Vec<BrowseFileDetail>,
+    width: Option<i64>,
+    height: Option<i64>,
+    is_primary: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -471,7 +510,7 @@ pub(super) fn browse_graph(
     let mut query = shots::table
         .inner_join(files::table)
         .select((
-            shots::id, shots::timestamp, shots::review_status,
+            shots::id, shots::timestamp, shots::review_status, shots::width, shots::height,
             files::id, files::mime_type, files::is_original, files::file_size,
         ))
         .into_boxed();
@@ -495,7 +534,16 @@ pub(super) fn browse_graph(
         query.filter(shots::primary_person_id.eq(id.to_string()))
     };
 
-    let rows: Vec<(String, Option<String>, Option<String>, String, Option<String>, Option<bool>, Option<i32>)> = query
+    let primary_shot_id: Option<String> = if unsorted { None } else {
+        people::table
+            .filter(people::id.eq(id))
+            .select(people::primary_shot_id)
+            .first(conn)
+            .ok()
+            .flatten()
+    };
+
+    let rows: Vec<(String, Option<String>, Option<String>, Option<i32>, Option<i32>, String, Option<String>, Option<bool>, Option<i32>)> = query
         .order((shots::id.asc(), files::is_original.desc(), files::path.asc()))
         .load(conn)
         .map_err(|e| {
@@ -507,7 +555,7 @@ pub(super) fn browse_graph(
     let mut shots_vec: Vec<BrowseShotDetail> = Vec::new();
     let mut current_shot_id: Option<String> = None;
 
-    for (shot_id, timestamp, review_status, file_id, mime_type, is_original, file_size) in rows {
+    for (shot_id, timestamp, review_status, width, height, file_id, mime_type, is_original, file_size) in rows {
         let file = BrowseFileDetail {
             thumbnail_url: format!("/api/files/{}/thumbnail", file_id),
             id: file_id,
@@ -523,10 +571,13 @@ pub(super) fn browse_graph(
             // New shot
             current_shot_id = Some(shot_id.clone());
             shots_vec.push(BrowseShotDetail {
+                is_primary: primary_shot_id.as_deref() == Some(&shot_id),
                 id: shot_id,
                 timestamp,
                 review_status,
                 files: vec![file],
+                width: width.map(i64::from),
+                height: height.map(i64::from),
             });
         }
     }
