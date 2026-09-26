@@ -144,7 +144,7 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', closeMenu))
 </script>
 
 <template>
-  <div class="h-full min-h-0 flex flex-col bg-base">
+  <div class="workbench-root min-h-0 overflow-hidden flex flex-col bg-base">
     <header class="flex flex-wrap items-center gap-3 px-4 py-3 border-b border-line flex-none">
       <button class="font-mono text-xs text-ink-tertiary hover:text-signal" @click="router.push(`/person/${route.params.id}`)">← Person</button>
       <h2 class="font-heading text-base font-semibold">Shot workbench</h2>
@@ -231,4 +231,8 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', closeMenu))
 .menu-row:hover:not(:disabled) { background: var(--bg-raised); color: var(--text-primary); }
 .menu-row:disabled { opacity: .45; }
 .pane-scroll { overscroll-behavior: contain; scrollbar-gutter: stable; }
+.workbench-root { height: calc(100dvh - 6.25rem); }
+@media (min-width: 768px) {
+  .workbench-root { height: 100dvh; }
+}
 </style>
