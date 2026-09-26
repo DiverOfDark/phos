@@ -11,7 +11,7 @@ const menu = ref(null)
 const pickerQuery = ref('')
 
 function makePane(id, key) {
-  return reactive({ id, key, person: null, shots: [], loading: false, error: '', scale: Number(localStorage.getItem(`phos_workbench_scale_${key}`) || 300) })
+  return reactive({ id, key, person: null, shots: [], loading: false, error: '', scale: Number(localStorage.getItem(`phos_workbench_scale_${key}`) || 320) })
 }
 const left = makePane(route.params.id, 'left')
 const right = makePane(route.params.id, 'right')
@@ -154,8 +154,8 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', closeMenu))
       <span v-else-if="notice" class="font-mono text-[11px] text-ready">{{ notice }}</span>
     </header>
 
-    <main class="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-line">
-      <section v-for="pane in panes" :key="pane.key" class="min-w-0 min-h-0 flex flex-col">
+    <main class="flex-1 min-h-0 overflow-hidden grid grid-cols-1 grid-rows-2 md:grid-cols-2 md:grid-rows-1 divide-y md:divide-y-0 md:divide-x divide-line">
+      <section v-for="pane in panes" :key="pane.key" class="min-w-0 min-h-0 overflow-hidden flex flex-col">
         <div class="p-3 border-b border-line flex items-center gap-2 flex-none bg-base">
           <select v-model="pane.id" class="min-w-0 flex-1 bg-surface border border-line rounded-sm px-2 py-1.5 text-[13px] text-ink" @change="loadPane(pane)">
             <option value="unsorted">Unsorted</option>
@@ -165,7 +165,7 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', closeMenu))
           <input v-model.number="pane.scale" type="range" min="140" max="720" step="20" class="w-20 accent-[var(--accent)]" @input="setScale(pane)" />
         </div>
 
-        <div class="flex-1 min-h-0 overflow-y-auto p-3" @dragover.prevent @drop.prevent="dropOnPane($event, pane)">
+        <div class="pane-scroll flex-1 min-h-0 overflow-y-auto p-3" @dragover.prevent @drop.prevent="dropOnPane($event, pane)">
           <div v-if="pane.loading" class="py-16 text-center font-mono text-xs text-ink-tertiary">loading shots…</div>
           <div v-else-if="pane.error" class="py-16 text-center font-mono text-xs text-error">{{ pane.error }}</div>
           <div v-else class="flex flex-col gap-4">
@@ -188,12 +188,12 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', closeMenu))
                 <span class="font-mono text-[10px] text-ink-tertiary">{{ shot.files.length }} FILE{{ shot.files.length === 1 ? '' : 'S' }}</span>
                 <button class="px-1 text-ink-tertiary hover:text-signal" aria-label="Shot actions" @click.stop="openMenu($event, pane, shot)">⋯</button>
               </header>
-              <div class="p-2 flex flex-col items-center gap-2">
+              <div class="p-2 flex flex-wrap items-start content-start gap-2">
                 <img
                   v-for="file in shot.files" :key="file.id"
                   :src="file.thumbnail_url" loading="lazy" draggable="true"
-                  class="block w-full h-auto border border-line rounded-sm bg-base cursor-grab active:cursor-grabbing"
-                  :style="{ maxWidth: `${pane.scale}px`, objectFit: 'contain' }"
+                  class="block h-auto max-w-full border border-line rounded-sm bg-base cursor-grab active:cursor-grabbing"
+                  :style="{ width: `${pane.scale}px`, objectFit: 'contain', outline: file.is_original ? '1px solid var(--accent)' : 'none' }"
                   @dragstart.stop="drag($event, { type: 'file', fileId: file.id, shotId: shot.id, personId: pane.id })"
                 />
               </div>
@@ -230,4 +230,5 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', closeMenu))
 .menu-row { display: block; width: 100%; padding: .625rem .75rem; text-align: left; font-size: 13px; color: var(--text-secondary); }
 .menu-row:hover:not(:disabled) { background: var(--bg-raised); color: var(--text-primary); }
 .menu-row:disabled { opacity: .45; }
+.pane-scroll { overscroll-behavior: contain; scrollbar-gutter: stable; }
 </style>
