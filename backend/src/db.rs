@@ -57,7 +57,7 @@ pub fn run_migrations(
 /// sync. This guard is intentionally idempotent: some deployment paths reuse a
 /// compiled migration set, and serving the new API against that database must
 /// not leave every `/api/people` request failing until another image rebuild.
-fn ensure_primary_shot_column(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
+pub(crate) fn ensure_primary_shot_column(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
     let has_column = diesel::sql_query(
         "SELECT COUNT(*) AS cnt FROM pragma_table_info('people') WHERE name = 'primary_shot_id'",
     )

@@ -60,6 +60,13 @@ struct PersonBriefRow {
 )]
 pub(crate) async fn get_people(UState(state): UState) -> Result<Json<Vec<PersonBrief>>, StatusCode> {
     let mut conn = state.pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Use the same connection for the compatibility guard and query. This also
+    // repairs a per-user database that became visible while its background
+    // startup migration was still running.
+    crate::db::ensure_primary_shot_column(&mut conn).map_err(|e| {
+        tracing::error!("Failed to ensure people schema: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let rows: Vec<PersonBriefRow> = diesel::sql_query(
         "SELECT p.id, p.name, COUNT(DISTINCT fa.id) as face_count, p.thumbnail_face_id,
