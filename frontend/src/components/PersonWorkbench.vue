@@ -201,23 +201,19 @@ async function reassign(shotId, personId) {
   notice.value = personId === 'unsorted' ? 'Shot moved to Unsorted' : 'Shot reassigned'
 }
 
-async function makePrimary(pane, shot) {
-  await request(`/api/people/${pane.id}/primary-shot`, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ shot_id: shot.id }),
-  })
+async function makePrimaryFile(shot, file) {
+  await request(`/api/files/${file.id}/set-original`, { method: 'PUT' })
   for (const visiblePane of panes) {
-    if (visiblePane.id !== pane.id) continue
-    for (const candidate of visiblePane.shots) candidate.is_primary = candidate.id === shot.id
+    const visibleShot = visiblePane.shots.find(candidate => candidate.id === shot.id)
+    if (!visibleShot) continue
+    for (const candidate of visibleShot.files) candidate.is_original = candidate.id === file.id
   }
-  const person = people.value.find(candidate => candidate.id === pane.id)
-  if (person) person.primary_shot_id = shot.id
-  notice.value = 'Primary shot updated'
+  notice.value = 'Primary photo updated'
 }
 
-function openMenu(event, pane, shot) {
+function openMenu(event, pane, shot, file = null) {
   event.preventDefault()
-  menu.value = { x: Math.min(event.clientX, window.innerWidth - 280), y: Math.min(event.clientY, window.innerHeight - 330), pane, shot, choosing: false }
+  menu.value = { x: Math.min(event.clientX, window.innerWidth - 280), y: Math.min(event.clientY, window.innerHeight - 330), pane, shot, file, choosing: false }
   pickerQuery.value = ''
 }
 
@@ -258,8 +254,7 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', closeMenu))
           <div v-else class="flex flex-col gap-4">
             <article
               v-for="shot in pane.shots" :key="shot.id"
-              class="border rounded bg-surface overflow-hidden"
-              :class="shot.is_primary ? 'border-signal' : 'border-line'"
+              class="border border-line rounded bg-surface overflow-hidden"
               style="content-visibility:auto; contain-intrinsic-size:auto 420px"
               @dragover.prevent @drop.prevent="dropOnShot($event, shot)" @contextmenu="openMenu($event, pane, shot)"
             >
@@ -270,7 +265,6 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', closeMenu))
               >
                 <span class="font-mono text-[10px] text-ink-tertiary">⠿</span>
                 <span class="font-mono text-[11px] text-ink-secondary truncate">{{ shot.timestamp || shot.id }}</span>
-                <span v-if="shot.is_primary" class="font-mono text-[9px] tracking-[.08em] text-signal">PRIMARY</span>
                 <span class="flex-1"></span>
                 <span class="font-mono text-[10px] text-ink-tertiary">{{ shot.files.length }} FILE{{ shot.files.length === 1 ? '' : 'S' }}</span>
                 <button class="px-1 text-ink-tertiary hover:text-signal" aria-label="Shot actions" @click.stop="openMenu($event, pane, shot)">⋯</button>
@@ -282,6 +276,7 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', closeMenu))
                   class="block h-auto max-w-full border border-line rounded-sm bg-base cursor-grab active:cursor-grabbing"
                   :style="{ width: `${pane.scale}px`, objectFit: 'contain', outline: file.is_original ? '1px solid var(--accent)' : 'none' }"
                   @dragstart.stop="drag($event, { type: 'file', fileId: file.id, shotId: shot.id, personId: pane.id })"
+                  @contextmenu.stop="openMenu($event, pane, shot, file)"
                 />
               </div>
             </article>
@@ -299,7 +294,7 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', closeMenu))
     >
       <template v-if="!menu.choosing">
         <button class="menu-row" @click="router.push(`/shot/${menu.shot.id}`)">Open shot</button>
-        <button v-if="menu.pane.id !== 'unsorted'" class="menu-row" :disabled="menu.shot.is_primary" @click="makePrimary(menu.pane, menu.shot)">Make primary</button>
+        <button v-if="menu.file" class="menu-row" :disabled="menu.file.is_original" @click="makePrimaryFile(menu.shot, menu.file)">Make primary</button>
         <button class="menu-row border-t border-line" @click="menu.choosing = true">Reassign to…</button>
         <button v-if="menu.pane.id !== 'unsorted'" class="menu-row text-degraded" @click="reassign(menu.shot.id, 'unsorted')">Move to Unsorted</button>
       </template>
