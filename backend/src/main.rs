@@ -34,6 +34,25 @@ use tracing::{info, Level};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
+const VISUAL_HASH_REPAIR_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+fn user_library_dirs(root: &Path) -> Vec<PathBuf> {
+    match std::fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .filter(|entry| entry.path().join(".phos.db").exists())
+            .map(|entry| entry.path())
+            .collect(),
+        Err(e) => {
+            tracing::error!("Failed to read library root: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "phos", about = "AI-powered photo/video manager")]
 struct Cli {
@@ -239,23 +258,7 @@ async fn run_server() {
             }
 
             // Find existing user directories (those with a .phos.db)
-            let user_dirs: Vec<PathBuf> = match std::fs::read_dir(&root) {
-                Ok(entries) => entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .filter(|e| {
-                        let name = e.file_name();
-                        let name_str = name.to_string_lossy();
-                        !name_str.starts_with('.')
-                    })
-                    .filter(|e| e.path().join(".phos.db").exists())
-                    .map(|e| e.path())
-                    .collect(),
-                Err(e) => {
-                    tracing::error!("Failed to read library root: {}", e);
-                    Vec::new()
-                }
-            };
+            let user_dirs = user_library_dirs(&root);
 
             let mut watcher_handles = Vec::new();
             for user_dir in &user_dirs {
@@ -298,6 +301,9 @@ async fn run_server() {
                 if let Err(e) = user_scanner.rehash_files() {
                     tracing::error!("Rehash failed for user {}: {}", user_name, e);
                 }
+                if let Err(e) = user_scanner.repair_missing_visual_hashes() {
+                    tracing::error!("Visual hash repair failed for user {}: {}", user_name, e);
+                }
                 // Before the scan, not only inside it: a library indexed by an
                 // older build carries duplicate boxes the reviewer would
                 // otherwise keep deleting by hand until the scan finishes.
@@ -337,9 +343,38 @@ async fn run_server() {
             // Keep the per-user watchers alive until shutdown (dropping the
             // handles stops watching). Reorganize scheduling is handled by
             // the organizer workers.
-            let mut guard = lock.lock().unwrap();
-            while !*guard {
-                guard = cvar.wait(guard).unwrap();
+            loop {
+                let guard = lock.lock().unwrap();
+                if *guard {
+                    break;
+                }
+                let (guard, timeout) = cvar
+                    .wait_timeout(guard, VISUAL_HASH_REPAIR_INTERVAL)
+                    .unwrap();
+                if *guard {
+                    break;
+                }
+                drop(guard);
+
+                if timeout.timed_out() {
+                    // Rediscover libraries so users first seen after server
+                    // startup are included in the periodic repair pass too.
+                    for user_dir in user_library_dirs(&root) {
+                        let user_name = user_dir
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let user_scanner =
+                            scanner_ref.with_db_path(user_dir.join(".phos.db"));
+                        if let Err(e) = user_scanner.repair_missing_visual_hashes() {
+                            tracing::error!(
+                                "Periodic visual hash repair failed for user {}: {}",
+                                user_name,
+                                e
+                            );
+                        }
+                    }
+                }
             }
             drop(watcher_handles);
         })
@@ -356,6 +391,9 @@ async fn run_server() {
             }
             if let Err(e) = scanner.rehash_files() {
                 tracing::error!("Rehash failed: {}", e);
+            }
+            if let Err(e) = scanner.repair_missing_visual_hashes() {
+                tracing::error!("Visual hash repair failed: {}", e);
             }
 
             if *lock.lock().unwrap() {
@@ -392,7 +430,7 @@ async fn run_server() {
             bg_organizer.watch(&scan_path);
 
             // Initial scan complete -- start watching for incremental changes.
-            match watcher::start_watcher(
+            let watcher_handle = match watcher::start_watcher(
                 watcher_library_path,
                 scanner.clone(),
                 bg_organizer,
@@ -400,19 +438,35 @@ async fn run_server() {
             ) {
                 Ok(watcher_handle) => {
                     info!("File watcher active after initial scan");
-                    // Keep the watcher alive until shutdown (dropping the
-                    // handle stops watching).
-                    let mut guard = lock.lock().unwrap();
-                    while !*guard {
-                        guard = cvar.wait(guard).unwrap();
-                    }
-                    info!("Shutdown signal received, stopping file watcher");
-                    drop(watcher_handle);
+                    Some(watcher_handle)
                 }
                 Err(e) => {
                     tracing::error!("Failed to start file watcher: {}", e);
+                    None
+                }
+            };
+
+            loop {
+                let guard = lock.lock().unwrap();
+                if *guard {
+                    break;
+                }
+                let (guard, timeout) = cvar
+                    .wait_timeout(guard, VISUAL_HASH_REPAIR_INTERVAL)
+                    .unwrap();
+                if *guard {
+                    break;
+                }
+                drop(guard);
+
+                if timeout.timed_out() {
+                    if let Err(e) = scanner.repair_missing_visual_hashes() {
+                        tracing::error!("Periodic visual hash repair failed: {}", e);
+                    }
                 }
             }
+            info!("Shutdown signal received, stopping background workers");
+            drop(watcher_handle);
         })
     };
 

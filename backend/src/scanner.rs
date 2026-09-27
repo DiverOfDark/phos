@@ -233,6 +233,62 @@ impl Scanner {
         Ok(())
     }
 
+    /// Compute perceptual hashes for media files that were indexed without one.
+    ///
+    /// This is intentionally narrower than reprocessing a file: it does not run
+    /// face detection or alter shot grouping, and only fills a still-NULL
+    /// `visual_embedding` column.
+    pub fn repair_missing_visual_hashes(&self) -> anyhow::Result<()> {
+        let mut conn = self.open_db()?;
+        let library_root = self.db_path.parent().unwrap();
+        let rows: Vec<(String, String, Option<String>)> = files::table
+            .select((files::id, files::path, files::mime_type))
+            .filter(files::visual_embedding.is_null())
+            .load(&mut conn)?;
+
+        if rows.is_empty() {
+            debug!("Visual hash repair: no missing hashes");
+            return Ok(());
+        }
+
+        info!("Repairing visual hashes for {} files...", rows.len());
+        let mut repaired = 0usize;
+        let mut failed = 0usize;
+
+        for (file_id, file_path, mime_type) in rows {
+            let path = db::resolve_path(library_root, &file_path);
+            let hash = if is_video_media(&path, mime_type.as_deref()) {
+                extract_first_video_frame(&path).map(|frame| compute_dhash(&frame))
+            } else {
+                open_image(&path).map(|image| compute_dhash(&image))
+            };
+
+            match hash {
+                Ok(hash) => {
+                    // The NULL predicate avoids overwriting a hash produced by a
+                    // concurrent scan while this file was being decoded.
+                    repaired += diesel::update(
+                        files::table
+                            .filter(files::id.eq(&file_id))
+                            .filter(files::visual_embedding.is_null()),
+                    )
+                    .set(files::visual_embedding.eq(hash.as_slice()))
+                    .execute(&mut conn)?;
+                }
+                Err(e) => {
+                    failed += 1;
+                    error!("Failed to repair visual hash for {:?}: {}", path, e);
+                }
+            }
+        }
+
+        info!(
+            "Visual hash repair complete: {} repaired, {} failed",
+            repaired, failed
+        );
+        Ok(())
+    }
+
     pub fn scan(&self, root: &Path) -> anyhow::Result<()> {
         let files_list: Vec<PathBuf> = WalkDir::new(root)
             .into_iter()
@@ -1846,6 +1902,21 @@ pub fn is_media_file(path: &Path) -> bool {
     matches!(
         ext.as_str(),
         "jpg" | "jpeg" | "png" | "webp" | "mp4" | "mkv" | "mov" | "avi" | "webm"
+    )
+}
+
+fn is_video_media(path: &Path, mime_type: Option<&str>) -> bool {
+    if mime_type.is_some_and(|mime| mime.starts_with("video/")) {
+        return true;
+    }
+
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_lowercase()
+            .as_str(),
+        "mp4" | "mkv" | "mov" | "avi" | "webm"
     )
 }
 
