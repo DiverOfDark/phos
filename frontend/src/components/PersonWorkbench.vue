@@ -201,6 +201,59 @@ async function reassign(shotId, personId) {
   notice.value = personId === 'unsorted' ? 'Shot moved to Unsorted' : 'Shot reassigned'
 }
 
+async function reassignFile(shot, file, sourcePersonId, targetPersonId) {
+  // A one-file shot is already the smallest movable unit; reassigning it has
+  // exactly the same result without creating and deleting an empty container.
+  if (shot.files.length === 1) {
+    await reassign(shot.id, targetPersonId)
+    return
+  }
+
+  const data = await request(`/api/shots/${shot.id}/split`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file_ids: [file.id] }),
+  })
+  if (!data.new_shot_id) throw new Error('Split did not return a shot id')
+
+  await request(`/api/shots/${data.new_shot_id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ primary_person_id: targetPersonId === 'unsorted' ? '' : targetPersonId }),
+  })
+
+  for (const visiblePane of panes) {
+    const source = visiblePane.shots.find(candidate => candidate.id === shot.id)
+    if (!source) continue
+    const wasOriginal = source.files.some(candidate => candidate.id === file.id && candidate.is_original)
+    source.files = source.files.filter(candidate => candidate.id !== file.id)
+    if (wasOriginal && source.files.length) source.files[0].is_original = true
+  }
+
+  addShotToPerson({
+    ...shot,
+    id: data.new_shot_id,
+    review_status: 'pending',
+    is_primary: false,
+    files: [{ ...file, is_original: true }],
+  }, targetPersonId)
+
+  const target = people.value.find(person => person.id === targetPersonId)
+  if (target) target.shot_count = (target.shot_count || 0) + 1
+  if (targetPersonId === sourcePersonId) {
+    // Splitting within one person creates one additional shot.
+    const sourcePerson = people.value.find(person => person.id === sourcePersonId)
+    if (sourcePerson && sourcePerson !== target) sourcePerson.shot_count = (sourcePerson.shot_count || 0) + 1
+  }
+  notice.value = targetPersonId === 'unsorted' ? 'Photo moved to Unsorted' : 'Photo reassigned'
+}
+
+async function reassignMenuTarget(personId) {
+  if (menu.value.file) {
+    await reassignFile(menu.value.shot, menu.value.file, menu.value.pane.id, personId)
+  } else {
+    await reassign(menu.value.shot.id, personId)
+  }
+}
+
 async function makePrimaryFile(shot, file) {
   await request(`/api/files/${file.id}/set-original`, { method: 'PUT' })
   for (const visiblePane of panes) {
@@ -295,13 +348,13 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', closeMenu))
       <template v-if="!menu.choosing">
         <button class="menu-row" @click="router.push(`/shot/${menu.shot.id}`)">Open shot</button>
         <button v-if="menu.file" class="menu-row" :disabled="menu.file.is_original" @click="makePrimaryFile(menu.shot, menu.file)">Make primary</button>
-        <button class="menu-row border-t border-line" @click="menu.choosing = true">Reassign to…</button>
-        <button v-if="menu.pane.id !== 'unsorted'" class="menu-row text-degraded" @click="reassign(menu.shot.id, 'unsorted')">Move to Unsorted</button>
+        <button class="menu-row border-t border-line" @click="menu.choosing = true">Reassign {{ menu.file ? 'photo' : 'shot' }} to…</button>
+        <button v-if="menu.pane.id !== 'unsorted'" class="menu-row text-degraded" @click="reassignMenuTarget('unsorted')">Move {{ menu.file ? 'photo' : 'shot' }} to Unsorted</button>
       </template>
       <template v-else>
         <div class="p-2 border-b border-line"><input v-model="pickerQuery" autofocus placeholder="Search people…" class="w-full bg-base border border-line rounded-sm px-2 py-1.5 text-[13px]" /></div>
         <div class="max-h-64 overflow-y-auto p-1">
-          <button v-for="p in filteredPeople" :key="p.id" class="menu-row" @click="reassign(menu.shot.id, p.id)">{{ p.name || 'Unnamed' }}</button>
+          <button v-for="p in filteredPeople" :key="p.id" class="menu-row" @click="reassignMenuTarget(p.id)">{{ p.name || 'Unnamed' }}</button>
         </div>
       </template>
     </div>
