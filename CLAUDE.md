@@ -86,8 +86,19 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   does not get a vote
 
 ### Key Design Decisions
-- **Florence-2 captions live on the shot.** `shots.description` is the library-search caption,
-  written by the captioning pass in `scanner.rs`
+- **Florence-2 captions live on the shot.** `shots.description` is the human-readable caption,
+  written by the captioning pass in `scanner.rs`. Decoding uses the KV-cache (`decoder_model_merged`)
+  export and Florence's own generation rules — forced first `<s>`, `no_repeat_ngram_size=3` —
+  without which the model can emit `<s>` until the token cap and the caption decodes to `""`
+- **Search and similarity run on SigLIP 2, also on the shot.** `shots.semantic_embedding` is the
+  768-d unit vector of the main photo (`src/semantic.rs`); `shots.semantic_source` is
+  `<model id>:<main file id>`, so a new model or a new main photo makes it stale and the next pass
+  re-embeds it. `GET /api/shots?q=` embeds the query (any language) and keeps shots at cosine
+  ≥ `MIN_QUERY_SIMILARITY` plus literal caption/path matches, most relevant first;
+  `/api/shots/{id}/similar` orders by image cosine. The duplicates lane stays on dHash
+- **Analysis order and CPU budget.** `describe_shots` embeds before it captions (embeddings are what
+  search needs and cost ~30x less), and every analysis pass uses at most
+  `half_available_threads()` — half of `available_parallelism()`, which honours cgroup limits
 - No global database — each root directory gets its own `.phos.db`
 - AI models (ONNX) are auto-downloaded from Hugging Face (`public-data/insightface`) on first run and cached locally by `hf-hub`; startup fails hard if download fails (unless `PHOS_DUMMY_AI=1`)
 - Backend serves the built frontend as static files via `fallback_service`
@@ -140,5 +151,8 @@ Models are auto-downloaded from Hugging Face (`public-data/insightface`, path `m
 
 - `det_10g.onnx` — SCRFD face detection (input: 640x640)
 - `w600k_r50.onnx` — ArcFace face recognition (output: 512-d embeddings)
+- `onnx-community/siglip2-base-patch16-256-ONNX` — SigLIP 2 vision (fp32) and text (int8) towers
+  for semantic search and similarity; loaded lazily, vision tower unloaded after each pass
+- `onnx-community/Florence-2-large-ft` — captions (q4); loaded lazily, unloaded after each pass
 
 Set `PHOS_DUMMY_AI=1` to skip model download entirely (useful for development/testing).

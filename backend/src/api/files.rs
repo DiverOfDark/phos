@@ -151,7 +151,7 @@ pub(super) async fn finalize_import(
         let caption_scanner = scanner.clone();
         tokio::task::spawn_blocking(move || {
             tracing::info!("Finalize: captioning shots in background...");
-            if let Err(e) = caption_scanner.caption_shots(&caption_library_root) {
+            if let Err(e) = caption_scanner.describe_shots(&caption_library_root) {
                 tracing::error!("Background captioning failed: {}", e);
             }
             tracing::info!("Finalize: background captioning complete");

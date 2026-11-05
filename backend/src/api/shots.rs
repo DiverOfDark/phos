@@ -30,7 +30,11 @@ pub(super) struct SimilarShotItem {
     file_count: i64,
     primary_person_name: Option<String>,
     review_status: Option<String>,
+    /// Hamming distance between the two main photos' 64-bit dHashes.
     distance: u32,
+    /// SigLIP 2 cosine between the two main photos (1.0 = same picture), when
+    /// both have been embedded. Results are ordered by it when present.
+    similarity: Option<f32>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -65,17 +69,39 @@ pub(crate) async fn get_shots(
     UState(state): UState,
     Query(params): Query<ShotsQuery>,
 ) -> Json<Vec<ShotBrief>> {
+    // A query is embedded with SigLIP 2 so it can match what a photo shows, not
+    // only the words its caption happens to use. Without the model (dummy mode,
+    // offline first run) search degrades to the substring match alone.
+    let query_vector: Option<Vec<f32>> = match params.q.as_deref().map(str::trim) {
+        Some(q) if !q.is_empty() => {
+            let scanner = state.scanner.clone();
+            let q = q.to_string();
+            tokio::task::spawn_blocking(move || {
+                let ai = scanner.ai()?;
+                ai.semantic
+                    .embed_text(&q)
+                    .map_err(|e| tracing::warn!("Semantic search unavailable: {}", e))
+                    .ok()
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        _ => None,
+    };
+
     let mut conn = match state.pool.get() {
         Ok(c) => c,
         Err(_) => return Json(Vec::new()),
     };
 
-    // Build dynamic SQL query
+    // Build dynamic SQL query. `{extra}` is filled in once the bind positions of
+    // the text pattern are known.
     let mut sql = String::from(
         "SELECT DISTINCT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number,
                 f.id AS main_file_id, p.name AS person_name,
                 (SELECT COUNT(*) FROM files WHERE shot_id = s.id) AS file_count,
-                s.description
+                s.description, {extra}
          FROM shots s
          LEFT JOIN files f ON s.main_file_id = f.id
          LEFT JOIN people p ON s.primary_person_id = p.id",
@@ -105,17 +131,26 @@ pub(crate) async fn get_shots(
         }
     }
 
+    let mut extra = String::from("0 AS text_match, NULL AS semantic_embedding");
     if let Some(ref q) = params.q {
         let pattern = format!("%{}%", q);
         bind_values.push(pattern.clone());
         let idx1 = bind_values.len();
         bind_values.push(pattern);
         let idx2 = bind_values.len();
-        conditions.push(format!(
+        let text_match = format!(
             "(EXISTS (SELECT 1 FROM files fq WHERE fq.shot_id = s.id AND fq.path LIKE ?{}) OR s.description LIKE ?{})",
             idx1, idx2
-        ));
+        );
+        if query_vector.is_some() {
+            // Every shot is a candidate; the filter is applied after scoring.
+            extra = format!("{text_match} AS text_match, s.semantic_embedding");
+        } else {
+            conditions.push(text_match);
+        }
     }
+    let sql = sql.replace("{extra}", &extra);
+    let mut sql = sql;
 
     if let Some(ref from) = params.from {
         bind_values.push(from.clone());
@@ -154,6 +189,10 @@ pub(crate) async fn get_shots(
         file_count: i64,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         description: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        text_match: bool,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+        semantic_embedding: Option<Vec<u8>>,
     }
 
     // Build the sql_query and bind parameters dynamically
@@ -204,6 +243,30 @@ pub(crate) async fn get_shots(
             .bind::<diesel::sql_types::Text, _>(&bind_values[5])
             .load::<ShotRow>(&mut conn),
     };
+
+    // Semantic mode: keep literal matches and shots that look like the query,
+    // most relevant first.
+    let rows = rows.map(|rows| match &query_vector {
+        None => rows,
+        Some(qv) => {
+            let mut scored: Vec<(f32, ShotRow)> = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let score = row
+                        .semantic_embedding
+                        .as_deref()
+                        .and_then(crate::embedding::decode_embedding)
+                        .filter(|v| v.len() == qv.len())
+                        .map(|v| crate::ai::cosine_similarity(qv, &v))
+                        .unwrap_or(f32::NEG_INFINITY);
+                    (row.text_match || score >= crate::semantic::MIN_QUERY_SIMILARITY)
+                        .then_some((score, row))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            scored.into_iter().map(|(_, row)| row).collect()
+        }
+    });
 
     let shots = match rows {
         Ok(rows) => rows
@@ -931,7 +994,7 @@ pub(super) async fn split_shot(
     path = "/api/shots/{id}/similar",
     tag = "shots",
     summary = "Find similar shots",
-    description = "Find shots visually similar to the given shot, grouped by the person they are assigned to. Uses perceptual hash comparison.",
+    description = "Find shots visually similar to the given shot, grouped by the person they are assigned to. Ordered by SigLIP 2 image-embedding similarity where both shots are embedded, otherwise by perceptual hash distance.",
     params(("id" = String, Path, description = "Shot ID")),
     responses(
         (status = 200, description = "Similar shots grouped by person", body = Vec<SimilarShotsGrouped>),
@@ -974,6 +1037,14 @@ pub(super) async fn get_similar_shots(
         }
         _ => return Ok(Json(vec![])),
     };
+
+    let current_vector: Option<Vec<f32>> = shots::table
+        .filter(shots::id.eq(&id))
+        .select(shots::semantic_embedding)
+        .first::<Option<Vec<u8>>>(&mut conn)
+        .ok()
+        .flatten()
+        .and_then(|blob| crate::embedding::decode_embedding(&blob));
 
     // Collect all person IDs from this shot's faces (primary + also_contains)
     let mut person_ids: Vec<(Option<String>, Option<String>)> = Vec::new();
@@ -1040,13 +1111,15 @@ pub(super) async fn get_similar_shots(
         file_count: i64,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
         visual_embedding: Option<Vec<u8>>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+        semantic_embedding: Option<Vec<u8>>,
     }
 
     for (person_id, person_name) in &person_ids {
         let candidates: Vec<CandidateRow> = diesel::sql_query(
             "SELECT s.id, s.main_file_id, s.review_status, p.name AS person_name,
                     (SELECT COUNT(*) FROM files WHERE shot_id = s.id) as file_count,
-                    f.visual_embedding
+                    f.visual_embedding, s.semantic_embedding
              FROM shots s
              LEFT JOIN people p ON s.primary_person_id = p.id
              JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
@@ -1072,6 +1145,10 @@ pub(super) async fn get_similar_shots(
                 candidate_dhash.copy_from_slice(&blob);
                 let distance =
                     crate::scanner::hamming_distance(&current_dhash, &candidate_dhash);
+                let similarity = current_vector.as_ref().and_then(|cv| {
+                    let v = crate::embedding::decode_embedding(row.semantic_embedding.as_deref()?)?;
+                    (v.len() == cv.len()).then(|| crate::ai::cosine_similarity(cv, &v))
+                });
                 Some(SimilarShotItem {
                     id: row.id,
                     thumbnail_url: format!(
@@ -1082,11 +1159,19 @@ pub(super) async fn get_similar_shots(
                     primary_person_name: row.person_name,
                     review_status: row.review_status,
                     distance,
+                    similarity,
                 })
             })
             .collect();
 
-        results.sort_by_key(|r| r.distance);
+        // Embedded shots first, most alike first: SigLIP sees through the crops,
+        // edits and re-encodes that scramble a dHash. The rest keep dHash order.
+        results.sort_by(|a, b| match (a.similarity, b.similarity) {
+            (Some(x), Some(y)) => y.total_cmp(&x),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.distance.cmp(&b.distance),
+        });
 
         if !results.is_empty() {
             groups.push(SimilarShotsGrouped {
@@ -1646,6 +1731,8 @@ pub(super) async fn get_similar_shot_groups(
                         &candidates[i].dhash,
                         &candidates[idx].dhash,
                     ),
+                    // Duplicate groups are a dHash judgement; see get_similar_shots.
+                    similarity: None,
                 });
             }
 
@@ -1658,6 +1745,7 @@ pub(super) async fn get_similar_shot_groups(
                 primary_person_name: candidates[i].person_name.clone(),
                 review_status: candidates[i].review_status.clone(),
                 distance: 0,
+                similarity: None,
             };
 
             let mut all_items = vec![primary_item];

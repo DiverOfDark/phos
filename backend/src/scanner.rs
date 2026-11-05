@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -1122,6 +1122,127 @@ impl Scanner {
                 Err(e)
             }
         }
+    }
+
+    /// Post-scan analysis of every shot: SigLIP 2 embeddings, then Florence-2
+    /// captions. Embeddings go first because they are what search needs and
+    /// they cost ~50x less per photo; captioning a large library takes days.
+    /// Each half skips shots it has already done, and a failure in one does
+    /// not stop the other.
+    pub fn describe_shots(&self, root: &Path) -> anyhow::Result<()> {
+        let embedded = self.embed_shots(root);
+        let captioned = self.caption_shots(root);
+        embedded.and(captioned)
+    }
+
+    /// Compute the SigLIP 2 embedding of every shot whose stored vector is
+    /// missing or stale — from another model, or from a main photo that has
+    /// since been replaced.
+    pub fn embed_shots(&self, root: &Path) -> anyhow::Result<()> {
+        let ai = match &self.ai {
+            Some(ai) => ai,
+            None => return Ok(()),
+        };
+        if std::env::var("PHOS_DUMMY_AI").is_ok_and(|v| v == "1") {
+            return Ok(());
+        }
+
+        let mut conn = self.open_db()?;
+        let library_root = self.db_path.parent().unwrap_or(root);
+        let prefix = format!("{}:", crate::semantic::MODEL_ID);
+
+        let stale: Vec<(String, String, String, Option<String>)> = shots::table
+            .inner_join(files::table.on(shots::main_file_id.eq(files::id.nullable())))
+            .select((shots::id, files::id, files::path, shots::semantic_source))
+            .load::<(String, String, String, Option<String>)>(&mut conn)?
+            .into_iter()
+            .filter(|(_, file_id, _, source)| {
+                source.as_deref() != Some(format!("{prefix}{file_id}").as_str())
+            })
+            .collect();
+
+        if stale.is_empty() {
+            debug!("All shots already have semantic embeddings");
+            return Ok(());
+        }
+        info!("Computing semantic embeddings for {} shots", stale.len());
+
+        // Decoding and inference share one pool of half the cores; the vision
+        // tower sizes its own intra-op threads the same way.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(half_available_threads())
+            .build()?;
+        let (mut done, mut failed) = (0usize, 0usize);
+        let started = std::time::Instant::now();
+
+        'batches: for batch in stale.chunks(crate::semantic::IMAGE_BATCH) {
+            let decoded: Vec<anyhow::Result<DynamicImage>> = pool.install(|| {
+                batch
+                    .par_iter()
+                    .map(|(_, _, file_path, _)| open_image(&db::resolve_path(library_root, file_path)))
+                    .collect()
+            });
+            let mut ok_rows = Vec::with_capacity(batch.len());
+            let mut images = Vec::with_capacity(batch.len());
+            for (row, img) in batch.iter().zip(decoded) {
+                match img {
+                    Ok(img) => {
+                        ok_rows.push(row);
+                        images.push(img);
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        error!("Failed to open shot {} for embedding: {}", row.0, e);
+                    }
+                }
+            }
+            if images.is_empty() {
+                continue;
+            }
+
+            // Every input is resized to 256x256, so an inference error is the
+            // model's, not a photo's: it would fail every remaining batch too.
+            let vectors = match pool.install(|| ai.semantic.embed_images(&images)) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Semantic embedding unavailable, stopping this pass: {}", e);
+                    break 'batches;
+                }
+            };
+            drop(images);
+
+            for ((shot_id, file_id, _, _), v) in ok_rows.into_iter().zip(vectors) {
+                let source = format!("{prefix}{file_id}");
+                // Keyed on the main file too: if it changed while this one was
+                // being decoded, the row stays stale for the next pass.
+                let res = diesel::update(
+                    shots::table
+                        .filter(shots::id.eq(shot_id))
+                        .filter(shots::main_file_id.eq(file_id)),
+                )
+                .set((
+                    shots::semantic_embedding.eq(crate::embedding::encode_embedding(&v)),
+                    shots::semantic_source.eq(&source),
+                ))
+                .execute(&mut conn);
+                match res {
+                    Ok(_) => done += 1,
+                    Err(e) => error!("Failed to save embedding for shot {}: {}", shot_id, e),
+                }
+            }
+            if done % 500 < crate::semantic::IMAGE_BATCH {
+                info!("Semantic embeddings: {}/{} ({:?})", done, stale.len(), started.elapsed());
+            }
+        }
+
+        info!(
+            "Semantic embeddings: {} computed, {} failed in {:?}",
+            done,
+            failed,
+            started.elapsed()
+        );
+        ai.semantic.unload_vision();
+        Ok(())
     }
 
     /// Generate captions for all shots that don't have one yet.

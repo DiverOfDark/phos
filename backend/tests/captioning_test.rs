@@ -112,3 +112,20 @@ fn test_caption_synthetic_image() {
     assert!(result.is_ok(), "generate_caption should not error on synthetic image: {:?}", result.err());
     println!("Caption for red square: {:?}", result.unwrap());
 }
+
+/// Manual aid: `PHOS_CAPTION_EVAL=a.jpg,b.jpg cargo test --release --test
+/// captioning_test caption_eval -- --ignored --nocapture` prints each caption
+/// with its wall time.
+#[test]
+#[ignore]
+fn caption_eval() {
+    ffmpeg_next::init().unwrap();
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    let ai = AiPipeline::new().expect("Failed to load AI models");
+    for path in std::env::var("PHOS_CAPTION_EVAL").expect("set PHOS_CAPTION_EVAL").split(',') {
+        let img = image::open(path).unwrap();
+        let t = std::time::Instant::now();
+        let caption = ai.generate_caption(&img).unwrap();
+        println!("{path}: {:?} in {:?}", caption, t.elapsed());
+    }
+}

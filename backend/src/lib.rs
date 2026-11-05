@@ -10,6 +10,7 @@ pub mod ingest;
 pub mod mcp;
 pub mod organizer;
 pub mod scanner;
+pub mod semantic;
 pub mod watcher;
 pub mod webdav;
 pub mod s3;
