@@ -85,8 +85,6 @@ pub struct AiPipeline {
     logged_outputs: AtomicBool,
     caption_models: Mutex<Option<CaptionModels>>,
     caption_load_attempted: AtomicBool,
-    /// SigLIP 2 towers for semantic search and visual similarity (lazy).
-    pub semantic: crate::semantic::SemanticModel,
 }
 
 #[allow(dead_code)]
@@ -407,7 +405,6 @@ impl AiPipeline {
                 logged_outputs: AtomicBool::new(false),
                 caption_models: Mutex::new(None),
                 caption_load_attempted: AtomicBool::new(false),
-                semantic: Default::default(),
             });
         }
 
@@ -444,7 +441,6 @@ impl AiPipeline {
             logged_outputs: AtomicBool::new(false),
             caption_models: Mutex::new(None),
             caption_load_attempted: AtomicBool::new(false),
-            semantic: Default::default(),
         })
     }
 

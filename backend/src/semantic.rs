@@ -290,6 +290,14 @@ pub struct SemanticModel {
     text_failed: Mutex<bool>,
 }
 
+/// The process-wide model. Towers load lazily, so a process that never
+/// searches or scans never pays for them, and every library and session
+/// shares one copy instead of loading ~650 MB each.
+pub fn shared() -> &'static SemanticModel {
+    static MODEL: std::sync::OnceLock<SemanticModel> = std::sync::OnceLock::new();
+    MODEL.get_or_init(SemanticModel::default)
+}
+
 fn dummy_mode() -> bool {
     std::env::var("PHOS_DUMMY_AI").is_ok_and(|v| v == "1")
 }

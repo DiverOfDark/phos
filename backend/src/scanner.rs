@@ -1187,12 +1187,13 @@ impl Scanner {
     }
 
     /// SigLIP-embed one image, or `None` without a model (dummy mode, offline).
+    /// Scanners built without an AI pipeline (read-only sessions) index nothing
+    /// new, so they do not embed either.
     fn embed_one(&self, img: &DynamicImage) -> Option<Vec<f32>> {
-        let ai = self.ai.as_ref()?;
-        if std::env::var("PHOS_DUMMY_AI").is_ok_and(|v| v == "1") {
+        if self.ai.is_none() || std::env::var("PHOS_DUMMY_AI").is_ok_and(|v| v == "1") {
             return None;
         }
-        ai.semantic
+        crate::semantic::shared()
             .embed_image(img)
             .map_err(|e| debug!("SigLIP embedding unavailable: {}", e))
             .ok()
@@ -1203,7 +1204,9 @@ impl Scanner {
     /// or there is no model.
     pub fn embed_paths(&self, pool: &rayon::ThreadPool, paths: &[&PathBuf]) -> Vec<Option<Vec<f32>>> {
         let mut out: Vec<Option<Vec<f32>>> = vec![None; paths.len()];
-        let Some(ai) = self.ai.as_ref() else { return out };
+        if self.ai.is_none() {
+            return out;
+        }
         if std::env::var("PHOS_DUMMY_AI").is_ok_and(|v| v == "1") {
             return out;
         }
@@ -1219,7 +1222,7 @@ impl Scanner {
             if imgs.is_empty() {
                 continue;
             }
-            match pool.install(|| ai.semantic.embed_images(&imgs)) {
+            match pool.install(|| crate::semantic::shared().embed_images(&imgs)) {
                 Ok(vectors) => {
                     for (i, v) in idx.into_iter().zip(vectors) {
                         out[i] = Some(v);
@@ -1300,9 +1303,7 @@ impl Scanner {
             failed,
             started.elapsed()
         );
-        if let Some(ai) = &self.ai {
-            ai.semantic.unload_vision();
-        }
+        crate::semantic::shared().unload_vision();
         Ok(())
     }
 

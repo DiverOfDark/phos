@@ -74,11 +74,11 @@ pub(crate) async fn get_shots(
     // offline first run) search degrades to the substring match alone.
     let query_vector: Option<Vec<f32>> = match params.q.as_deref().map(str::trim) {
         Some(q) if !q.is_empty() => {
-            let scanner = state.scanner.clone();
             let q = q.to_string();
+            // The shared model, not the scanner's AI pipeline: a read-only MCP
+            // session has no pipeline but can still search an embedded library.
             tokio::task::spawn_blocking(move || {
-                let ai = scanner.ai()?;
-                ai.semantic
+                crate::semantic::shared()
                     .embed_text(&q)
                     .map_err(|e| tracing::warn!("Semantic search unavailable: {}", e))
                     .ok()
@@ -144,7 +144,9 @@ pub(crate) async fn get_shots(
         );
         if query_vector.is_some() {
             // Every shot is a candidate; the filter is applied after scoring.
-            extra = format!("{text_match} AS text_match, f.semantic_embedding");
+            // COALESCE: `description LIKE ?` is NULL on an uncaptioned shot, and
+            // one NULL in a non-null column fails the whole result set.
+            extra = format!("COALESCE({text_match}, 0) AS text_match, f.semantic_embedding");
         } else {
             conditions.push(text_match);
         }
