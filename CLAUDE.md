@@ -90,12 +90,20 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   written by the captioning pass in `scanner.rs`. Decoding uses the KV-cache (`decoder_model_merged`)
   export and Florence's own generation rules — forced first `<s>`, `no_repeat_ngram_size=3` —
   without which the model can emit `<s>` until the token cap and the caption decodes to `""`
-- **Search and similarity run on SigLIP 2, also on the shot.** `shots.semantic_embedding` is the
-  768-d unit vector of the main photo (`src/semantic.rs`); `shots.semantic_source` is
-  `<model id>:<main file id>`, so a new model or a new main photo makes it stale and the next pass
-  re-embeds it. `GET /api/shots?q=` embeds the query (any language) and keeps shots at cosine
-  ≥ `MIN_QUERY_SIMILARITY` plus literal caption/path matches, most relevant first;
-  `/api/shots/{id}/similar` orders by image cosine. The duplicates lane stays on dHash
+- **Every file carries a SigLIP 2 vector.** `files.semantic_embedding` is the 768-d unit vector of
+  the file (videos: first frame), `files.semantic_model` the model that made it — a model change
+  makes it stale and `embed_files` re-embeds it. A shot's vector is its main file's.
+  `GET /api/shots?q=` embeds the query (any language) and keeps shots at cosine
+  ≥ `MIN_QUERY_SIMILARITY` plus literal caption/path matches, most relevant first
+- **"Same photo" is dHash OR SigLIP, one rule in `VisualSignature`.** Automatic grouping (scan and
+  import) needs dHash ≤ 10 *or* cosine ≥ 0.97: SigLIP catches flips, crops and reframing that
+  scramble a dHash, but two different portraits of one person already score 0.887, so it cannot
+  group on its own. The duplicates lane (`similar-groups`, reviewed by a person) uses dHash ≤ 10
+  or cosine ≥ 0.88. All-pairs comparisons go through a 64-bit SimHash of the vector (random
+  hyperplanes, Hamming ≈ angle) so only near pairs pay for the 768-wide dot product. Scans embed
+  each 64-file chunk in batches *before* indexing it, so the vision tower never runs beside the
+  scan workers. Known gap: two copies of one photo indexed in the same parallel chunk can miss
+  each other (check-then-insert race, as with dHash before); the duplicates lane catches them
 - **Analysis order and CPU budget.** `describe_shots` embeds before it captions (embeddings are what
   search needs and cost ~30x less), and every analysis pass uses at most
   `half_available_threads()` — half of `available_parallelism()`, which honours cgroup limits

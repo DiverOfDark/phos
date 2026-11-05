@@ -116,3 +116,71 @@ fn eval() {
         println!("  … last {n:<14} cos={c:.4} p={:.6}", match_probability(*c));
     }
 }
+
+/// Manual calibration for "same photo" grouping: SigLIP cosine and dHash
+/// distance for edited copies vs. distinct photos.
+/// `PHOS_SEMANTIC_EVAL_DIR=/path cargo test --release --test semantic_test variation_eval -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn variation_eval() {
+    use image::imageops::FilterType;
+    use phos_backend::scanner::{compute_dhash, hamming_distance};
+    use phos_backend::semantic::{simhash, SAME_PHOTO_SIMILARITY};
+    let dir = std::env::var("PHOS_SEMANTIC_EVAL_DIR").expect("set PHOS_SEMANTIC_EVAL_DIR");
+    let model = SemanticModel::default();
+    let mut paths: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+    paths.sort();
+    let originals: Vec<image::DynamicImage> = paths.iter().filter_map(|p| image::open(p).ok()).collect();
+    let jpeg = |img: &image::DynamicImage, q: u8| {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, q).encode_image(&img.to_rgb8()).unwrap();
+        image::load_from_memory(&buf.into_inner()).unwrap()
+    };
+    type Edit = (&'static str, fn(&image::DynamicImage) -> image::DynamicImage);
+    let edits: Vec<Edit> = vec![
+        ("resize25", |i| i.resize(i.width() / 4, i.height() / 4, FilterType::Triangle)),
+        ("crop10", |i| i.crop_imm(i.width() / 20, i.height() / 20, i.width() * 9 / 10, i.height() * 9 / 10)),
+        ("crop30", |i| i.crop_imm(i.width() * 3 / 20, i.height() * 3 / 20, i.width() * 7 / 10, i.height() * 7 / 10)),
+        ("bright", |i| i.brighten(40)),
+        ("contrast", |i| i.adjust_contrast(30.0)),
+        ("gray", |i| image::DynamicImage::ImageLuma8(i.to_luma8())),
+        ("hue", |i| i.huerotate(25)),
+        ("flip", |i| i.fliph()),
+        ("shift20", |i| i.crop_imm(i.width() / 5, 0, i.width() * 4 / 5, i.height())),
+    ];
+    let emb: Vec<Vec<f32>> = model.embed_images(&originals).unwrap();
+    let dh: Vec<[u8; 8]> = originals.iter().map(compute_dhash).collect();
+    for (name, f) in &edits {
+        let mut cos = Vec::new();
+        let mut ham = Vec::new();
+        let mut bits = Vec::new();
+        for (i, o) in originals.iter().enumerate() {
+            let v = if *name == "resize25" { f(o) } else { jpeg(&f(o), 85) };
+            let e = model.embed_image(&v).unwrap();
+            cos.push(dot(&emb[i], &e));
+            bits.push((simhash(&emb[i]) ^ simhash(&e)).count_ones());
+            ham.push(hamming_distance(&dh[i], &compute_dhash(&v)));
+        }
+        let same = cos.iter().filter(|&&c| c >= SAME_PHOTO_SIMILARITY).count();
+        println!("          simhash bits max={} ; grouped by SigLIP: {same}/{} ; by either: {}/{}",
+            bits.iter().max().unwrap(), cos.len(),
+            cos.iter().zip(&ham).filter(|(c, h)| **c >= SAME_PHOTO_SIMILARITY || **h <= 10).count(), cos.len());
+        cos.sort_by(f32::total_cmp);
+        ham.sort();
+        println!("{name:<9} cos min={:.3} med={:.3} | dhash max={} med={} (<=10: {}/{})",
+            cos[0], cos[cos.len() / 2], ham[ham.len() - 1], ham[ham.len() / 2],
+            ham.iter().filter(|&&h| h <= 10).count(), ham.len());
+    }
+    let mut pairs: Vec<(f32, u32, usize, usize)> = Vec::new();
+    for i in 0..originals.len() {
+        for j in i + 1..originals.len() {
+            pairs.push((dot(&emb[i], &emb[j]), hamming_distance(&dh[i], &dh[j]), i, j));
+        }
+    }
+    pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    println!("distinct pairs: {} ; dhash<=10: {}", pairs.len(), pairs.iter().filter(|p| p.1 <= 10).count());
+    for (c, h, i, j) in pairs.iter().take(6) {
+        let bits = (simhash(&emb[*i]) ^ simhash(&emb[*j])).count_ones();
+        println!("  cos={c:.3} dhash={h} simhash={bits} {:?} {:?}", paths[*i].file_name().unwrap(), paths[*j].file_name().unwrap());
+    }
+}

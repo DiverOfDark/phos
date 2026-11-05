@@ -12,51 +12,39 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use crate::semantic::VisualSignature;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-/// Hamming distance between two 8-byte dHash values (out of 64 bits).
-fn hamming_distance(a: &[u8; 8], b: &[u8; 8]) -> u32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x ^ y).count_ones())
-        .sum()
-}
-
-/// A cached record of an already-imported file's dHash and target path.
+/// An already-imported file: where it lives and what it looks like.
 struct StoredFileRecord {
     path: String,
-    dhash: [u8; 8],
+    signature: VisualSignature,
 }
 
-/// Load all files with visual_embedding (dHash) from the DB.
-/// Resolves DB paths to absolute using the library root.
+/// Every indexed file's grouping signature (dHash and SigLIP vector), with
+/// DB paths resolved to absolute using the library root.
 fn load_dhash_cache(conn: &mut SqliteConnection, library_root: &Path) -> Vec<StoredFileRecord> {
-    let rows: Vec<(String, Vec<u8>)> = match files::table
-        .select((files::path, files::visual_embedding.assume_not_null()))
-        .filter(files::visual_embedding.is_not_null())
-        .load::<(String, Vec<u8>)>(conn)
+    let rows: Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>)> = match files::table
+        .select((files::path, files::visual_embedding, files::semantic_embedding))
+        .filter(files::visual_embedding.is_not_null().or(files::semantic_embedding.is_not_null()))
+        .load(conn)
     {
         Ok(r) => r,
         Err(e) => {
-            warn!("Failed to load dHash cache: {}", e);
+            warn!("Failed to load visual cache: {}", e);
             return Vec::new();
         }
     };
 
-    let mut records = Vec::new();
-    for (path, blob) in rows {
-        if blob.len() == 8 {
-            let mut dhash = [0u8; 8];
-            dhash.copy_from_slice(&blob);
-            let resolved = db::resolve_path(library_root, &path)
-                .to_string_lossy()
-                .to_string();
-            records.push(StoredFileRecord { path: resolved, dhash });
-        }
-    }
-    records
+    rows.into_iter()
+        .map(|(path, dhash, vector)| StoredFileRecord {
+            path: db::resolve_path(library_root, &path).to_string_lossy().to_string(),
+            signature: VisualSignature::from_blobs(dhash.as_deref(), vector.as_deref()),
+        })
+        .filter(|r| !r.signature.is_empty())
+        .collect()
 }
 
 /// Find the next counter (numbered subfolder) inside a directory.
@@ -176,34 +164,44 @@ pub fn run_import(
         .num_threads(threads)
         .build()?;
 
-    pool.install(|| {
-        source_files.par_iter().for_each(|source_path| {
-            pb.set_message(
-                source_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-            );
+    // Same two-phase chunks as a scan: SigLIP-embed a chunk in batches, then
+    // import it in parallel, so the vision tower never runs beside the workers.
+    let embed_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(scanner::half_available_threads())
+        .build()?;
+    for chunk in source_files.chunks(64) {
+        let refs: Vec<&PathBuf> = chunk.iter().collect();
+        let vectors = scanner.embed_paths(&embed_pool, &refs);
+        pool.install(|| {
+            chunk.par_iter().zip(vectors).for_each(|(source_path, vector)| {
+                pb.set_message(
+                    source_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                );
 
-            match import_single_file(
-                source_path,
-                target,
-                move_files,
-                &db_path,
-                &scanner,
-                &dhash_cache,
-                &stats,
-            ) {
-                Ok(()) => {}
-                Err(e) => {
-                    error!("Error importing {:?}: {}", source_path, e);
-                    stats.skipped_error.fetch_add(1, Ordering::Relaxed);
+                match import_single_file(
+                    source_path,
+                    target,
+                    move_files,
+                    &db_path,
+                    &scanner,
+                    &dhash_cache,
+                    vector,
+                    &stats,
+                ) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        error!("Error importing {:?}: {}", source_path, e);
+                        stats.skipped_error.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-            }
 
-            pb.inc(1);
+                pb.inc(1);
+            });
         });
-    });
+    }
 
     pb.finish_with_message("Import complete!");
 
@@ -345,6 +343,7 @@ fn import_single_file(
     db_path: &Path,
     scanner: &Scanner,
     dhash_cache: &Mutex<Vec<StoredFileRecord>>,
+    vector: Option<Vec<f32>>,
     stats: &ImportStats,
 ) -> anyhow::Result<()> {
     // 1. SHA256 hash — check for exact duplicate
@@ -392,14 +391,14 @@ fn import_single_file(
     let target_dir: PathBuf;
 
     if let Some(ref img) = img {
-        let dhash = scanner::compute_dhash(img);
+        let signature = VisualSignature::new(Some(scanner::compute_dhash(img)), vector.clone());
 
-        // Check against all stored dHashes (brief lock)
+        // Same rule as scan-time grouping: dHash or SigLIP (brief lock)
         let variation_match = {
             let cache = dhash_cache.lock().unwrap();
             cache
                 .iter()
-                .find(|stored| hamming_distance(&dhash, &stored.dhash) <= 10)
+                .find(|stored| stored.signature.same_photo(&signature))
                 .map(|stored| stored.path.clone())
         };
 
@@ -469,16 +468,15 @@ fn import_single_file(
     // Create a scanner-specific dHash cache for process_file.
     // Import already handles variation detection separately via its own cache,
     // so this cache starts empty — its purpose is just to satisfy the API.
-    let scan_dhash_cache = std::sync::Mutex::new(Vec::<scanner::DHashCacheEntry>::new());
+    let scan_dhash_cache = std::sync::Mutex::new(Vec::<scanner::VisualCacheEntry>::new());
     let mut scan_conn = scanner.open_db()?;
-    scanner.process_file(&mut scan_conn, &target_path, &scan_dhash_cache)?;
+    scanner.process_file_with(&mut scan_conn, &target_path, &scan_dhash_cache, Some(vector.clone()))?;
 
-    // Update dHash cache with the newly imported file (brief lock)
+    // Update the cache with the newly imported file (brief lock)
     if let Some(ref img) = img {
-        let dhash = scanner::compute_dhash(img);
         dhash_cache.lock().unwrap().push(StoredFileRecord {
             path: target_path.to_string_lossy().to_string(),
-            dhash,
+            signature: VisualSignature::new(Some(scanner::compute_dhash(img)), vector),
         });
     }
 

@@ -33,7 +33,7 @@ pub(super) struct SimilarShotItem {
     /// Hamming distance between the two main photos' 64-bit dHashes.
     distance: u32,
     /// SigLIP 2 cosine between the two main photos (1.0 = same picture), when
-    /// both have been embedded. Results are ordered by it when present.
+    /// both have been embedded. `/similar` orders by it when present.
     similarity: Option<f32>,
 }
 
@@ -97,7 +97,7 @@ pub(crate) async fn get_shots(
 
     // Build dynamic SQL query. `{extra}` is filled in once the bind positions of
     // the text pattern are known.
-    let mut sql = String::from(
+    let sql = String::from(
         "SELECT DISTINCT s.id, s.timestamp, s.primary_person_id, s.review_status, s.folder_number,
                 f.id AS main_file_id, p.name AS person_name,
                 (SELECT COUNT(*) FROM files WHERE shot_id = s.id) AS file_count,
@@ -144,13 +144,12 @@ pub(crate) async fn get_shots(
         );
         if query_vector.is_some() {
             // Every shot is a candidate; the filter is applied after scoring.
-            extra = format!("{text_match} AS text_match, s.semantic_embedding");
+            extra = format!("{text_match} AS text_match, f.semantic_embedding");
         } else {
             conditions.push(text_match);
         }
     }
-    let sql = sql.replace("{extra}", &extra);
-    let mut sql = sql;
+    let mut sql = sql.replace("{extra}", &extra);
 
     if let Some(ref from) = params.from {
         bind_values.push(from.clone());
@@ -1038,9 +1037,9 @@ pub(super) async fn get_similar_shots(
         _ => return Ok(Json(vec![])),
     };
 
-    let current_vector: Option<Vec<f32>> = shots::table
-        .filter(shots::id.eq(&id))
-        .select(shots::semantic_embedding)
+    let current_vector: Option<Vec<f32>> = files::table
+        .filter(files::id.eq(&main_file_id))
+        .select(files::semantic_embedding)
         .first::<Option<Vec<u8>>>(&mut conn)
         .ok()
         .flatten()
@@ -1119,7 +1118,7 @@ pub(super) async fn get_similar_shots(
         let candidates: Vec<CandidateRow> = diesel::sql_query(
             "SELECT s.id, s.main_file_id, s.review_status, p.name AS person_name,
                     (SELECT COUNT(*) FROM files WHERE shot_id = s.id) as file_count,
-                    f.visual_embedding, s.semantic_embedding
+                    f.visual_embedding, f.semantic_embedding
              FROM shots s
              LEFT JOIN people p ON s.primary_person_id = p.id
              JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
@@ -1607,7 +1606,7 @@ pub(super) struct SimilarGroupsResponse {
     path = "/api/shots/similar-groups",
     tag = "shots",
     summary = "List similar shot groups",
-    description = "Retrieve paginated groups of similar shots across the entire library for bulk deduplication review.",
+    description = "Retrieve paginated groups of similar shots across the entire library for bulk deduplication review. Two shots are grouped when their main photos' dHashes are within 10 bits or their SigLIP 2 embeddings reach cosine 0.88.",
     params(SimilarGroupsQuery),
     responses(
         (status = 200, description = "Paginated similar shot groups", body = SimilarGroupsResponse),
@@ -1634,12 +1633,14 @@ pub(super) async fn get_similar_shot_groups(
         file_count: i64,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
         visual_embedding: Option<Vec<u8>>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+        semantic_embedding: Option<Vec<u8>>,
     }
 
     let all_shots: Vec<ShotDataRow> = diesel::sql_query(
         "SELECT s.id, s.main_file_id, s.review_status, p.name AS person_name,
                 (SELECT COUNT(*) FROM files WHERE shot_id = s.id) as file_count,
-                f.visual_embedding
+                f.visual_embedding, f.semantic_embedding
          FROM shots s
          LEFT JOIN people p ON s.primary_person_id = p.id
          JOIN files f ON f.id = s.main_file_id AND f.visual_embedding IS NOT NULL
@@ -1654,25 +1655,25 @@ pub(super) async fn get_similar_shot_groups(
         review_status: Option<String>,
         person_name: Option<String>,
         file_count: i64,
-        dhash: [u8; 8],
+        signature: crate::semantic::VisualSignature,
     }
 
     let candidates: Vec<ShotData> = all_shots
         .into_iter()
         .filter_map(|row| {
-            let blob = row.visual_embedding?;
-            if blob.len() != 8 {
-                return None;
-            }
-            let mut dhash = [0u8; 8];
-            dhash.copy_from_slice(&blob);
+            let signature = crate::semantic::VisualSignature::from_blobs(
+                row.visual_embedding.as_deref(),
+                row.semantic_embedding.as_deref(),
+            );
+            // `distance` is reported for every item, so a dHash is required.
+            signature.dhash?;
             Some(ShotData {
                 id: row.id,
                 main_fid: row.main_file_id.unwrap_or_default(),
                 review_status: row.review_status,
                 person_name: row.person_name,
                 file_count: row.file_count,
-                dhash,
+                signature,
             })
         })
         .collect();
@@ -1700,6 +1701,14 @@ pub(super) async fn get_similar_shot_groups(
                 continue;
             }
 
+            // dHash within 10, or SigLIP cosine >= REVIEW_SIMILARITY. Checked
+            // before the ignore list: it is the cheap test that rejects
+            // almost every pair (SimHash prefilter, no allocation).
+            let Some(similarity) = candidates[i].signature.review_match(&candidates[j].signature)
+            else {
+                continue;
+            };
+
             let (s1, s2) = if candidates[i].id < candidates[j].id {
                 (&candidates[i].id, &candidates[j].id)
             } else {
@@ -1710,54 +1719,37 @@ pub(super) async fn get_similar_shot_groups(
                 continue;
             }
 
-            let dist = crate::scanner::hamming_distance(&candidates[i].dhash, &candidates[j].dhash);
-            if dist <= 10 {
-                // Threshold for similarity
-                current_group.push(j);
-            }
+            current_group.push((j, similarity));
         }
 
         if !current_group.is_empty() {
-            let mut candidates_items = Vec::new();
-            for idx in current_group {
-                used.insert(candidates[idx].id.clone());
-                candidates_items.push(SimilarShotItem {
-                    id: candidates[idx].id.clone(),
-                    thumbnail_url: format!("/api/files/{}/thumbnail", candidates[idx].main_fid),
-                    file_count: candidates[idx].file_count,
-                    primary_person_name: candidates[idx].person_name.clone(),
-                    review_status: candidates[idx].review_status.clone(),
-                    distance: crate::scanner::hamming_distance(
-                        &candidates[i].dhash,
-                        &candidates[idx].dhash,
-                    ),
-                    // Duplicate groups are a dHash judgement; see get_similar_shots.
-                    similarity: None,
-                });
-            }
-
             used.insert(candidates[i].id.clone());
-
-            let primary_item = SimilarShotItem {
-                id: candidates[i].id.clone(),
-                thumbnail_url: format!("/api/files/{}/thumbnail", candidates[i].main_fid),
-                file_count: candidates[i].file_count,
-                primary_person_name: candidates[i].person_name.clone(),
-                review_status: candidates[i].review_status.clone(),
-                distance: 0,
-                similarity: None,
+            let mut members: Vec<usize> = vec![i];
+            for (idx, _) in current_group {
+                used.insert(candidates[idx].id.clone());
+                members.push(idx);
+            }
+            // The fattest shot is primary; every candidate's distance and
+            // similarity are measured against that shot, not the one the group
+            // was seeded from.
+            members.sort_by(|a, b| candidates[*b].file_count.cmp(&candidates[*a].file_count));
+            let primary = members[0];
+            let item = |idx: usize| {
+                let c = &candidates[idx];
+                let p = &candidates[primary].signature;
+                SimilarShotItem {
+                    id: c.id.clone(),
+                    thumbnail_url: format!("/api/files/{}/thumbnail", c.main_fid),
+                    file_count: c.file_count,
+                    primary_person_name: c.person_name.clone(),
+                    review_status: c.review_status.clone(),
+                    distance: p.dhash_distance(&c.signature).unwrap_or(64),
+                    similarity: p.similarity(&c.signature),
+                }
             };
-
-            let mut all_items = vec![primary_item];
-            all_items.extend(candidates_items);
-            // Sort by file_count descending, so the fattest shot is primary
-            all_items.sort_by(|a, b| b.file_count.cmp(&a.file_count));
-
-            let actual_primary = all_items.remove(0);
-
             groups.push(SimilarShotGroup {
-                primary: actual_primary,
-                candidates: all_items,
+                primary: item(primary),
+                candidates: members[1..].iter().map(|&idx| item(idx)).collect(),
             });
         }
     }

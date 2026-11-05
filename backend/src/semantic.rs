@@ -29,8 +29,8 @@ const VISION_FILE: &str = "onnx/vision_model.onnx";
 const TEXT_FILE: &str = "onnx/text_model_quantized.onnx";
 
 /// Identifies the vectors this model produces. Stored next to every embedding
-/// (as `<MODEL_ID>:<file id>`) so a model change or a new main photo makes the
-/// stored vector stale instead of silently comparable with fresh ones.
+/// (`files.semantic_model`) so a model change makes the stored vector stale
+/// instead of silently comparable with fresh ones.
 pub const MODEL_ID: &str = "siglip2-base-p16-256";
 
 const IMAGE_SIZE: u32 = 256;
@@ -57,6 +57,138 @@ pub const MIN_QUERY_SIMILARITY: f32 = 0.08;
 
 /// Probability that `text` describes the image, from the cosine of their
 /// unit embeddings — SigLIP's own sigmoid head.
+/// Two files are the same photo — one shot, grouped without asking — when their
+/// dHashes are within this Hamming distance…
+pub const SAME_PHOTO_MAX_DHASH: u32 = 10;
+/// …or their SigLIP vectors are at least this close. Calibrated on 21 photos ×
+/// 9 edits: crops, shifted framing and flips (which scramble a dHash) score
+/// ≥ 0.92–0.95 median 0.95–0.99, while the closest pair of *different* photos
+/// (two portraits of one man) scored 0.887. 0.97 only admits light edits; a
+/// burst of near-identical frames can still clear it.
+pub const SAME_PHOTO_SIMILARITY: f32 = 0.97;
+/// Shots this alike are offered for review in the duplicates lane, where a
+/// person confirms or dismisses each merge. Low enough to catch heavy edits
+/// (grayscale 0.88, strong crops 0.92), so it also surfaces near-identical
+/// photos taken moments apart.
+pub const REVIEW_SIMILARITY: f32 = 0.88;
+
+/// What grouping compares: a file's dHash and, once embedded, its SigLIP
+/// vector with the vector's SimHash.
+#[derive(Clone, Debug)]
+pub struct VisualSignature {
+    pub dhash: Option<[u8; 8]>,
+    pub vector: Option<Vec<f32>>,
+    simhash: u64,
+}
+
+impl VisualSignature {
+    pub fn new(dhash: Option<[u8; 8]>, vector: Option<Vec<f32>>) -> Self {
+        let simhash = vector.as_deref().map(simhash).unwrap_or(0);
+        Self { dhash, vector, simhash }
+    }
+
+    /// Decode the two blobs stored on a file row; malformed blobs count as absent.
+    pub fn from_blobs(dhash: Option<&[u8]>, vector: Option<&[u8]>) -> Self {
+        let dhash = dhash.and_then(|b| <[u8; 8]>::try_from(b).ok());
+        let vector = vector
+            .and_then(crate::embedding::decode_embedding)
+            .filter(|v| v.len() == EMBEDDING_DIM);
+        Self::new(dhash, vector)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dhash.is_none() && self.vector.is_none()
+    }
+
+    pub fn dhash_distance(&self, other: &Self) -> Option<u32> {
+        Some(dhash_hamming(self.dhash.as_ref()?, other.dhash.as_ref()?))
+    }
+
+    /// Cosine of the two SigLIP vectors, or `None` unless both are embedded.
+    /// Pairs whose SimHashes disagree on more than `max_bits` bits are
+    /// rejected without the 768-wide dot product; `max_bits` must leave room
+    /// for the threshold the caller applies afterwards.
+    fn cosine_if_near(&self, other: &Self, max_bits: u32) -> Option<f32> {
+        let (a, b) = (self.vector.as_ref()?, other.vector.as_ref()?);
+        if (self.simhash ^ other.simhash).count_ones() > max_bits {
+            return Some(-1.0);
+        }
+        // Unit vectors: clamp the rounding that pushes a self-match past 1.
+        Some(a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>().clamp(-1.0, 1.0))
+    }
+
+    /// Exact cosine between the two vectors, when both exist.
+    pub fn similarity(&self, other: &Self) -> Option<f32> {
+        self.cosine_if_near(other, u32::MAX)
+    }
+
+    /// Automatic grouping at scan and import: dHash OR SigLIP.
+    pub fn same_photo(&self, other: &Self) -> bool {
+        self.dhash_distance(other).is_some_and(|d| d <= SAME_PHOTO_MAX_DHASH)
+            || self
+                .cosine_if_near(other, SIMHASH_BITS_SAME_PHOTO)
+                .is_some_and(|c| c >= SAME_PHOTO_SIMILARITY)
+    }
+
+    /// The duplicates lane: anything grouping would merge, plus looser
+    /// SigLIP matches a person should look at. Returns the cosine (if known)
+    /// when the pair qualifies.
+    pub fn review_match(&self, other: &Self) -> Option<Option<f32>> {
+        let cos = self.cosine_if_near(other, SIMHASH_BITS_REVIEW);
+        let by_hash = self.dhash_distance(other).is_some_and(|d| d <= SAME_PHOTO_MAX_DHASH);
+        let by_vector = cos.is_some_and(|c| c >= REVIEW_SIMILARITY);
+        (by_hash || by_vector).then(|| {
+            // A prefilter rejection is not a real cosine; recompute for display.
+            if by_vector { cos } else { self.similarity(other) }
+        })
+    }
+}
+
+fn dhash_hamming(a: &[u8; 8], b: &[u8; 8]) -> u32 {
+    a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+}
+
+pub const EMBEDDING_DIM: usize = 768;
+
+/// SimHash prefilter bounds. For random hyperplanes the chance one bit differs
+/// is angle/π, so cos 0.97 (14°) expects ~5 of 64 bits and cos 0.88 (28°) ~10.
+/// The bounds sit well past the expectation (≈ +4σ) so the prefilter discards
+/// unrelated pairs (~32 bits) without losing true matches.
+const SIMHASH_BITS_SAME_PHOTO: u32 = 16;
+const SIMHASH_BITS_REVIEW: u32 = 24;
+
+/// 64 fixed pseudo-random hyperplanes (xorshift, constant seed): the same on
+/// every run, so nothing derived from them needs storing.
+fn hyperplanes() -> &'static [f32] {
+    static PLANES: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    PLANES.get_or_init(|| {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..64 * EMBEDDING_DIM)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // Uniform in [-1, 1): symmetric, which is all SimHash needs.
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    })
+}
+
+/// 64-bit SimHash: bit i is the side of hyperplane i the vector falls on.
+pub fn simhash(v: &[f32]) -> u64 {
+    if v.len() != EMBEDDING_DIM {
+        return 0;
+    }
+    hyperplanes()
+        .chunks_exact(EMBEDDING_DIM)
+        .enumerate()
+        .fold(0u64, |acc, (i, plane)| {
+            let side: f32 = plane.iter().zip(v).map(|(p, x)| p * x).sum();
+            if side >= 0.0 { acc | (1 << i) } else { acc }
+        })
+}
+
 #[allow(dead_code)] // calibration aid, used by tests/semantic_test.rs
 pub fn match_probability(cosine: f32) -> f32 {
     1.0 / (1.0 + (-(cosine * LOGIT_SCALE + LOGIT_BIAS)).exp())
@@ -276,6 +408,67 @@ mod tests {
         assert_eq!(data.len(), 3 * 256 * 256);
         assert_eq!(data[0], -1.0);
         assert_eq!(data[255], 1.0);
+    }
+
+    fn unit(seed: u64) -> Vec<f32> {
+        let mut state = seed | 1;
+        l2_normalize(
+            (0..EMBEDDING_DIM)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+                })
+                .collect(),
+        )
+    }
+
+    /// `a` nudged towards `b` until their cosine is about `target`.
+    fn blend(a: &[f32], b: &[f32], target: f32) -> Vec<f32> {
+        let mut t = 0.0f32;
+        loop {
+            let v = l2_normalize(a.iter().zip(b).map(|(x, y)| x * (1.0 - t) + y * t).collect());
+            let c: f32 = v.iter().zip(a).map(|(x, y)| x * y).sum();
+            if c <= target {
+                return v;
+            }
+            t += 0.002;
+        }
+    }
+
+    #[test]
+    fn simhash_tracks_the_angle() {
+        let a = unit(1);
+        let far = unit(2);
+        let near = blend(&a, &far, 0.97);
+        let bits = |x: &[f32], y: &[f32]| (simhash(x) ^ simhash(y)).count_ones();
+        assert_eq!(bits(&a, &a), 0);
+        assert!(bits(&a, &near) <= SIMHASH_BITS_SAME_PHOTO, "{}", bits(&a, &near));
+        assert!(bits(&a, &far) > SIMHASH_BITS_REVIEW, "{}", bits(&a, &far));
+    }
+
+    #[test]
+    fn same_photo_is_dhash_or_close_vector() {
+        let a = unit(3);
+        let other = unit(4);
+        let edit = blend(&a, &other, 0.975);
+        let lookalike = blend(&a, &other, 0.90);
+        let sig = |d: Option<[u8; 8]>, v: &[f32]| VisualSignature::new(d, Some(v.to_vec()));
+
+        // dHash alone decides when it matches, whatever the vectors say.
+        assert!(sig(Some([0; 8]), &a).same_photo(&sig(Some([1, 0, 0, 0, 0, 0, 0, 0]), &other)));
+        // dHash far apart, vectors nearly identical: grouped.
+        assert!(sig(Some([0; 8]), &a).same_photo(&sig(Some([0xff; 8]), &edit)));
+        // Look-alike: not grouped automatically, but offered for review.
+        let (x, y) = (sig(Some([0; 8]), &a), sig(Some([0xff; 8]), &lookalike));
+        assert!(!x.same_photo(&y));
+        assert!(x.review_match(&y).is_some());
+        // Unrelated: neither.
+        let z = sig(Some([0xff; 8]), &other);
+        assert!(!x.same_photo(&z) && x.review_match(&z).is_none());
+        // Nothing to compare: no match.
+        assert!(!VisualSignature::new(None, None).same_photo(&x));
     }
 
     #[test]
