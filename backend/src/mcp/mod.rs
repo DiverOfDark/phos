@@ -55,9 +55,12 @@ those for the full record, including each file's id. To actually look at a \
 photo, call `get_image` with a *file* id (not a shot id) — shot records list \
 their files.
 
-Free-text search matches the AI-written caption on each shot and the file path, \
-not the contents of the image, so a search that finds nothing does not mean the \
-library holds nothing of the kind.";
+Free-text search compares the query with what each photo shows (a SigLIP 2 \
+image embedding, any language) and also matches the AI caption and file path \
+literally; results come most relevant first. Short concrete phrases (\"dog on a \
+beach\") work best. Shots not yet analysed are found only by the literal match, \
+so a search that finds nothing does not prove the library holds nothing of the \
+kind.";
 
 /// The MCP server: one library, one permission level.
 #[derive(Clone)]

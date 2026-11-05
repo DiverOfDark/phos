@@ -130,7 +130,8 @@ impl PhosMcp {
     #[rmcp::tool(
         name = "search_shots",
         description = "Search the library for shots (one shot = one moment, holding one or \
-                       more files). Filter by free text over the AI caption and file path, by \
+                       more files). Filter by free text — matched against what the photo shows \
+                       as well as the AI caption and file path, most relevant first — by \
                        person, by date range, or by review status. Returns links to \
                        phos://shot/{id} resources — read the ones that look relevant.",
         annotations(title = "Search shots", read_only_hint = true)
@@ -158,8 +159,8 @@ impl PhosMcp {
 
         let total = shots.len();
         let mut content = vec![ContentBlock::text(if total == 0 {
-            "No shots matched. Free-text search reads the AI caption and the file path, not \
-             the image itself, so try a broader phrase or drop a filter."
+            "No shots matched. Try a shorter, more concrete phrase (what is visible in \
+             the photo) or drop a filter."
                 .to_string()
         } else if total > limit {
             format!("{total} shots matched; the first {limit} are linked below.")

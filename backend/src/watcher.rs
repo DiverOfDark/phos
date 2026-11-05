@@ -183,7 +183,7 @@ fn flush_pending(
     // Build a dHash cache so new files can be grouped into existing shots.
     // Created once before the loop so that files in the same watcher batch
     // can still match against each other.
-    let dhash_cache = std::sync::Mutex::new(Vec::<crate::scanner::DHashCacheEntry>::new());
+    let dhash_cache = std::sync::Mutex::new(Vec::<crate::scanner::VisualCacheEntry>::new());
 
     // Drain the map so we process each path exactly once.
     let actions: Vec<(PathBuf, FileAction)> = pending
@@ -235,7 +235,7 @@ fn flush_pending(
 
     if had_changes {
         // Caption any newly added shots that don't have descriptions yet
-        if let Err(e) = scanner.caption_shots(library_path) {
+        if let Err(e) = scanner.describe_shots(library_path) {
             error!("Watcher: captioning failed: {}", e);
         }
         // New/removed files change clustering and folder layout — let the

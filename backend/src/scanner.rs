@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -96,6 +96,25 @@ pub fn compute_dhash(img: &DynamicImage) -> [u8; 8] {
 }
 
 /// Hamming distance between two 8-byte dHash values (out of 64 bits).
+/// Files per scan chunk: embedded together, then indexed together.
+const SCAN_CHUNK: usize = 64;
+
+/// Every indexed file's grouping signature (dHash and SigLIP vector).
+pub fn load_visual_cache(conn: &mut SqliteConnection) -> anyhow::Result<Vec<VisualCacheEntry>> {
+    let rows: Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>)> = files::table
+        .select((files::shot_id, files::visual_embedding, files::semantic_embedding))
+        .filter(files::visual_embedding.is_not_null().or(files::semantic_embedding.is_not_null()))
+        .load(conn)?;
+    Ok(rows
+        .into_iter()
+        .map(|(shot_id, dhash, vector)| VisualCacheEntry {
+            shot_id,
+            signature: crate::semantic::VisualSignature::from_blobs(dhash.as_deref(), vector.as_deref()),
+        })
+        .filter(|e| !e.signature.is_empty())
+        .collect())
+}
+
 pub fn hamming_distance(a: &[u8; 8], b: &[u8; 8]) -> u32 {
     a.iter()
         .zip(b.iter())
@@ -104,9 +123,10 @@ pub fn hamming_distance(a: &[u8; 8], b: &[u8; 8]) -> u32 {
 }
 
 /// Entry in the in-memory dHash cache used for shot grouping during scanning.
-pub struct DHashCacheEntry {
+/// A file already in the library, as shot grouping sees it.
+pub struct VisualCacheEntry {
     pub shot_id: String,
-    pub dhash: [u8; 8],
+    pub signature: crate::semantic::VisualSignature,
 }
 
 pub struct Scanner {
@@ -306,47 +326,46 @@ impl Scanner {
             .map(|e| e.path().to_path_buf())
             .collect();
 
-        // Build an in-memory dHash cache from existing files in the DB
-        let dhash_cache = {
+        // What shot grouping compares new files against: every indexed file.
+        let (dhash_cache, indexed_paths) = {
             let mut conn = self.open_db()?;
-            let entries: Vec<(String, Vec<u8>)> = files::table
-                .select((files::shot_id, files::visual_embedding.assume_not_null()))
-                .filter(files::visual_embedding.is_not_null())
-                .load::<(String, Vec<u8>)>(&mut conn)?;
-
-            let cache: Vec<DHashCacheEntry> = entries
-                .into_iter()
-                .filter_map(|(shot_id, blob)| {
-                    if blob.len() == 8 {
-                        let mut dhash = [0u8; 8];
-                        dhash.copy_from_slice(&blob);
-                        Some(DHashCacheEntry { shot_id, dhash })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            std::sync::Mutex::new(cache)
+            let cache = load_visual_cache(&mut conn)?;
+            let paths: HashSet<String> = files::table.select(files::path).load(&mut conn)?.into_iter().collect();
+            (std::sync::Mutex::new(cache), paths)
         };
+        let library_root = self.db_path.parent().unwrap();
+        let new_files: Vec<&PathBuf> = files_list
+            .iter()
+            .filter(|p| !indexed_paths.contains(&db::make_relative(library_root, p)))
+            .collect();
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(half_available_threads())
             .build()?;
 
-        pool.install(|| {
-            files_list.par_iter().for_each(|path| {
-                let mut conn = match self.open_db() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("Failed to open DB: {}", e);
-                        return;
+        // Chunks alternate two phases, each within the pool's half of the
+        // machine: SigLIP-embed the chunk in batches (the vision tower runs
+        // its own intra-op threads, so it must not overlap the workers), then
+        // index it in parallel. Embedding inside the workers would stack N
+        // tower threads on top of N workers.
+        for chunk in new_files.chunks(SCAN_CHUNK) {
+            let vectors = self.embed_paths(&pool, chunk);
+            pool.install(|| {
+                chunk.par_iter().zip(vectors).for_each(|(path, vector)| {
+                    let mut conn = match self.open_db() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("Failed to open DB: {}", e);
+                            return;
+                        }
+                    };
+                    let vector = Some(vector);
+                    if let Err(e) = self.process_file_with(&mut conn, path, &dhash_cache, vector) {
+                        error!("Error processing {:?}: {}", path, e);
                     }
-                };
-                if let Err(e) = self.process_file(&mut conn, path, &dhash_cache) {
-                    error!("Error processing {:?}: {}", path, e);
-                }
+                });
             });
-        });
+        }
 
         // After all files are processed, run face clustering
         let mut conn = self.open_db()?;
@@ -843,7 +862,21 @@ impl Scanner {
         &self,
         conn: &mut SqliteConnection,
         path: &Path,
-        dhash_cache: &std::sync::Mutex<Vec<DHashCacheEntry>>,
+        dhash_cache: &std::sync::Mutex<Vec<VisualCacheEntry>>,
+    ) -> anyhow::Result<bool> {
+        self.process_file_with(conn, path, dhash_cache, None)
+    }
+
+    /// `semantic`: the file's SigLIP vector when the caller embedded it in a
+    /// batch — `Some(None)` if that failed. `None` embeds it here, which is
+    /// right for one-off files (uploads, watcher events) and wrong inside a
+    /// parallel scan.
+    pub fn process_file_with(
+        &self,
+        conn: &mut SqliteConnection,
+        path: &Path,
+        dhash_cache: &std::sync::Mutex<Vec<VisualCacheEntry>>,
+        semantic: Option<Option<Vec<f32>>>,
     ) -> anyhow::Result<bool> {
         // --- Phase 1: CPU-heavy work (no DB writes) ---
         let library_root = self.db_path.parent().unwrap();
@@ -933,9 +966,19 @@ impl Scanner {
         let mut image_faces: Vec<FaceResult> = Vec::new();
         let mut keyframe_results: Vec<KeyframeResult> = Vec::new();
 
+        let mut semantic = semantic;
+        let mut embed_inline = |img: &DynamicImage| {
+            if semantic.is_none() {
+                semantic = Some(self.embed_one(img));
+            }
+        };
+
         let dhash: Option<[u8; 8]> = if mime_type.starts_with("image/") {
             let img = open_image(path).ok();
             let dhash = img.as_ref().map(|i| compute_dhash(i));
+            if let Some(ref img) = img {
+                embed_inline(img);
+            }
 
             if let (Some(ai), Some(ref img)) = (&self.ai, &img) {
                 image_faces = detect_faces_collect(ai, img);
@@ -943,10 +986,11 @@ impl Scanner {
             // img dropped here — single load for both operations
             dhash
         } else if mime_type.starts_with("video/") {
-            // Extract first frame for dHash (lightweight — single frame)
-            let dhash = extract_first_video_frame(path)
-                .ok()
-                .map(|frame| compute_dhash(&frame));
+            // Extract first frame for dHash and SigLIP (lightweight — single frame)
+            let dhash = extract_first_video_frame(path).ok().map(|frame| {
+                embed_inline(&frame);
+                compute_dhash(&frame)
+            });
 
             if let Some(ai) = &self.ai {
                 // Stream keyframes one at a time: each DynamicImage is dropped
@@ -979,15 +1023,15 @@ impl Scanner {
             dedup_face_results(pooled)
         };
 
-        // --- Phase 2: dHash shot grouping ---
-        // Check the dhash_cache for a match (Hamming distance <= 10).
-        // If match found: add file to existing shot (is_original = false).
-        // No match: create new shot (is_original = true).
-        let (actual_shot_id, is_new_shot, is_original) = if let Some(ref file_dhash) = dhash {
+        // --- Phase 2: shot grouping ---
+        // A file that is the same photo as an indexed one (dHash within 10, or
+        // SigLIP cosine >= 0.97 — see `VisualSignature::same_photo`) joins that
+        // shot as a variation (is_original = false); otherwise it starts one.
+        let vector = semantic.flatten();
+        let signature = crate::semantic::VisualSignature::new(dhash, vector.clone());
+        let (actual_shot_id, is_new_shot, is_original) = if !signature.is_empty() {
             let cache = dhash_cache.lock().unwrap();
-            let matched = cache
-                .iter()
-                .find(|entry| hamming_distance(&entry.dhash, file_dhash) <= 10);
+            let matched = cache.iter().find(|entry| entry.signature.same_photo(&signature));
             if let Some(entry) = matched {
                 (entry.shot_id.clone(), false, false)
             } else {
@@ -1053,6 +1097,14 @@ impl Scanner {
                     .set(files::visual_embedding.eq(dhash_val.as_slice()))
                     .execute(conn)?;
             }
+            if let Some(ref v) = vector {
+                diesel::update(files::table.filter(files::id.eq(&id)))
+                    .set((
+                        files::semantic_embedding.eq(crate::embedding::encode_embedding(v)),
+                        files::semantic_model.eq(crate::semantic::MODEL_ID),
+                    ))
+                    .execute(conn)?;
+            }
 
             for face in &image_faces {
                 diesel::insert_into(faces::table)
@@ -1105,12 +1157,11 @@ impl Scanner {
             Ok(()) => {
                 diesel::sql_query("COMMIT").execute(conn)?;
 
-                // Add to the dHash cache so subsequent files can match against this one
-                if let Some(ref file_dhash) = dhash {
-                    let mut cache = dhash_cache.lock().unwrap();
-                    cache.push(DHashCacheEntry {
+                // Add to the cache so subsequent files can match against this one
+                if !signature.is_empty() {
+                    dhash_cache.lock().unwrap().push(VisualCacheEntry {
                         shot_id: actual_shot_id.clone(),
-                        dhash: *file_dhash,
+                        signature,
                     });
                 }
 
@@ -1122,6 +1173,138 @@ impl Scanner {
                 Err(e)
             }
         }
+    }
+
+    /// Post-scan analysis of every shot: SigLIP 2 embeddings, then Florence-2
+    /// captions. Embeddings go first because they are what search needs and
+    /// they cost ~50x less per photo; captioning a large library takes days.
+    /// Each half skips shots it has already done, and a failure in one does
+    /// not stop the other.
+    pub fn describe_shots(&self, root: &Path) -> anyhow::Result<()> {
+        let embedded = self.embed_files(root);
+        let captioned = self.caption_shots(root);
+        embedded.and(captioned)
+    }
+
+    /// SigLIP-embed one image, or `None` without a model (dummy mode, offline).
+    /// Scanners built without an AI pipeline (read-only sessions) index nothing
+    /// new, so they do not embed either.
+    fn embed_one(&self, img: &DynamicImage) -> Option<Vec<f32>> {
+        if self.ai.is_none() || std::env::var("PHOS_DUMMY_AI").is_ok_and(|v| v == "1") {
+            return None;
+        }
+        crate::semantic::shared()
+            .embed_image(img)
+            .map_err(|e| debug!("SigLIP embedding unavailable: {}", e))
+            .ok()
+    }
+
+    /// SigLIP-embed `paths` in batches, decoding in parallel on `pool`. One
+    /// entry per path, in order; `None` where the file could not be decoded
+    /// or there is no model.
+    pub fn embed_paths(&self, pool: &rayon::ThreadPool, paths: &[&PathBuf]) -> Vec<Option<Vec<f32>>> {
+        let mut out: Vec<Option<Vec<f32>>> = vec![None; paths.len()];
+        if self.ai.is_none() {
+            return out;
+        }
+        if std::env::var("PHOS_DUMMY_AI").is_ok_and(|v| v == "1") {
+            return out;
+        }
+        let batch = crate::semantic::IMAGE_BATCH;
+        for (b, chunk) in paths.chunks(batch).enumerate() {
+            let decoded: Vec<Option<DynamicImage>> =
+                pool.install(|| chunk.par_iter().map(|p| open_image(p).ok()).collect());
+            let (idx, imgs): (Vec<usize>, Vec<DynamicImage>) = decoded
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, img)| Some((b * batch + i, img?)))
+                .unzip();
+            if imgs.is_empty() {
+                continue;
+            }
+            match pool.install(|| crate::semantic::shared().embed_images(&imgs)) {
+                Ok(vectors) => {
+                    for (i, v) in idx.into_iter().zip(vectors) {
+                        out[i] = Some(v);
+                    }
+                }
+                Err(e) => {
+                    // Same failure for every batch: the model is missing.
+                    debug!("SigLIP embedding unavailable: {}", e);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Compute the SigLIP 2 embedding of every file that has none from the
+    /// current model — files indexed before embeddings existed, or by an
+    /// older model, or whose embedding failed at scan time.
+    pub fn embed_files(&self, root: &Path) -> anyhow::Result<()> {
+        if self.ai.is_none() || std::env::var("PHOS_DUMMY_AI").is_ok_and(|v| v == "1") {
+            return Ok(());
+        }
+        let mut conn = self.open_db()?;
+        let library_root = self.db_path.parent().unwrap_or(root);
+
+        // `IS NOT` is NULL-safe: unembedded rows have a NULL model.
+        let stale: Vec<(String, String)> = files::table
+            .select((files::id, files::path))
+            .filter(diesel::dsl::sql::<diesel::sql_types::Bool>("semantic_model IS NOT ")
+                .bind::<diesel::sql_types::Text, _>(crate::semantic::MODEL_ID))
+            .load(&mut conn)?;
+        if stale.is_empty() {
+            debug!("All files already have semantic embeddings");
+            return Ok(());
+        }
+        info!("Computing semantic embeddings for {} files", stale.len());
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(half_available_threads())
+            .build()?;
+        let started = std::time::Instant::now();
+        let (mut done, mut failed) = (0usize, 0usize);
+
+        for chunk in stale.chunks(SCAN_CHUNK) {
+            let paths: Vec<PathBuf> =
+                chunk.iter().map(|(_, p)| db::resolve_path(library_root, p)).collect();
+            let refs: Vec<&PathBuf> = paths.iter().collect();
+            let vectors = self.embed_paths(&pool, &refs);
+            if done == 0 && vectors.iter().all(Option::is_none) {
+                // Nothing in the first chunk embedded: no model, or no
+                // decodable file. Either way the next pass retries.
+                warn!("Semantic embedding produced nothing, stopping this pass");
+                failed += chunk.len();
+                break;
+            }
+            for ((file_id, _), v) in chunk.iter().zip(vectors) {
+                let Some(v) = v else {
+                    failed += 1;
+                    continue;
+                };
+                let res = diesel::update(files::table.filter(files::id.eq(file_id)))
+                    .set((
+                        files::semantic_embedding.eq(crate::embedding::encode_embedding(&v)),
+                        files::semantic_model.eq(crate::semantic::MODEL_ID),
+                    ))
+                    .execute(&mut conn);
+                match res {
+                    Ok(_) => done += 1,
+                    Err(e) => error!("Failed to save embedding for file {}: {}", file_id, e),
+                }
+            }
+            info!("Semantic embeddings: {}/{} ({:?})", done, stale.len(), started.elapsed());
+        }
+
+        info!(
+            "Semantic embeddings: {} computed, {} failed in {:?}",
+            done,
+            failed,
+            started.elapsed()
+        );
+        crate::semantic::shared().unload_vision();
+        Ok(())
     }
 
     /// Generate captions for all shots that don't have one yet.
@@ -2235,7 +2418,7 @@ mod tests {
         // Process the file first
         {
             let mut conn = scanner.open_db().unwrap();
-            let dhash_cache = std::sync::Mutex::new(Vec::<DHashCacheEntry>::new());
+            let dhash_cache = std::sync::Mutex::new(Vec::<VisualCacheEntry>::new());
             scanner
                 .process_file(&mut conn, &shot_path, &dhash_cache)
                 .unwrap();

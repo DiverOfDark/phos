@@ -27,6 +27,8 @@ diesel::table! {
         visual_embedding -> Nullable<Binary>,
         created_at -> Nullable<Timestamp>,
         updated_at -> Nullable<Timestamp>,
+        semantic_embedding -> Nullable<Binary>,
+        semantic_model -> Nullable<Text>,
     }
 }
 

@@ -15,6 +15,7 @@ mod models;
 mod organizer;
 mod s3;
 mod scanner;
+mod semantic;
 mod schema;
 mod virtualfs;
 mod watcher;
@@ -314,7 +315,7 @@ async fn run_server() {
                 if *lock.lock().unwrap() {
                     return;
                 }
-                if let Err(e) = user_scanner.caption_shots(user_dir) {
+                if let Err(e) = user_scanner.describe_shots(user_dir) {
                     tracing::error!("Captioning failed for user {}: {}", user_name, e);
                 }
                 if let Err(e) = bg_organizer.run_now(user_dir) {
@@ -410,7 +411,7 @@ async fn run_server() {
             if *lock.lock().unwrap() {
                 return;
             }
-            if let Err(e) = scanner.caption_shots(&scan_path) {
+            if let Err(e) = scanner.describe_shots(&scan_path) {
                 tracing::error!("Captioning failed: {}", e);
             }
 

@@ -86,8 +86,27 @@ Uppercase mono is the "railway schedule" register for labels, counts, ids and fi
   does not get a vote
 
 ### Key Design Decisions
-- **Florence-2 captions live on the shot.** `shots.description` is the library-search caption,
-  written by the captioning pass in `scanner.rs`
+- **Florence-2 captions live on the shot.** `shots.description` is the human-readable caption,
+  written by the captioning pass in `scanner.rs`. Decoding uses the KV-cache (`decoder_model_merged`)
+  export and Florence's own generation rules — forced first `<s>`, `no_repeat_ngram_size=3` —
+  without which the model can emit `<s>` until the token cap and the caption decodes to `""`
+- **Every file carries a SigLIP 2 vector.** `files.semantic_embedding` is the 768-d unit vector of
+  the file (videos: first frame), `files.semantic_model` the model that made it — a model change
+  makes it stale and `embed_files` re-embeds it. A shot's vector is its main file's.
+  `GET /api/shots?q=` embeds the query (any language) and keeps shots at cosine
+  ≥ `MIN_QUERY_SIMILARITY` plus literal caption/path matches, most relevant first
+- **"Same photo" is dHash OR SigLIP, one rule in `VisualSignature`.** Automatic grouping (scan and
+  import) needs dHash ≤ 10 *or* cosine ≥ 0.97: SigLIP catches flips, crops and reframing that
+  scramble a dHash, but two different portraits of one person already score 0.887, so it cannot
+  group on its own. The duplicates lane (`similar-groups`, reviewed by a person) uses dHash ≤ 10
+  or cosine ≥ 0.88. All-pairs comparisons go through a 64-bit SimHash of the vector (random
+  hyperplanes, Hamming ≈ angle) so only near pairs pay for the 768-wide dot product. Scans embed
+  each 64-file chunk in batches *before* indexing it, so the vision tower never runs beside the
+  scan workers. Known gap: two copies of one photo indexed in the same parallel chunk can miss
+  each other (check-then-insert race, as with dHash before); the duplicates lane catches them
+- **Analysis order and CPU budget.** `describe_shots` embeds before it captions (embeddings are what
+  search needs and cost ~30x less), and every analysis pass uses at most
+  `half_available_threads()` — half of `available_parallelism()`, which honours cgroup limits
 - No global database — each root directory gets its own `.phos.db`
 - AI models (ONNX) are auto-downloaded from Hugging Face (`public-data/insightface`) on first run and cached locally by `hf-hub`; startup fails hard if download fails (unless `PHOS_DUMMY_AI=1`)
 - Backend serves the built frontend as static files via `fallback_service`
@@ -140,5 +159,8 @@ Models are auto-downloaded from Hugging Face (`public-data/insightface`, path `m
 
 - `det_10g.onnx` — SCRFD face detection (input: 640x640)
 - `w600k_r50.onnx` — ArcFace face recognition (output: 512-d embeddings)
+- `onnx-community/siglip2-base-patch16-256-ONNX` — SigLIP 2 vision (fp32) and text (int8) towers
+  for semantic search and similarity; loaded lazily, vision tower unloaded after each pass
+- `onnx-community/Florence-2-large-ft` — captions (q4); loaded lazily, unloaded after each pass
 
 Set `PHOS_DUMMY_AI=1` to skip model download entirely (useful for development/testing).

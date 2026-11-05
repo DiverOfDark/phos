@@ -23,6 +23,32 @@ const ARCFACE_REF_LANDMARKS: [(f32, f32); 5] = [
     (70.7299, 92.2041),
 ];
 
+/// Florence-2-large decoder shape and generation settings
+/// (`config.json` / `generation_config.json` of `microsoft/Florence-2-large-ft`).
+const FLORENCE_DECODER_LAYERS: usize = 12;
+const FLORENCE_HEADS: usize = 16;
+const FLORENCE_HEAD_DIM: usize = 64;
+const FLORENCE_BOS: i64 = 0;
+const FLORENCE_PAD: i64 = 1;
+const FLORENCE_EOS: i64 = 2;
+/// BART-style: decoding starts from `</s>`.
+const FLORENCE_DECODER_START: i64 = 2;
+const FLORENCE_NO_REPEAT_NGRAM: usize = 3;
+const FLORENCE_MAX_NEW_TOKENS: usize = 256;
+
+/// Tokens that would complete an n-gram already present in `ids`
+/// (Hugging Face's `no_repeat_ngram_size`).
+fn banned_ngram_tokens(ids: &[i64], n: usize) -> Vec<i64> {
+    if n == 0 || ids.len() + 1 < n {
+        return Vec::new();
+    }
+    let prefix = &ids[ids.len() + 1 - n..];
+    ids.windows(n)
+        .filter(|w| &w[..n - 1] == prefix)
+        .map(|w| w[n - 1])
+        .collect()
+}
+
 /// Computes the cosine similarity between two embedding vectors.
 ///
 /// Returns a value in [-1, 1] where 1 means identical direction,
@@ -423,13 +449,16 @@ impl AiPipeline {
         let vision_encoder_path = ensure_caption_model("onnx/vision_encoder_q4.onnx")?;
         let embed_tokens_path = ensure_caption_model("onnx/embed_tokens_q4.onnx")?;
         let encoder_path = ensure_caption_model("onnx/encoder_model_q4.onnx")?;
-        let decoder_path = ensure_caption_model("onnx/decoder_model_q4.onnx")?;
+        let decoder_path = ensure_caption_model("onnx/decoder_model_merged_q4.onnx")?;
         let tokenizer_path = ensure_caption_model("tokenizer.json")?;
 
+        // Captioning runs one photo at a time after the scan, so its sessions
+        // get the half of the machine the scan's pool would otherwise use.
+        let threads = crate::scanner::half_available_threads();
         let build = |path: &std::path::Path| -> Result<Session> {
             Session::builder()
                 .map_err(|e| anyhow::anyhow!("{e}"))?
-                .with_intra_threads(1)
+                .with_intra_threads(threads)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .with_inter_threads(1)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -585,65 +614,109 @@ impl AiPipeline {
             tensor.1.to_vec()
         };
 
-        // --- Step 7: Greedy decoder loop ---
-        let decoder_start_token_id: i64 = 2; // </s> — BART-style decoder start
-        let eos_token_id: i64 = 2;
-        let max_new_tokens: usize = 150;
-        let mut generated_ids: Vec<i64> = vec![decoder_start_token_id];
+        // --- Step 7: Greedy decoding with a KV cache ---
+        // The merged decoder runs its no-cache branch once over the start token
+        // and returns every layer's keys/values; each later step feeds only the
+        // newest token plus that cache, so a token costs the same at position 5
+        // as at position 150 instead of re-running the whole prefix.
+        //
+        // Logits processing follows Florence-2's generation config: the first
+        // generated token is forced to `<s>` (forced_bos_token_id) and no
+        // trigram may repeat (no_repeat_ngram_size=3). Without the forced BOS the
+        // model can emit `<s>` forever — 150 tokens that decode to "".
+        let enc_hidden_value = Value::from_array((vec![1, combined_len, d_model], encoder_hidden))?;
+        let mut generated_ids: Vec<i64> = vec![FLORENCE_DECODER_START];
+        let mut past: Vec<(String, ort::value::DynValue)> = Vec::new();
+        for layer in 0..FLORENCE_DECODER_LAYERS {
+            for part in ["decoder", "encoder"] {
+                for kv in ["key", "value"] {
+                    // Never read: the no-cache branch ignores past inputs. One
+                    // position, because ort refuses zero-length tensors.
+                    let placeholder = Value::from_array((
+                        vec![1usize, FLORENCE_HEADS, 1, FLORENCE_HEAD_DIM],
+                        vec![0f32; FLORENCE_HEADS * FLORENCE_HEAD_DIM],
+                    ))?;
+                    past.push((format!("past_key_values.{layer}.{part}.{kv}"), placeholder.into_dyn()));
+                }
+            }
+        }
 
         let mut dec_session = dec_mutex.lock().map_err(|_| anyhow::anyhow!("Decoder mutex poisoned"))?;
-
-        // Pre-create encoder hidden state Value once —
-        // pass by reference in the loop to avoid cloning ~2.4MB per iteration.
-        let enc_hidden_value = Value::from_array((vec![1, combined_len, d_model], encoder_hidden))?;
-
-        for _ in 0..max_new_tokens {
-            let seq_len = generated_ids.len();
-
-            // Embed all generated tokens so far
-            let decoder_embeds = {
-                let ids = Value::from_array((vec![1, seq_len], generated_ids.clone()))?;
+        for step in 0..FLORENCE_MAX_NEW_TOKENS {
+            let last = *generated_ids.last().unwrap();
+            let embeds = {
+                let ids = Value::from_array((vec![1usize, 1], vec![last]))?;
                 let mut et_session = et_mutex.lock().map_err(|_| anyhow::anyhow!("Embed tokens mutex poisoned"))?;
                 let outputs = et_session.run(inputs!["input_ids" => ids])?;
-                let tensor = outputs[0].try_extract_tensor::<f32>()?;
-                let data: Vec<f32> = tensor.1.to_vec();
-                Value::from_array((vec![1, seq_len, d_model], data))?
+                let (_, data) = outputs[0].try_extract_tensor::<f32>()?;
+                Value::from_array((vec![1usize, 1, d_model], data.to_vec()))?
+            };
+            let use_cache = Value::from_array((vec![1usize], vec![step > 0]))?;
+
+            let mut feed: Vec<(std::borrow::Cow<'_, str>, ort::session::SessionInputValue<'_>)> = vec![
+                ("inputs_embeds".into(), embeds.into()),
+                ("encoder_hidden_states".into(), (&enc_hidden_value).into()),
+                ("encoder_attention_mask".into(), (&enc_attn_mask_value).into()),
+                ("use_cache_branch".into(), use_cache.into()),
+            ];
+            feed.extend(past.iter().map(|(name, v)| (name.as_str().into(), v.into())));
+            let mut outputs = dec_session.run(feed)?;
+
+            let next_token = {
+                let (shape, logits) = outputs
+                    .get("logits")
+                    .ok_or_else(|| anyhow::anyhow!("Decoder output missing 'logits' tensor"))?
+                    .try_extract_tensor::<f32>()?;
+                let vocab_size = *shape.last().unwrap() as usize;
+                let mut last_logits = logits[logits.len() - vocab_size..].to_vec();
+                if step == 0 {
+                    FLORENCE_BOS
+                } else {
+                    last_logits[FLORENCE_BOS as usize] = f32::NEG_INFINITY;
+                    last_logits[FLORENCE_PAD as usize] = f32::NEG_INFINITY;
+                    for banned in banned_ngram_tokens(&generated_ids, FLORENCE_NO_REPEAT_NGRAM) {
+                        if let Some(l) = last_logits.get_mut(banned as usize) {
+                            *l = f32::NEG_INFINITY;
+                        }
+                    }
+                    last_logits
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                        .map(|(idx, _)| idx as i64)
+                        .unwrap_or(FLORENCE_EOS)
+                }
             };
 
-            let outputs = dec_session.run(
-                inputs![
-                    "inputs_embeds" => decoder_embeds,
-                    "encoder_hidden_states" => &enc_hidden_value,
-                    "encoder_attention_mask" => &enc_attn_mask_value
-                ]
-            )?;
-
-            let logits_val = outputs.get("logits")
-                .ok_or_else(|| anyhow::anyhow!("Decoder output missing 'logits' tensor"))?;
-            let logits_tensor = logits_val.try_extract_tensor::<f32>()?;
-            let logits_shape = logits_tensor.0;
-            let logits_data = logits_tensor.1;
-
-            let vocab_size = *logits_shape.last().unwrap() as usize;
-            let last_token_offset = (seq_len - 1) * vocab_size;
-            let last_logits = &logits_data[last_token_offset..last_token_offset + vocab_size];
-
-            // Greedy: argmax
-            let next_token = last_logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx as i64)
-                .unwrap_or(eos_token_id);
-
-            if next_token == eos_token_id && generated_ids.len() > 1 {
-                break;
+            // Decoder self-attention grows every step. The cross-attention
+            // keys/values come from the encoder and only the first (no-cache)
+            // pass computes them; later passes may hand back placeholders.
+            for (name, value) in past.iter_mut() {
+                if step > 0 && name.contains(".encoder.") {
+                    continue;
+                }
+                let present = name.replacen("past_key_values", "present", 1);
+                *value = outputs
+                    .remove(present.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Decoder output missing '{present}'"))?;
             }
 
             generated_ids.push(next_token);
+            if next_token == FLORENCE_EOS {
+                break;
+            }
         }
-
         drop(dec_session);
+        let eos_token_id = FLORENCE_EOS;
+
+        let raw = tokenizer
+            .decode(&generated_ids.iter().map(|&id| id as u32).collect::<Vec<_>>(), false)
+            .unwrap_or_default();
+        tracing::debug!(
+            "Caption decoder: {} tokens, raw={:?}",
+            generated_ids.len() - 1,
+            raw.chars().take(300).collect::<String>()
+        );
 
         // --- Step 8: Decode token IDs to text (skip start token) ---
         let token_ids: Vec<u32> = generated_ids
@@ -1207,6 +1280,16 @@ mod tests {
         let b = vec![1.0, 0.0, 0.0];
         let sim = cosine_similarity(&a, &b);
         assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn test_banned_ngram_tokens() {
+        // "a b c a b" -> a trigram starting "a b" already ended in "c"
+        assert_eq!(banned_ngram_tokens(&[1, 2, 3, 1, 2], 3), vec![3]);
+        assert!(banned_ngram_tokens(&[1, 2, 3, 4], 3).is_empty());
+        assert!(banned_ngram_tokens(&[1], 3).is_empty());
+        // `<s> <s>` already seen: a third would repeat the trigram
+        assert_eq!(banned_ngram_tokens(&[0, 0, 0], 3), vec![0]);
     }
 
     #[test]

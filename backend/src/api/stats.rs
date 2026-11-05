@@ -186,7 +186,7 @@ pub(crate) async fn trigger_scan(
         if let Err(e) = scanner.scan(path) {
             tracing::error!("Triggered scan failed: {}", e);
         }
-        if let Err(e) = scanner.caption_shots(path) {
+        if let Err(e) = scanner.describe_shots(path) {
             tracing::error!("Triggered captioning failed: {}", e);
         }
     });
