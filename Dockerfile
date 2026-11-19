@@ -35,6 +35,9 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     libswresample-dev libavdevice-dev libavfilter-dev wget unzip nasm yasm \
     && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked
+# cargo-auditable embeds the resolved crate list in the binary (.dep-v0
+# section, survives strip) so Trivy can report Rust CVEs from the image.
+RUN cargo install cargo-auditable@0.7.7 --locked
 WORKDIR /app/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
 COPY backend/build.rs ./
@@ -63,7 +66,7 @@ ENV PHOS_VERSION=${PHOS_VERSION}
 COPY backend/Cargo.toml backend/Cargo.lock backend/build.rs ./
 COPY backend/migrations ./migrations
 COPY backend/src ./src
-RUN cargo build --release && \
+RUN cargo auditable build --release && \
     cp target/release/phos-backend /usr/local/bin/phos-backend
 
 # Stage 2e: Build Android APK (bundled into the image, downloadable from the web UI)
