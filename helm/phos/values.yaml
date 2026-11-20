@@ -115,3 +115,14 @@ extraEnv: []
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# Extra manifests rendered with the release, in its namespace unless they set
+# one. Strings and maps both go through `tpl`, so values can be referenced.
+# The homelab deployment uses this for the GitImage that builds the image
+# in-cluster and the ExternalSecret holding the APK signing password, e.g.:
+#   extraObjects:
+#     - apiVersion: gitimage.dev/v1alpha1
+#       kind: GitImage
+#       metadata: { name: phos }
+#       spec: { url: https://github.com/DiverOfDark/phos.git, ref: master }
+extraObjects: []

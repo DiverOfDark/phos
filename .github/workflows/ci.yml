@@ -11,14 +11,11 @@ jobs:
   build-android:
     runs-on: ubuntu-latest
     steps:
+      # The Android versionCode is the commit's committer time, which a depth-1
+      # clone has. (It used to be `git rev-list --count HEAD`, which needed full
+      # history; the commit time is also what GitImage builds use, so an APK
+      # from either source compares correctly against the other.)
       - uses: actions/checkout@v6
-        with:
-          # The Android versionCode is `git rev-list --count HEAD`, and
-          # actions/checkout defaults to a depth-1 clone, where that count is 1
-          # on every single build. The in-app updater would then compare 1
-          # against 1 and answer "up to date" forever — the exact failure this
-          # versioning scheme exists to prevent. Full history is not optional.
-          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -53,8 +50,9 @@ jobs:
             name="${GITHUB_REF_NAME}+$(git rev-parse --short HEAD)"
           fi
           echo "version=$name" >> "$GITHUB_OUTPUT"
-          # Monotonic on master, unlike anything derived from tags.
-          echo "version_code=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+          # Monotonic on master, unlike anything derived from tags, and under
+          # Android's 2100000000 cap until mid-2036.
+          echo "version_code=$(git log -1 --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
 
       # Both properties are passed unconditionally. Passing only -PversionName —
       # as this job used to — left versionCode at Gradle's fallback of 1, so an
@@ -174,11 +172,6 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v6
-        with:
-          # See build-android: a shallow clone makes `git rev-list --count HEAD`
-          # return 1 forever, and the image would ship an APK that no installed
-          # client ever considers newer.
-          fetch-depth: 0
 
       - name: Compute version
         id: version
@@ -193,7 +186,7 @@ jobs:
           fi
           # The Android versionCode. Same expression as build-android, so the
           # two jobs cannot disagree about which build is newer.
-          echo "version_code=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version_code=$(git log -1 --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
