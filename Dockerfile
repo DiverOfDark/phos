@@ -4,28 +4,65 @@
 # Build:
 #   DOCKER_BUILDKIT=1 docker build \
 #     --build-arg PHOS_VERSION=v1.2.3 \
-#     --build-arg PHOS_VERSION_CODE=$(git rev-list --count HEAD) \
+#     --build-arg PHOS_VERSION_CODE=$(git log -1 --format=%ct HEAD) \
 #     --secret id=keystore_password,env=KEYSTORE_PASSWORD \
 #     -t phos .
 #
 # PHOS_VERSION_CODE is the Android versionCode and MUST come from outside: no
-# stage in here has the git history to count commits itself. CI passes
-# `git rev-list --count HEAD`, which is monotonic on master rather than only on
-# tags — the in-app updater compares that number against what the running APK
-# reports, so a value that does not increase means "up to date" forever.
+# stage in here has the git metadata. It is the commit's committer time (unix
+# seconds), which only grows on master — the in-app updater compares that
+# number against what the running APK reports, so a value that does not
+# increase means "up to date" forever. It stays under Android's 2100000000 cap
+# until mid-2036.
+#
+# GitImage (https://diverofdark.github.io/gitimage/) cannot pass PHOS_* args
+# per commit, but it passes GITIMAGE_REVISION (full sha) and
+# GITIMAGE_COMMIT_TIME (committer time) on every build. The `version` stage
+# turns either set into one name and one code, so both builders agree:
+#   - versionCode: PHOS_VERSION_CODE, else GITIMAGE_COMMIT_TIME, else 1
+#   - versionName: PHOS_VERSION, plus `+<short sha>` when GITIMAGE_REVISION is
+#     set (GitImage sets PHOS_VERSION to the branch, giving `master+6365d4f`,
+#     the same shape GitHub CI produces)
 
 ARG PHOS_VERSION=dev
-ARG PHOS_VERSION_CODE=1
+ARG PHOS_VERSION_CODE=
+
+# Stage 0: Resolve the version once, for every stage below. Its RUN changes on
+# every commit; it is the only layer that does on its own.
+FROM debian:trixie-slim AS version
+ARG PHOS_VERSION
+ARG PHOS_VERSION_CODE
+ARG GITIMAGE_REVISION=
+ARG GITIMAGE_COMMIT_TIME=
+RUN set -eu; \
+    name="${PHOS_VERSION:-dev}"; \
+    if [ -n "$GITIMAGE_REVISION" ]; then \
+        name="${name}+$(printf '%s' "$GITIMAGE_REVISION" | cut -c1-7)"; \
+    fi; \
+    code="${PHOS_VERSION_CODE:-${GITIMAGE_COMMIT_TIME:-1}}"; \
+    case "$code" in \
+      ''|0|*[!0-9]*) \
+        echo "versionCode must be a positive integer, got '${code}'" >&2; \
+        exit 1 ;; \
+    esac; \
+    if [ "$code" -gt 2100000000 ]; then \
+        echo "versionCode ${code} is above Android's 2100000000 cap" >&2; \
+        exit 1; \
+    fi; \
+    mkdir /version; \
+    printf '%s' "$name" > /version/name; \
+    printf '%s' "$code" > /version/code; \
+    echo "version ${name} (${code})"
 
 # Stage 1: Build Frontend
 FROM node:25-slim AS frontend-builder
-ARG PHOS_VERSION
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN --mount=type=cache,target=/root/.npm \
     npm ci
 COPY frontend/ ./
-RUN PHOS_VERSION=${PHOS_VERSION} npm run build
+COPY --from=version /version /version
+RUN PHOS_VERSION="$(cat /version/name)" npm run build
 
 # Stage 2a: Chef base (install cargo-chef + system deps)
 FROM rust:1.94 AS chef
@@ -61,12 +98,11 @@ FROM chef AS backend-builder
 COPY --from=planner /app/backend/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
-ARG PHOS_VERSION
-ENV PHOS_VERSION=${PHOS_VERSION}
+COPY --from=version /version /version
 COPY backend/Cargo.toml backend/Cargo.lock backend/build.rs ./
 COPY backend/migrations ./migrations
 COPY backend/src ./src
-RUN cargo auditable build --release && \
+RUN PHOS_VERSION="$(cat /version/name)" cargo auditable build --release && \
     cp target/release/phos-backend /usr/local/bin/phos-backend
 
 # Stage 2e: Build Android APK (bundled into the image, downloadable from the web UI)
@@ -84,8 +120,7 @@ RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && \
         "platform-tools" "platforms;android-36" "build-tools;36.0.0" > /dev/null
 WORKDIR /app/android
 COPY android/ ./
-ARG PHOS_VERSION
-ARG PHOS_VERSION_CODE
+COPY --from=version /version /version
 # Signed release when the keystore_password secret is provided, unsigned otherwise.
 #
 # versionName AND versionCode are passed to Gradle on EVERY build, not only for
@@ -94,10 +129,10 @@ ARG PHOS_VERSION_CODE
 # image shipped versionCode 1 / versionName 1.0.0 and the in-app updater would
 # compare 1 against 1 forever.
 #
-# versionCode is the commit count handed in by CI rather than anything derived
-# from the tag: mixing the two schemes would let a tag (v1.0.0 -> 10000) outrank
-# every subsequent master build, which is the same "never updates" failure with
-# extra steps.
+# versionCode is the commit time resolved by the `version` stage rather than
+# anything derived from the tag: mixing the two schemes would let a tag
+# (v1.0.0 -> 10000) outrank every subsequent master build, which is the same
+# "never updates" failure with extra steps.
 #
 # The sidecar phos.apk.json is written from the SAME two values given to Gradle,
 # and then checked against what aapt2 reads back out of the APK, so what the
@@ -112,16 +147,11 @@ RUN --mount=type=cache,target=/root/.gradle \
         KEYSTORE_PASSWORD="$(cat /run/secrets/keystore_password)"; \
         export KEYSTORE_PASSWORD; \
     fi; \
-    VERSION_NAME="${PHOS_VERSION:-dev}"; \
+    VERSION_NAME="$(cat /version/name)"; \
     case "$VERSION_NAME" in \
       v[0-9]*.[0-9]*.[0-9]*) VERSION_NAME="${VERSION_NAME#v}" ;; \
     esac; \
-    VERSION_CODE="${PHOS_VERSION_CODE:-1}"; \
-    case "$VERSION_CODE" in \
-      ''|0|*[!0-9]*) \
-        echo "PHOS_VERSION_CODE must be a positive integer, got '${VERSION_CODE}'" >&2; \
-        exit 1 ;; \
-    esac; \
+    VERSION_CODE="$(cat /version/code)"; \
     chmod +x gradlew; \
     ./gradlew --no-daemon assembleRelease \
         "-PversionName=${VERSION_NAME}" "-PversionCode=${VERSION_CODE}"; \
