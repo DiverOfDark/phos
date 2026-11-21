@@ -121,6 +121,12 @@ RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && \
 WORKDIR /app/android
 COPY android/ ./
 COPY --from=version /version /version
+# Set by deployments that ship the APK to phones (the GitImage spec in the homelab): the
+# SHA-256 of the release signing certificate. The build then fails unless the APK is signed by
+# exactly that certificate. An unsigned or differently signed APK would be served by
+# /api/client/version, and every installed app would refuse to update to it - silently.
+# Unset (GitHub PR builds, local builds), an unsigned APK is fine.
+ARG PHOS_SIGNING_CERT_SHA256=
 # Signed release when the keystore_password secret is provided, unsigned otherwise.
 #
 # versionName AND versionCode are passed to Gradle on EVERY build, not only for
@@ -146,6 +152,9 @@ RUN --mount=type=cache,target=/root/.gradle \
     if [ -s /run/secrets/keystore_password ]; then \
         KEYSTORE_PASSWORD="$(cat /run/secrets/keystore_password)"; \
         export KEYSTORE_PASSWORD; \
+    elif [ -n "$PHOS_SIGNING_CERT_SHA256" ]; then \
+        echo "PHOS_SIGNING_CERT_SHA256 is set but the keystore_password secret is missing or empty" >&2; \
+        exit 1; \
     fi; \
     VERSION_NAME="$(cat /version/name)"; \
     case "$VERSION_NAME" in \
@@ -161,6 +170,15 @@ RUN --mount=type=cache,target=/root/.gradle \
       *"versionCode='${VERSION_CODE}'"*"versionName='${VERSION_NAME}'"*) ;; \
       *) echo "APK does not carry the requested version: ${BADGING}" >&2; exit 1 ;; \
     esac; \
+    if [ -n "$PHOS_SIGNING_CERT_SHA256" ]; then \
+        SIGNER="$(${ANDROID_HOME}/build-tools/36.0.0/apksigner verify --print-certs /phos.apk 2>&1 \
+            | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')"; \
+        if [ "$SIGNER" != "$PHOS_SIGNING_CERT_SHA256" ]; then \
+            echo "APK signer certificate '${SIGNER:-none: unsigned}' is not the release certificate ${PHOS_SIGNING_CERT_SHA256}" >&2; \
+            exit 1; \
+        fi; \
+        echo "APK signed by the release certificate ${SIGNER}"; \
+    fi; \
     SHA256="$(sha256sum /phos.apk | cut -d' ' -f1)"; \
     SIZE_BYTES="$(stat -c %s /phos.apk)"; \
     NAME_JSON="$(printf '%s' "$VERSION_NAME" | sed 's/\\/\\\\/g; s/"/\\"/g')"; \
